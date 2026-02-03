@@ -4,6 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# Compat layer (must be first)
+add_subdirectory(compat)
+
 # MOQ
 add_library(moxygen
     MoQFramer.cpp
@@ -25,6 +28,7 @@ target_compile_options(
 )
 target_link_libraries(
     moxygen PUBLIC
+    moqcompat
     Folly::folly
     wangle::wangle
     proxygen::proxygen

@@ -35,6 +35,11 @@ option(BUILD_SHARED_LIBS
 # is generally discouraged.
 mark_as_advanced(BUILD_SHARED_LIBS)
 
+option(MOXYGEN_USE_FOLLY
+  "Build with Folly support (coroutines, IOBuf, etc). When OFF, uses std alternatives."
+  ON
+)
+
 include(FBBuildOptions)
 fb_activate_static_library_option()
 
