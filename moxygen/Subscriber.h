@@ -8,10 +8,14 @@
 
 #pragma once
 
-#include <folly/coro/Task.h>
 #include <moxygen/MoQTypes.h>
 #include <moxygen/compat/Async.h>
+#include <moxygen/compat/Callbacks.h>
 #include <moxygen/compat/Expected.h>
+
+#if MOXYGEN_USE_FOLLY
+#include <folly/coro/Task.h>
+#endif
 
 // MoQ Subscriber interface
 //
@@ -85,6 +89,7 @@ class Subscriber {
   // Send/respond to PUBLISH_NAMESPACE
   using PublishNamespaceResult = compat::
       Expected<std::shared_ptr<PublishNamespaceHandle>, PublishNamespaceError>;
+#if MOXYGEN_USE_FOLLY
   virtual compat::Task<PublishNamespaceResult> publishNamespace(
       PublishNamespace ann,
       std::shared_ptr<PublishNamespaceCallback> = nullptr) {
@@ -94,16 +99,41 @@ class Subscriber {
             PublishNamespaceErrorCode::NOT_SUPPORTED,
             "unimplemented"}));
   }
+#else
+  // Callback-based API for std-mode
+  virtual void publishNamespaceWithCallback(
+      PublishNamespace ann,
+      std::shared_ptr<PublishNamespaceCallback> cancelCallback,
+      std::shared_ptr<compat::ResultCallback<
+          std::shared_ptr<PublishNamespaceHandle>,
+          PublishNamespaceError>> callback) {
+    callback->onError(PublishNamespaceError{
+        ann.requestID,
+        PublishNamespaceErrorCode::NOT_SUPPORTED,
+        "unimplemented"});
+  }
+#endif
 
   // Result of a PUBLISH request containing consumer and async reply
+#if MOXYGEN_USE_FOLLY
   struct PublishConsumerAndReplyTask {
     std::shared_ptr<TrackConsumer> consumer;
     compat::Task<compat::Expected<PublishOk, PublishError>> reply;
   };
+#else
+  // Callback-based version for std-mode
+  struct PublishConsumerAndReplyCallback {
+    std::shared_ptr<TrackConsumer> consumer;
+    // In std-mode, the caller provides a callback that will be invoked
+    // when the PublishOk/PublishError is received
+    std::shared_ptr<compat::ResultCallback<PublishOk, PublishError>> callback;
+  };
+#endif
 
   // Send/respond to a PUBLISH - synchronous API o that the publisher can
   // immediately start sending data instead of waiting for a PUBLISH_OK from the
   // peer
+#if MOXYGEN_USE_FOLLY
   using PublishResult =
       compat::Expected<PublishConsumerAndReplyTask, PublishError>;
   virtual PublishResult publish(
@@ -113,6 +143,18 @@ class Subscriber {
         PublishError{
             pub.requestID, PublishErrorCode::NOT_SUPPORTED, "unimplemented"});
   }
+#else
+  // Callback-based version for std-mode
+  using PublishResult =
+      compat::Expected<PublishConsumerAndReplyCallback, PublishError>;
+  virtual PublishResult publish(
+      PublishRequest pub,
+      std::shared_ptr<SubscriptionHandle> /*handle*/ = nullptr) {
+    return compat::makeUnexpected(
+        PublishError{
+            pub.requestID, PublishErrorCode::NOT_SUPPORTED, "unimplemented"});
+  }
+#endif
 
   virtual void goaway(Goaway /*goaway*/) {}
 };

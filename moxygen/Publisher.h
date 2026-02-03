@@ -8,10 +8,14 @@
 
 #pragma once
 
-#include <folly/coro/Task.h>
 #include <moxygen/MoQTypes.h>
 #include <moxygen/compat/Async.h>
+#include <moxygen/compat/Callbacks.h>
 #include <moxygen/compat/Expected.h>
+
+#if MOXYGEN_USE_FOLLY
+#include <folly/coro/Task.h>
+#endif
 
 // MoQ Publisher interface
 //
@@ -51,8 +55,17 @@ class SubscriptionHandle {
   // Updates subscription parameters (start/end locations, priority, forward).
   // This is a coroutine because it may do async work, such as forwarding the
   // update to the upstream publisher in a relay scenario.
+#if MOXYGEN_USE_FOLLY
   virtual compat::Task<SubscribeUpdateResult> subscribeUpdate(
       SubscribeUpdate subUpdate) = 0;
+#else
+  // Callback-based API for std-mode
+  virtual void subscribeUpdateWithCallback(
+      SubscribeUpdate subUpdate,
+      std::shared_ptr<
+          compat::ResultCallback<SubscribeUpdateOk, SubscribeUpdateError>>
+          callback) = 0;
+#endif
 
   const SubscribeOk& subscribeOk() const {
     return *subscribeOk_;
@@ -74,6 +87,7 @@ class Publisher {
 
   // Send/respond to TRACK_STATUS_REQUEST
   using TrackStatusResult = compat::Expected<TrackStatusOk, TrackStatusError>;
+#if MOXYGEN_USE_FOLLY
   virtual compat::Task<TrackStatusResult> trackStatus(
       const TrackStatus trackStatus) {
     return folly::coro::makeTask<TrackStatusResult>(
@@ -82,12 +96,25 @@ class Publisher {
             TrackStatusErrorCode::NOT_SUPPORTED,
             "Track status not implemented"}));
   }
+#else
+  // Callback-based API for std-mode
+  virtual void trackStatusWithCallback(
+      const TrackStatus trackStatus,
+      std::shared_ptr<compat::ResultCallback<TrackStatusOk, TrackStatusError>>
+          callback) {
+    callback->onError(TrackStatusError{
+        trackStatus.requestID,
+        TrackStatusErrorCode::NOT_SUPPORTED,
+        "Track status not implemented"});
+  }
+#endif
 
   // On successful SUBSCRIBE, a SubscriptionHandle is returned, which the
   // caller can use to UNSUBSCRIBE or SUBSCRIBE_UPDATE.
   // Send/respond to a SUBSCRIBE
   using SubscribeResult =
       compat::Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>;
+#if MOXYGEN_USE_FOLLY
   virtual compat::Task<SubscribeResult> subscribe(
       SubscribeRequest sub,
       std::shared_ptr<TrackConsumer> callback) {
@@ -97,6 +124,18 @@ class Publisher {
             SubscribeErrorCode::NOT_SUPPORTED,
             "unimplemented"}));
   }
+#else
+  // Callback-based API for std-mode
+  virtual void subscribeWithCallback(
+      SubscribeRequest sub,
+      std::shared_ptr<TrackConsumer> consumer,
+      std::shared_ptr<compat::ResultCallback<
+          std::shared_ptr<SubscriptionHandle>,
+          SubscribeError>> callback) {
+    callback->onError(SubscribeError{
+        sub.requestID, SubscribeErrorCode::NOT_SUPPORTED, "unimplemented"});
+  }
+#endif
 
   // On successful FETCH, a FetchHandle is returned, which the caller can use
   // to FETCH_CANCEL.
@@ -122,6 +161,7 @@ class Publisher {
 
   // Send/respond to a FETCH
   using FetchResult = compat::Expected<std::shared_ptr<FetchHandle>, FetchError>;
+#if MOXYGEN_USE_FOLLY
   virtual compat::Task<FetchResult> fetch(
       Fetch fetch,
       std::shared_ptr<FetchConsumer> fetchCallback) {
@@ -129,6 +169,18 @@ class Publisher {
         FetchError{
             fetch.requestID, FetchErrorCode::NOT_SUPPORTED, "unimplemented"}));
   }
+#else
+  // Callback-based API for std-mode
+  virtual void fetchWithCallback(
+      Fetch fetch,
+      std::shared_ptr<FetchConsumer> consumer,
+      std::shared_ptr<
+          compat::ResultCallback<std::shared_ptr<FetchHandle>, FetchError>>
+          callback) {
+    callback->onError(FetchError{
+        fetch.requestID, FetchErrorCode::NOT_SUPPORTED, "unimplemented"});
+  }
+#endif
 
   // On successful SUBSCRIBE_NAMESPACE, a SubscribeNamespaceHandle is returned,
   // which the caller can use to UNSUBSCRIBE_NAMESPACE
@@ -157,6 +209,7 @@ class Publisher {
   using SubscribeNamespaceResult = compat::Expected<
       std::shared_ptr<SubscribeNamespaceHandle>,
       SubscribeNamespaceError>;
+#if MOXYGEN_USE_FOLLY
   virtual compat::Task<SubscribeNamespaceResult> subscribeNamespace(
       SubscribeNamespace subAnn) {
     return folly::coro::makeTask<SubscribeNamespaceResult>(
@@ -166,6 +219,19 @@ class Publisher {
                 SubscribeNamespaceErrorCode::NOT_SUPPORTED,
                 "unimplemented"}));
   }
+#else
+  // Callback-based API for std-mode
+  virtual void subscribeNamespaceWithCallback(
+      SubscribeNamespace subAnn,
+      std::shared_ptr<compat::ResultCallback<
+          std::shared_ptr<SubscribeNamespaceHandle>,
+          SubscribeNamespaceError>> callback) {
+    callback->onError(SubscribeNamespaceError{
+        subAnn.requestID,
+        SubscribeNamespaceErrorCode::NOT_SUPPORTED,
+        "unimplemented"});
+  }
+#endif
 
   virtual void goaway(Goaway /*goaway*/) {}
 };
