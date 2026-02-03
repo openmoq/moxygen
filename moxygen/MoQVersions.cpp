@@ -6,13 +6,24 @@
 
 #include <moxygen/MoQVersions.h>
 
-#include <folly/Conv.h>
+#include <moxygen/compat/Config.h>
 #include <algorithm>
+#include <charconv>
+#include <string>
 
 namespace {
 
 bool isDraftVariant(uint64_t version) {
   return (version & 0x00ff0000);
+}
+
+std::optional<uint64_t> tryParseUint64(std::string_view sv) {
+  uint64_t value = 0;
+  auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value);
+  if (ec == std::errc() && ptr == sv.data() + sv.size()) {
+    return value;
+  }
+  return std::nullopt;
 }
 
 } // namespace
@@ -59,8 +70,8 @@ std::optional<uint64_t> getVersionFromAlpn(std::string_view alpn) {
       draftStr = draftStr.substr(0, hyphenPos);
     }
 
-    auto draftNum = folly::tryTo<uint64_t>(draftStr);
-    if (draftNum.hasValue() && draftNum.value() >= 15) {
+    auto draftNum = tryParseUint64(draftStr);
+    if (draftNum.has_value() && draftNum.value() >= 15) {
       return 0xff000000 | draftNum.value();
     }
   }
@@ -96,7 +107,7 @@ std::string getSupportedVersionsString() {
     if (i > 0) {
       result += ",";
     }
-    result += folly::to<std::string>(kSupportedVersions[i]);
+    result += std::to_string(kSupportedVersions[i]);
   }
   return result;
 }

@@ -6,8 +6,9 @@
 
 #pragma once
 
-#include <folly/Expected.h>
-#include <folly/container/F14Map.h>
+#include <moxygen/compat/Containers.h>
+#include <moxygen/compat/Expected.h>
+#include <moxygen/compat/Unit.h>
 #include <cstdint>
 #include <list>
 
@@ -26,7 +27,7 @@ class MoQTokenCache {
   // Evicts most recently inserted/used rather than LRU order to handle
   // optimisitic inserts during CLIENT_SETUP that are resolved after
   // SERVER_SETUP.
-  folly::Expected<folly::Unit, ErrorCode> setMaxSize(
+  compat::Expected<compat::Unit, ErrorCode> setMaxSize(
       uint64_t maxSize,
       bool evict = false) {
     if (maxSize < totalSize_) {
@@ -35,34 +36,34 @@ class MoQTokenCache {
           evictMRU();
         }
       } else {
-        return folly::makeUnexpected(ErrorCode::LIMIT_EXCEEDED);
+        return compat::makeUnexpected(ErrorCode::LIMIT_EXCEEDED);
       }
     }
     maxSize_ = maxSize;
-    return folly::unit;
+    return compat::unit;
   }
 
   using Alias = uint64_t;
   using TokenValue = std::string;
   // For encoder -- alias is set automatically
-  folly::Expected<Alias, ErrorCode> registerToken(
+  compat::Expected<Alias, ErrorCode> registerToken(
       uint64_t tokenType,
       TokenValue tokenValue);
 
   // for decoder -- alias is set by caller
-  folly::Expected<folly::Unit, ErrorCode>
+  compat::Expected<compat::Unit, ErrorCode>
   registerToken(Alias alias, uint64_t tokenType, TokenValue tokenValue);
 
-  folly::Expected<Alias, ErrorCode> getAliasForToken(
+  compat::Expected<Alias, ErrorCode> getAliasForToken(
       uint64_t tokenType,
       const TokenValue& tokenValue);
 
-  folly::Expected<folly::Unit, ErrorCode> deleteToken(Alias alias);
+  compat::Expected<compat::Unit, ErrorCode> deleteToken(Alias alias);
   struct TokenTypeAndValue {
     uint64_t tokenType;
     TokenValue tokenValue;
   };
-  folly::Expected<TokenTypeAndValue, ErrorCode> getTokenForAlias(Alias alias);
+  compat::Expected<TokenTypeAndValue, ErrorCode> getTokenForAlias(Alias alias);
   Alias evictLRU();
   Alias evictMRU();
 
@@ -93,7 +94,7 @@ class MoQTokenCache {
     TokenValue tokenValue;
     std::list<Alias>::iterator aliasIt;
   };
-  folly::F14FastMap<Alias, CachedToken> aliasToToken_;
+  compat::FastMap<Alias, CachedToken> aliasToToken_;
   std::list<Alias> lru_; // technically only used by encoders, but it's O(1)
   uint64_t maxSize_;
   uint64_t nextAlias_ = 0;

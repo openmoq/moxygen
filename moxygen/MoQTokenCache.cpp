@@ -6,10 +6,10 @@
 
 #include <moxygen/MoQTokenCache.h>
 
-#include <folly/logging/xlog.h>
+#include <moxygen/compat/Debug.h>
 
 namespace moxygen {
-folly::Expected<MoQTokenCache::Alias, MoQTokenCache::ErrorCode>
+compat::Expected<MoQTokenCache::Alias, MoQTokenCache::ErrorCode>
 MoQTokenCache::registerToken(uint64_t tokenType, TokenValue tokenValue) {
   // Generate a new alias
   Alias alias = nextAlias_;
@@ -17,7 +17,7 @@ MoQTokenCache::registerToken(uint64_t tokenType, TokenValue tokenValue) {
   // Call the second registerToken function
   auto res = registerToken(alias, tokenType, std::move(tokenValue));
   if (res.hasError()) {
-    return folly::makeUnexpected(res.error());
+    return compat::makeUnexpected(res.error());
   }
 
   // Increment the next alias
@@ -26,31 +26,30 @@ MoQTokenCache::registerToken(uint64_t tokenType, TokenValue tokenValue) {
 }
 
 // for decoder -- alias is set by caller
-folly::Expected<folly::Unit, MoQTokenCache::ErrorCode>
+compat::Expected<compat::Unit, MoQTokenCache::ErrorCode>
 MoQTokenCache::registerToken(
     Alias alias,
     uint64_t tokenType,
     TokenValue tokenValue) {
   // Check if the cache size limit is exceeded
   if (aliasToToken_.contains(alias)) {
-    return folly::makeUnexpected(ErrorCode::DUPLICATE_ALIAS);
+    return compat::makeUnexpected(ErrorCode::DUPLICATE_ALIAS);
   }
   auto tokenSize = cachedSize(tokenValue);
   if (totalSize_ + tokenSize > maxSize_) {
-    return folly::makeUnexpected(ErrorCode::LIMIT_EXCEEDED);
+    return compat::makeUnexpected(ErrorCode::LIMIT_EXCEEDED);
   }
   totalSize_ += tokenSize;
 
   // Insert the new token into the cache with the provided alias
   lru_.push_back(alias);
-  XLOG(DBG4) << "Inserting alias: " << alias << ", TokenValue: " << tokenValue;
 
   aliasToToken_.emplace(
       alias, CachedToken{tokenType, std::move(tokenValue), --lru_.end()});
-  return folly::unit;
+  return compat::unit;
 }
 
-folly::Expected<MoQTokenCache::Alias, MoQTokenCache::ErrorCode>
+compat::Expected<MoQTokenCache::Alias, MoQTokenCache::ErrorCode>
 MoQTokenCache::getAliasForToken(
     uint64_t tokenType,
     const TokenValue& tokenValue) {
@@ -60,31 +59,29 @@ MoQTokenCache::getAliasForToken(
       return alias;
     }
   }
-  return folly::makeUnexpected(ErrorCode::UNKNOWN_TOKEN);
+  return compat::makeUnexpected(ErrorCode::UNKNOWN_TOKEN);
 }
 
-folly::Expected<folly::Unit, MoQTokenCache::ErrorCode>
+compat::Expected<compat::Unit, MoQTokenCache::ErrorCode>
 MoQTokenCache::deleteToken(Alias alias) {
   auto it = aliasToToken_.find(alias);
   if (it == aliasToToken_.end()) {
-    return folly::makeUnexpected(ErrorCode::UNKNOWN_ALIAS);
+    return compat::makeUnexpected(ErrorCode::UNKNOWN_ALIAS);
   }
 
-  XLOG(DBG4) << "Deleting alias: " << alias
-             << ", TokenValue: " << it->second.tokenValue;
   auto size = cachedSize(it->second.tokenValue);
-  XCHECK_GE(totalSize_, size);
+  CHECK_GE(totalSize_, size);
   totalSize_ -= size;
   lru_.erase(it->second.aliasIt);
   aliasToToken_.erase(it);
-  return folly::Unit();
+  return compat::Unit();
 }
 
-folly::Expected<MoQTokenCache::TokenTypeAndValue, MoQTokenCache::ErrorCode>
+compat::Expected<MoQTokenCache::TokenTypeAndValue, MoQTokenCache::ErrorCode>
 MoQTokenCache::getTokenForAlias(Alias alias) {
   auto it = aliasToToken_.find(alias);
   if (it == aliasToToken_.end()) {
-    return folly::makeUnexpected(ErrorCode::UNKNOWN_ALIAS);
+    return compat::makeUnexpected(ErrorCode::UNKNOWN_ALIAS);
   }
 
   auto& cachedToken = it->second;
@@ -93,26 +90,24 @@ MoQTokenCache::getTokenForAlias(Alias alias) {
 }
 
 MoQTokenCache::Alias MoQTokenCache::evictHelper(std::list<Alias>::iterator it) {
-  XCHECK(it != lru_.end());
+  CHECK(it != lru_.end());
   auto alias = *it;
   lru_.erase(it);
   auto tokenIt = aliasToToken_.find(alias);
-  XCHECK(tokenIt != aliasToToken_.end());
-  XCHECK_GE(totalSize_, cachedSize(tokenIt->second.tokenValue));
-  XLOG(DBG4) << "Removing alias: " << alias
-             << ", TokenValue: " << tokenIt->second.tokenValue;
+  CHECK(tokenIt != aliasToToken_.end());
+  CHECK_GE(totalSize_, cachedSize(tokenIt->second.tokenValue));
   totalSize_ -= cachedSize(tokenIt->second.tokenValue);
   aliasToToken_.erase(tokenIt);
   return alias;
 }
 
 MoQTokenCache::Alias MoQTokenCache::evictLRU() {
-  XCHECK(!lru_.empty());
+  CHECK(!lru_.empty());
   return evictHelper(lru_.begin());
 }
 
 MoQTokenCache::Alias MoQTokenCache::evictMRU() {
-  XCHECK(!lru_.empty());
+  CHECK(!lru_.empty());
   return evictHelper(--lru_.end());
 }
 

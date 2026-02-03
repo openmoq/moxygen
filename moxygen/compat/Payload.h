@@ -12,9 +12,12 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #if MOXYGEN_USE_FOLLY
 #include <folly/io/IOBuf.h>
+#else
+#include <moxygen/compat/ByteBuffer.h>
 #endif
 
 namespace moxygen::compat {
@@ -193,6 +196,15 @@ class Payload {
 
   static std::unique_ptr<Payload> copyBuffer(const std::string& str) {
     return copyBuffer(str.data(), str.size());
+  }
+
+  // Wrap a ByteBuffer (for compatibility with Buffer type alias)
+  static std::unique_ptr<Payload> wrap(std::unique_ptr<ByteBuffer> buf) {
+    if (!buf) {
+      return nullptr;
+    }
+    return std::make_unique<Payload>(std::vector<uint8_t>(
+        buf->data(), buf->data() + buf->length()));
   }
 
  private:

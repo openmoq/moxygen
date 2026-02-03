@@ -6,15 +6,19 @@
 
 #pragma once
 
-#include <folly/container/F14Map.h>
-#include <folly/logging/xlog.h>
-#include <quic/common/events/QuicTimer.h>
+#include <moxygen/compat/Config.h>
+#include <moxygen/compat/Containers.h>
+#include <moxygen/compat/Debug.h>
 #include <moxygen/MoQFramer.h>
 #include <moxygen/events/MoQExecutor.h>
 #include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
+
+#if MOXYGEN_USE_FOLLY
+#include <quic/common/events/QuicTimer.h>
+#endif
 
 // Forward declarations
 namespace moxygen {
@@ -36,10 +40,7 @@ class MoQDeliveryTimer {
       StreamResetCallback streamResetCallback)
       : exec_(std::move(exec)),
         streamResetCallback_(std::move(streamResetCallback)),
-        deliveryTimeout_(deliveryTimeout) {
-    XLOG(DBG3) << "Setting delivery timeout to " << deliveryTimeout_.count()
-               << "ms";
-  }
+        deliveryTimeout_(deliveryTimeout) {}
   ~MoQDeliveryTimer();
 
   /*
@@ -73,10 +74,12 @@ class MoQDeliveryTimer {
   std::shared_ptr<MoQExecutor> exec_;
   StreamResetCallback streamResetCallback_;
   // (objectId -> timer)
-  folly::F14FastMap<uint64_t, std::unique_ptr<ObjectTimerCallback>>
+  compat::FastMap<uint64_t, std::unique_ptr<ObjectTimerCallback>>
       objectTimers_;
   std::chrono::milliseconds deliveryTimeout_;
 };
+
+#if MOXYGEN_USE_FOLLY
 
 class ObjectTimerCallback : public quic::QuicTimerCallback {
  public:
@@ -86,14 +89,29 @@ class ObjectTimerCallback : public quic::QuicTimerCallback {
   void timeoutExpired() noexcept override;
 
   // Don't invoke callback when timer is cancelled
-  void callbackCanceled() noexcept override {
-    XLOG(DBG6) << "MoQDeliveryTimer: ObjectID " << objectId_
-               << " timer cancelled";
-  }
+  void callbackCanceled() noexcept override {}
 
  private:
   uint64_t objectId_;
   MoQDeliveryTimer& owner_;
 };
+
+#else // !MOXYGEN_USE_FOLLY
+
+// Std-mode: stub timer callback
+class ObjectTimerCallback {
+ public:
+  ObjectTimerCallback(uint64_t objectId, MoQDeliveryTimer& owner)
+      : objectId_(objectId), owner_(owner) {}
+
+  void timeoutExpired() noexcept;
+  void callbackCanceled() noexcept {}
+
+ private:
+  uint64_t objectId_;
+  MoQDeliveryTimer& owner_;
+};
+
+#endif // MOXYGEN_USE_FOLLY
 
 } // namespace moxygen

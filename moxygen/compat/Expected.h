@@ -11,6 +11,7 @@
 #if MOXYGEN_USE_FOLLY
 #include <folly/Expected.h>
 #else
+#include <type_traits>
 #include <utility>
 #include <variant>
 #endif
@@ -54,8 +55,19 @@ Unexpected<std::decay_t<E>> makeUnexpected(E&& e) {
 template <typename T, typename E>
 class Expected {
  public:
+  // Default constructor - initializes with default T value
+  Expected() : storage_(T{}) {}
+
   Expected(T value) : storage_(std::move(value)) {}
   Expected(Unexpected<E> error) : storage_(std::move(error)) {}
+
+  // Converting constructor for types implicitly convertible to T
+  template <
+      typename U,
+      typename = std::enable_if_t<
+          std::is_convertible_v<U, T> && !std::is_same_v<std::decay_t<U>, T> &&
+          !std::is_same_v<std::decay_t<U>, Expected>>>
+  Expected(U&& value) : storage_(T(std::forward<U>(value))) {}
 
   bool hasValue() const { return std::holds_alternative<T>(storage_); }
   bool hasError() const { return !hasValue(); }

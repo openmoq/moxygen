@@ -6,11 +6,9 @@
 
 #include <moxygen/MoQTypes.h>
 
-#include <folly/Conv.h>
-#include <folly/String.h>
-#include <folly/container/F14Map.h>
-#include <folly/container/F14Set.h>
-#include <folly/logging/xlog.h>
+#include <moxygen/compat/Containers.h>
+#include <moxygen/compat/Debug.h>
+#include <sstream>
 
 namespace {
 
@@ -46,7 +44,6 @@ const char* getFrameTypeString(moxygen::FrameType type) {
       // can happen when type was cast from uint8_t
       return "Unknown";
   }
-  LOG(FATAL) << "Unreachable";
 }
 
 const char* getStreamTypeString(moxygen::StreamType type) {
@@ -64,7 +61,6 @@ const char* getStreamTypeString(moxygen::StreamType type) {
       // can happen when type was cast from uint8_t
       return "Unknown";
   }
-  LOG(FATAL) << "Unreachable";
 }
 
 const char* getObjectStatusString(moxygen::ObjectStatus objectStatus) {
@@ -83,7 +79,22 @@ const char* getObjectStatusString(moxygen::ObjectStatus objectStatus) {
       // can happen when type was cast from uint8_t
       return "Unknown";
   }
-  LOG(FATAL) << "Unreachable";
+}
+
+// Helper to split string by delimiter
+std::vector<std::string> splitString(
+    const std::string& str,
+    const std::string& delimiter) {
+  std::vector<std::string> result;
+  size_t start = 0;
+  size_t end = str.find(delimiter);
+  while (end != std::string::npos) {
+    result.push_back(str.substr(start, end - start));
+    start = end + delimiter.length();
+    end = str.find(delimiter, start);
+  }
+  result.push_back(str.substr(start));
+  return result;
 }
 
 } // namespace
@@ -91,18 +102,20 @@ const char* getObjectStatusString(moxygen::ObjectStatus objectStatus) {
 namespace moxygen {
 
 std::string AbsoluteLocation::describe() const {
-  return folly::to<std::string>("{", group, ",", object, "}");
+  std::ostringstream oss;
+  oss << "{" << group << "," << object << "}";
+  return oss.str();
 }
 
 TrackNamespace::TrackNamespace(std::string tns, std::string delimiter) {
-  folly::split(delimiter, tns, trackNamespace);
+  trackNamespace = splitString(tns, delimiter);
 }
 
 std::string FullTrackName::describe() const {
   if (trackNamespace.empty()) {
     return trackName;
   }
-  return folly::to<std::string>(trackNamespace.describe(), '/', trackName);
+  return trackNamespace.describe() + "/" + trackName;
 }
 
 std::string toString(LocationType loctype) {
@@ -168,7 +181,7 @@ std::ostream& operator<<(std::ostream& os, const ObjectHeader& header) {
 //// Parameters ////
 
 // Frame type sets for parameter allowlist
-const folly::F14FastSet<FrameType> kAllowedFramesForAuthToken = {
+const compat::FastSet<FrameType> kAllowedFramesForAuthToken = {
     FrameType::PUBLISH,
     FrameType::SUBSCRIBE,
     FrameType::SUBSCRIBE_UPDATE,
@@ -177,39 +190,39 @@ const folly::F14FastSet<FrameType> kAllowedFramesForAuthToken = {
     FrameType::TRACK_STATUS,
     FrameType::FETCH};
 
-const folly::F14FastSet<FrameType> kAllowedFramesForDeliveryTimeout = {
+const compat::FastSet<FrameType> kAllowedFramesForDeliveryTimeout = {
     FrameType::PUBLISH_OK,
     FrameType::SUBSCRIBE,
     FrameType::SUBSCRIBE_UPDATE};
 
-const folly::F14FastSet<FrameType> kAllowedFramesForSubscriberPriority = {
+const compat::FastSet<FrameType> kAllowedFramesForSubscriberPriority = {
     FrameType::SUBSCRIBE,
     FrameType::FETCH,
     FrameType::SUBSCRIBE_UPDATE,
     FrameType::PUBLISH_OK};
 
-const folly::F14FastSet<FrameType> kAllowedFramesForSubscriptionFilter = {
+const compat::FastSet<FrameType> kAllowedFramesForSubscriptionFilter = {
     FrameType::SUBSCRIBE,
     FrameType::PUBLISH_OK,
     FrameType::SUBSCRIBE_UPDATE};
 
-const folly::F14FastSet<FrameType> kAllowedFramesForExpires = {
+const compat::FastSet<FrameType> kAllowedFramesForExpires = {
     FrameType::SUBSCRIBE_OK,
     FrameType::PUBLISH,
     FrameType::PUBLISH_OK,
     FrameType::REQUEST_OK};
 
-const folly::F14FastSet<FrameType> kAllowedFramesForGroupOrder = {
+const compat::FastSet<FrameType> kAllowedFramesForGroupOrder = {
     FrameType::SUBSCRIBE,
     FrameType::PUBLISH_OK,
     FrameType::FETCH};
 
-const folly::F14FastSet<FrameType> kAllowedFramesForLargestObject = {
+const compat::FastSet<FrameType> kAllowedFramesForLargestObject = {
     FrameType::SUBSCRIBE_OK,
     FrameType::PUBLISH,
     FrameType::REQUEST_OK};
 
-const folly::F14FastSet<FrameType> kAllowedFramesForForward = {
+const compat::FastSet<FrameType> kAllowedFramesForForward = {
     FrameType::SUBSCRIBE,
     FrameType::SUBSCRIBE_UPDATE,
     FrameType::PUBLISH,
@@ -218,7 +231,7 @@ const folly::F14FastSet<FrameType> kAllowedFramesForForward = {
 
 // Allowlist mapping: TrackRequestParamKey -> set of allowed FrameTypes
 // Empty set means allowed for all frame types
-const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
+const compat::FastMap<TrackRequestParamKey, compat::FastSet<FrameType>>
     kParamAllowlist = {
         {TrackRequestParamKey::AUTHORIZATION_TOKEN, kAllowedFramesForAuthToken},
         {TrackRequestParamKey::DELIVERY_TIMEOUT,
@@ -236,7 +249,7 @@ const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
 };
 
 // Frame types that allow all parameters (no validation)
-const folly::F14FastSet<FrameType> kAllowAllParamsFrameTypes = {
+const compat::FastSet<FrameType> kAllowAllParamsFrameTypes = {
     FrameType::CLIENT_SETUP,
     FrameType::SERVER_SETUP,
     FrameType::LEGACY_CLIENT_SETUP,
@@ -303,8 +316,8 @@ SubscribeRequest SubscribeRequest::make(
   for (const auto& param : inputParams) {
     auto result = req.params.insertParam(param);
     if (result.hasError()) {
-      XLOG(ERR) << "SubscribeRequest::make: param not allowed, key="
-                << param.key;
+      LOG(ERROR) << "SubscribeRequest::make: param not allowed, key="
+                 << param.key;
     }
   }
   return req;
@@ -326,7 +339,7 @@ Fetch::Fetch(
   for (const auto& param : pa) {
     auto result = params.insertParam(param);
     if (result.hasError()) {
-      XLOG(ERR) << "Fetch: param not allowed, key=" << param.key;
+      LOG(ERROR) << "Fetch: param not allowed, key=" << param.key;
     }
   }
 }
@@ -349,9 +362,23 @@ Fetch::Fetch(
   for (const auto& param : pa) {
     auto result = params.insertParam(param);
     if (result.hasError()) {
-      XLOG(ERR) << "Fetch: param not allowed, key=" << param.key;
+      LOG(ERROR) << "Fetch: param not allowed, key=" << param.key;
     }
   }
+}
+
+RequestOk RequestOk::fromTrackStatusOk(const TrackStatusOk& trackStatusOk) {
+  RequestOk requestOk;
+  requestOk.requestID = trackStatusOk.requestID;
+  requestOk.params = trackStatusOk.params;
+  return requestOk;
+}
+
+TrackStatusOk RequestOk::toTrackStatusOk() const {
+  TrackStatusOk trackStatusOk;
+  trackStatusOk.requestID = requestID;
+  trackStatusOk.params = params;
+  return trackStatusOk;
 }
 
 } // namespace moxygen

@@ -52,13 +52,18 @@ set (DEPS_LIBRARIES_DIR ${MOXYGEN_FBCODE_ROOT}/_build/deps/lib)
 #
 # IMPORTANT: If you change this, make the analogous update in:
 #   cmake/moxygen-config.cmake.in
-find_package(folly REQUIRED)
-find_package(wangle REQUIRED)
-find_package(mvfst REQUIRED)
-find_package(proxygen REQUIRED)
-find_package(Glog REQUIRED)
-find_package(gflags REQUIRED)
-find_package(Zstd REQUIRED)
+if(MOXYGEN_USE_FOLLY)
+  find_package(folly REQUIRED)
+  find_package(wangle REQUIRED)
+  find_package(mvfst REQUIRED)
+  find_package(proxygen REQUIRED)
+  find_package(Glog REQUIRED)
+  find_package(gflags REQUIRED)
+  find_package(Zstd REQUIRED)
+else()
+  # Std-mode: minimal dependencies
+  find_package(Threads REQUIRED)
+endif()
 
 list(APPEND
   _MOXYGEN_COMMON_COMPILE_OPTIONS

@@ -7,16 +7,32 @@
 # Compat layer (must be first)
 add_subdirectory(compat)
 
-# MOQ
-add_library(moxygen
-    MoQFramer.cpp
-    MoQCodec.cpp
-    MoQSession.cpp
-    MoQTokenCache.cpp
-    MoQTypes.cpp
-    MoQVersions.cpp
-    events/MoQDeliveryTimer.cpp
-)
+# MOQ Core Library
+# Note: In std-mode, only core types and utilities are built.
+# The Framer, Codec, and Session require Folly/Proxygen and are Folly-only.
+if(MOXYGEN_USE_FOLLY)
+    set(MOXYGEN_CORE_SOURCES
+        MoQFramer.cpp
+        MoQCodec.cpp
+        MoQSession.cpp
+        MoQTokenCache.cpp
+        MoQTypes.cpp
+        MoQVersions.cpp
+        events/MoQDeliveryTimer.cpp
+    )
+else()
+    # Std-mode: core library with parsing support (no Session - requires transport)
+    set(MOXYGEN_CORE_SOURCES
+        MoQFramer.cpp
+        MoQCodec.cpp
+        MoQTokenCache.cpp
+        MoQTypes.cpp
+        MoQVersions.cpp
+        events/MoQDeliveryTimer.cpp
+    )
+endif()
+
+add_library(moxygen ${MOXYGEN_CORE_SOURCES})
 
 target_include_directories(
     moxygen PUBLIC
@@ -26,15 +42,25 @@ target_compile_options(
     moxygen PRIVATE
     ${_MOXYGEN_COMMON_COMPILE_OPTIONS}
 )
-target_link_libraries(
-    moxygen PUBLIC
-    moqcompat
-    Folly::folly
-    wangle::wangle
-    proxygen::proxygen
-    mvfst::mvfst_events
-    mlogger
-)
+
+if(MOXYGEN_USE_FOLLY)
+    target_link_libraries(
+        moxygen PUBLIC
+        moqcompat
+        Folly::folly
+        wangle::wangle
+        proxygen::proxygen
+        mvfst::mvfst_events
+        mlogger
+    )
+else()
+    # Std-mode: minimal dependencies
+    target_link_libraries(
+        moxygen PUBLIC
+        moqcompat
+        Threads::Threads
+    )
+endif()
 
 install(
     TARGETS moxygen
@@ -42,6 +68,10 @@ install(
     ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
     LIBRARY DESTINATION ${LIB_INSTALL_DIR}
 )
+
+# Folly-dependent targets - only build when MOXYGEN_USE_FOLLY is ON
+if(MOXYGEN_USE_FOLLY)
+
 add_library(moqrelaysession
     MoQRelaySession.cpp
 )
@@ -155,7 +185,6 @@ target_link_libraries(
     proxygen::proxygenhqserver
 )
 
-
 add_subdirectory(mlog)
 add_subdirectory(relay)
 # TODO: Fails with compiler error in ubuntu P1361252588
@@ -168,3 +197,5 @@ add_subdirectory(moq_mi)
 add_subdirectory(moqtest)
 add_subdirectory(flv_parser)
 add_subdirectory(test)
+
+endif() # MOXYGEN_USE_FOLLY

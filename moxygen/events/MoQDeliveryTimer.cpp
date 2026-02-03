@@ -6,8 +6,6 @@
 
 #include <moxygen/events/MoQDeliveryTimer.h>
 
-#include <folly/logging/xlog.h>
-
 namespace moxygen {
 
 MoQDeliveryTimer::~MoQDeliveryTimer() {
@@ -16,19 +14,15 @@ MoQDeliveryTimer::~MoQDeliveryTimer() {
 
 void MoQDeliveryTimer::setDeliveryTimeout(std::chrono::milliseconds timeout) {
   if (timeout.count() == 0) {
-    XLOG(DBG6)
-        << "MoQDeliveryTimer::setDeliveryTimeout: Ignoring delivery timeout update of 0ms";
     return;
   }
-  XLOG(DBG6) << "MoQDeliveryTimer::setDeliveryTimeout: TIMER VALUE UPDATED"
-             << " timeout=" << timeout.count() << "ms";
   deliveryTimeout_ = timeout;
 }
 
 void MoQDeliveryTimer::startTimer(
     uint64_t objId,
     std::chrono::microseconds srtt) {
-  XCHECK(exec_) << "MoQDeliveryTimer::startTimer: exec_ is not set";
+  CHECK(exec_) << "MoQDeliveryTimer::startTimer: exec_ is not set";
 
   auto callback = std::make_unique<ObjectTimerCallback>(objId, *this);
   auto* callbackPtr = callback.get();
@@ -36,11 +30,15 @@ void MoQDeliveryTimer::startTimer(
 
   if (inserted) {
     auto timeout = calculateTimeout(srtt);
+#if MOXYGEN_USE_FOLLY
     exec_->scheduleTimeout(callbackPtr, timeout);
+#else
+    // Std-mode: use scheduleTimeout from MoQExecutor
+    exec_->scheduleTimeout(
+        [callbackPtr]() { callbackPtr->timeoutExpired(); }, timeout);
+#endif
   } else {
     // ObjectID already sent, this is an internal error (?)
-    XLOG(ERR) << "MoQDeliveryTimer::startTimer: Internal Error::ObjectID "
-              << objId << " already has a timer.";
     streamResetCallback_(ResetStreamErrorCode::INTERNAL_ERROR);
   }
 }
@@ -56,18 +54,9 @@ std::chrono::milliseconds MoQDeliveryTimer::calculateTimeout(
     auto oneWayLatency =
         std::chrono::ceil<std::chrono::milliseconds>(srtt / 2.0);
     timeout = deliveryTimeout_ + oneWayLatency;
-
-    XLOG(DBG6)
-        << "Using RTT-adjusted timeout: " << timeout.count()
-        << "ms (base: " << deliveryTimeout_.count()
-        << "ms + one-way latency: " << oneWayLatency.count() << "ms, srtt: "
-        << std::chrono::duration_cast<std::chrono::milliseconds>(srtt).count()
-        << "ms)";
   } else {
     // RTT is 0 or not available: fall back to doubling
     timeout = deliveryTimeout_ * 2;
-    XLOG(DBG6) << "RTT not available, using fallback timeout (2x)"
-               << timeout.count() << "ms";
   }
   return timeout;
 }
@@ -83,8 +72,6 @@ void MoQDeliveryTimer::cancelTimer(uint64_t objId) {
     // MoQSession::onByteEventCanceled() will call cancelTimer() potentially
     // all offsets.  eg: if we register timers for 0, 1, 2 and 0 is cancelled.
     // We still get onByteEventCanceled for 1 and 2.
-    XLOG(DBG5) << "MoQDeliveryTimer::cancelTimer: ERROR: ObjectID " << objId
-               << " does not have a timer";
     return;
   }
   objectTimers_.erase(objId);
@@ -93,15 +80,10 @@ void MoQDeliveryTimer::cancelTimer(uint64_t objId) {
 void MoQDeliveryTimer::cancelAllTimers() {
   // Cancel all timers for objects in this stream
   // The destructors will call cancelImpl() without invoking callbacks
-  XLOG(DBG6) << "MoQDeliveryTimer::cancelAllTimers: Canceling all "
-             << objectTimers_.size() << " pending timers";
   objectTimers_.clear();
-  XLOG(DBG2) << "MoQDeliveryTimer::cancelAllTimers: ALL TIMERS CANCELED";
 }
 
 void ObjectTimerCallback::timeoutExpired() noexcept {
-  XLOG(DBG0) << "MoQDeliveryTimer::timeoutExpired: ObjectID " << objectId_
-             << " timed out.";
   if (owner_.streamResetCallback_) {
     owner_.streamResetCallback_(ResetStreamErrorCode::DELIVERY_TIMEOUT);
   }

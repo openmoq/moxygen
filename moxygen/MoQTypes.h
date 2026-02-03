@@ -7,10 +7,11 @@
 #pragma once
 
 #include <moxygen/compat/Config.h>
+#include <moxygen/compat/Debug.h>
 #include <moxygen/compat/Expected.h>
+#include <moxygen/compat/Hash.h>
 #include <moxygen/compat/Payload.h>
 #include <moxygen/compat/Unit.h>
-#include <folly/hash/Hash.h>
 #include <algorithm>
 #include <optional>
 #include <vector>
@@ -545,7 +546,7 @@ template <class T>
 std::optional<uint64_t> getFirstIntParam(
     const T& params,
     TrackRequestParamKey key) {
-  auto keyValue = folly::to_underlying(key);
+  auto keyValue = compat::to_underlying(key);
   for (const auto& param : params) {
     if (param.key == keyValue) {
       return param.asUint64;
@@ -813,7 +814,7 @@ struct TrackNamespace {
   }
   struct hash {
     size_t operator()(const TrackNamespace& tn) const {
-      return folly::hash::hash_range(
+      return compat::hash_range(
           tn.trackNamespace.begin(), tn.trackNamespace.end());
     }
   };
@@ -888,8 +889,9 @@ struct FullTrackName {
   std::string describe() const;
   struct hash {
     size_t operator()(const FullTrackName& ftn) const {
-      return folly::hash::hash_combine(
-          TrackNamespace::hash()(ftn.trackNamespace), ftn.trackName);
+      return compat::hash_combine(
+          TrackNamespace::hash()(ftn.trackNamespace),
+          std::hash<std::string>{}(ftn.trackName));
     }
   };
 };
@@ -1179,3 +1181,20 @@ using TrackStatusErrorCode = RequestErrorCode;
 using SubscribeUpdateErrorCode = RequestErrorCode;
 
 } // namespace moxygen
+
+// std::hash specializations for enum types used as container keys
+namespace std {
+template <>
+struct hash<moxygen::FrameType> {
+  size_t operator()(moxygen::FrameType ft) const {
+    return hash<uint64_t>{}(static_cast<uint64_t>(ft));
+  }
+};
+
+template <>
+struct hash<moxygen::TrackRequestParamKey> {
+  size_t operator()(moxygen::TrackRequestParamKey key) const {
+    return hash<uint64_t>{}(static_cast<uint64_t>(key));
+  }
+};
+} // namespace std

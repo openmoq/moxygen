@@ -41,15 +41,15 @@ class MoQCodec {
 
   // If ParseResult::BLOCKED is returned, must call onIngress again to restart
   virtual ParseResult onIngress(
-      std::unique_ptr<folly::IOBuf> data,
+      std::unique_ptr<Buffer> data,
       bool eom) = 0;
 
  protected:
-  void onIngressStart(std::unique_ptr<folly::IOBuf> data);
+  void onIngressStart(std::unique_ptr<Buffer> data);
   void onIngressEnd(size_t remainingLength, bool eom, Callback* callback);
 
   uint64_t streamId_{std::numeric_limits<uint64_t>::max()};
-  folly::IOBufQueue ingress_{folly::IOBufQueue::cacheChainLength()};
+  BufQueue ingress_{BufQueue::cacheChainLength()};
 
   std::optional<ErrorCode> connError_;
   ObjectHeader curObjectHeader_;
@@ -103,7 +103,7 @@ class MoQControlCodec : public MoQCodec {
   }
 
   // If ParseResult::BLOCKED is returned, must call onIngress again to restart
-  ParseResult onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) override;
+  ParseResult onIngress(std::unique_ptr<Buffer> data, bool eom) override;
 
  private:
   bool checkFrameAllowed(FrameType f) {
@@ -147,7 +147,7 @@ class MoQControlCodec : public MoQCodec {
     return false;
   }
 
-  folly::Expected<folly::Unit, ErrorCode> parseFrame(folly::io::Cursor& cursor);
+  compat::Expected<compat::Unit, ErrorCode> parseFrame(Cursor& cursor);
 
   Direction dir_;
   ControlCallback* callback_{nullptr};
@@ -202,7 +202,7 @@ class MoQObjectStreamCodec : public MoQCodec {
     callback_ = callback;
   }
 
-  ParseResult onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) override;
+  ParseResult onIngress(std::unique_ptr<Buffer> data, bool eom) override;
 
  private:
   enum class ParseState {
