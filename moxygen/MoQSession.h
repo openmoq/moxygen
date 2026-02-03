@@ -78,7 +78,7 @@ class MoQSession : public Subscriber,
         const std::shared_ptr<MoQSession>& session) = 0;
 
     // Authority validation callback - returns error code if validation fails
-    virtual folly::Expected<folly::Unit, SessionCloseErrorCode>
+    virtual compat::Expected<compat::Unit, SessionCloseErrorCode>
     validateAuthority(
         const ClientSetup& clientSetup,
         uint64_t negotiatedVersion,
@@ -164,7 +164,7 @@ class MoQSession : public Subscriber,
 
   void goaway(Goaway goaway) override;
 
-  folly::coro::Task<ServerSetup> setup(ClientSetup setup);
+  compat::Task<ServerSetup> setup(ClientSetup setup);
 
   void setMaxConcurrentRequests(uint64_t maxConcurrent);
 
@@ -178,14 +178,14 @@ class MoQSession : public Subscriber,
 
   static std::string getMoQTImplementationString();
 
-  folly::coro::Task<TrackStatusResult> trackStatus(
+  compat::Task<TrackStatusResult> trackStatus(
       TrackStatus trackStatus) override;
 
-  folly::coro::Task<SubscribeResult> subscribe(
+  compat::Task<SubscribeResult> subscribe(
       SubscribeRequest sub,
       std::shared_ptr<TrackConsumer> callback) override;
 
-  folly::coro::Task<FetchResult> fetch(
+  compat::Task<FetchResult> fetch(
       Fetch fetch,
       std::shared_ptr<FetchConsumer> fetchy) override;
 
@@ -193,7 +193,7 @@ class MoQSession : public Subscriber,
     SubscribeResult subscribeResult;
     FetchResult fetchResult;
   };
-  folly::coro::Task<JoinResult> join(
+  compat::Task<JoinResult> join(
       SubscribeRequest subscribe,
       std::shared_ptr<TrackConsumer> subscribeCallback,
       uint64_t joiningStart,
@@ -390,23 +390,23 @@ class MoQSession : public Subscriber,
  private:
   static const folly::RequestToken& sessionRequestToken();
 
-  folly::coro::Task<void> controlWriteLoop(
+  compat::Task<void> controlWriteLoop(
       proxygen::WebTransport::StreamWriteHandle* writeHandle);
-  folly::coro::Task<void> controlReadLoop(
+  compat::Task<void> controlReadLoop(
       proxygen::WebTransport::StreamReadHandle* readHandle);
 
-  folly::coro::Task<void> unidirectionalReadLoop(
+  compat::Task<void> unidirectionalReadLoop(
       std::shared_ptr<MoQSession> session,
       proxygen::WebTransport::StreamReadHandle* readHandle);
 
   class TrackPublisherImpl;
   class FetchPublisherImpl;
 
-  folly::coro::Task<void> handleTrackStatus(TrackStatus trackStatus);
+  compat::Task<void> handleTrackStatus(TrackStatus trackStatus);
   void trackStatusOk(const TrackStatusOk& trackStatusOk);
   void trackStatusError(const TrackStatusError& trackStatusError);
 
-  folly::coro::Task<void> handleSubscribe(
+  compat::Task<void> handleSubscribe(
       SubscribeRequest sub,
       std::shared_ptr<TrackPublisherImpl> trackPublisher);
   void sendSubscribeOk(const SubscribeOk& subOk);
@@ -419,14 +419,14 @@ class MoQSession : public Subscriber,
       RequestID subscriptionRequestID);
   void sendSubscribeDone(const SubscribeDone& subDone);
 
-  folly::coro::Task<void> handleFetch(
+  compat::Task<void> handleFetch(
       Fetch fetch,
       std::shared_ptr<FetchPublisherImpl> fetchPublisher);
   void fetchOk(const FetchOk& fetchOk);
   void fetchError(const FetchError& fetchError);
   void fetchCancel(const FetchCancel& fetchCancel);
 
-  folly::coro::Task<void> handlePublish(
+  compat::Task<void> handlePublish(
       PublishRequest publish,
       std::shared_ptr<Publisher::SubscriptionHandle> publishHandle);
   void publishOk(const PublishOk& pubOk);
@@ -580,12 +580,12 @@ class MoQSession : public Subscriber,
       ~Storage() {}
 
       std::shared_ptr<SubscribeTrackReceiveState> subscribeTrack_;
-      folly::coro::Promise<folly::Expected<PublishOk, PublishError>> publish_;
-      folly::coro::Promise<folly::Expected<TrackStatusOk, TrackStatusError>>
+      folly::coro::Promise<compat::Expected<PublishOk, PublishError>> publish_;
+      folly::coro::Promise<compat::Expected<TrackStatusOk, TrackStatusError>>
           trackStatus_;
       std::shared_ptr<FetchTrackReceiveState> fetchTrack_;
       folly::coro::Promise<
-          folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
+          compat::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
           subscribeUpdate_;
     } storage_;
 
@@ -600,7 +600,7 @@ class MoQSession : public Subscriber,
     }
 
     static std::unique_ptr<PendingRequestState> makePublish(
-        folly::coro::Promise<folly::Expected<PublishOk, PublishError>>
+        folly::coro::Promise<compat::Expected<PublishOk, PublishError>>
             promise) {
       auto result = std::make_unique<PendingRequestState>();
       result->type_ = Type::PUBLISH;
@@ -609,7 +609,7 @@ class MoQSession : public Subscriber,
     }
 
     static std::unique_ptr<PendingRequestState> makeTrackStatus(
-        folly::coro::Promise<folly::Expected<TrackStatusOk, TrackStatusError>>
+        folly::coro::Promise<compat::Expected<TrackStatusOk, TrackStatusError>>
             promise) {
       auto result = std::make_unique<PendingRequestState>();
       result->type_ = Type::TRACK_STATUS;
@@ -627,7 +627,7 @@ class MoQSession : public Subscriber,
 
     static std::unique_ptr<PendingRequestState> makeSubscribeUpdate(
         folly::coro::Promise<
-            folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>> promise) {
+            compat::Expected<SubscribeUpdateOk, SubscribeUpdateError>> promise) {
       auto result = std::make_unique<PendingRequestState>();
       result->type_ = Type::SUBSCRIBE_UPDATE;
       new (&result->storage_.subscribeUpdate_) auto(std::move(promise));
@@ -701,7 +701,7 @@ class MoQSession : public Subscriber,
       return getFrameType(false);
     }
 
-    virtual folly::Expected<Type, folly::Unit> setError(
+    virtual compat::Expected<Type, compat::Unit> setError(
         RequestError error,
         FrameType frameType);
 
@@ -711,12 +711,12 @@ class MoQSession : public Subscriber,
                                             : nullptr;
     }
 
-    folly::coro::Promise<folly::Expected<PublishOk, PublishError>>*
+    folly::coro::Promise<compat::Expected<PublishOk, PublishError>>*
     tryGetPublish() {
       return type_ == Type::PUBLISH ? &storage_.publish_ : nullptr;
     }
 
-    folly::coro::Promise<folly::Expected<TrackStatusOk, TrackStatusError>>*
+    folly::coro::Promise<compat::Expected<TrackStatusOk, TrackStatusError>>*
     tryGetTrackStatus() {
       return type_ == Type::TRACK_STATUS ? &storage_.trackStatus_ : nullptr;
     }
@@ -726,7 +726,7 @@ class MoQSession : public Subscriber,
     }
 
     folly::coro::Promise<
-        folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>*
+        compat::Expected<SubscribeUpdateOk, SubscribeUpdateError>>*
     tryGetSubscribeUpdate() {
       return type_ == Type::SUBSCRIBE_UPDATE ? &storage_.subscribeUpdate_
                                              : nullptr;
