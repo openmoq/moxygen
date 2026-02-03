@@ -9,6 +9,17 @@
 
 namespace moxygen {
 
+namespace {
+// Helper to convert IOBuf to vector for Extension construction
+std::vector<uint8_t> iobufToVector(std::unique_ptr<folly::IOBuf> buf) {
+  if (!buf) {
+    return {};
+  }
+  buf->coalesce();
+  return std::vector<uint8_t>(buf->data(), buf->data() + buf->length());
+}
+} // namespace
+
 std::unique_ptr<MoQMi::MoqMiObject> MoQMi::encodeToMoQMi(
     std::unique_ptr<MediaItem> item) noexcept {
   if (!item) {
@@ -30,7 +41,7 @@ std::unique_ptr<MoQMi::MoqMiObject> MoQMi::encodeToMoQMi(
         folly::to_underlying(
             HeaderExtensionsTypeIDs::
                 MOQ_EXT_HEADER_TYPE_MOQMI_VIDEO_H264_IN_AVCC_METADATA),
-        std::move(extBuff));
+        iobufToVector(std::move(extBuff)));
 
     if (item->metadata) {
       // Add extradata (AVCDecoderConfigurationRecord)
@@ -38,7 +49,7 @@ std::unique_ptr<MoQMi::MoqMiObject> MoQMi::encodeToMoQMi(
           folly::to_underlying(
               HeaderExtensionsTypeIDs::
                   MOQ_EXT_HEADER_TYPE_MOQMI_VIDEO_H264_IN_AVCC_EXTRADATA),
-          std::move(item->metadata));
+          iobufToVector(std::move(item->metadata)));
     }
   } else if (item->type == MediaType::AUDIO) {
     // Check codecType to determine which codec to use
@@ -57,7 +68,7 @@ std::unique_ptr<MoQMi::MoqMiObject> MoQMi::encodeToMoQMi(
           folly::to_underlying(
               HeaderExtensionsTypeIDs::
                   MOQ_EXT_HEADER_TYPE_MOQMI_AUDIO_OPUS_METADATA),
-          std::move(extBuff));
+          iobufToVector(std::move(extBuff)));
     } else {
       // Default to AAC for backwards compatibility
       // Specify media type
@@ -74,7 +85,7 @@ std::unique_ptr<MoQMi::MoqMiObject> MoQMi::encodeToMoQMi(
           folly::to_underlying(
               HeaderExtensionsTypeIDs::
                   MOQ_EXT_HEADER_TYPE_MOQMI_AUDIO_AACLC_MPEG4_METADATA),
-          std::move(extBuff));
+          iobufToVector(std::move(extBuff)));
     }
   } else {
     // Unknown media type
@@ -142,11 +153,12 @@ MoQMi::MoqMiItem MoQMi::decodeMoQMi(
         // Multiple extradata
         return MoQMi::MoqMiReadCmd::MOQMI_ERR;
       }
-      if (!ext.arrayValue) {
+      if (ext.arrayValue.empty()) {
         // AVCC extradata empty
         return MoQMi::MoqMiReadCmd::MOQMI_ERR;
       }
-      extradata = ext.arrayValue->clone();
+      extradata = folly::IOBuf::copyBuffer(
+          ext.arrayValue.data(), ext.arrayValue.size());
     }
 
     // Metadata AVCC
@@ -158,11 +170,13 @@ MoQMi::MoqMiItem MoQMi::decodeMoQMi(
         // Multiple AVCC metadata
         return MoQMi::MoqMiReadCmd::MOQMI_ERR;
       }
-      if (ext.arrayValue == nullptr) {
+      if (ext.arrayValue.empty()) {
         // Empty AVCC metadata
         return MoQMi::MoqMiReadCmd::MOQMI_ERR;
       }
-      videoH264AVCCWCPData = MoQMi::decodeMoqMiAVCCMetadata(*ext.arrayValue);
+      auto buf = folly::IOBuf::wrapBuffer(
+          ext.arrayValue.data(), ext.arrayValue.size());
+      videoH264AVCCWCPData = MoQMi::decodeMoqMiAVCCMetadata(*buf);
       if (!videoH264AVCCWCPData) {
         // Error parsing h264 AVCC metadata
         return MoQMi::MoqMiReadCmd::MOQMI_ERR;
@@ -178,11 +192,13 @@ MoQMi::MoqMiItem MoQMi::decodeMoQMi(
         // Multiple AACLC metadata
         return MoQMi::MoqMiReadCmd::MOQMI_ERR;
       }
-      if (ext.arrayValue == nullptr) {
+      if (ext.arrayValue.empty()) {
         // Empty AACLC metadata
         return MoQMi::MoqMiReadCmd::MOQMI_ERR;
       }
-      audioAACMP4LCWCPData = decodeMoqMiAACLCMetadata(*ext.arrayValue);
+      auto buf = folly::IOBuf::wrapBuffer(
+          ext.arrayValue.data(), ext.arrayValue.size());
+      audioAACMP4LCWCPData = decodeMoqMiAACLCMetadata(*buf);
       if (!audioAACMP4LCWCPData) {
         // Error parsing AACLC metadata
         return MoQMi::MoqMiReadCmd::MOQMI_ERR;
@@ -198,11 +214,13 @@ MoQMi::MoqMiItem MoQMi::decodeMoQMi(
         // Multiple Opus metadata
         return MoQMi::MoqMiReadCmd::MOQMI_ERR;
       }
-      if (ext.arrayValue == nullptr) {
+      if (ext.arrayValue.empty()) {
         // Empty Opus metadata
         return MoQMi::MoqMiReadCmd::MOQMI_ERR;
       }
-      audioOpusWCPData = decodeMoqMiOpusMetadata(*ext.arrayValue);
+      auto buf = folly::IOBuf::wrapBuffer(
+          ext.arrayValue.data(), ext.arrayValue.size());
+      audioOpusWCPData = decodeMoqMiOpusMetadata(*buf);
       if (!audioOpusWCPData) {
         // Error parsing Opus metadata
         return MoQMi::MoqMiReadCmd::MOQMI_ERR;

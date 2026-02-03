@@ -1108,9 +1108,9 @@ MLogger::convertExtensionToMoQTExtensionHeaders(
     MOQTExtensionHeader e;
     e.headerType = ext.type;
     if (ext.type % 2 == 1) {
-      e.headerLength = ext.arrayValue->length();
+      e.headerLength = ext.arrayValue.size();
       std::unique_ptr<folly::IOBuf> arrayPayload = folly::IOBuf::copyBuffer(
-          {ext.arrayValue->data(), ext.arrayValue->length()});
+          ext.arrayValue.data(), ext.arrayValue.size());
       e.payload = std::move(arrayPayload);
     } else {
       e.headerValue = ext.intValue;

@@ -629,58 +629,26 @@ struct Extension {
   // Odd type => holds value in arrayValue
   uint64_t type;
   uint64_t intValue;
-  std::unique_ptr<folly::IOBuf> arrayValue;
+  std::vector<uint8_t> arrayValue;
 
   Extension() noexcept : Extension(0, 0) {}
   Extension(uint64_t type, uint64_t intValue) noexcept
-      : type(type), intValue(intValue), arrayValue(nullptr) {}
-  Extension(uint64_t type, std::unique_ptr<folly::IOBuf> arrayValue) noexcept
+      : type(type), intValue(intValue), arrayValue() {}
+  Extension(uint64_t type, std::vector<uint8_t> arrayValue) noexcept
       : type(type), intValue(0), arrayValue(std::move(arrayValue)) {}
 
-  Extension(const Extension& other) noexcept {
-    copyFrom(other);
-  }
-
-  Extension& operator=(const Extension& other) noexcept {
-    copyFrom(other);
-    return *this;
-  }
-
-  Extension(Extension&& other) noexcept {
-    moveFrom(std::move(other));
-  }
-
-  Extension& operator=(Extension&& other) noexcept {
-    moveFrom(std::move(other));
-    return *this;
-  }
-
   bool operator==(const Extension& other) const noexcept {
-    if (type == other.type) {
-      if (isOddType()) {
-        folly::IOBufEqualTo eq;
-        return eq(arrayValue, other.arrayValue);
-      } else {
-        return intValue == other.intValue;
-      }
+    if (type != other.type) {
+      return false;
     }
-    return false;
+    if (isOddType()) {
+      return arrayValue == other.arrayValue;
+    }
+    return intValue == other.intValue;
   }
 
   bool isOddType() const {
     return type & 0x1;
-  }
-
- private:
-  void copyFrom(const Extension& other) {
-    type = other.type;
-    intValue = other.intValue;
-    arrayValue = other.arrayValue ? other.arrayValue->clone() : nullptr;
-  };
-  void moveFrom(Extension&& other) {
-    type = other.type;
-    intValue = other.intValue;
-    arrayValue = std::move(other.arrayValue);
   }
 };
 

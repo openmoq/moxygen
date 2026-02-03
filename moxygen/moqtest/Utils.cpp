@@ -161,10 +161,9 @@ std::vector<Extension> getExtensions(
   }
   if (variableExtensionId >= 0) {
     uint64_t randomNumber = std::rand() % kTestVariableExtensionMax + 1;
-    auto buf = folly::IOBuf::create(randomNumber);
-    buf->append(randomNumber);
+    std::vector<uint8_t> buf(randomNumber);
     Extension ext{
-        static_cast<uint64_t>(2 * variableExtensionId + 1), {std::move(buf)}};
+        static_cast<uint64_t>(2 * variableExtensionId + 1), std::move(buf)};
     extensions.push_back(ext);
   }
   return extensions;

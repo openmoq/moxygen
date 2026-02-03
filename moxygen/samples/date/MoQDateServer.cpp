@@ -51,12 +51,10 @@ DEFINE_string(mlog_path, "", "Path to mlog file");
 namespace {
 using namespace moxygen;
 
-uint8_t extTestBuff[5] = {0x01, 0x02, 0x03, 0x04, 0x05};
 static const Extensions kExtensions{
     std::vector<Extension>{
         {0xacedecade, 1977},
-        {0xdeadbeef,
-         folly::IOBuf::copyBuffer(extTestBuff, sizeof(extTestBuff))}},
+        {0xdeadbeef, std::vector<uint8_t>{0x01, 0x02, 0x03, 0x04, 0x05}}},
     {} // empty immutable extensions
 };
 

@@ -3069,8 +3069,9 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseExtension(
       return folly::unit;
     }
 
-    // Regular odd-type extension (byte array). Clone the value buffer
-    cursor.clone(ext.arrayValue, extLen->first);
+    // Regular odd-type extension (byte array). Copy into vector
+    ext.arrayValue.resize(extLen->first);
+    cursor.pull(ext.arrayValue.data(), extLen->first);
     length -= extLen->first;
   } else {
     // Even-type extension (integer value)
@@ -3561,14 +3562,14 @@ void MoQFrameWriter::writeKeyValuePairs(
     }
     if (ext.isOddType()) {
       // odd = length prefix
-      if (ext.arrayValue) {
-        writeVarint(
-            writeBuf, ext.arrayValue->computeChainDataLength(), size, error);
+      if (!ext.arrayValue.empty()) {
+        writeVarint(writeBuf, ext.arrayValue.size(), size, error);
         if (error) {
           return;
         }
-        writeBuf.append(ext.arrayValue->clone());
-        size += ext.arrayValue->computeChainDataLength();
+        writeBuf.append(
+            folly::IOBuf::copyBuffer(ext.arrayValue.data(), ext.arrayValue.size()));
+        size += ext.arrayValue.size();
       } else {
         writeVarint(writeBuf, 0, size, error);
       }
@@ -3672,8 +3673,7 @@ size_t MoQFrameWriter::calculateExtensionVectorSize(
     size += *maybeTypeSize;
     if (ext.type & 0x1) {
       // odd = length prefix
-      auto dataLen =
-          ext.arrayValue ? ext.arrayValue->computeChainDataLength() : 0;
+      auto dataLen = ext.arrayValue.size();
       auto maybeDataLengthSize = quic::getQuicIntegerSize(dataLen);
       if (maybeDataLengthSize.hasError()) {
         error = true;

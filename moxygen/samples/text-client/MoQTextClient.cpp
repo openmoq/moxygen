@@ -112,12 +112,10 @@ class TextHandler : public ObjectReceiverCallback {
     const auto& mutable_exts = header.extensions.getMutableExtensions();
     for (const auto& ext : mutable_exts) {
       if (ext.type & 0x1) {
-        ext.arrayValue->coalesce();
         std::cout << "data extension="
                   << folly::base64Encode(
-                         {(const char*)(ext.arrayValue->data()),
-                          ext.arrayValue->length()})
-
+                         {(const char*)(ext.arrayValue.data()),
+                          ext.arrayValue.size()})
                   << std::endl;
       } else {
         std::cout << "int extension=" << ext.intValue << std::endl;

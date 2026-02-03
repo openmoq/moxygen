@@ -13,10 +13,9 @@
 namespace moxygen::test {
 
 std::vector<Extension> getTestExtensions() {
-  static uint8_t extTestBuff[3] = {0x01, 0x02, 0x03};
   static std::vector<Extension> extensions = {
       {10, 10},
-      {13, folly::IOBuf::copyBuffer(extTestBuff, sizeof(extTestBuff))}};
+      {13, std::vector<uint8_t>{0x01, 0x02, 0x03}}};
   return extensions;
 }
 

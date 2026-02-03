@@ -1533,7 +1533,9 @@ TEST_P(MoQFramerTest, OddExtensionLengthVarintBoundary) {
   ObjectHeader obj(2, 3, 4, 5);
   std::string payload(64, 'x');
   std::vector<Extension> exts;
-  exts.emplace_back(13, folly::IOBuf::copyBuffer(payload)); // odd type (13)
+  exts.emplace_back(
+      13,
+      std::vector<uint8_t>(payload.begin(), payload.end())); // odd type (13)
   obj.extensions.insertMutableExtensions(exts);
 
   // Write subgroup header (includeExtensions=true) and the stream object
@@ -1561,8 +1563,7 @@ TEST_P(MoQFramerTest, OddExtensionLengthVarintBoundary) {
   EXPECT_TRUE(objRes->value.extensions.getMutableExtensions()[0].isOddType());
   EXPECT_EQ(objRes->value.extensions.getMutableExtensions()[0].type, 13);
   EXPECT_EQ(
-      objRes->value.extensions.getMutableExtensions()[0]
-          .arrayValue->computeChainDataLength(),
+      objRes->value.extensions.getMutableExtensions()[0].arrayValue.size(),
       64);
 }
 
@@ -1870,7 +1871,8 @@ TEST_P(MoQImmutableExtensionsTest, ParseEncodedExtensionsBlob) {
   std::vector<Extension> expectedImmutable = {
       Extension{20, 100},
       Extension{
-          21, folly::IOBuf::copyBuffer(kExpectedBin, sizeof(kExpectedBin))}};
+          21,
+          std::vector<uint8_t>(kExpectedBin, kExpectedBin + sizeof(kExpectedBin))}};
 
   // Check that mutable and immutable extensions match expected
   EXPECT_THAT(
@@ -1915,7 +1917,9 @@ TEST_P(MoQImmutableExtensionsTest, WriteImmutableExtensionsDraft) {
   std::vector<Extension> immutableExts = {
       Extension{20, 100},
       Extension{
-          21, folly::IOBuf::copyBuffer(kTestBinary, sizeof(kTestBinary))}};
+          21,
+          std::vector<uint8_t>(
+              kTestBinary, kTestBinary + sizeof(kTestBinary))}};
 
   Extensions extensions(mutableExts, immutableExts);
 
@@ -1962,7 +1966,9 @@ TEST_P(MoQImmutableExtensionsTest, WriteOnlyImmutableExtensionsDraft) {
   std::vector<Extension> immutableExts = {
       Extension{24, 555},
       Extension{
-          27, folly::IOBuf::copyBuffer(kTestBinary, sizeof(kTestBinary))}};
+          27,
+          std::vector<uint8_t>(
+              kTestBinary, kTestBinary + sizeof(kTestBinary))}};
 
   Extensions extensions(mutableExts, immutableExts);
 
