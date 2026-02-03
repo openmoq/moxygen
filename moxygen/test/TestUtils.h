@@ -8,6 +8,7 @@
 
 #include <folly/io/IOBuf.h>
 #include <moxygen/MoQFramer.h>
+#include <moxygen/MoQTypes.h>
 
 namespace moxygen::test {
 
@@ -31,7 +32,7 @@ inline std::unique_ptr<folly::IOBuf> writeAllMessages(
   return buf;
 }
 
-std::unique_ptr<folly::IOBuf> makeBuf(uint32_t size = 10);
+Payload makeBuf(uint32_t size = 10);
 
 std::vector<Extension> getTestExtensions();
 std::vector<Parameter> getTestTrackRequestParams(

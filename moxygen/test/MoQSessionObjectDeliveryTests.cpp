@@ -70,7 +70,7 @@ CO_TEST_P_X(MoQSessionTest, ObjectPayloadTooLong) {
                 folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
     EXPECT_TRUE(sgp->beginObject(1, 100, test::makeBuf(10)).hasValue());
     auto payloadFail =
-        sgp->objectPayload(folly::IOBuf::copyBuffer(std::string(200, 'x')));
+        sgp->objectPayload(compat::Payload::copyBuffer(std::string(200, 'x')));
     EXPECT_EQ(payloadFail.error().code, MoQPublishError::API_ERROR);
     pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
   });
@@ -86,7 +86,7 @@ CO_TEST_P_X(MoQSessionTest, ObjectPayloadEarlyFin) {
     // Attempt to send an object payload with length 20 and fin=true, which
     // should fail
     auto payloadFinFail = sgp->objectPayload(
-        folly::IOBuf::copyBuffer(std::string(20, 'x')), true);
+        compat::Payload::copyBuffer(std::string(20, 'x')), true);
     EXPECT_EQ(payloadFinFail.error().code, MoQPublishError::API_ERROR);
 
     pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
@@ -105,7 +105,7 @@ CO_TEST_P_X(MoQSessionTest, PublisherResetAfterBeginObject) {
 
     // Attempt to send an object payload after reset, which should fail
     auto payloadFail =
-        sgp->objectPayload(folly::IOBuf::copyBuffer(std::string(20, 'x')));
+        sgp->objectPayload(compat::Payload::copyBuffer(std::string(20, 'x')));
     EXPECT_EQ(payloadFail.error().code, MoQPublishError::CANCELLED);
 
     pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
@@ -161,7 +161,7 @@ CO_TEST_P_X(MoQSessionTest, Datagrams) {
   co_await setupMoQSession();
   expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
     pub->datagram(
-        ObjectHeader(0, 0, 1, 0, 11), folly::IOBuf::copyBuffer("hello world"));
+        ObjectHeader(0, 0, 1, 0, 11), compat::Payload::copyBuffer("hello world"));
     pub->datagram(
         ObjectHeader(0, 0, 2, 0, ObjectStatus::OBJECT_NOT_EXIST), nullptr);
     pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
@@ -432,7 +432,7 @@ CO_TEST_P_X(MoQSessionTest, TestOnObjectPayload) {
   co_await receivedBeginObject;
 
   auto payloadSendResult = subgroupPublisher->objectPayload(
-      folly::IOBuf::copyBuffer(std::string(90, 'x')), true);
+      compat::Payload::copyBuffer(std::string(90, 'x')), true);
   EXPECT_TRUE(payloadSendResult.hasValue());
   folly::coro::Baton receivedObjectPayload;
   EXPECT_CALL(*sg, objectPayload(_, _))

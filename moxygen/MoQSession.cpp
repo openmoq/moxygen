@@ -616,7 +616,7 @@ StreamPublisherImpl::writeCurrentObject(
   XLOG(DBG6) << "writeCurrentObject sgp=" << this << " objectID=" << objectID;
   bool entireObjectWritten = (!currentLengthRemaining_.has_value());
   (void)moqFrameWriter_.writeStreamObject(
-      writeBuf_, streamType_, header_, std::move(payload));
+      writeBuf_, streamType_, header_, payload ? payload->releaseIOBuf() : nullptr);
   return writeToStream(finStream, entireObjectWritten);
 }
 
@@ -756,7 +756,7 @@ compat::Expected<compat::Unit, MoQPublishError> StreamPublisherImpl::beginObject
   }
   currentLengthRemaining_ = length;
   auto validateObjectPublishRes = validateObjectPublishAndUpdateState(
-      initialPayload.get(),
+      initialPayload ? initialPayload->getIOBuf() : nullptr,
       /*finStream=*/false);
   if (!validateObjectPublishRes) {
     return compat::makeUnexpected(validateObjectPublishRes.error());
@@ -788,11 +788,13 @@ StreamPublisherImpl::objectPayload(Payload payload, bool finStream) {
         MoQPublishError(MoQPublishError::CANCELLED, "Cancelled objectPayload"));
   }
   auto validateObjectPublishRes =
-      validateObjectPublishAndUpdateState(payload.get(), finStream);
+      validateObjectPublishAndUpdateState(payload ? payload->getIOBuf() : nullptr, finStream);
   if (!validateObjectPublishRes) {
     return validateObjectPublishRes;
   }
-  writeBuf_.append(std::move(payload));
+  if (payload) {
+    writeBuf_.append(payload->releaseIOBuf());
+  }
   bool entireObjectWritten = (!currentLengthRemaining_.has_value());
   auto writeRes = writeToStream(finStream, entireObjectWritten);
   if (writeRes.hasValue()) {
@@ -1558,7 +1560,7 @@ MoQSession::TrackPublisherImpl::datagram(
           header.status,
           header.extensions,
           headerLength),
-      std::move(payload));
+      payload ? payload->releaseIOBuf() : nullptr);
   // TODO: set priority when WT has an API for that
   auto res = wt->sendDatagram(writeBuf.move());
   if (res.hasError()) {
@@ -3386,7 +3388,7 @@ void MoQSession::deliverBufferedData(TrackAlias trackAlias) {
     auto datagrams = std::move(datagramsIt->second);
     bufferedDatagrams_.erase(datagramsIt);
     for (auto& datagram : datagrams) {
-      onDatagram(std::move(datagram));
+      onDatagram(datagram->releaseIOBuf());
     }
   }
 
@@ -4899,7 +4901,7 @@ void MoQSession::onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept {
           << alias << " sess = " << this;
       return;
     }
-    it.first->second.push_back(readBuf.move());
+    it.first->second.push_back(compat::Payload::wrap(readBuf.move()));
     return;
   }
   readBuf.trimStart(readBuf.chainLength() - remainingLength);
@@ -4913,7 +4915,8 @@ void MoQSession::onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept {
       }
     }
     logger_->logObjectDatagramParsed(
-        objHeader.trackAlias, objHeader.objectHeader, payload);
+        objHeader.trackAlias, objHeader.objectHeader,
+        payload ? compat::Payload::wrap(std::move(payload)) : nullptr);
   }
   if (state) {
     auto callback = state->getSubscribeCallback();
@@ -4922,7 +4925,7 @@ void MoQSession::onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept {
       if (!objHeader.objectHeader.priority.has_value()) {
         objHeader.objectHeader.priority = state->getPublisherPriority();
       }
-      callback->datagram(objHeader.objectHeader, readBuf.move());
+      callback->datagram(objHeader.objectHeader, compat::Payload::wrap(readBuf.move()));
     }
   }
 }

@@ -110,9 +110,11 @@ class ObjectSubgroupReceiver : public SubgroupConsumer {
       Payload payload,
       bool /*finSubgroup*/) override {
     // TODO: add common component for state verification
-    payload_.append(std::move(payload));
+    if (payload) {
+      payload_.append(payload->releaseIOBuf());
+    }
     if (payload_.chainLength() == header_.length) {
-      auto fcState = callback_->onObject(trackAlias_, header_, payload_.move());
+      auto fcState = callback_->onObject(trackAlias_, header_, compat::Payload::wrap(payload_.move()));
       if (fcState == ObjectReceiverCallback::FlowControlState::BLOCKED) {
         // Is it bad that we can't return DONE here?
         if (streamType_ == StreamType::FETCH_HEADER) {

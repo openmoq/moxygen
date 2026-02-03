@@ -323,14 +323,14 @@ class DatePublisher : public Publisher {
     std::stringstream ss;
     ss << std::put_time(lt, "%Y-%m-%d %H:%M:");
     XLOG(DBG1) << ss.str() << lt->tm_sec;
-    return folly::IOBuf::copyBuffer(ss.str());
+    return compat::Payload::wrap(folly::IOBuf::copyBuffer(ss.str()));
   }
 
   Payload secondPayload(uint64_t object) {
     XCHECK_GT(object, 0llu);
     auto secBuf = folly::to<std::string>(object - 1);
     XLOG(DBG1) << (object - 1);
-    return folly::IOBuf::copyBuffer(secBuf);
+    return compat::Payload::wrap(folly::IOBuf::copyBuffer(secBuf));
   }
 
   folly::coro::Task<void> catchup(

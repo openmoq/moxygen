@@ -179,7 +179,7 @@ folly::coro::Task<void> MoQTestServer::sendOneSubgroupPerGroup(
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         std::string p = std::string(objectSize, 't');
-        auto objectPayload = folly::IOBuf::copyBuffer(p);
+        auto objectPayload = compat::Payload::copyBuffer(p);
         subConsumer->object(
             objectId,
             std::move(objectPayload),
@@ -233,7 +233,7 @@ folly::coro::Task<void> MoQTestServer::sendOneSubgroupPerObject(
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         std::string p = std::string(objectSize, 't');
-        auto objectPayload = folly::IOBuf::copyBuffer(p);
+        auto objectPayload = compat::Payload::copyBuffer(p);
         subConsumer->object(
             objectId,
             std::move(objectPayload),
@@ -301,7 +301,7 @@ folly::coro::Task<void> MoQTestServer::sendTwoSubgroupsPerGroup(
         int index = objectId % 2;
         LOG(INFO) << "Sending Object " << objectId << " to Subgroup " << index;
         std::string p = std::string(objectSize, 't');
-        auto objectPayload = folly::IOBuf::copyBuffer(p);
+        auto objectPayload = compat::Payload::copyBuffer(p);
         subConsumers[index]->object(
             objectId,
             std::move(objectPayload),
@@ -369,7 +369,7 @@ folly::coro::Task<void> MoQTestServer::sendDatagram(
       int objectSize = getObjectSize(objectId, &params);
 
       std::string p = std::string(objectSize, 't');
-      auto objectPayload = folly::IOBuf::copyBuffer(p);
+      auto objectPayload = compat::Payload::copyBuffer(p);
 
       // Build object header
       ObjectHeader header;
@@ -503,7 +503,7 @@ folly::coro::Task<void> MoQTestServer::fetchOneSubgroupPerGroup(
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         std::string p = std::string(objectSize, 't');
-        auto objectPayload = folly::IOBuf::copyBuffer(p);
+        auto objectPayload = compat::Payload::copyBuffer(p);
         callback->object(
             groupNum,
             0 /* subgroupId */,
@@ -553,7 +553,7 @@ folly::coro::Task<void> MoQTestServer::fetchOneSubgroupPerObject(
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         std::string p = std::string(objectSize, 't');
-        auto objectPayload = folly::IOBuf::copyBuffer(p);
+        auto objectPayload = compat::Payload::copyBuffer(p);
         callback->object(
             groupNum,
             objectId,
@@ -609,7 +609,7 @@ folly::coro::Task<void> MoQTestServer::fetchTwoSubgroupsPerGroup(
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         std::string p = std::string(objectSize, 't');
-        auto objectPayload = folly::IOBuf::copyBuffer(p);
+        auto objectPayload = compat::Payload::copyBuffer(p);
         callback->object(
             groupNum,
             subgroupId,

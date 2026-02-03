@@ -48,7 +48,7 @@ CO_TEST_P_X(MoQSessionTest, RelativeJoiningFetch) {
   co_await setupMoQSession();
   expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
     pub->datagram(
-        ObjectHeader(0, 0, 1, 0, 11), folly::IOBuf::copyBuffer("hello world"));
+        ObjectHeader(0, 0, 1, 0, 11), compat::Payload::copyBuffer("hello world"));
     pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
     co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
   });
@@ -113,7 +113,7 @@ CO_TEST_P_X(MoQSessionTest, AbsoluteJoiningFetch) {
     for (uint32_t group = 6; group < 10; group++) {
       pub->datagram(
           ObjectHeader(group, 0, 0, 0, 11),
-          folly::IOBuf::copyBuffer("hello world"));
+          compat::Payload::copyBuffer("hello world"));
     }
     pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
     co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});

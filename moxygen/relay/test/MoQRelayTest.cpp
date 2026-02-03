@@ -864,7 +864,7 @@ TEST_F(MoQRelayTest, ForwarderOnlyCreatesSubgroupsBeforeObjectData) {
 
   // First object -> goes to subscriber 1
   EXPECT_TRUE(subgroup->beginObject(0, 4, 0).hasValue());
-  EXPECT_TRUE(subgroup->objectPayload(folly::IOBuf::copyBuffer("test"), false)
+  EXPECT_TRUE(subgroup->objectPayload(compat::Payload::copyBuffer("test"), false)
                   .hasValue());
 
   // Subscriber 2 joins after first object
@@ -878,7 +878,7 @@ TEST_F(MoQRelayTest, ForwarderOnlyCreatesSubgroupsBeforeObjectData) {
 
   // Payload and endOfSubgroup -> only to subscribers 1, 2 (NOT 3)
   EXPECT_TRUE(
-      subgroup->objectPayload(folly::IOBuf::copyBuffer("more data"), false)
+      subgroup->objectPayload(compat::Payload::copyBuffer("more data"), false)
           .hasValue());
   EXPECT_TRUE(subgroup->endOfSubgroup().hasValue());
 
@@ -1296,13 +1296,13 @@ TEST_F(MoQRelayTest, DataOperationCancelledWhenAllSubscribersFail) {
   EXPECT_TRUE(subgroup->beginObject(0, 100, 0).hasValue());
 
   // First objectPayload succeeds - both subscribers receive it
-  auto res1 = subgroup->objectPayload(folly::IOBuf::copyBuffer("data1"), false);
+  auto res1 = subgroup->objectPayload(compat::Payload::copyBuffer("data1"), false);
   EXPECT_TRUE(res1.hasValue());
   EXPECT_EQ(*res1, ObjectPublishStatus::IN_PROGRESS);
 
   // Second objectPayload causes both subscribers to fail and get removed
   // This should return CANCELLED because all subscribers are gone
-  auto res2 = subgroup->objectPayload(folly::IOBuf::copyBuffer("data2"), false);
+  auto res2 = subgroup->objectPayload(compat::Payload::copyBuffer("data2"), false);
   EXPECT_FALSE(res2.hasValue());
   EXPECT_EQ(res2.error().code, MoQPublishError::CANCELLED);
 
@@ -1382,13 +1382,13 @@ TEST_F(MoQRelayTest, PartialSubscriberFailureDoesNotCancelData) {
   EXPECT_TRUE(subgroup->beginObject(0, 100, 0).hasValue());
 
   // First objectPayload succeeds - all 3 subscribers receive it
-  auto res1 = subgroup->objectPayload(folly::IOBuf::copyBuffer("data1"), false);
+  auto res1 = subgroup->objectPayload(compat::Payload::copyBuffer("data1"), false);
   EXPECT_TRUE(res1.hasValue());
   EXPECT_EQ(*res1, ObjectPublishStatus::IN_PROGRESS);
 
   // Second objectPayload causes subscriber 0 to fail and get removed
   // But subscribers 1 and 2 still exist, so operation succeeds
-  auto res2 = subgroup->objectPayload(folly::IOBuf::copyBuffer("data2"), false);
+  auto res2 = subgroup->objectPayload(compat::Payload::copyBuffer("data2"), false);
   EXPECT_TRUE(res2.hasValue());
   EXPECT_EQ(*res2, ObjectPublishStatus::IN_PROGRESS);
 

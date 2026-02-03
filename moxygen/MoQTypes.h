@@ -8,9 +8,9 @@
 
 #include <moxygen/compat/Config.h>
 #include <moxygen/compat/Expected.h>
+#include <moxygen/compat/Payload.h>
 #include <moxygen/compat/Unit.h>
 #include <folly/hash/Hash.h>
-#include <folly/io/IOBuf.h>
 #include <algorithm>
 #include <optional>
 #include <vector>
@@ -31,7 +31,7 @@ const uint64_t kPriorObjectIdGapExtensionType = 0x3E;
 
 //////// Types ////////
 
-using Payload = std::unique_ptr<folly::IOBuf>;
+using Payload = std::unique_ptr<compat::Payload>;
 using Priority = uint8_t;
 
 // Undefine Windows macros that conflict with our enum values

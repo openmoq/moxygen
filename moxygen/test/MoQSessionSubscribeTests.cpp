@@ -174,7 +174,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeForwardingFalse) {
   co_await setupMoQSession();
   expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
     auto pubResult1 = pub->datagram(
-        ObjectHeader(0, 0, 1, 0, 11), folly::IOBuf::copyBuffer("hello world"));
+        ObjectHeader(0, 0, 1, 0, 11), compat::Payload::copyBuffer("hello world"));
     EXPECT_TRUE(pubResult1.hasError());
     auto pubResult2 = pub->objectStream(ObjectHeader(0, 0, 1, 0, 11), nullptr);
     EXPECT_TRUE(pubResult2.hasError());
@@ -818,7 +818,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeDoneIgnoredAfterClose) {
     reqID = sub.requestID;
     // Publish a datagram
     pub->datagram(
-        ObjectHeader(0, 0, 0, 0, 11), folly::IOBuf::copyBuffer("hello world"));
+        ObjectHeader(0, 0, 0, 0, 11), compat::Payload::copyBuffer("hello world"));
 
     handle = std::move(pub);
     handle->subscribeDone(getTrackEndedSubscribeDone(reqID));

@@ -389,7 +389,7 @@ std::unique_ptr<folly::IOBuf> writeAllFetchMessages(
   return writeBuf.move();
 }
 
-std::unique_ptr<folly::IOBuf> makeBuf(uint32_t size) {
+Payload makeBuf(uint32_t size) {
   auto out = folly::IOBuf::create(size);
   out->append(size);
   // fill with random junk
@@ -400,7 +400,7 @@ std::unique_ptr<folly::IOBuf> makeBuf(uint32_t size) {
   while (cursor.length()) {
     cursor.write<uint8_t>((uint8_t)folly::Random::rand32());
   }
-  return out;
+  return compat::Payload::wrap(std::move(out));
 }
 
 } // namespace moxygen::test

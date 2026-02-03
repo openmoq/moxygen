@@ -286,9 +286,8 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
                      << " have=" << ingress_.chainLength() - totalBytesConsumed;
           trimStart();
 
-          std::unique_ptr<folly::IOBuf> payload;
           auto chunkLen = availableForObject(*curObjectHeader_.length);
-          payload = splitAndResetCursor(chunkLen);
+          auto iobuf = splitAndResetCursor(chunkLen);
           auto endOfObject = chunkLen == *curObjectHeader_.length;
           if (endOfStream && !endOfObject) {
             XLOG(ERR) << "End of stream before end of object";
@@ -303,7 +302,7 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
                 curObjectHeader_.id,
                 std::move(curObjectHeader_.extensions),
                 *curObjectHeader_.length,
-                std::move(payload),
+                compat::Payload::wrap(std::move(iobuf)),
                 endOfObject,
                 endOfStream && ingress_.chainLength() == 0);
             if (result == ParseResult::BLOCKED) {
@@ -359,12 +358,11 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
       case ParseState::OBJECT_PAYLOAD: {
         trimStart();
 
-        std::unique_ptr<folly::IOBuf> payload;
         XCHECK(curObjectHeader_.length);
         XLOG(DBG2) << "Parsing object with length, need="
                    << *curObjectHeader_.length;
         auto chunkLen = availableForObject(*curObjectHeader_.length);
-        payload = splitAndResetCursor(chunkLen);
+        auto iobuf = splitAndResetCursor(chunkLen);
         *curObjectHeader_.length -= chunkLen;
         if (endOfStream && *curObjectHeader_.length != 0) {
           XLOG(ERR) << "End of stream before end of object remaining length="
@@ -373,6 +371,7 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
           break;
         }
         bool endOfObject = (*curObjectHeader_.length == 0);
+        auto payload = iobuf ? compat::Payload::wrap(std::move(iobuf)) : nullptr;
         if (callback_ && (payload || endOfObject)) {
           auto result =
               callback_->onObjectPayload(std::move(payload), endOfObject);

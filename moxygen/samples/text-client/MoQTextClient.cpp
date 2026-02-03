@@ -123,7 +123,7 @@ class TextHandler : public ObjectReceiverCallback {
     }
 
     if (payload) {
-      std::cout << payload->moveToFbString() << std::endl;
+      std::cout << payload->moveToString() << std::endl;
     }
     return FlowControlState::UNBLOCKED;
   }

@@ -247,7 +247,7 @@ class MoQFlvStreamerClient
 
     XLOG(DBG1) << "Sending audio frame" << objHeader << ", payload size: "
                << moqMiObj->payload->computeChainDataLength();
-    audioPub_->objectStream(objHeader, std::move(moqMiObj->payload));
+    audioPub_->objectStream(objHeader, compat::Payload::wrap(std::move(moqMiObj->payload)));
   }
 
   void publishVideo(std::unique_ptr<flv::FlvStreamParser::MediaItem> item) {
@@ -299,7 +299,7 @@ class MoQFlvStreamerClient
                  << moqMiObj->payload->computeChainDataLength();
       videoSgPub_->object(
           largestVideo_.object++,
-          std::move(moqMiObj->payload),
+          compat::Payload::wrap(std::move(moqMiObj->payload)),
           Extensions(std::move(moqMiObj->extensions), {}));
     } else {
       XLOG(ERR) << "Should not happen";

@@ -206,7 +206,8 @@ class TrackReceiverHandler : public ObjectReceiverCallback {
 
       auto payloadDecodedData = MoQMi::decodeMoQMi(
           std::make_unique<MoQMi::MoqMiObject>(
-              objHeader.extensions.getMutableExtensions(), std::move(payload)));
+              objHeader.extensions.getMutableExtensions(),
+              payload ? payload->releaseIOBuf() : nullptr));
       logData(payloadDecodedData);
       if (payloadDecodedData.index() ==
               MoQMi::MoqMIItemTypeIndex::MOQMI_ITEM_INDEX_VIDEO_H264_AVC ||
