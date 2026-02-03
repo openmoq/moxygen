@@ -11,7 +11,7 @@ namespace moxygen {
 // Template implementations
 
 template <typename Fn>
-folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::forEachSubscriber(
+compat::Expected<compat::Unit, MoQPublishError> MoQForwarder::forEachSubscriber(
     Fn&& fn) {
   for (auto subscriberIt = subscribers_.begin();
        subscriberIt != subscribers_.end();) {
@@ -21,14 +21,14 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::forEachSubscriber(
   }
   // Check if empty after iteration - subscribers may have been removed in loop
   if (subscribers_.empty()) {
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::CANCELLED, "No subscribers"));
   }
-  return folly::unit;
+  return compat::unit;
 }
 
 template <typename Fn>
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::forEachSubscriberSubgroup(
     Fn&& fn,
     bool makeNew,
@@ -74,10 +74,10 @@ MoQForwarder::SubgroupForwarder::forEachSubscriberSubgroup(
   });
   // Check if empty after iteration - subscribers may have been removed in loop
   if (forwarder_.subscribers_.empty()) {
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::CANCELLED, "No subscribers"));
   }
-  return folly::unit;
+  return compat::unit;
 }
 
 // MoQForwarder implementation
@@ -170,7 +170,7 @@ folly::Expected<SubscribeRange, FetchError> MoQForwarder::resolveJoiningFetch(
   auto subIt = subscribers_.find(session.get());
   if (subIt == subscribers_.end()) {
     XLOG(ERR) << "Session not found";
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         FetchError{
             RequestID(0),
             FetchErrorCode::TRACK_NOT_EXIST,
@@ -180,7 +180,7 @@ folly::Expected<SubscribeRange, FetchError> MoQForwarder::resolveJoiningFetch(
     XLOG(ERR) << joining.joiningRequestID
               << " does not name a Subscribe "
                  " for this track";
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         FetchError{
             RequestID(0),
             FetchErrorCode::INTERNAL_ERROR,
@@ -190,7 +190,7 @@ folly::Expected<SubscribeRange, FetchError> MoQForwarder::resolveJoiningFetch(
     // No content exists, fetch error
     // Relay caller verifies upstream SubscribeOK has been processed before
     // calling resolveJoiningFetch()
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         FetchError{RequestID(0), FetchErrorCode::INTERNAL_ERROR, "No largest"});
   }
   CHECK(
@@ -341,10 +341,10 @@ void MoQForwarder::removeSubscriberOnError(
       callsite);
 }
 
-folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::setTrackAlias(
+compat::Expected<compat::Unit, MoQPublishError> MoQForwarder::setTrackAlias(
     TrackAlias alias) {
   trackAlias_ = alias;
-  return folly::unit;
+  return compat::unit;
 }
 
 folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
@@ -369,7 +369,7 @@ MoQForwarder::beginSubgroup(
     }
   });
   if (res.hasError()) {
-    return folly::makeUnexpected(res.error());
+    return compat::makeUnexpected(res.error());
   }
   subgroups_.emplace(subgroupIdentifier, subgroupForwarder);
   return subgroupForwarder;
@@ -380,7 +380,7 @@ MoQForwarder::awaitStreamCredit() {
   return folly::makeSemiFuture();
 }
 
-folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::objectStream(
+compat::Expected<compat::Unit, MoQPublishError> MoQForwarder::objectStream(
     const ObjectHeader& header,
     Payload payload) {
   updateLargest(header.group, header.id);
@@ -395,7 +395,7 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::objectStream(
   });
 }
 
-folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::datagram(
+compat::Expected<compat::Unit, MoQPublishError> MoQForwarder::datagram(
     const ObjectHeader& header,
     Payload payload) {
   updateLargest(header.group, header.id);
@@ -410,7 +410,7 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::datagram(
   });
 }
 
-folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::subscribeDone(
+compat::Expected<compat::Unit, MoQPublishError> MoQForwarder::subscribeDone(
     SubscribeDone subDone) {
   XLOG(DBG1) << __func__ << " subDone reason=" << subDone.reasonPhrase;
   draining_ = true;
@@ -425,7 +425,7 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::subscribeDone(
         "subscribeDone");
   });
   // Cleanup/draining operation - succeed even with no subscribers
-  return folly::unit;
+  return compat::unit;
 }
 
 void MoQForwarder::addForwardingSubscriber() {
@@ -510,7 +510,7 @@ MoQForwarder::Subscriber::subscribeUpdate(SubscribeUpdate subscribeUpdate) {
       XLOG(ERR) << "Invalid subscribeUpdate: end Location " << newEnd
                 << " is less than start " << range.start;
       session->close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
-      co_return folly::makeUnexpected(SubscribeUpdateError(
+      co_return compat::makeUnexpected(SubscribeUpdateError(
           subscribeUpdate.requestID,
           RequestErrorCode::INVALID_RANGE,
           "End Location is less than start"));
@@ -566,11 +566,11 @@ void MoQForwarder::SubgroupForwarder::closeSubgroupForSubscriber(
   }
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::removeSubgroupAndCheckEmpty() {
   forwarder_.subgroups_.erase(identifier_);
   forwarder_.checkAndFireOnEmpty();
-  return folly::unit;
+  return compat::unit;
 }
 
 template <typename T>
@@ -584,14 +584,14 @@ MoQForwarder::SubgroupForwarder::cleanupOnError(
   return result;
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::object(
     uint64_t objectID,
     Payload payload,
     Extensions extensions,
     bool finSubgroup) {
   if (currentObjectLength_) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
   }
   forwarder_.updateLargest(identifier_.group, objectID);
@@ -615,7 +615,7 @@ MoQForwarder::SubgroupForwarder::object(
   return cleanupOnError(res);
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::beginObject(
     uint64_t objectID,
     uint64_t length,
@@ -624,7 +624,7 @@ MoQForwarder::SubgroupForwarder::beginObject(
   // TODO: use a shared class for object publish state validation
   forwarder_.updateLargest(identifier_.group, objectID);
   if (currentObjectLength_) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
   }
   auto payloadLength =
@@ -645,10 +645,10 @@ MoQForwarder::SubgroupForwarder::beginObject(
       }));
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::endOfGroup(uint64_t endOfGroupObjectID) {
   if (currentObjectLength_) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
   }
   forwarder_.updateLargest(identifier_.group, endOfGroupObjectID);
@@ -666,11 +666,11 @@ MoQForwarder::SubgroupForwarder::endOfGroup(uint64_t endOfGroupObjectID) {
   return removeSubgroupAndCheckEmpty();
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::endOfTrackAndGroup(
     uint64_t endOfTrackObjectID) {
   if (currentObjectLength_) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
   }
   forwarder_.updateLargest(identifier_.group, endOfTrackObjectID);
@@ -689,10 +689,10 @@ MoQForwarder::SubgroupForwarder::endOfTrackAndGroup(
   return removeSubgroupAndCheckEmpty();
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::endOfSubgroup() {
   if (currentObjectLength_) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
   }
   forEachSubscriberSubgroup(
@@ -725,12 +725,12 @@ MoQForwarder::SubgroupForwarder::objectPayload(
     Payload payload,
     bool finSubgroup) {
   if (!currentObjectLength_) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Haven't started publishing object"));
   }
   auto payloadLength = (payload) ? payload->computeChainDataLength() : 0;
   if (payloadLength > *currentObjectLength_) {
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::API_ERROR, "Payload exceeded length"));
   }
   *currentObjectLength_ -= payloadLength;
@@ -758,7 +758,7 @@ MoQForwarder::SubgroupForwarder::objectPayload(
     // Data operation - propagate CANCELLED if no subscribers
     auto cleanupRes = cleanupOnError(res);
     if (cleanupRes.hasError()) {
-      return folly::makeUnexpected(cleanupRes.error());
+      return compat::makeUnexpected(cleanupRes.error());
     }
     return ObjectPublishStatus::DONE;
   }
@@ -766,7 +766,7 @@ MoQForwarder::SubgroupForwarder::objectPayload(
   // Data operation, propagate CANCELLED if no subscribers
   auto cleanupRes = cleanupOnError(res);
   if (cleanupRes.hasError()) {
-    return folly::makeUnexpected(cleanupRes.error());
+    return compat::makeUnexpected(cleanupRes.error());
   }
   return ObjectPublishStatus::IN_PROGRESS;
 }

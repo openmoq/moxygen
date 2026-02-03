@@ -11,7 +11,7 @@
 
 namespace moxygen {
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQPerfClientFetchConsumer::object(
     uint64_t groupID,
     uint64_t subgroupID,
@@ -20,7 +20,7 @@ MoQPerfClientFetchConsumer::object(
     Extensions extensions,
     bool finFetch) {
   incrementFetchDataSent(payload->computeChainDataLength());
-  return folly::Unit();
+  return compat::unit;
 }
 
 void MoQPerfClientFetchConsumer::incrementFetchDataSent(uint64_t amount) {
@@ -33,7 +33,7 @@ uint64_t MoQPerfClientFetchConsumer::getFetchDataSent() {
 
 void MoQPerfClientFetchConsumer::checkpoint() {}
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQPerfClientFetchConsumer::beginObject(
     uint64_t groupID,
     uint64_t subgroupID,
@@ -42,41 +42,41 @@ MoQPerfClientFetchConsumer::beginObject(
     Payload initialPayload,
     Extensions extensions) {
   incrementFetchDataSent(initialPayload->computeChainDataLength());
-  return folly::Unit();
+  return compat::unit;
 }
 
-folly::Expected<ObjectPublishStatus, MoQPublishError>
+compat::Expected<ObjectPublishStatus, MoQPublishError>
 MoQPerfClientFetchConsumer::objectPayload(Payload payload, bool finSubgroup) {
   incrementFetchDataSent(payload->computeChainDataLength());
   return ObjectPublishStatus::DONE;
 }
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQPerfClientFetchConsumer::endOfGroup(
     uint64_t groupID,
     uint64_t subgroupID,
     uint64_t objectID,
     bool finFetch) {
-  return folly::Unit();
+  return compat::unit;
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQPerfClientFetchConsumer::endOfTrackAndGroup(
     uint64_t groupID,
     uint64_t subgroupID,
     uint64_t objectID) {
-  return folly::Unit();
+  return compat::unit;
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQPerfClientFetchConsumer::endOfFetch() {
-  return folly::Unit();
+  return compat::unit;
 }
 
 void MoQPerfClientFetchConsumer::reset(ResetStreamErrorCode error) {}
 
-folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>
+compat::Expected<compat::SemiFuture<uint64_t>, MoQPublishError>
 MoQPerfClientFetchConsumer::awaitReadyToConsume() {
-  return folly::makeSemiFuture<uint64_t>(0);
+  return compat::makeSemiFuture<uint64_t>(0);
 }
 
 MoQPerfClient::MoQPerfClient(

@@ -23,22 +23,22 @@ class MoQPerfClientSubgroupConsumer : public SubgroupConsumer {
       std::function<void(uint64_t)> dataSentFn)
       : SubgroupConsumer(), dataSentFn_(std::move(dataSentFn)) {}
 
-  folly::Expected<folly::Unit, MoQPublishError> object(
+  compat::Expected<compat::Unit, MoQPublishError> object(
       uint64_t /* objectID */,
       Payload payload,
       Extensions /* extensions */,
       bool /* finSubgroup */) override {
     dataSentFn_(payload->computeChainDataLength());
-    return folly::Unit();
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> beginObject(
+  compat::Expected<compat::Unit, MoQPublishError> beginObject(
       uint64_t /* objectID */,
       uint64_t /* length */,
       Payload initialPayload,
       Extensions /* extensions */) override {
     dataSentFn_(initialPayload->computeChainDataLength());
-    return folly::Unit();
+    return compat::unit;
   }
 
   folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
@@ -48,18 +48,18 @@ class MoQPerfClientSubgroupConsumer : public SubgroupConsumer {
     return ObjectPublishStatus::DONE;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+  compat::Expected<compat::Unit, MoQPublishError> endOfGroup(
       uint64_t /* endOfGroupObjectID */) override {
-    return folly::Unit();
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+  compat::Expected<compat::Unit, MoQPublishError> endOfTrackAndGroup(
       uint64_t /* endOfTrackObjectID */) override {
-    return folly::Unit();
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfSubgroup() override {
-    return folly::Unit();
+  compat::Expected<compat::Unit, MoQPublishError> endOfSubgroup() override {
+    return compat::unit;
   }
 
   void reset(ResetStreamErrorCode /* error */) override {}
@@ -70,9 +70,9 @@ class MoQPerfClientSubgroupConsumer : public SubgroupConsumer {
 
 class MoQPerfClientTrackConsumer : public TrackConsumer {
  public:
-  folly::Expected<folly::Unit, MoQPublishError> setTrackAlias(
+  compat::Expected<compat::Unit, MoQPublishError> setTrackAlias(
       TrackAlias) override {
-    return folly::unit;
+    return compat::unit;
   }
 
   folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
@@ -86,26 +86,26 @@ class MoQPerfClientTrackConsumer : public TrackConsumer {
 
   folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
   awaitStreamCredit() override {
-    return folly::Unit();
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> objectStream(
+  compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& /* header */,
       Payload payload) override {
     dataSent_ += payload->computeChainDataLength();
-    return folly::Unit();
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> datagram(
+  compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& /* header */,
       Payload payload) override {
     dataSent_ += payload->computeChainDataLength();
-    return folly::Unit();
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> subscribeDone(
+  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
       SubscribeDone /* subDone */) override {
-    return folly::Unit();
+    return compat::unit;
   }
 
   uint64_t getDataSent() {
@@ -118,7 +118,7 @@ class MoQPerfClientTrackConsumer : public TrackConsumer {
 
 class MoQPerfClientFetchConsumer : public FetchConsumer {
  public:
-  folly::Expected<folly::Unit, MoQPublishError> object(
+  compat::Expected<compat::Unit, MoQPublishError> object(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID,
@@ -132,7 +132,7 @@ class MoQPerfClientFetchConsumer : public FetchConsumer {
 
   virtual void checkpoint() override;
 
-  virtual folly::Expected<folly::Unit, MoQPublishError> beginObject(
+  virtual compat::Expected<compat::Unit, MoQPublishError> beginObject(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID,
@@ -144,18 +144,18 @@ class MoQPerfClientFetchConsumer : public FetchConsumer {
       Payload payload,
       bool finSubgroup = false) override;
 
-  virtual folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+  virtual compat::Expected<compat::Unit, MoQPublishError> endOfGroup(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID,
       bool finFetch = false) override;
 
-  virtual folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+  virtual compat::Expected<compat::Unit, MoQPublishError> endOfTrackAndGroup(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID) override;
 
-  virtual folly::Expected<folly::Unit, MoQPublishError> endOfFetch() override;
+  virtual compat::Expected<compat::Unit, MoQPublishError> endOfFetch() override;
 
   virtual void reset(ResetStreamErrorCode error) override;
 

@@ -99,7 +99,7 @@ bool exists(ObjectStatus status) {
       status != ObjectStatus::GROUP_NOT_EXIST;
 }
 
-folly::Expected<folly::Unit, MoQPublishError> publishObject(
+compat::Expected<compat::Unit, MoQPublishError> publishObject(
     ObjectStatus status,
     std::shared_ptr<FetchConsumer> consumer,
     const AbsoluteLocation& current,
@@ -120,7 +120,7 @@ folly::Expected<folly::Unit, MoQPublishError> publishObject(
       if (lastObject) {
         consumer->endOfFetch();
       }
-      return folly::unit;
+      return compat::unit;
     case ObjectStatus::END_OF_GROUP:
       return consumer->endOfGroup(
           current.group, object.subgroup, current.object, lastObject);
@@ -128,7 +128,7 @@ folly::Expected<folly::Unit, MoQPublishError> publishObject(
       return consumer->endOfTrackAndGroup(
           current.group, object.subgroup, current.object);
   }
-  return folly::makeUnexpected(
+  return compat::makeUnexpected(
       MoQPublishError{MoQPublishError::API_ERROR, "Unknown status"});
 }
 
@@ -136,7 +136,7 @@ folly::Expected<folly::Unit, MoQPublishError> publishObject(
 
 namespace moxygen {
 
-folly::Expected<folly::Unit, MoQPublishError> MoQCache::CacheGroup::cacheObject(
+compat::Expected<compat::Unit, MoQPublishError> MoQCache::CacheGroup::cacheObject(
     uint64_t subgroup,
     uint64_t objectID,
     ObjectStatus status,
@@ -153,7 +153,7 @@ folly::Expected<folly::Unit, MoQPublishError> MoQCache::CacheGroup::cacheObject(
       XLOG(ERR) << "Invalid cache status change; objID=" << objectID
                 << " status=" << (uint32_t)status
                 << " already exists with different status";
-      return folly::makeUnexpected(
+      return compat::makeUnexpected(
           MoQPublishError(MoQPublishError::API_ERROR, "Invalid status change"));
     }
     if (status == ObjectStatus::NORMAL && cachedObject->complete &&
@@ -163,7 +163,7 @@ folly::Expected<folly::Unit, MoQPublishError> MoQCache::CacheGroup::cacheObject(
           payload->computeChainDataLength() !=
               cachedObject->payload->computeChainDataLength()))) {
       XLOG(ERR) << "Payload mismatch; objID=" << objectID;
-      return folly::makeUnexpected(
+      return compat::makeUnexpected(
           MoQPublishError(MoQPublishError::API_ERROR, "payload mismatch"));
     }
 
@@ -181,7 +181,7 @@ folly::Expected<folly::Unit, MoQPublishError> MoQCache::CacheGroup::cacheObject(
         (status == ObjectStatus::END_OF_GROUP ||
          status == ObjectStatus::GROUP_NOT_EXIST);
   }
-  return folly::unit;
+  return compat::unit;
 }
 
 void MoQCache::CacheGroup::cacheMissingStatus(
@@ -225,13 +225,13 @@ class MoQCache::FetchHandle : public Publisher::FetchHandle {
   std::shared_ptr<Publisher::FetchHandle> upstreamFetchHandle_;
 };
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQCache::CacheTrack::updateLargest(AbsoluteLocation current, bool eot) {
   // Check for a new largest object past the old endOfTrack
   if (!largestGroupAndObject || current > *largestGroupAndObject) {
     if (endOfTrack) {
       XLOG(ERR) << "Malformed track, end of track set, but new largest object";
-      return folly::makeUnexpected(
+      return compat::makeUnexpected(
           MoQPublishError(MoQPublishError::MALFORMED_TRACK, "Malformed track"));
     } else {
       endOfTrack = eot;
@@ -240,10 +240,10 @@ MoQCache::CacheTrack::updateLargest(AbsoluteLocation current, bool eot) {
   } else if (eot && current != *largestGroupAndObject) {
     // End of track is not the largest
     XLOG(ERR) << "Malformed track, eot is not the largest object";
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::MALFORMED_TRACK, "Malformed track"));
   }
-  return folly::unit;
+  return compat::unit;
 }
 
 MoQCache::CacheGroup& MoQCache::CacheTrack::getOrCreateGroup(uint64_t groupID) {
@@ -254,7 +254,7 @@ MoQCache::CacheGroup& MoQCache::CacheTrack::getOrCreateGroup(uint64_t groupID) {
   return *it->second;
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQCache::CacheTrack::processGapExtensions(
     uint64_t groupID,
     uint64_t objectID,
@@ -269,7 +269,7 @@ MoQCache::CacheTrack::processGapExtensions(
     if (gap > groupID) {
       XLOG(ERR) << "Prior Group ID Gap " << gap << " is larger than Group ID "
                 << groupID;
-      return folly::makeUnexpected(MoQPublishError(
+      return compat::makeUnexpected(MoQPublishError(
           MoQPublishError::MALFORMED_TRACK,
           "Prior Group ID Gap larger than Group ID"));
     }
@@ -281,7 +281,7 @@ MoQCache::CacheTrack::processGapExtensions(
         XLOG(ERR) << "Prior Group ID Gap mismatch in group " << groupID
                   << ": previously saw " << *currentGroup.seenPriorGroupIdGap
                   << ", now got " << gap;
-        return folly::makeUnexpected(MoQPublishError(
+        return compat::makeUnexpected(MoQPublishError(
             MoQPublishError::MALFORMED_TRACK,
             "Inconsistent Prior Group ID Gap values in group"));
       }
@@ -301,7 +301,7 @@ MoQCache::CacheTrack::processGapExtensions(
                  ObjectStatus::GROUP_NOT_EXIST)) {
           XLOG(ERR) << "Prior Group ID Gap covers existing object in group "
                     << g;
-          return folly::makeUnexpected(MoQPublishError(
+          return compat::makeUnexpected(MoQPublishError(
               MoQPublishError::MALFORMED_TRACK,
               "Prior Group ID Gap covers existing object"));
         }
@@ -323,7 +323,7 @@ MoQCache::CacheTrack::processGapExtensions(
     if (gap > objectID) {
       XLOG(ERR) << "Prior Object ID Gap " << gap << " is larger than Object ID "
                 << objectID;
-      return folly::makeUnexpected(MoQPublishError(
+      return compat::makeUnexpected(MoQPublishError(
           MoQPublishError::MALFORMED_TRACK,
           "Prior Object ID Gap larger than Object ID"));
     }
@@ -338,7 +338,7 @@ MoQCache::CacheTrack::processGapExtensions(
         if (it->second->status != ObjectStatus::OBJECT_NOT_EXIST) {
           XLOG(ERR) << "Prior Object ID Gap covers existing object " << o
                     << " in group " << groupID;
-          return folly::makeUnexpected(MoQPublishError(
+          return compat::makeUnexpected(MoQPublishError(
               MoQPublishError::MALFORMED_TRACK,
               "Prior Object ID Gap covers existing object"));
         }
@@ -349,7 +349,7 @@ MoQCache::CacheTrack::processGapExtensions(
     }
   }
 
-  return folly::unit;
+  return compat::unit;
 }
 
 class MoQCache::SubgroupWriteback : public SubgroupConsumer {
@@ -371,7 +371,7 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
   SubgroupWriteback(SubgroupWriteback&&) = delete;
   SubgroupWriteback& operator=(SubgroupWriteback&&) = delete;
 
-  folly::Expected<folly::Unit, MoQPublishError> object(
+  compat::Expected<compat::Unit, MoQPublishError> object(
       uint64_t objID,
       Payload payload,
       Extensions ext,
@@ -397,7 +397,7 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
     return consumer_->checkpoint();
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> beginObject(
+  compat::Expected<compat::Unit, MoQPublishError> beginObject(
       uint64_t objectID,
       uint64_t length,
       Payload initialPayload,
@@ -442,7 +442,7 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
     return consumer_->objectPayload(std::move(payload), finSubgroup);
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+  compat::Expected<compat::Unit, MoQPublishError> endOfGroup(
       uint64_t endOfGroupObjectID) override {
     auto res = cacheTrack_.updateLargest({group_, endOfGroupObjectID});
     if (!res) {
@@ -461,7 +461,7 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
     return consumer_->endOfGroup(endOfGroupObjectID);
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+  compat::Expected<compat::Unit, MoQPublishError> endOfTrackAndGroup(
       uint64_t endOfTrackObjectID) override {
     auto res = cacheTrack_.updateLargest({group_, endOfTrackObjectID}, true);
     if (!res) {
@@ -480,7 +480,7 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
     return consumer_->endOfTrackAndGroup(endOfTrackObjectID);
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfSubgroup() override {
+  compat::Expected<compat::Unit, MoQPublishError> endOfSubgroup() override {
     return consumer_->endOfSubgroup();
   }
 
@@ -516,7 +516,7 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
     track_.isLive = false;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> setTrackAlias(
+  compat::Expected<compat::Unit, MoQPublishError> setTrackAlias(
       TrackAlias alias) override {
     return consumer_->setTrackAlias(std::move(alias));
   }
@@ -542,7 +542,7 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
     return consumer_->awaitStreamCredit();
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> objectStream(
+  compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
       Payload payload) override {
     auto res = track_.updateLargest(
@@ -569,7 +569,7 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
     return consumer_->objectStream(header, std::move(payload));
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> datagram(
+  compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
       Payload payload) override {
     auto res = track_.updateLargest(
@@ -596,7 +596,7 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
     return consumer_->datagram(header, std::move(payload));
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> subscribeDone(
+  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
       SubscribeDone subDone) override {
     return consumer_->subscribeDone(std::move(subDone));
   }
@@ -704,7 +704,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
     cacheMissing(end_);
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> object(
+  compat::Expected<compat::Unit, MoQPublishError> object(
       uint64_t gID,
       uint64_t sgID,
       uint64_t objID,
@@ -730,7 +730,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
     consumer_->checkpoint();
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> beginObject(
+  compat::Expected<compat::Unit, MoQPublishError> beginObject(
       uint64_t gID,
       uint64_t sgID,
       uint64_t objID,
@@ -777,7 +777,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
     return consumer_->objectPayload(std::move(payload), finFetch && proxyFin_);
   }
 
-  folly::Expected<folly::Unit, MoQPublishError>
+  compat::Expected<compat::Unit, MoQPublishError>
   endOfGroup(uint64_t gID, uint64_t sgID, uint64_t objID, bool fin) override {
     constexpr auto kEndOfGroup = ObjectStatus::END_OF_GROUP;
     auto res = cacheImpl(
@@ -788,7 +788,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
     return consumer_->endOfGroup(gID, sgID, objID, fin && proxyFin_);
   }
 
-  folly::Expected<folly::Unit, MoQPublishError>
+  compat::Expected<compat::Unit, MoQPublishError>
   endOfTrackAndGroup(uint64_t gID, uint64_t sgID, uint64_t objID) override {
     constexpr auto kEndOfTrack = ObjectStatus::END_OF_TRACK;
     auto res = cacheImpl(
@@ -799,7 +799,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
     return consumer_->endOfTrackAndGroup(gID, sgID, objID);
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfFetch() override {
+  compat::Expected<compat::Unit, MoQPublishError> endOfFetch() override {
     cacheMissing(fetchRangeIt_.end());
     updateInProgress();
     complete_.post();
@@ -807,7 +807,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
       XLOG(DBG1) << "Forward End of Fetch";
       return consumer_->endOfFetch();
     }
-    return folly::unit;
+    return compat::unit;
   }
 
   void reset(ResetStreamErrorCode error) override {
@@ -869,7 +869,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
     }
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> cacheImpl(
+  compat::Expected<compat::Unit, MoQPublishError> cacheImpl(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID,
@@ -900,7 +900,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
         complete_.post();
       }
     }
-    return folly::unit;
+    return compat::unit;
   }
 };
 
@@ -1058,7 +1058,7 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchImpl(
             consumer,
             upstream);
         if (res.hasError()) {
-          co_return folly::makeUnexpected(res.error());
+          co_return compat::makeUnexpected(res.error());
         } // else success but only returns FetchOk on lastObject
       }
       fetchStart.reset();
@@ -1074,7 +1074,7 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchImpl(
         XLOG(DBG1) << "Fetch blocked, waiting";
         auto blockedRes = co_await handleBlocked(consumer, fetch);
         if (blockedRes.hasError()) {
-          co_return folly::makeUnexpected(blockedRes.error());
+          co_return compat::makeUnexpected(blockedRes.error());
         }
       } else {
         XLOG(ERR) << "Consumer error=" << res.error().msg;
@@ -1082,7 +1082,7 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchImpl(
             ? ResetStreamErrorCode::MALFORMED_TRACK
             : ResetStreamErrorCode::INTERNAL_ERROR;
         consumer->reset(resetCode);
-        co_return folly::makeUnexpected(
+        co_return compat::makeUnexpected(
             FetchError{
                 fetch.requestID,
                 FetchErrorCode::INTERNAL_ERROR,
@@ -1113,7 +1113,7 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchImpl(
           consumer,
           upstream);
       if (res.hasError()) {
-        co_return folly::makeUnexpected(res.error());
+        co_return compat::makeUnexpected(res.error());
       }
     }
     if (!fetchHandle) {
@@ -1210,7 +1210,7 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchUpstream(
   if (res.hasError()) {
     XLOG(ERR) << "upstream fetch failed err=" << res.error().reasonPhrase;
     consumer->reset(ResetStreamErrorCode::CANCELLED);
-    co_return folly::makeUnexpected(
+    co_return compat::makeUnexpected(
         FetchError{
             fetch.requestID, res.error().errorCode, res.error().reasonPhrase});
   }
@@ -1237,7 +1237,7 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchUpstream(
   if (writeback->wasReset()) {
     // FetchOk but fetch stream was reset, can't continue
     XLOG(ERR) << "Fetch was reset, returning error";
-    co_return folly::makeUnexpected(
+    co_return compat::makeUnexpected(
         FetchError{
             fetch.requestID,
             FetchErrorCode::INTERNAL_ERROR,
@@ -1255,7 +1255,7 @@ MoQCache::handleBlocked(
   if (!awaitRes) {
     XLOG(ERR) << "awaitReadyToConsume error: " << awaitRes.error().what();
     consumer->reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    co_return folly::makeUnexpected(
+    co_return compat::makeUnexpected(
         FetchError{
             fetch.requestID,
             FetchErrorCode::INTERNAL_ERROR,
@@ -1263,7 +1263,7 @@ MoQCache::handleBlocked(
                 "Consumer error awaiting ready=", awaitRes.error().msg)});
   }
   co_await std::move(awaitRes.value());
-  co_return folly::unit;
+  co_return compat::unit;
 }
 
 MoQCache::FetchRangeIterator::FetchRangeIterator(

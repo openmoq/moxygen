@@ -8,35 +8,35 @@ class TrackConsumerFilter : public TrackConsumer {
   explicit TrackConsumerFilter(std::shared_ptr<TrackConsumer> downstream)
       : downstream_(std::move(downstream)) {}
 
-  folly::Expected<folly::Unit, MoQPublishError> setTrackAlias(
+  compat::Expected<compat::Unit, MoQPublishError> setTrackAlias(
       TrackAlias alias) override {
     return downstream_->setTrackAlias(alias);
   }
 
-  folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+  compat::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
   beginSubgroup(uint64_t groupID, uint64_t subgroupID, Priority priority)
       override {
     return downstream_->beginSubgroup(groupID, subgroupID, priority);
   }
 
-  folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
+  compat::Expected<compat::SemiFuture<compat::Unit>, MoQPublishError>
   awaitStreamCredit() override {
     return downstream_->awaitStreamCredit();
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> objectStream(
+  compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
       Payload payload) override {
     return downstream_->objectStream(header, std::move(payload));
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> datagram(
+  compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
       Payload payload) override {
     return downstream_->datagram(header, std::move(payload));
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> subscribeDone(
+  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
       SubscribeDone subDone) override {
     return downstream_->subscribeDone(std::move(subDone));
   }

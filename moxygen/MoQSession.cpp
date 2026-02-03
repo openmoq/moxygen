@@ -86,14 +86,14 @@ StreamPriority getStreamPriority(
 
 // Helper function to validate priority from application is set.
 // Applications must always provide a set priority value.
-folly::Expected<folly::Unit, MoQPublishError> validatePrioritySet(
+compat::Expected<compat::Unit, MoQPublishError> validatePrioritySet(
     const std::optional<uint8_t>& priority) {
   if (!priority.has_value()) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR,
         "Application must provide a priority value (cannot be unset)"));
   }
-  return folly::unit;
+  return compat::unit;
 }
 
 // Helper function to elide priority for writing if it matches publisher
@@ -179,28 +179,28 @@ class StreamPublisherImpl
   // SubgroupConsumer overrides
   // Note where the interface uses finSubgroup, this class uses finStream,
   // since it is used for fetch and subgroups
-  folly::Expected<folly::Unit, MoQPublishError> object(
+  compat::Expected<compat::Unit, MoQPublishError> object(
       uint64_t objectID,
       Payload payload,
       Extensions extensions,
       bool finStream) override;
-  folly::Expected<folly::Unit, MoQPublishError> beginObject(
+  compat::Expected<compat::Unit, MoQPublishError> beginObject(
       uint64_t objectId,
       uint64_t length,
       Payload initialPayload,
       Extensions extensions) override;
-  folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
+  compat::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
       Payload payload,
       bool finStream) override;
-  folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+  compat::Expected<compat::Unit, MoQPublishError> endOfGroup(
       uint64_t endOfGroupObjectId) override;
-  folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+  compat::Expected<compat::Unit, MoQPublishError> endOfTrackAndGroup(
       uint64_t endOfTrackObjectId) override;
-  folly::Expected<folly::Unit, MoQPublishError> endOfSubgroup() override;
+  compat::Expected<compat::Unit, MoQPublishError> endOfSubgroup() override;
   void reset(ResetStreamErrorCode error) override;
 
   // FetchConsumer overrides
-  folly::Expected<folly::Unit, MoQPublishError> object(
+  compat::Expected<compat::Unit, MoQPublishError> object(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID,
@@ -208,7 +208,7 @@ class StreamPublisherImpl
       Extensions extensions,
       bool finFetch) override {
     if (!setGroupAndSubgroup(groupID, subgroupID)) {
-      return folly::makeUnexpected(
+      return compat::makeUnexpected(
           MoQPublishError(MoQPublishError::API_ERROR, "Group moved back"));
     }
     header_.status = ObjectStatus::NORMAL;
@@ -216,7 +216,7 @@ class StreamPublisherImpl
         objectID, std::move(payload), std::move(extensions), finFetch);
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> beginObject(
+  compat::Expected<compat::Unit, MoQPublishError> beginObject(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID,
@@ -224,7 +224,7 @@ class StreamPublisherImpl
       Payload initialPayload,
       Extensions extensions) override {
     if (!setGroupAndSubgroup(groupID, subgroupID)) {
-      return folly::makeUnexpected(
+      return compat::makeUnexpected(
           MoQPublishError(MoQPublishError::API_ERROR, "Group moved back"));
     }
     header_.status = ObjectStatus::NORMAL;
@@ -232,33 +232,33 @@ class StreamPublisherImpl
         objectID, length, std::move(initialPayload), std::move(extensions));
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+  compat::Expected<compat::Unit, MoQPublishError> endOfGroup(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID,
       bool finFetch) override {
     if (!setGroupAndSubgroup(groupID, subgroupID)) {
-      return folly::makeUnexpected(
+      return compat::makeUnexpected(
           MoQPublishError(MoQPublishError::API_ERROR, "Group moved back"));
     }
     return publishStatus(
         objectID, ObjectStatus::END_OF_GROUP, noExtensions(), finFetch);
   }
-  folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+  compat::Expected<compat::Unit, MoQPublishError> endOfTrackAndGroup(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID) override {
     if (!setGroupAndSubgroup(groupID, subgroupID)) {
-      return folly::makeUnexpected(
+      return compat::makeUnexpected(
           MoQPublishError(MoQPublishError::API_ERROR, "Group moved back"));
     }
     return endOfTrackAndGroup(objectID);
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfFetch() override {
+  compat::Expected<compat::Unit, MoQPublishError> endOfFetch() override {
     if (!writeHandle_) {
       if (streamComplete_) {
-        return folly::makeUnexpected(
+        return compat::makeUnexpected(
             MoQPublishError(MoQPublishError::CANCELLED, "Fetch cancelled"));
       }
       auto res = ensureWriteHandle();
@@ -269,10 +269,10 @@ class StreamPublisherImpl
     return endOfSubgroup();
   }
 
-  folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>
+  compat::Expected<compat::SemiFuture<uint64_t>, MoQPublishError>
   awaitReadyToConsume() override;
 
-  folly::Expected<folly::Unit, MoQPublishError> publishStatus(
+  compat::Expected<compat::Unit, MoQPublishError> publishStatus(
       uint64_t objectID,
       ObjectStatus status,
       const Extensions& extensions,
@@ -408,21 +408,21 @@ class StreamPublisherImpl
     return true;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> ensureWriteHandle();
+  compat::Expected<compat::Unit, MoQPublishError> ensureWriteHandle();
 
   void setWriteHandle(proxygen::WebTransport::StreamWriteHandle* writeHandle);
 
-  folly::Expected<folly::Unit, MoQPublishError> validatePublish(
+  compat::Expected<compat::Unit, MoQPublishError> validatePublish(
       uint64_t objectID);
-  folly::Expected<ObjectPublishStatus, MoQPublishError>
+  compat::Expected<ObjectPublishStatus, MoQPublishError>
   validateObjectPublishAndUpdateState(folly::IOBuf* payload, bool finStream);
-  folly::Expected<folly::Unit, MoQPublishError> writeCurrentObject(
+  compat::Expected<compat::Unit, MoQPublishError> writeCurrentObject(
       uint64_t objectID,
       uint64_t length,
       Payload payload,
       const Extensions& extensions,
       bool finStream);
-  folly::Expected<folly::Unit, MoQPublishError> writeToStream(
+  compat::Expected<compat::Unit, MoQPublishError> writeToStream(
       bool finStream,
       bool endObject = false);
 
@@ -583,12 +583,12 @@ void StreamPublisherImpl::onStreamComplete() {
   }
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 StreamPublisherImpl::validatePublish(uint64_t objectID) {
   if (currentLengthRemaining_) {
     XLOG(ERR) << "Still publishing previous object sgp=" << this;
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Previous object incomplete"));
   }
   if (header_.id != std::numeric_limits<uint64_t>::max() &&
@@ -596,13 +596,13 @@ StreamPublisherImpl::validatePublish(uint64_t objectID) {
     XLOG(ERR) << "Object ID not advancing header_.id=" << header_.id
               << " objectID=" << objectID << " sgp=" << this;
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Object ID not advancing in subgroup"));
   }
   return ensureWriteHandle();
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 StreamPublisherImpl::writeCurrentObject(
     uint64_t objectID,
     uint64_t length,
@@ -620,17 +620,17 @@ StreamPublisherImpl::writeCurrentObject(
   return writeToStream(finStream, entireObjectWritten);
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
   if (streamType_ != StreamType::FETCH_HEADER &&
       !publisher_->canBufferBytes(writeBuf_.chainLength())) {
     publisher_->onTooManyBytesBuffered();
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::TOO_FAR_BEHIND, "Too far behind"));
   }
 
   if (!writeHandle_) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::CANCELLED, "Cancelled: writeCurrentObject"));
   }
 
@@ -662,22 +662,22 @@ StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
     if (finStream) {
       onStreamComplete();
     }
-    return folly::unit;
+    return compat::unit;
   }
   XLOG(ERR) << "write error=" << uint64_t(writeRes.error());
   reset(ResetStreamErrorCode::INTERNAL_ERROR);
-  return folly::makeUnexpected(
+  return compat::makeUnexpected(
       MoQPublishError(MoQPublishError::WRITE_ERROR, "write error"));
 }
 
-folly::Expected<ObjectPublishStatus, MoQPublishError>
+compat::Expected<ObjectPublishStatus, MoQPublishError>
 StreamPublisherImpl::validateObjectPublishAndUpdateState(
     folly::IOBuf* payload,
     bool finStream) {
   auto length = payload ? payload->computeChainDataLength() : 0;
   if (!currentLengthRemaining_) {
     XLOG(ERR) << "Not publishing object sgp=" << this;
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::API_ERROR, "Not publishing object"));
   }
   if (length > *currentLengthRemaining_) {
@@ -685,7 +685,7 @@ StreamPublisherImpl::validateObjectPublishAndUpdateState(
               << " exceeds remaining=" << *currentLengthRemaining_
               << " sgp=" << this;
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Length exceeds remaining in object"));
   }
   *currentLengthRemaining_ -= length;
@@ -696,7 +696,7 @@ StreamPublisherImpl::validateObjectPublishAndUpdateState(
     XLOG(ERR) << "finStream with length remaining=" << *currentLengthRemaining_
               << " sgp=" << this;
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "finStream with open object"));
   }
   return ObjectPublishStatus::IN_PROGRESS;
@@ -704,14 +704,14 @@ StreamPublisherImpl::validateObjectPublishAndUpdateState(
 
 // Interface Methods
 
-folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::object(
+compat::Expected<compat::Unit, MoQPublishError> StreamPublisherImpl::object(
     uint64_t objectID,
     Payload payload,
     Extensions extensions,
     bool finStream) {
   if (!forward_) {
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::API_ERROR, "shouldForward is false"));
   }
   auto validateRes = validatePublish(objectID);
@@ -740,14 +740,14 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::object(
       objectID, length, std::move(payload), extensions, finStream);
 }
 
-folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::beginObject(
+compat::Expected<compat::Unit, MoQPublishError> StreamPublisherImpl::beginObject(
     uint64_t objectID,
     uint64_t length,
     Payload initialPayload,
     Extensions extensions) {
   if (!forward_) {
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::API_ERROR, "shouldForward is false"));
   }
   auto validateRes = validatePublish(objectID);
@@ -759,7 +759,7 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::beginObject(
       initialPayload.get(),
       /*finStream=*/false);
   if (!validateObjectPublishRes) {
-    return folly::makeUnexpected(validateObjectPublishRes.error());
+    return compat::makeUnexpected(validateObjectPublishRes.error());
   }
   header_.status = ObjectStatus::NORMAL;
 
@@ -776,15 +776,15 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::beginObject(
       /*finStream=*/false);
 }
 
-folly::Expected<ObjectPublishStatus, MoQPublishError>
+compat::Expected<ObjectPublishStatus, MoQPublishError>
 StreamPublisherImpl::objectPayload(Payload payload, bool finStream) {
   if (!forward_) {
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::API_ERROR, "shouldForward is false"));
   }
   if (!writeHandle_) {
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::CANCELLED, "Cancelled objectPayload"));
   }
   auto validateObjectPublishRes =
@@ -798,15 +798,15 @@ StreamPublisherImpl::objectPayload(Payload payload, bool finStream) {
   if (writeRes.hasValue()) {
     return validateObjectPublishRes.value();
   } else {
-    return folly::makeUnexpected(writeRes.error());
+    return compat::makeUnexpected(writeRes.error());
   }
 }
 
-folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::endOfGroup(
+compat::Expected<compat::Unit, MoQPublishError> StreamPublisherImpl::endOfGroup(
     uint64_t endOfGroupObjectId) {
   if (!forward_) {
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::API_ERROR, "shouldForward is false"));
   }
   return publishStatus(
@@ -816,11 +816,11 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::endOfGroup(
       /*finStream=*/true);
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 StreamPublisherImpl::endOfTrackAndGroup(uint64_t endOfTrackObjectId) {
   if (!forward_) {
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::API_ERROR, "shouldForward is false"));
   }
   return publishStatus(
@@ -830,7 +830,7 @@ StreamPublisherImpl::endOfTrackAndGroup(uint64_t endOfTrackObjectId) {
       /*finStream=*/true);
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 StreamPublisherImpl::publishStatus(
     uint64_t objectID,
     ObjectStatus status,
@@ -838,7 +838,7 @@ StreamPublisherImpl::publishStatus(
     bool finStream) {
   if (!forward_) {
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::API_ERROR, "shouldForward is false"));
   }
   auto validateRes = validatePublish(objectID);
@@ -855,17 +855,17 @@ StreamPublisherImpl::publishStatus(
       finStream);
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 StreamPublisherImpl::endOfSubgroup() {
   if (!forward_) {
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::API_ERROR, "shouldForward is false"));
   }
   if (currentLengthRemaining_) {
     XLOG(ERR) << "Still publishing previous object sgp=" << this;
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Previous object incomplete"));
   }
   if (!writeBuf_.empty()) {
@@ -898,29 +898,29 @@ void StreamPublisherImpl::reset(ResetStreamErrorCode error) {
   onStreamComplete();
 }
 
-folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>
+compat::Expected<compat::SemiFuture<uint64_t>, MoQPublishError>
 StreamPublisherImpl::awaitReadyToConsume() {
   if (!writeHandle_) {
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::CANCELLED, "Fetch cancelled"));
   }
   auto writableFuture = writeHandle_->awaitWritable();
   if (!writableFuture) {
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::WRITE_ERROR, "awaitWritable failed"));
   }
   return std::move(writableFuture.value());
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 StreamPublisherImpl::ensureWriteHandle() {
   if (writeHandle_) {
-    return folly::unit;
+    return compat::unit;
   }
   if (streamComplete_) {
     // TODO: return CANCELLED if after stop sending, since that's not an API
     // error
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Write after stream complete or reset"));
   }
   XCHECK(publisher_) << "publisher_ has not been set";
@@ -929,7 +929,7 @@ StreamPublisherImpl::ensureWriteHandle() {
   auto wt = publisher_->getWebTransport();
   if (!wt) {
     XLOG(ERR) << "Trying to publish after fetchCancel";
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Publish after fetchCancel"));
   }
 
@@ -937,7 +937,7 @@ StreamPublisherImpl::ensureWriteHandle() {
   if (!stream) {
     // failed to create a stream
     XLOG(ERR) << "Failed to create uni stream tp=" << this;
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::BLOCKED, "Failed to create uni stream."));
   }
   XLOG(DBG4) << "New stream created, id: " << stream.value()->getID()
@@ -949,7 +949,7 @@ StreamPublisherImpl::ensureWriteHandle() {
   stream.value()->setPriority(
       quic::HTTPPriorityQueue::Priority(pri.urgency, false, pri.order));
   setWriteHandle(*stream);
-  return folly::unit;
+  return compat::unit;
 }
 
 } // namespace
@@ -993,17 +993,17 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     }
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> setTrackAlias(
+  compat::Expected<compat::Unit, MoQPublishError> setTrackAlias(
       TrackAlias trackAlias) override {
     if (trackAlias_ && trackAlias != *trackAlias_) {
-      return folly::makeUnexpected(MoQPublishError(
+      return compat::makeUnexpected(MoQPublishError(
           MoQPublishError::API_ERROR,
           "Track Alias already set to different value"));
     }
     // TODO: there's now way to verify which aliases are already in use from the
     // publisher side
     trackAlias_ = trackAlias;
-    return folly::unit;
+    return compat::unit;
   }
 
   void setSubscriptionHandle(
@@ -1204,11 +1204,11 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
   }
 
   // TrackConsumer overrides
-  folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+  compat::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
   beginSubgroup(uint64_t groupID, uint64_t subgroupID, Priority priority)
       override;
 
-  folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+  compat::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
   beginSubgroup(
       uint64_t groupID,
       uint64_t subgroupID,
@@ -1216,18 +1216,18 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       SubgroupIDFormat format,
       bool includeExtensions);
 
-  folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
+  compat::Expected<compat::SemiFuture<compat::Unit>, MoQPublishError>
   awaitStreamCredit() override;
 
-  folly::Expected<folly::Unit, MoQPublishError> objectStream(
+  compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
       Payload payload) override;
 
-  folly::Expected<folly::Unit, MoQPublishError> datagram(
+  compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
       Payload payload) override;
 
-  folly::Expected<folly::Unit, MoQPublishError> subscribeDone(
+  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
       SubscribeDone subDone) override;
 
   void setDeliveryCallback(std::shared_ptr<DeliveryCallback> callback) override;
@@ -1339,7 +1339,7 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
 
 // TrackPublisherImpl
 
-folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+compat::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
 MoQSession::TrackPublisherImpl::beginSubgroup(
     uint64_t groupID,
     uint64_t subgroupID,
@@ -1348,7 +1348,7 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
       groupID, subgroupID, pubPriority, SubgroupIDFormat::Present, true);
 }
 
-folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+compat::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
 MoQSession::TrackPublisherImpl::beginSubgroup(
     uint64_t groupID,
     uint64_t subgroupID,
@@ -1356,11 +1356,11 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
     SubgroupIDFormat format,
     bool includeExtensions) {
   if (!trackAlias_) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Must set track alias first"));
   }
   if (!forward_) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR,
         "Cannot create subgroups for subscriptions with forward flag set to false"));
   }
@@ -1368,7 +1368,7 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
   auto wt = getWebTransport();
   if (!wt || state_ != State::OPEN) {
     XLOG(ERR) << "Trying to publish after subscribeDone";
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Publish after subscribeDone"));
   }
   auto stream = wt->createUniStream();
@@ -1377,7 +1377,7 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
     // TODO: can it fail for non-stream credit reasons? Session closing should
     // be handled above.
     XLOG(ERR) << "Failed to create uni stream tp=" << this;
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::BLOCKED, "Failed to create uni stream."));
   }
   XLOG(DBG4) << "New stream created, id: " << stream.value()->getID()
@@ -1413,11 +1413,11 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
   return subgroupPublisher;
 }
 
-folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
+compat::Expected<compat::SemiFuture<compat::Unit>, MoQPublishError>
 MoQSession::TrackPublisherImpl::awaitStreamCredit() {
   auto wt = getWebTransport();
   if (!wt || state_ != State::OPEN) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "awaitStreamCredit after subscribeDone"));
   }
   return wt->awaitUniStreamCredit();
@@ -1454,18 +1454,18 @@ void MoQSession::TrackPublisherImpl::onTooManyBytesBuffered() {
       ResetStreamErrorCode::INTERNAL_ERROR);
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQSession::TrackPublisherImpl::objectStream(
     const ObjectHeader& objHeader,
     Payload payload) {
   if (!trackAlias_) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Must set track alias first"));
   }
   // Validate that application provided a priority value
   auto priorityValidation = validatePrioritySet(objHeader.priority);
   if (priorityValidation.hasError()) {
-    return folly::makeUnexpected(std::move(priorityValidation.error()));
+    return compat::makeUnexpected(std::move(priorityValidation.error()));
   }
   XCHECK(objHeader.status == ObjectStatus::NORMAL || !payload);
   Extensions extensions = objHeader.extensions;
@@ -1477,7 +1477,7 @@ MoQSession::TrackPublisherImpl::objectStream(
                                          : SubgroupIDFormat::Present,
       !extensions.empty());
   if (subgroup.hasError()) {
-    return folly::makeUnexpected(std::move(subgroup.error()));
+    return compat::makeUnexpected(std::move(subgroup.error()));
   }
 
   switch (objHeader.status) {
@@ -1502,32 +1502,32 @@ MoQSession::TrackPublisherImpl::objectStream(
     case ObjectStatus::END_OF_TRACK:
       return subgroup.value()->endOfTrackAndGroup(objHeader.id);
   }
-  return folly::makeUnexpected(
+  return compat::makeUnexpected(
       MoQPublishError(MoQPublishError::WRITE_ERROR, "unreachable"));
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQSession::TrackPublisherImpl::datagram(
     const ObjectHeader& header,
     Payload payload) {
   if (!trackAlias_) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Must set track alias first"));
   }
   // Validate that application provided a priority value
   auto priorityValidation = validatePrioritySet(header.priority);
   if (priorityValidation.hasError()) {
-    return folly::makeUnexpected(std::move(priorityValidation.error()));
+    return compat::makeUnexpected(std::move(priorityValidation.error()));
   }
   if (!forward_) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR,
         "Cannot send datagrams for subscriptions with forward flag set to false"));
   }
   auto wt = getWebTransport();
   if (!wt || state_ != State::OPEN) {
     XLOG(ERR) << "Trying to publish after subscribeDone";
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Publish after subscribeDone"));
   }
 
@@ -1562,16 +1562,16 @@ MoQSession::TrackPublisherImpl::datagram(
   // TODO: set priority when WT has an API for that
   auto res = wt->sendDatagram(writeBuf.move());
   if (res.hasError()) {
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         MoQPublishError(MoQPublishError::WRITE_ERROR, "sendDatagram failed"));
   }
-  return folly::unit;
+  return compat::unit;
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
+compat::Expected<compat::Unit, MoQPublishError>
 MoQSession::TrackPublisherImpl::subscribeDone(SubscribeDone subDone) {
   if (state_ != State::OPEN || !session_) {
-    return folly::makeUnexpected(MoQPublishError(
+    return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "subscribeDone twice or after close"));
   }
   state_ = State::DONE;
@@ -1580,12 +1580,12 @@ MoQSession::TrackPublisherImpl::subscribeDone(SubscribeDone subDone) {
     // subscribeDone called from inside the subscribe handler,
     // before subscribeOk.
     pendingSubscribeDone_ = std::move(subDone);
-    return folly::unit;
+    return compat::unit;
   }
   subDone.streamCount = streamCount_;
   subscriptionHandle_.reset();
   session_->sendSubscribeDone(subDone);
-  return folly::unit;
+  return compat::unit;
 }
 
 void MoQSession::TrackPublisherImpl::setDeliveryCallback(
@@ -1719,7 +1719,7 @@ class MoQSession::SubscribeTrackReceiveState
     XLOG(DBG1) << __func__ << " trackReceiveState=" << this;
     if (!publish_ && !subscribePromise_.isFulfilled()) {
       subErr.requestID = requestID_;
-      subscribePromise_.setValue(folly::makeUnexpected(std::move(subErr)));
+      subscribePromise_.setValue(compat::makeUnexpected(std::move(subErr)));
     } else if (callback_) {
       // Clear pending to avoid false duplicate detection - we're already
       // cleaning up this subscription
@@ -1909,7 +1909,7 @@ class MoQSession::FetchTrackReceiveState
   void fetchError(FetchError fetchErr) {
     if (!promise_.isFulfilled()) {
       fetchErr.requestID = requestID_;
-      promise_.setValue(folly::makeUnexpected(std::move(fetchErr)));
+      promise_.setValue(compat::makeUnexpected(std::move(fetchErr)));
     } // there's likely a missing case here from shutdown
   }
 
@@ -1944,7 +1944,7 @@ MoQSession::PendingRequestState::setError(
     case FrameType::SUBSCRIBE_ERROR: {
       auto ptr = tryGetSubscribeTrack();
       if (!ptr || !*ptr || (*ptr)->isPublish()) {
-        return folly::makeUnexpected(folly::unit);
+        return compat::makeUnexpected(compat::unit);
       }
       (*ptr)->subscribeError(std::move(error));
       return type_;
@@ -1952,21 +1952,21 @@ MoQSession::PendingRequestState::setError(
     case FrameType::PUBLISH_ERROR: {
       auto promise = tryGetPublish();
       if (!promise) {
-        return folly::makeUnexpected(folly::unit);
+        return compat::makeUnexpected(compat::unit);
       }
-      promise->setValue(folly::makeUnexpected(std::move(error)));
+      promise->setValue(compat::makeUnexpected(std::move(error)));
       return type_;
     }
     case FrameType::TRACK_STATUS: {
       storage_.trackStatus_.setValue(
-          folly::makeUnexpected(TrackStatusError(
+          compat::makeUnexpected(TrackStatusError(
               {error.requestID, error.errorCode, error.reasonPhrase})));
       return type_;
     }
     case FrameType::FETCH_ERROR: {
       auto fetchPtr = tryGetFetch();
       if (!fetchPtr) {
-        return folly::makeUnexpected(folly::unit);
+        return compat::makeUnexpected(compat::unit);
       }
       (*fetchPtr)->fetchError(std::move(error));
       return type_;
@@ -1974,24 +1974,24 @@ MoQSession::PendingRequestState::setError(
     case FrameType::SUBSCRIBE_UPDATE: {
       if (type_ == Type::SUBSCRIBE_UPDATE) {
         storage_.subscribeUpdate_.setValue(
-            folly::makeUnexpected(
+            compat::makeUnexpected(
                 SubscribeUpdateError{
                     error.requestID, error.errorCode, error.reasonPhrase}));
         return type_;
       }
-      return folly::makeUnexpected(folly::unit);
+      return compat::makeUnexpected(compat::unit);
     }
     case FrameType::PUBLISH_NAMESPACE_ERROR:
     case FrameType::SUBSCRIBE_NAMESPACE_ERROR: {
       // These types are handled by MoQRelaySession subclass
-      return folly::makeUnexpected(folly::unit);
+      return compat::makeUnexpected(compat::unit);
     }
     default:
       // fall through
       break;
   }
   // Should not reach here
-  return folly::makeUnexpected(folly::unit);
+  return compat::makeUnexpected(compat::unit);
 }
 
 using folly::coro::co_awaitTry;
@@ -2612,7 +2612,7 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       }
     }
 
-    folly::Expected<folly::Unit, MoQPublishError> res{folly::unit};
+    compat::Expected<compat::Unit, MoQPublishError> res{compat::unit};
     if (objectComplete) {
       res = invokeCallback(
           &SubgroupConsumer::object,
@@ -2682,7 +2682,7 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     if (isCancelled()) {
       return MoQCodec::ParseResult::ERROR_TERMINATE;
     }
-    folly::Expected<folly::Unit, MoQPublishError> res{folly::unit};
+    compat::Expected<compat::Unit, MoQPublishError> res{compat::unit};
     // Handle subscription/fetch consumers
     switch (status) {
       case ObjectStatus::NORMAL:
@@ -3430,7 +3430,7 @@ class MoQSession::ReceiverSubscriptionHandle
   folly::coro::Task<SubscriptionHandle::SubscribeUpdateResult> subscribeUpdate(
       SubscribeUpdate subscribeUpdate) override {
     if (!session_) {
-      co_return folly::makeUnexpected(
+      co_return compat::makeUnexpected(
           SubscribeUpdateError{
               subscribeUpdate.requestID,
               RequestErrorCode::INTERNAL_ERROR,
@@ -3976,7 +3976,7 @@ folly::coro::Task<MoQSession::TrackStatusResult> MoQSession::trackStatus(
         trackStatus.requestID,
         TrackStatusErrorCode::INTERNAL_ERROR,
         "Draining session"};
-    co_return folly::makeUnexpected(trackStatusError);
+    co_return compat::makeUnexpected(trackStatusError);
   }
   aliasifyAuthTokens(trackStatus.params);
   trackStatus.requestID = getNextRequestID();
@@ -3984,7 +3984,7 @@ folly::coro::Task<MoQSession::TrackStatusResult> MoQSession::trackStatus(
   auto res = moqFrameWriter_.writeTrackStatus(controlWriteBuf_, trackStatus);
   if (!res) {
     XLOG(ERR) << "writeTrackStatus failed sess=" << this;
-    co_return folly::makeUnexpected(
+    co_return compat::makeUnexpected(
         TrackStatusError{
             trackStatus.requestID,
             TrackStatusErrorCode::INTERNAL_ERROR,
@@ -4063,7 +4063,7 @@ void MoQSession::onTrackStatusError(TrackStatusError trackStatusError) {
     return;
   }
 
-  trackStatusPtr->setValue(folly::makeUnexpected(std::move(trackStatusError)));
+  trackStatusPtr->setValue(compat::makeUnexpected(std::move(trackStatusError)));
   pendingRequests_.erase(trackStatusIt);
 }
 
@@ -4116,7 +4116,7 @@ Subscriber::PublishResult MoQSession::publish(
   // Reject new publish attempts if session is draining
   if (draining_) {
     XLOG(DBG1) << "Rejecting publish request, session draining sess=" << this;
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         PublishError{
             pub.requestID,
             PublishErrorCode::INTERNAL_ERROR,
@@ -4126,7 +4126,7 @@ Subscriber::PublishResult MoQSession::publish(
   if (!handle) {
     XLOG(DBG1) << "Rejecting publish request, no subscription handle sess="
                << this;
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         PublishError{
             pub.requestID,
             PublishErrorCode::INTERNAL_ERROR,
@@ -4151,7 +4151,7 @@ Subscriber::PublishResult MoQSession::publish(
   auto res = moqFrameWriter_.writePublish(controlWriteBuf_, pub);
   if (!res) {
     XLOG(ERR) << "writePublish failed sess=" << this;
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         PublishError{
             pub.requestID,
             PublishErrorCode::INTERNAL_ERROR,
@@ -4306,7 +4306,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
         "Draining session"};
     MOQ_SUBSCRIBER_STATS(
         subscriberStatsCallback_, onSubscribeError, subscribeError.errorCode);
-    co_return folly::makeUnexpected(subscribeError);
+    co_return compat::makeUnexpected(subscribeError);
   }
   auto fullTrackName = sub.fullTrackName;
   RequestID reqID = getNextRequestID();
@@ -4321,7 +4321,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
         reqID, SubscribeErrorCode::INTERNAL_ERROR, "local write failed"};
     MOQ_SUBSCRIBER_STATS(
         subscriberStatsCallback_, onSubscribeError, subscribeError.errorCode);
-    co_return folly::makeUnexpected(subscribeError);
+    co_return compat::makeUnexpected(subscribeError);
   }
   controlWriteEvent_.signal();
   auto trackReceiveState = std::make_shared<SubscribeTrackReceiveState>(
@@ -4348,7 +4348,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
         subscriberStatsCallback_,
         onSubscribeError,
         subscribeResult.error().errorCode);
-    co_return folly::makeUnexpected(subscribeResult.error());
+    co_return compat::makeUnexpected(subscribeResult.error());
   } else {
     MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscribeSuccess);
     co_return std::make_shared<ReceiverSubscriptionHandle>(
@@ -4626,7 +4626,7 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
         "Draining session"};
     MOQ_SUBSCRIBER_STATS(
         subscriberStatsCallback_, onFetchError, fetchError.errorCode);
-    co_return folly::makeUnexpected(fetchError);
+    co_return compat::makeUnexpected(fetchError);
   }
 
   auto [standalone, joining] = fetchType(fetch);
@@ -4653,7 +4653,7 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
           "Invalid JSID"};
       MOQ_SUBSCRIBER_STATS(
           subscriberStatsCallback_, onFetchError, fetchError.errorCode);
-      co_return folly::makeUnexpected(fetchError);
+      co_return compat::makeUnexpected(fetchError);
     }
 
     if (fullTrackName != state->fullTrackName()) {
@@ -4665,7 +4665,7 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
           "Track name mismatch"};
       MOQ_SUBSCRIBER_STATS(
           subscriberStatsCallback_, onFetchError, fetchError.errorCode);
-      co_return folly::makeUnexpected(fetchError);
+      co_return compat::makeUnexpected(fetchError);
     }
   }
   auto reqID = getNextRequestID();
@@ -4678,7 +4678,7 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
         reqID, FetchErrorCode::INTERNAL_ERROR, "local write failed"};
     MOQ_SUBSCRIBER_STATS(
         subscriberStatsCallback_, onFetchError, fetchError.errorCode);
-    co_return folly::makeUnexpected(fetchError);
+    co_return compat::makeUnexpected(fetchError);
   }
   controlWriteEvent_.signal();
   auto trackReceiveState = std::make_shared<FetchTrackReceiveState>(
@@ -4696,7 +4696,7 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
     XLOG(ERR) << fetchResult.error().reasonPhrase;
     MOQ_SUBSCRIBER_STATS(
         subscriberStatsCallback_, onFetchError, fetchResult.error().errorCode);
-    co_return folly::makeUnexpected(fetchResult.error());
+    co_return compat::makeUnexpected(fetchResult.error());
   } else {
     MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onFetchSuccess);
     co_return std::make_shared<ReceiverFetchHandle>(

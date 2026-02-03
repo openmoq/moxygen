@@ -78,7 +78,7 @@ MoQRelay::publishNamespace(
   XLOG(DBG1) << __func__ << " ns=" << ann.trackNamespace;
   // check auth
   if (!ann.trackNamespace.startsWith(allowedNamespacePrefix_)) {
-    co_return folly::makeUnexpected(
+    co_return compat::makeUnexpected(
         PublishNamespaceError{
             ann.requestID,
             PublishNamespaceErrorCode::UNINTERESTED,
@@ -309,13 +309,13 @@ Subscriber::PublishResult MoQRelay::publish(
   XLOG(DBG1) << __func__ << " ftn=" << pub.fullTrackName;
   XCHECK(handle) << "Publish handle cannot be null";
   if (!pub.fullTrackName.trackNamespace.startsWith(allowedNamespacePrefix_)) {
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         PublishError{
             pub.requestID, PublishErrorCode::UNINTERESTED, "bad namespace"});
   }
 
   if (pub.fullTrackName.trackNamespace.empty()) {
-    return folly::makeUnexpected(PublishError(
+    return compat::makeUnexpected(PublishError(
         {pub.requestID,
          PublishErrorCode::INTERNAL_ERROR,
          "namespace required"}));
@@ -379,7 +379,7 @@ Subscriber::PublishResult MoQRelay::publish(
       std::forward_as_tuple(pub.fullTrackName),
       std::forward_as_tuple(forwarder, session));
   auto& rsub = subRes.first->second;
-  rsub.promise.setValue(folly::unit);
+  rsub.promise.setValue(compat::unit);
   rsub.requestID = pub.requestID;
   rsub.handle = std::move(handle);
   rsub.isPublish = true;
@@ -498,7 +498,7 @@ class MoQRelay::TerminationFilter : public TrackConsumerFilter {
         relay_(std::move(relay)),
         ftn_(std::move(ftn)) {}
 
-  folly::Expected<folly::Unit, MoQPublishError> subscribeDone(
+  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
       SubscribeDone subDone) override {
     // Notify relay that publisher is done - this will:
     // 1. Remove from nodePtr->publishes
@@ -531,7 +531,7 @@ MoQRelay::subscribeNamespace(SubscribeNamespace subNs) {
   XLOG(DBG1) << __func__ << " nsp=" << subNs.trackNamespacePrefix;
   // check auth
   if (subNs.trackNamespacePrefix.empty()) {
-    co_return folly::makeUnexpected(
+    co_return compat::makeUnexpected(
         SubscribeNamespaceError{
             subNs.requestID,
             SubscribeNamespaceErrorCode::NAMESPACE_PREFIX_UNKNOWN,
@@ -687,7 +687,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     // get trackNamespace
     if (subReq.fullTrackName.trackNamespace.empty()) {
       // message error?
-      co_return folly::makeUnexpected(SubscribeError(
+      co_return compat::makeUnexpected(SubscribeError(
           {subReq.requestID,
            SubscribeErrorCode::TRACK_NOT_EXIST,
            "namespace required"}));
@@ -696,7 +696,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
         findPublishNamespaceSession(subReq.fullTrackName.trackNamespace);
     if (!upstreamSession) {
       // no such namespace has been published
-      co_return folly::makeUnexpected(SubscribeError(
+      co_return compat::makeUnexpected(SubscribeError(
           {subReq.requestID,
            SubscribeErrorCode::TRACK_NOT_EXIST,
            "no such namespace or track"}));
@@ -731,7 +731,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     if (!subscriber) {
       XLOG(ERR) << "addSubscriber returned null (draining?) for "
                 << subReq.fullTrackName << " reqID=" << subReq.requestID;
-      co_return folly::makeUnexpected(
+      co_return compat::makeUnexpected(
           SubscribeError{
               subReq.requestID,
               SubscribeErrorCode::INTERNAL_ERROR,
@@ -747,7 +747,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     auto subRes = co_await upstreamSession->subscribe(
         subReq, getSubscribeWriteback(subReq.fullTrackName, forwarder));
     if (subRes.hasError()) {
-      co_return folly::makeUnexpected(SubscribeError(
+      co_return compat::makeUnexpected(SubscribeError(
           {subReq.requestID,
            subRes.error().errorCode,
            folly::to<std::string>(
@@ -789,7 +789,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     auto& rsub = it->second;
     rsub.requestID = subRes.value()->subscribeOk().requestID;
     rsub.handle = std::move(subRes.value());
-    rsub.promise.setValue(folly::unit);
+    rsub.promise.setValue(compat::unit);
     co_return subscriber;
   } else {
     if (!subscriptionIt->second.promise.isFulfilled()) {
@@ -800,7 +800,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     auto& forwarder = subscriptionIt->second.forwarder;
     if (forwarder->largest() && subReq.locType == LocationType::AbsoluteRange &&
         subReq.endGroup < forwarder->largest()->group) {
-      co_return folly::makeUnexpected(
+      co_return compat::makeUnexpected(
           SubscribeError{
               subReq.requestID,
               SubscribeErrorCode::INVALID_RANGE,
@@ -814,7 +814,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     if (!subscriber) {
       XLOG(ERR) << "addSubscriber returned null (draining?) for "
                 << subReq.fullTrackName << " reqID=" << subReq.requestID;
-      co_return folly::makeUnexpected(
+      co_return compat::makeUnexpected(
           SubscribeError{
               subReq.requestID,
               SubscribeErrorCode::INTERNAL_ERROR,
@@ -841,7 +841,7 @@ folly::coro::Task<Publisher::FetchResult> MoQRelay::fetch(
   // check auth
   // get trackNamespace
   if (fetch.fullTrackName.trackNamespace.empty()) {
-    co_return folly::makeUnexpected(FetchError(
+    co_return compat::makeUnexpected(FetchError(
         {fetch.requestID,
          FetchErrorCode::TRACK_NOT_EXIST,
          "namespace required"}));
@@ -853,7 +853,7 @@ folly::coro::Task<Publisher::FetchResult> MoQRelay::fetch(
     if (subscriptionIt == subscriptions_.end()) {
       XLOG(ERR) << "No subscription for joining fetch";
       // message error
-      co_return folly::makeUnexpected(FetchError(
+      co_return compat::makeUnexpected(FetchError(
           {fetch.requestID,
            FetchErrorCode::TRACK_NOT_EXIST,
            "No subscription for joining fetch"}));
@@ -861,7 +861,7 @@ folly::coro::Task<Publisher::FetchResult> MoQRelay::fetch(
       auto res = subscriptionIt->second.forwarder->resolveJoiningFetch(
           session, *joining);
       if (res.hasError()) {
-        co_return folly::makeUnexpected(res.error());
+        co_return compat::makeUnexpected(res.error());
       }
       fetch.args = StandaloneFetch(res.value().start, res.value().end);
       joining = nullptr;
@@ -880,14 +880,14 @@ folly::coro::Task<Publisher::FetchResult> MoQRelay::fetch(
       upstreamSession = subscriptionIt->second.upstream;
     } else {
       // no such namespace has been published
-      co_return folly::makeUnexpected(FetchError(
+      co_return compat::makeUnexpected(FetchError(
           {fetch.requestID,
            FetchErrorCode::TRACK_NOT_EXIST,
            "no such namespace"}));
     }
   }
   if (session.get() == upstreamSession.get()) {
-    co_return folly::makeUnexpected(FetchError(
+    co_return compat::makeUnexpected(FetchError(
         {fetch.requestID, FetchErrorCode::INTERNAL_ERROR, "self fetch"}));
   }
   fetch.priority = kDefaultUpstreamPriority;

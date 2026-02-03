@@ -70,7 +70,7 @@ class DateSubscriptionHandle : public Publisher::SubscriptionHandle {
   // To Be Implemented
   folly::coro::Task<folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
   subscribeUpdate(SubscribeUpdate update) override {
-    co_return folly::makeUnexpected(
+    co_return compat::makeUnexpected(
         SubscribeUpdateError{
             update.requestID,
             SubscribeUpdateErrorCode::NOT_SUPPORTED,
@@ -185,7 +185,7 @@ class DatePublisher : public Publisher {
       TrackStatus trackStatus) override {
     XLOG(DBG1) << __func__ << trackStatus.fullTrackName;
     if (trackStatus.fullTrackName != dateTrackName()) {
-      co_return folly::makeUnexpected(
+      co_return compat::makeUnexpected(
           TrackStatusError{
               trackStatus.requestID,
               TrackStatusErrorCode::TRACK_NOT_EXIST,
@@ -209,7 +209,7 @@ class DatePublisher : public Publisher {
                << " name=" << subReq.fullTrackName.trackName
                << " requestID=" << subReq.requestID;
     if (subReq.fullTrackName != dateTrackName()) {
-      co_return folly::makeUnexpected(
+      co_return compat::makeUnexpected(
           SubscribeError{
               subReq.requestID,
               SubscribeErrorCode::TRACK_NOT_EXIST,
@@ -218,7 +218,7 @@ class DatePublisher : public Publisher {
     auto largest = updateLargest();
     if (subReq.locType == LocationType::AbsoluteRange &&
         subReq.endGroup < largest.group) {
-      co_return folly::makeUnexpected(
+      co_return compat::makeUnexpected(
           SubscribeError{
               subReq.requestID,
               SubscribeErrorCode::INVALID_RANGE,
@@ -256,7 +256,7 @@ class DatePublisher : public Publisher {
                << " name=" << fetch.fullTrackName.trackName
                << " requestID=" << fetch.requestID;
     if (fetch.fullTrackName != dateTrackName()) {
-      co_return folly::makeUnexpected(
+      co_return compat::makeUnexpected(
           FetchError{
               fetch.requestID,
               FetchErrorCode::TRACK_NOT_EXIST,
@@ -270,7 +270,7 @@ class DatePublisher : public Publisher {
       if (res.hasError()) {
         XLOG(ERR) << "Bad joining fetch id=" << fetch.requestID
                   << " err=" << res.error().reasonPhrase;
-        co_return folly::makeUnexpected(res.error());
+        co_return compat::makeUnexpected(res.error());
       }
       sf = StandaloneFetch(res.value().start, res.value().end);
       standalone = &sf;
@@ -281,12 +281,12 @@ class DatePublisher : public Publisher {
     if (standalone->end < standalone->start &&
         !(standalone->start.group == standalone->end.group &&
           standalone->end.object == 0)) {
-      co_return folly::makeUnexpected(
+      co_return compat::makeUnexpected(
           FetchError{
               fetch.requestID, FetchErrorCode::INVALID_RANGE, "No objects"});
     }
     if (standalone->start > largest) {
-      co_return folly::makeUnexpected(
+      co_return compat::makeUnexpected(
           FetchError{
               fetch.requestID,
               FetchErrorCode::INVALID_RANGE,
@@ -348,7 +348,7 @@ class DatePublisher : public Publisher {
     while (!token.isCancellationRequested() && range.start < range.end) {
       uint64_t subgroup =
           mode_ == Mode::STREAM_PER_OBJECT ? range.start.object : 0;
-      folly::Expected<folly::Unit, MoQPublishError> res{folly::unit};
+      compat::Expected<compat::Unit, MoQPublishError> res{compat::unit};
       if (range.start.object == 0) {
         res = fetchPub->object(
             range.start.group,

@@ -69,7 +69,7 @@ class ObjectSubgroupReceiver : public SubgroupConsumer {
     header_.subgroup = subgroupID;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> object(
+  compat::Expected<compat::Unit, MoQPublishError> object(
       uint64_t objectID,
       Payload payload,
       Extensions ext,
@@ -84,16 +84,16 @@ class ObjectSubgroupReceiver : public SubgroupConsumer {
     }
     if (fcState == ObjectReceiverCallback::FlowControlState::BLOCKED) {
       if (streamType_ == StreamType::FETCH_HEADER) {
-        return folly::makeUnexpected(
+        return compat::makeUnexpected(
             MoQPublishError(MoQPublishError::BLOCKED, "blocked"));
       } else {
         XLOG(WARN) << "ObjectReceiverCallback returned BLOCKED for Subscribe";
       }
     }
-    return folly::unit;
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> beginObject(
+  compat::Expected<compat::Unit, MoQPublishError> beginObject(
       uint64_t objectID,
       uint64_t length,
       Payload initialPayload,
@@ -103,10 +103,10 @@ class ObjectSubgroupReceiver : public SubgroupConsumer {
     header_.status = ObjectStatus::NORMAL;
     header_.extensions = std::move(ext);
     objectPayload(std::move(initialPayload), false);
-    return folly::unit;
+    return compat::unit;
   }
 
-  folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
+  compat::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
       Payload payload,
       bool /*finSubgroup*/) override {
     // TODO: add common component for state verification
@@ -116,7 +116,7 @@ class ObjectSubgroupReceiver : public SubgroupConsumer {
       if (fcState == ObjectReceiverCallback::FlowControlState::BLOCKED) {
         // Is it bad that we can't return DONE here?
         if (streamType_ == StreamType::FETCH_HEADER) {
-          return folly::makeUnexpected(
+          return compat::makeUnexpected(
               MoQPublishError(MoQPublishError::BLOCKED, "blocked"));
         } else {
           XLOG(WARN) << "ObjectReceiverCallback returned BLOCKED for Subscribe";
@@ -127,30 +127,30 @@ class ObjectSubgroupReceiver : public SubgroupConsumer {
     return ObjectPublishStatus::IN_PROGRESS;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+  compat::Expected<compat::Unit, MoQPublishError> endOfGroup(
       uint64_t endOfGroupObjectID) override {
     header_.id = endOfGroupObjectID;
     header_.status = ObjectStatus::END_OF_GROUP;
     header_.extensions = noExtensions();
     callback_->onObjectStatus(trackAlias_, header_);
     notifyParentFinished();
-    return folly::unit;
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+  compat::Expected<compat::Unit, MoQPublishError> endOfTrackAndGroup(
       uint64_t endOfTrackObjectID) override {
     header_.id = endOfTrackObjectID;
     header_.status = ObjectStatus::END_OF_TRACK;
     header_.extensions = noExtensions();
     callback_->onObjectStatus(trackAlias_, header_);
     notifyParentFinished();
-    return folly::unit;
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfSubgroup() override {
+  compat::Expected<compat::Unit, MoQPublishError> endOfSubgroup() override {
     callback_->onEndOfStream();
     notifyParentFinished();
-    return folly::unit;
+    return compat::unit;
   }
 
   void reset(ResetStreamErrorCode error) override {
@@ -184,13 +184,13 @@ class ObjectReceiver : public TrackConsumer,
     }
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> setTrackAlias(
+  compat::Expected<compat::Unit, MoQPublishError> setTrackAlias(
       TrackAlias alias) override {
     trackAlias_ = alias;
-    return folly::unit;
+    return compat::unit;
   }
 
-  folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+  compat::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
   beginSubgroup(uint64_t groupID, uint64_t subgroupID, Priority priority)
       override {
     ++openSubgroups_;
@@ -219,42 +219,42 @@ class ObjectReceiver : public TrackConsumer,
     }
   }
 
-  folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
+  compat::Expected<compat::SemiFuture<compat::Unit>, MoQPublishError>
   awaitStreamCredit() override {
-    return folly::makeSemiFuture();
+    return compat::makeSemiFuture();
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> objectStream(
+  compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
       Payload payload) override {
     auto fcState = callback_->onObject(trackAlias_, header, std::move(payload));
     if (fcState == ObjectReceiverCallback::FlowControlState::BLOCKED) {
       if (fetchPublisher_) {
-        return folly::makeUnexpected(
+        return compat::makeUnexpected(
             MoQPublishError(MoQPublishError::BLOCKED, "blocked"));
       } else {
         XLOG(WARN) << "ObjectReceiverCallback returned BLOCKED for Subscribe";
       }
     }
-    return folly::unit;
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> datagram(
+  compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
       Payload payload) override {
     (void)callback_->onObject(trackAlias_, header, std::move(payload));
-    return folly::unit;
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> subscribeDone(
+  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
       SubscribeDone subDone) override {
     callback_->onSubscribeDone(std::move(subDone));
     subscribeDoneDelivered_ = true;
     maybeFireAllDataReceived();
-    return folly::unit;
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> object(
+  compat::Expected<compat::Unit, MoQPublishError> object(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID,
@@ -266,7 +266,7 @@ class ObjectReceiver : public TrackConsumer,
         objectID, std::move(payload), std::move(extensions), finFetch);
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> beginObject(
+  compat::Expected<compat::Unit, MoQPublishError> beginObject(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID,
@@ -278,13 +278,13 @@ class ObjectReceiver : public TrackConsumer,
         objectID, length, std::move(initialPayload), std::move(extensions));
   }
 
-  folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
+  compat::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
       Payload payload,
       bool finSubgroup) override {
     return fetchPublisher_->objectPayload(std::move(payload), finSubgroup);
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+  compat::Expected<compat::Unit, MoQPublishError> endOfGroup(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID,
@@ -293,7 +293,7 @@ class ObjectReceiver : public TrackConsumer,
     return fetchPublisher_->endOfGroup(objectID);
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+  compat::Expected<compat::Unit, MoQPublishError> endOfTrackAndGroup(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID) override {
@@ -301,7 +301,7 @@ class ObjectReceiver : public TrackConsumer,
     return fetchPublisher_->endOfTrackAndGroup(objectID);
   }
 
-  folly::Expected<folly::Unit, MoQPublishError> endOfFetch() override {
+  compat::Expected<compat::Unit, MoQPublishError> endOfFetch() override {
     auto endOfSubgroupResult = fetchPublisher_->endOfSubgroup();
     callback_->onAllDataReceived();
     return endOfSubgroupResult;
@@ -311,12 +311,12 @@ class ObjectReceiver : public TrackConsumer,
     return fetchPublisher_->reset(error);
   }
 
-  folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>
+  compat::Expected<compat::SemiFuture<uint64_t>, MoQPublishError>
   awaitReadyToConsume() override {
     // TODO: Consider extending ObjectReceiverCallback with a mechanism
     // to trigger backpressure here.  For now, FETCH consumers that want
     // actual backpressure need to implement FetchConsumer directly.
-    return folly::makeSemiFuture<uint64_t>(0);
+    return compat::makeSemiFuture<uint64_t>(0);
   }
 };
 

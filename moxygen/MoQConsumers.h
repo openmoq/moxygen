@@ -11,6 +11,9 @@
 #include <proxygen/lib/http/webtransport/WebTransport.h>
 #include <moxygen/MoQPublishError.h>
 #include <moxygen/MoQTypes.h>
+#include <moxygen/compat/Async.h>
+#include <moxygen/compat/Expected.h>
+#include <moxygen/compat/Unit.h>
 
 namespace moxygen {
 
@@ -65,7 +68,7 @@ class SubgroupConsumer {
   // stream in the middle of a streaming object.
 
   // Deliver the next object on this subgroup.
-  virtual folly::Expected<folly::Unit, MoQPublishError> object(
+  virtual compat::Expected<compat::Unit, MoQPublishError> object(
       uint64_t objectID,
       Payload payload,
       Extensions extensions = noExtensions(),
@@ -76,7 +79,7 @@ class SubgroupConsumer {
   virtual void checkpoint() {}
 
   // Begin delivering the next object in this subgroup.
-  virtual folly::Expected<folly::Unit, MoQPublishError> beginObject(
+  virtual compat::Expected<compat::Unit, MoQPublishError> beginObject(
       uint64_t objectID,
       uint64_t length,
       Payload initialPayload,
@@ -85,24 +88,24 @@ class SubgroupConsumer {
   // Deliver the next chunk of data in the current object.  The return value is
   // IN_PROGRESS if the object is not yet complete, DONE if the payload exactly
   // matched the remaining expected size.
-  virtual folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
+  virtual compat::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
       Payload payload,
       bool finSubgroup = false) = 0;
 
   // Deliver Object Status=EndOfGroup for the given object ID.  This implies
   // endOfSubgroup.
-  virtual folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+  virtual compat::Expected<compat::Unit, MoQPublishError> endOfGroup(
       uint64_t endOfGroupObjectID) = 0;
 
   // Deliver Object Status=EndOfTrackAndGroup for the given object ID.  This
   // implies endOfSubgroup.
-  virtual folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+  virtual compat::Expected<compat::Unit, MoQPublishError> endOfTrackAndGroup(
       uint64_t endOfTrackObjectID) = 0;
 
   // Inform the consumer the subgroup is complete.  If the consumer is writing,
   // this closes the underlying transport stream.  This can only be called if
   // the publisher knows the entire subgroup has been delivered.
-  virtual folly::Expected<folly::Unit, MoQPublishError> endOfSubgroup() = 0;
+  virtual compat::Expected<compat::Unit, MoQPublishError> endOfSubgroup() = 0;
 
   // Inform the consumer that the subgroup terminates with an error.  If the
   // consumer is writing, this resets the transport stream with the given error
@@ -114,9 +117,9 @@ class SubgroupConsumer {
   // pace data according to the rate at which the consumer is consuming it. If
   // the publisher ignores this signal (which is perfectly valid), it may get
   // a TOO_FAR_BEHIND if the client is unable to keep up.
-  virtual folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>
+  virtual compat::Expected<compat::SemiFuture<uint64_t>, MoQPublishError>
   awaitReadyToConsume() {
-    return folly::makeSemiFuture<uint64_t>(0);
+    return compat::makeSemiFuture<uint64_t>(0);
   }
 };
 
@@ -138,35 +141,35 @@ class TrackConsumer {
   // Set the Track Alias for this track.  This is called by publishers in
   // response to SUBSCRIBE requests.  This can fail if the alias is already
   // in use or has already been set.
-  virtual folly::Expected<folly::Unit, MoQPublishError> setTrackAlias(
+  virtual compat::Expected<compat::Unit, MoQPublishError> setTrackAlias(
       TrackAlias alias) = 0;
 
   // Begin delivering a new subgroup in the specified group.  If the consumer is
   // writing, this Can fail with MoQPublishError::BLOCKED when out of stream
   // credit.
-  virtual folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+  virtual compat::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
   beginSubgroup(uint64_t groupID, uint64_t subgroupID, Priority priority) = 0;
 
   // Wait for additional stream credit.
-  virtual folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
+  virtual compat::Expected<compat::SemiFuture<compat::Unit>, MoQPublishError>
   awaitStreamCredit() = 0;
 
   // Deliver a single-object or object status subgroup.  header.length must
   // equal payload length, or be 0 for non-NORMAL status.  Can fail with
   // MoQPublishError::BLOCKED when out of stream credit.
-  virtual folly::Expected<folly::Unit, MoQPublishError> objectStream(
+  virtual compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
       Payload payload) = 0;
 
   // Deliver a datagram in this track.  This can be dropped by the sender or
   // receiver if resources are low.
-  virtual folly::Expected<folly::Unit, MoQPublishError> datagram(
+  virtual compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
       Payload payload) = 0;
 
   // Inform the consumer that the publisher will not open any new subgroups or
   // send any new datagrams for this track.
-  virtual folly::Expected<folly::Unit, MoQPublishError> subscribeDone(
+  virtual compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
       SubscribeDone subDone) = 0;
 
   // Set a callback to be notified when objects are delivered.
@@ -209,7 +212,7 @@ class FetchConsumer {
   // middle of a streaming object.
 
   // Deliver the next object in this FETCH response.
-  virtual folly::Expected<folly::Unit, MoQPublishError> object(
+  virtual compat::Expected<compat::Unit, MoQPublishError> object(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID,
@@ -221,7 +224,7 @@ class FetchConsumer {
   virtual void checkpoint() {}
 
   // Begin delivering the next object in this subgroup.
-  virtual folly::Expected<folly::Unit, MoQPublishError> beginObject(
+  virtual compat::Expected<compat::Unit, MoQPublishError> beginObject(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID,
@@ -229,12 +232,12 @@ class FetchConsumer {
       Payload initialPayload,
       Extensions extensions = noExtensions()) = 0;
 
-  virtual folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
+  virtual compat::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
       Payload payload,
       bool finSubgroup = false) = 0;
 
   // Deliver Object Status=EndOfGroup for the given object ID.
-  virtual folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+  virtual compat::Expected<compat::Unit, MoQPublishError> endOfGroup(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID,
@@ -242,7 +245,7 @@ class FetchConsumer {
 
   // Deliver Object Status=EndOfTrackAndGroup for the given object ID.  This
   // implies endOfFetch.
-  virtual folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+  virtual compat::Expected<compat::Unit, MoQPublishError> endOfTrackAndGroup(
       uint64_t groupID,
       uint64_t subgroupID,
       uint64_t objectID) = 0;
@@ -250,7 +253,7 @@ class FetchConsumer {
   // Inform the consumer the fetch is complete.  If the consumer is writing,
   // this closes the underlying transport stream.  This can only be called if
   // the publisher knows the entire fetch has been delivered.
-  virtual folly::Expected<folly::Unit, MoQPublishError> endOfFetch() = 0;
+  virtual compat::Expected<compat::Unit, MoQPublishError> endOfFetch() = 0;
 
   // Inform the consumer that the fetch terminates with an error.  If the
   // consumer is writing, this resets the transport stream with the given error
@@ -258,7 +261,7 @@ class FetchConsumer {
   virtual void reset(ResetStreamErrorCode error) = 0;
 
   // Wait for the fetch to become writable
-  virtual folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>
+  virtual compat::Expected<compat::SemiFuture<uint64_t>, MoQPublishError>
   awaitReadyToConsume() = 0;
 };
 

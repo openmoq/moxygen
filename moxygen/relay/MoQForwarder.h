@@ -149,7 +149,7 @@ class MoQForwarder : public TrackConsumer {
       const std::string& callsite);
 
   template <typename Fn>
-  folly::Expected<folly::Unit, MoQPublishError> forEachSubscriber(Fn&& fn);
+  compat::Expected<compat::Unit, MoQPublishError> forEachSubscriber(Fn&& fn);
 
   void updateLargest(uint64_t group, uint64_t object = 0);
 
@@ -160,7 +160,7 @@ class MoQForwarder : public TrackConsumer {
       const MoQPublishError& err,
       const std::string& callsite /*for logging*/);
 
-  folly::Expected<folly::Unit, MoQPublishError> setTrackAlias(
+  compat::Expected<compat::Unit, MoQPublishError> setTrackAlias(
       TrackAlias alias) override;
 
   folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
@@ -170,15 +170,15 @@ class MoQForwarder : public TrackConsumer {
   folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
   awaitStreamCredit() override;
 
-  folly::Expected<folly::Unit, MoQPublishError> objectStream(
+  compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
       Payload payload) override;
 
-  folly::Expected<folly::Unit, MoQPublishError> datagram(
+  compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
       Payload payload) override;
 
-  folly::Expected<folly::Unit, MoQPublishError> subscribeDone(
+  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
       SubscribeDone subDone) override;
 
   class SubgroupForwarder : public SubgroupConsumer {
@@ -188,7 +188,7 @@ class MoQForwarder : public TrackConsumer {
     Priority priority_;
 
     template <typename Fn>
-    folly::Expected<folly::Unit, MoQPublishError> forEachSubscriberSubgroup(
+    compat::Expected<compat::Unit, MoQPublishError> forEachSubscriberSubgroup(
         Fn&& fn,
         bool makeNew = true,
         const std::string& callsite = "");
@@ -200,7 +200,7 @@ class MoQForwarder : public TrackConsumer {
         const std::string& callsite);
 
     // Removes this subgroup from the forwarder and checks if forwarder is empty
-    folly::Expected<folly::Unit, MoQPublishError> removeSubgroupAndCheckEmpty();
+    compat::Expected<compat::Unit, MoQPublishError> removeSubgroupAndCheckEmpty();
 
     // Removes subgroup if result contains error, otherwise returns result
     // unchanged
@@ -215,25 +215,25 @@ class MoQForwarder : public TrackConsumer {
         uint64_t subgroup,
         Priority priority);
 
-    folly::Expected<folly::Unit, MoQPublishError> object(
+    compat::Expected<compat::Unit, MoQPublishError> object(
         uint64_t objectID,
         Payload payload,
         Extensions extensions,
         bool finSubgroup) override;
 
-    folly::Expected<folly::Unit, MoQPublishError> beginObject(
+    compat::Expected<compat::Unit, MoQPublishError> beginObject(
         uint64_t objectID,
         uint64_t length,
         Payload initialPayload,
         Extensions extensions) override;
 
-    folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+    compat::Expected<compat::Unit, MoQPublishError> endOfGroup(
         uint64_t endOfGroupObjectID) override;
 
-    folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+    compat::Expected<compat::Unit, MoQPublishError> endOfTrackAndGroup(
         uint64_t endOfTrackObjectID) override;
 
-    folly::Expected<folly::Unit, MoQPublishError> endOfSubgroup() override;
+    compat::Expected<compat::Unit, MoQPublishError> endOfSubgroup() override;
 
     void reset(ResetStreamErrorCode error) override;
 

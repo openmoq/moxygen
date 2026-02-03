@@ -7,6 +7,7 @@
 #pragma once
 
 #include <moxygen/compat/Config.h>
+#include <moxygen/compat/Unit.h>
 
 #if MOXYGEN_USE_FOLLY
 #include <folly/coro/Task.h>

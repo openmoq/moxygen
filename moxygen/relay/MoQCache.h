@@ -79,7 +79,7 @@ class MoQCache {
     // (all objects in a group must have the same gap value)
     std::optional<uint64_t> seenPriorGroupIdGap;
 
-    folly::Expected<folly::Unit, MoQPublishError> cacheObject(
+    compat::Expected<compat::Unit, MoQPublishError> cacheObject(
         uint64_t subgroup,
         uint64_t objectID,
         ObjectStatus status,
@@ -102,14 +102,14 @@ class MoQCache {
     std::optional<AbsoluteLocation> largestGroupAndObject;
     FetchInProgressSet fetchInProgress;
 
-    folly::Expected<folly::Unit, MoQPublishError> updateLargest(
+    compat::Expected<compat::Unit, MoQPublishError> updateLargest(
         AbsoluteLocation current,
         bool endOfTrack = false);
     CacheGroup& getOrCreateGroup(uint64_t groupID);
 
     // Process Prior Group ID Gap and Prior Object ID Gap extensions
     // and cache the missing groups/objects accordingly
-    folly::Expected<folly::Unit, MoQPublishError> processGapExtensions(
+    compat::Expected<compat::Unit, MoQPublishError> processGapExtensions(
         uint64_t groupID,
         uint64_t objectID,
         const Extensions& extensions);
