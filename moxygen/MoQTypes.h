@@ -6,7 +6,9 @@
 
 #pragma once
 
-#include <folly/Expected.h>
+#include <moxygen/compat/Config.h>
+#include <moxygen/compat/Expected.h>
+#include <moxygen/compat/Unit.h>
 #include <folly/hash/Hash.h>
 #include <folly/io/IOBuf.h>
 #include <algorithm>
@@ -453,34 +455,34 @@ class Parameters {
     return params_.at(position);
   }
 
-  folly::Expected<folly::Unit, ErrorCode> insertParam(Parameter&& param) {
+  compat::Expected<compat::Unit, ErrorCode> insertParam(Parameter&& param) {
     auto key = static_cast<TrackRequestParamKey>(param.key);
     if (!isParamAllowed(key)) {
-      return folly::makeUnexpected(ErrorCode::INVALID_REQUEST_ID);
+      return compat::makeUnexpected(ErrorCode::INVALID_REQUEST_ID);
     }
     params_.emplace_back(std::move(param));
-    return folly::unit;
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, ErrorCode> insertParam(const Parameter& param) {
+  compat::Expected<compat::Unit, ErrorCode> insertParam(const Parameter& param) {
     auto key = static_cast<TrackRequestParamKey>(param.key);
     if (!isParamAllowed(key)) {
-      return folly::makeUnexpected(ErrorCode::INVALID_REQUEST_ID);
+      return compat::makeUnexpected(ErrorCode::INVALID_REQUEST_ID);
     }
     params_.emplace_back(param);
-    return folly::unit;
+    return compat::unit;
   }
 
-  folly::Expected<folly::Unit, ErrorCode> insertParam(
+  compat::Expected<compat::Unit, ErrorCode> insertParam(
       size_t position,
       Parameter&& param) {
     auto key = static_cast<TrackRequestParamKey>(param.key);
     if (!isParamAllowed(key)) {
-      return folly::makeUnexpected(ErrorCode::INVALID_REQUEST_ID);
+      return compat::makeUnexpected(ErrorCode::INVALID_REQUEST_ID);
     }
     CHECK_LE(position, params_.size());
     params_.insert(params_.begin() + position, std::move(param));
-    return folly::unit;
+    return compat::unit;
   }
 
   void eraseParam(size_t position) {
