@@ -9,6 +9,7 @@
 #include <fizz/protocol/CertificateVerifier.h>
 #include <folly/coro/Promise.h>
 #include <proxygen/lib/http/webtransport/QuicWebTransport.h>
+#include <moxygen/compat/Async.h>
 #include <proxygen/lib/http/webtransport/WebTransport.h>
 #include <proxygen/lib/utils/URL.h>
 #include <quic/client/QuicClientTransport.h>
@@ -64,7 +65,7 @@ class MoQClientBase : public proxygen::WebTransportHandler {
   }
 
   std::shared_ptr<MoQSession> moqSession_;
-  virtual folly::coro::Task<void> setupMoQSession(
+  virtual compat::Task<void> setupMoQSession(
       std::chrono::milliseconds connect_timeout,
       std::chrono::milliseconds transaction_timeout,
       std::shared_ptr<Publisher> publishHandler,
@@ -80,7 +81,7 @@ class MoQClientBase : public proxygen::WebTransportHandler {
  protected:
   static bool shouldSendAuthorityParam(
       const std::vector<uint64_t>& supportedVersions);
-  virtual folly::coro::Task<std::shared_ptr<quic::QuicClientTransport>>
+  virtual compat::Task<std::shared_ptr<quic::QuicClientTransport>>
   connectQuic(
       folly::SocketAddress connectAddr,
       std::chrono::milliseconds timeoutMs,
@@ -93,7 +94,7 @@ class MoQClientBase : public proxygen::WebTransportHandler {
 
   static SessionFactory defaultSessionFactory();
 
-  folly::coro::Task<ServerSetup> completeSetupMoQSession(
+  compat::Task<ServerSetup> completeSetupMoQSession(
       proxygen::WebTransport* wt,
       const std::optional<std::string>& pathParam,
       std::shared_ptr<Publisher> publishHandler,

@@ -9,6 +9,7 @@
 #include <folly/coro/Task.h>
 #include <proxygen/lib/utils/URL.h>
 #include <moxygen/MoQClientBase.h>
+#include <moxygen/compat/Async.h>
 
 namespace moxygen {
 
@@ -48,7 +49,7 @@ class MoQClient : public MoQClientBase {
             std::move(verifier)) {}
 
  protected:
-  folly::coro::Task<std::shared_ptr<quic::QuicClientTransport>> connectQuic(
+  compat::Task<std::shared_ptr<quic::QuicClientTransport>> connectQuic(
       folly::SocketAddress connectAddr,
       std::chrono::milliseconds timeoutMs,
       std::shared_ptr<fizz::CertificateVerifier> verifier,

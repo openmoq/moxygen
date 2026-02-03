@@ -23,7 +23,7 @@ bool MoQClientBase::shouldSendAuthorityParam(
   return false;
 }
 
-folly::coro::Task<void> MoQClientBase::setupMoQSession(
+compat::Task<void> MoQClientBase::setupMoQSession(
     std::chrono::milliseconds connect_timeout,
     std::chrono::milliseconds transaction_timeout,
     std::shared_ptr<Publisher> publishHandler,
@@ -78,7 +78,7 @@ folly::coro::Task<void> MoQClientBase::setupMoQSession(
   }
 }
 
-folly::coro::Task<ServerSetup> MoQClientBase::completeSetupMoQSession(
+compat::Task<ServerSetup> MoQClientBase::completeSetupMoQSession(
     proxygen::WebTransport* wt,
     const std::optional<std::string>& pathParam,
     std::shared_ptr<Publisher> publishHandler,

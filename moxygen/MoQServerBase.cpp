@@ -31,7 +31,7 @@ std::shared_ptr<MoQSession> MoQServerBase::createSession(
       std::move(wt), *this, std::move(executor));
 }
 
-folly::coro::Task<void> MoQServerBase::handleClientSession(
+compat::Task<void> MoQServerBase::handleClientSession(
     std::shared_ptr<MoQSession> clientSession) {
   onNewSession(clientSession);
   clientSession->start();
@@ -110,7 +110,7 @@ folly::Try<ServerSetup> MoQServerBase::onClientSetup(
   return folly::Try<ServerSetup>(serverSetup);
 }
 
-folly::Expected<folly::Unit, SessionCloseErrorCode>
+compat::Expected<compat::Unit, SessionCloseErrorCode>
 MoQServerBase::validateAuthority(
     const ClientSetup& setup,
     uint64_t negotiatedVersion,
@@ -130,19 +130,19 @@ MoQServerBase::validateAuthority(
       // MALFORMED_AUTHORITY validation
       if (!isValidAuthorityFormat(authority)) {
         XLOG(ERR) << "Malformed authority format: " << authority;
-        return folly::makeUnexpected(
+        return compat::makeUnexpected(
             SessionCloseErrorCode::MALFORMED_AUTHORITY);
       }
 
       // INVALID_AUTHORITY validation
       if (!isSupportedAuthority(authority)) {
         XLOG(ERR) << "Unsupported authority: " << authority;
-        return folly::makeUnexpected(SessionCloseErrorCode::INVALID_AUTHORITY);
+        return compat::makeUnexpected(SessionCloseErrorCode::INVALID_AUTHORITY);
       }
     }
   }
 
-  return folly::unit;
+  return compat::unit;
 }
 
 bool MoQServerBase::isValidAuthorityFormat(const std::string& authority) {

@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <moxygen/compat/Async.h>
+#include <moxygen/compat/Expected.h>
 #include <moxygen/MoQSession.h>
 #include <moxygen/mlog/MLoggerFactory.h>
 #include <memory>
@@ -62,7 +64,7 @@ class MoQServerBase : public MoQSession::ServerSetupCallback {
       ClientSetup clientSetup,
       const std::shared_ptr<MoQSession>& session) override;
 
-  folly::Expected<folly::Unit, SessionCloseErrorCode> validateAuthority(
+  compat::Expected<compat::Unit, SessionCloseErrorCode> validateAuthority(
       const ClientSetup& clientSetup,
       uint64_t negotiatedVersion,
       std::shared_ptr<MoQSession> session) override;
@@ -73,7 +75,7 @@ class MoQServerBase : public MoQSession::ServerSetupCallback {
       std::shared_ptr<MoQExecutor> executor);
 
   // Coroutine to handle client session lifecycle
-  folly::coro::Task<void> handleClientSession(
+  compat::Task<void> handleClientSession(
       std::shared_ptr<MoQSession> clientSession);
 
   // Create a logger from the factory if one is set

@@ -9,7 +9,7 @@
 #include <moxygen/util/QuicConnector.h>
 
 namespace moxygen {
-folly::coro::Task<std::shared_ptr<quic::QuicClientTransport>>
+compat::Task<std::shared_ptr<quic::QuicClientTransport>>
 MoQClient::connectQuic(
     folly::SocketAddress connectAddr,
     std::chrono::milliseconds timeoutMs,
