@@ -10,6 +10,8 @@
 
 #include <folly/coro/Task.h>
 #include <moxygen/MoQTypes.h>
+#include <moxygen/compat/Async.h>
+#include <moxygen/compat/Expected.h>
 
 // MoQ Publisher interface
 //
@@ -24,7 +26,7 @@
 //
 // And the remote peer will receive a callback
 //
-// folly::coro::Task<SubscribeResult> subscribe(...) {
+// compat::Task<SubscribeResult> subscribe(...) {
 //   verify subscribe
 //   create SubscriptionHandle
 //   Fill in subscribeOK
@@ -45,11 +47,11 @@ class SubscriptionHandle {
 
   virtual void unsubscribe() = 0;
   using SubscribeUpdateResult =
-      folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>;
+      compat::Expected<SubscribeUpdateOk, SubscribeUpdateError>;
   // Updates subscription parameters (start/end locations, priority, forward).
   // This is a coroutine because it may do async work, such as forwarding the
   // update to the upstream publisher in a relay scenario.
-  virtual folly::coro::Task<SubscribeUpdateResult> subscribeUpdate(
+  virtual compat::Task<SubscribeUpdateResult> subscribeUpdate(
       SubscribeUpdate subUpdate) = 0;
 
   const SubscribeOk& subscribeOk() const {
@@ -71,11 +73,11 @@ class Publisher {
   virtual ~Publisher() = default;
 
   // Send/respond to TRACK_STATUS_REQUEST
-  using TrackStatusResult = folly::Expected<TrackStatusOk, TrackStatusError>;
-  virtual folly::coro::Task<TrackStatusResult> trackStatus(
+  using TrackStatusResult = compat::Expected<TrackStatusOk, TrackStatusError>;
+  virtual compat::Task<TrackStatusResult> trackStatus(
       const TrackStatus trackStatus) {
     return folly::coro::makeTask<TrackStatusResult>(
-        folly::makeUnexpected<TrackStatusError>(TrackStatusError{
+        compat::makeUnexpected<TrackStatusError>(TrackStatusError{
             trackStatus.requestID,
             TrackStatusErrorCode::NOT_SUPPORTED,
             "Track status not implemented"}));
@@ -85,11 +87,11 @@ class Publisher {
   // caller can use to UNSUBSCRIBE or SUBSCRIBE_UPDATE.
   // Send/respond to a SUBSCRIBE
   using SubscribeResult =
-      folly::Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>;
-  virtual folly::coro::Task<SubscribeResult> subscribe(
+      compat::Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>;
+  virtual compat::Task<SubscribeResult> subscribe(
       SubscribeRequest sub,
       std::shared_ptr<TrackConsumer> callback) {
-    return folly::coro::makeTask<SubscribeResult>(folly::makeUnexpected(
+    return folly::coro::makeTask<SubscribeResult>(compat::makeUnexpected(
         SubscribeError{
             sub.requestID,
             SubscribeErrorCode::NOT_SUPPORTED,
@@ -119,11 +121,11 @@ class Publisher {
   };
 
   // Send/respond to a FETCH
-  using FetchResult = folly::Expected<std::shared_ptr<FetchHandle>, FetchError>;
-  virtual folly::coro::Task<FetchResult> fetch(
+  using FetchResult = compat::Expected<std::shared_ptr<FetchHandle>, FetchError>;
+  virtual compat::Task<FetchResult> fetch(
       Fetch fetch,
       std::shared_ptr<FetchConsumer> fetchCallback) {
-    return folly::coro::makeTask<FetchResult>(folly::makeUnexpected(
+    return folly::coro::makeTask<FetchResult>(compat::makeUnexpected(
         FetchError{
             fetch.requestID, FetchErrorCode::NOT_SUPPORTED, "unimplemented"}));
   }
@@ -152,13 +154,13 @@ class Publisher {
   };
 
   // Send/respond to SUBSCRIBE_NAMESPACE
-  using SubscribeNamespaceResult = folly::Expected<
+  using SubscribeNamespaceResult = compat::Expected<
       std::shared_ptr<SubscribeNamespaceHandle>,
       SubscribeNamespaceError>;
-  virtual folly::coro::Task<SubscribeNamespaceResult> subscribeNamespace(
+  virtual compat::Task<SubscribeNamespaceResult> subscribeNamespace(
       SubscribeNamespace subAnn) {
     return folly::coro::makeTask<SubscribeNamespaceResult>(
-        folly::makeUnexpected(
+        compat::makeUnexpected(
             SubscribeNamespaceError{
                 subAnn.requestID,
                 SubscribeNamespaceErrorCode::NOT_SUPPORTED,

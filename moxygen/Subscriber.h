@@ -10,6 +10,8 @@
 
 #include <folly/coro/Task.h>
 #include <moxygen/MoQTypes.h>
+#include <moxygen/compat/Async.h>
+#include <moxygen/compat/Expected.h>
 
 // MoQ Subscriber interface
 //
@@ -81,12 +83,12 @@ class Subscriber {
   };
 
   // Send/respond to PUBLISH_NAMESPACE
-  using PublishNamespaceResult = folly::
+  using PublishNamespaceResult = compat::
       Expected<std::shared_ptr<PublishNamespaceHandle>, PublishNamespaceError>;
-  virtual folly::coro::Task<PublishNamespaceResult> publishNamespace(
+  virtual compat::Task<PublishNamespaceResult> publishNamespace(
       PublishNamespace ann,
       std::shared_ptr<PublishNamespaceCallback> = nullptr) {
-    return folly::coro::makeTask<PublishNamespaceResult>(folly::makeUnexpected(
+    return folly::coro::makeTask<PublishNamespaceResult>(compat::makeUnexpected(
         PublishNamespaceError{
             ann.requestID,
             PublishNamespaceErrorCode::NOT_SUPPORTED,
@@ -96,18 +98,18 @@ class Subscriber {
   // Result of a PUBLISH request containing consumer and async reply
   struct PublishConsumerAndReplyTask {
     std::shared_ptr<TrackConsumer> consumer;
-    folly::coro::Task<folly::Expected<PublishOk, PublishError>> reply;
+    compat::Task<compat::Expected<PublishOk, PublishError>> reply;
   };
 
   // Send/respond to a PUBLISH - synchronous API o that the publisher can
   // immediately start sending data instead of waiting for a PUBLISH_OK from the
   // peer
   using PublishResult =
-      folly::Expected<PublishConsumerAndReplyTask, PublishError>;
+      compat::Expected<PublishConsumerAndReplyTask, PublishError>;
   virtual PublishResult publish(
       PublishRequest pub,
       std::shared_ptr<SubscriptionHandle> /*handle*/ = nullptr) {
-    return folly::makeUnexpected(
+    return compat::makeUnexpected(
         PublishError{
             pub.requestID, PublishErrorCode::NOT_SUPPORTED, "unimplemented"});
   }
