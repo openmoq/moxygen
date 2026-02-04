@@ -46,9 +46,13 @@ target_compile_options(
 )
 
 if(MOXYGEN_USE_FOLLY)
+    # Build mlog first so mlogger is available for moxygen to link
+    add_subdirectory(mlog)
+
     target_link_libraries(
         moxygen PUBLIC
         moqcompat
+        mlogger
         Folly::folly
         wangle::wangle
     )
@@ -117,8 +121,6 @@ install(
     LIBRARY DESTINATION ${LIB_INSTALL_DIR}
 )
 
-add_subdirectory(mlog)
-
 # mvfst-specific components (executor, server, client libraries)
 if(MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
 
@@ -159,6 +161,7 @@ target_compile_options(
 target_link_libraries(
     moxygenserver PUBLIC
     moxygen
+    mlogger
     proxygen::proxygenhqserver
     proxygen::quicwebtransport
     moqfollyexecutorimpl
@@ -183,6 +186,7 @@ target_compile_options(
 target_link_libraries(
     moxygenclient PUBLIC
     moxygen
+    mlogger
     proxygen::proxygenhqserver
     proxygen::quicwebtransport
     moqfollyexecutorimpl

@@ -35,6 +35,38 @@ if(MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
     ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
     LIBRARY DESTINATION ${LIB_INSTALL_DIR}
   )
+
+  # MvfstStdModeAdapter - allows std-mode code to use mvfst transport
+  # This adapter wraps mvfst/proxygen and provides a callback-based interface
+  add_library(moqtransport_mvfst_stdmode
+    MvfstStdModeAdapter.cpp
+  )
+
+  target_include_directories(
+    moqtransport_mvfst_stdmode PUBLIC
+    $<BUILD_INTERFACE:${MOXYGEN_FBCODE_ROOT}>
+  )
+
+  target_compile_options(
+    moqtransport_mvfst_stdmode PRIVATE
+    ${_MOXYGEN_COMMON_COMPILE_OPTIONS}
+  )
+
+  target_link_libraries(
+    moqtransport_mvfst_stdmode PUBLIC
+    moxygen
+    moqcompat
+    Folly::folly
+    proxygen::proxygen
+    proxygen::quicwebtransport
+  )
+
+  install(
+    TARGETS moqtransport_mvfst_stdmode
+    EXPORT moxygen-exports
+    ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
+    LIBRARY DESTINATION ${LIB_INSTALL_DIR}
+  )
 endif()
 
 # --- picoquic transport implementation ---
