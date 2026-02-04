@@ -7,6 +7,9 @@
 #pragma once
 
 #include <moxygen/MoQFramer.h>
+#include <moxygen/compat/Config.h>
+
+#include <functional>
 
 namespace moxygen {
 
@@ -162,7 +165,7 @@ class MoQSubscriberStatsCallback : public MoQStatsCallback {
 
 #define MOQ_PUBLISHER_STATS(publisherStatsCallback, method, ...) \
   if (publisherStatsCallback) {                                  \
-    folly::invoke(                                               \
+    std::invoke(                                                 \
         &MoQPublisherStatsCallback::method,                      \
         publisherStatsCallback,                                  \
         ##__VA_ARGS__);                                          \
@@ -171,7 +174,7 @@ class MoQSubscriberStatsCallback : public MoQStatsCallback {
 
 #define MOQ_SUBSCRIBER_STATS(subscriberStatsCallback, method, ...) \
   if (subscriberStatsCallback) {                                   \
-    folly::invoke(                                                 \
+    std::invoke(                                                   \
         &MoQSubscriberStatsCallback::method,                       \
         subscriberStatsCallback,                                   \
         ##__VA_ARGS__);                                            \

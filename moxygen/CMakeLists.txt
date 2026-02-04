@@ -21,10 +21,11 @@ if(MOXYGEN_USE_FOLLY)
         events/MoQDeliveryTimer.cpp
     )
 else()
-    # Std-mode: core library with parsing support (no Session - requires transport)
+    # Std-mode: core library with parsing support and callback-based session
     set(MOXYGEN_CORE_SOURCES
         MoQFramer.cpp
         MoQCodec.cpp
+        MoQSessionCompat.cpp
         MoQTokenCache.cpp
         MoQTypes.cpp
         MoQVersions.cpp

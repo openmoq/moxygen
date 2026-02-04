@@ -9,10 +9,12 @@
 #include <moxygen/compat/Config.h>
 #include <moxygen/compat/Expected.h>
 #include <moxygen/compat/Payload.h>
+#include <moxygen/compat/SocketAddress.h>
 
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace moxygen::compat {
@@ -93,19 +95,6 @@ class BidiStreamHandle {
 
   virtual StreamWriteHandle* writeHandle() = 0;
   virtual StreamReadHandle* readHandle() = 0;
-};
-
-// Simple address representation for std-mode
-struct SocketAddress {
-  std::string host;
-  uint16_t port{0};
-
-  SocketAddress() = default;
-  SocketAddress(std::string h, uint16_t p) : host(std::move(h)), port(p) {}
-
-  bool empty() const {
-    return host.empty() && port == 0;
-  }
 };
 
 // Abstract WebTransport interface

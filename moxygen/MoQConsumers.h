@@ -8,7 +8,10 @@
 
 #pragma once
 
+#include <moxygen/compat/Config.h>
+#if MOXYGEN_USE_FOLLY
 #include <proxygen/lib/http/webtransport/WebTransport.h>
+#endif
 #include <moxygen/MoQPublishError.h>
 #include <moxygen/MoQTypes.h>
 #include <moxygen/compat/Async.h>

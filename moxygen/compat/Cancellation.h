@@ -149,3 +149,10 @@ class CancellationCallback {
 } // namespace folly
 
 #endif // !MOXYGEN_USE_FOLLY
+
+// Bring into compat namespace
+namespace moxygen::compat {
+using CancellationToken = folly::CancellationToken;
+using CancellationSource = folly::CancellationSource;
+using CancellationCallback = folly::CancellationCallback;
+} // namespace moxygen::compat

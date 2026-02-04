@@ -180,3 +180,9 @@ inline Try<void> makeTryWith() {
 } // namespace folly
 
 #endif // !MOXYGEN_USE_FOLLY
+
+// Bring into compat namespace
+namespace moxygen::compat {
+template <typename T>
+using Try = folly::Try<T>;
+} // namespace moxygen::compat

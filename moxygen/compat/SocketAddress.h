@@ -88,3 +88,8 @@ class SocketAddress {
 } // namespace folly
 
 #endif // !MOXYGEN_USE_FOLLY
+
+// Bring into compat namespace
+namespace moxygen::compat {
+using SocketAddress = folly::SocketAddress;
+} // namespace moxygen::compat

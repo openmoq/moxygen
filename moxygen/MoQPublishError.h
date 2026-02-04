@@ -8,7 +8,11 @@
 
 #pragma once
 
+#include <moxygen/compat/Config.h>
+
+#if MOXYGEN_USE_FOLLY
 #include <fmt/core.h>
+#endif
 
 #include <string>
 
@@ -36,7 +40,11 @@ struct MoQPublishError {
       : code(inCode), msg(std::move(inMsg)) {}
 
   std::string describe() const {
+#if MOXYGEN_USE_FOLLY
     return fmt::format("error={} msg={}", fmt::underlying(code), msg);
+#else
+    return "error=" + std::to_string(static_cast<int>(code)) + " msg=" + msg;
+#endif
   }
 
   const char* what() const noexcept {

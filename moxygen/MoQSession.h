@@ -6,27 +6,48 @@
 
 #pragma once
 
-#include <proxygen/lib/http/webtransport/WebTransport.h>
 #include <moxygen/MoQCodec.h>
-#include <moxygen/events/MoQDeliveryTimer.h>
-#include <moxygen/events/MoQExecutor.h>
-#include <chrono>
-
-#include <folly/MaybeManagedPtr.h>
-#include <folly/container/F14Map.h>
-#include <folly/coro/Promise.h>
-#include <folly/coro/Task.h>
-#include <folly/logging/xlog.h>
 #include <moxygen/MoQConsumers.h>
 #include <moxygen/Publisher.h>
 #include <moxygen/Subscriber.h>
+#include <moxygen/compat/Callbacks.h>
+#include <moxygen/compat/Cancellation.h>
+#include <moxygen/compat/Containers.h>
+#include <moxygen/compat/Debug.h>
+#include <moxygen/compat/SocketAddress.h>
+#include <moxygen/compat/Try.h>
+#include <moxygen/compat/WebTransportInterface.h>
+#include <moxygen/events/MoQDeliveryTimer.h>
+#include <moxygen/events/MoQExecutor.h>
 #include <moxygen/stats/MoQStats.h>
+
+#include <chrono>
 #include <memory>
 #include <optional>
+
+#if MOXYGEN_USE_FOLLY
+#include <proxygen/lib/http/webtransport/WebTransport.h>
+#include <folly/MaybeManagedPtr.h>
+#include <folly/coro/Promise.h>
+#include <folly/coro/Task.h>
+#include <folly/logging/xlog.h>
 #include "moxygen/mlog/MLogger.h"
 #include "moxygen/util/TimedBaton.h"
+#endif
 
 namespace moxygen {
+
+// Forward declaration for MLogger (only used in Folly mode, stub available in std-mode)
+#if MOXYGEN_USE_FOLLY
+class MLogger;
+#else
+// Minimal MLogger stub for std-mode
+class MLogger {
+ public:
+  virtual ~MLogger() = default;
+  // Empty stubs - logging is disabled in std-mode
+};
+#endif
 
 namespace detail {
 class ObjectStreamCallback;
@@ -54,9 +75,12 @@ struct MoQSettings {
 class MoQSession : public Subscriber,
                    public Publisher,
                    public MoQControlCodec::ControlCallback,
+#if MOXYGEN_USE_FOLLY
                    public proxygen::WebTransportHandler,
+#endif
                    public std::enable_shared_from_this<MoQSession> {
  public:
+#if MOXYGEN_USE_FOLLY
   struct MoQSessionRequestData : public folly::RequestData {
     explicit MoQSessionRequestData(std::shared_ptr<MoQSession> s)
         : session(std::move(s)) {}
@@ -67,13 +91,14 @@ class MoQSession : public Subscriber,
   };
 
   static std::shared_ptr<MoQSession> getRequestSession();
+#endif
 
   void setServerMaxTokenCacheSizeGuess(size_t size);
 
   class ServerSetupCallback {
    public:
     virtual ~ServerSetupCallback() = default;
-    virtual folly::Try<ServerSetup> onClientSetup(
+    virtual compat::Try<ServerSetup> onClientSetup(
         ClientSetup clientSetup,
         const std::shared_ptr<MoQSession>& session) = 0;
 
@@ -89,7 +114,7 @@ class MoQSession : public Subscriber,
    public:
     virtual ~MoQSessionCloseCallback() = default;
     virtual void onMoQSessionClosed() {
-      XLOG(DBG1) << __func__ << " sess=" << this;
+      LOG(INFO) << __func__ << " sess=" << this;
     }
   };
 
@@ -97,6 +122,7 @@ class MoQSession : public Subscriber,
     closeCallback_ = cb;
   }
 
+#if MOXYGEN_USE_FOLLY
   explicit MoQSession(
       folly::MaybeManagedPtr<proxygen::WebTransport> wt,
       std::shared_ptr<MoQExecutor> exec);
@@ -105,6 +131,16 @@ class MoQSession : public Subscriber,
       folly::MaybeManagedPtr<proxygen::WebTransport> wt,
       ServerSetupCallback& serverSetupCallback,
       std::shared_ptr<MoQExecutor> exec);
+#else
+  explicit MoQSession(
+      std::shared_ptr<compat::WebTransportInterface> wt,
+      std::shared_ptr<MoQExecutor> exec);
+
+  explicit MoQSession(
+      std::shared_ptr<compat::WebTransportInterface> wt,
+      ServerSetupCallback& serverSetupCallback,
+      std::shared_ptr<MoQExecutor> exec);
+#endif
 
   void setVersion(uint64_t version);
   void setMoqSettings(MoQSettings settings);
@@ -127,17 +163,18 @@ class MoQSession : public Subscriber,
     return exec_.get();
   }
 
-  folly::CancellationToken getCancelToken() const {
+  compat::CancellationToken getCancelToken() const {
     return cancellationSource_.getToken();
   }
 
-  folly::SocketAddress getPeerAddress() const {
+  compat::SocketAddress getPeerAddress() const {
     if (wt_) {
       return wt_->getPeerAddress();
     }
-    return folly::SocketAddress();
+    return compat::SocketAddress();
   }
 
+#if MOXYGEN_USE_FOLLY
   [[nodiscard]] quic::TransportInfo getTransportInfo() const {
     if (!wt_) {
       return {};
@@ -155,6 +192,7 @@ class MoQSession : public Subscriber,
 
     return cachedTransportInfo_;
   }
+#endif
 
   ~MoQSession() override;
 
@@ -164,7 +202,14 @@ class MoQSession : public Subscriber,
 
   void goaway(Goaway goaway) override;
 
+#if MOXYGEN_USE_FOLLY
   compat::Task<ServerSetup> setup(ClientSetup setup);
+#else
+  void setupWithCallback(
+      ClientSetup setup,
+      std::shared_ptr<compat::ResultCallback<ServerSetup, SessionCloseErrorCode>>
+          callback);
+#endif
 
   void setMaxConcurrentRequests(uint64_t maxConcurrent);
 
@@ -178,6 +223,7 @@ class MoQSession : public Subscriber,
 
   static std::string getMoQTImplementationString();
 
+#if MOXYGEN_USE_FOLLY
   compat::Task<TrackStatusResult> trackStatus(
       TrackStatus trackStatus) override;
 
@@ -202,6 +248,7 @@ class MoQSession : public Subscriber,
       std::vector<Parameter> fetchParams,
       std::shared_ptr<FetchConsumer> fetchCallback,
       FetchType fetchType);
+#endif
 
   void setPublisherStatsCallback(
       std::shared_ptr<MoQPublisherStatsCallback> publisherStatsCallback) {
@@ -302,12 +349,21 @@ class MoQSession : public Subscriber,
 
     void fetchComplete();
 
+#if MOXYGEN_USE_FOLLY
     proxygen::WebTransport* getWebTransport() const {
       if (session_) {
-        return session_->wt_;
+        return session_->wt_.get();
       }
       return nullptr;
     }
+#else
+    compat::WebTransportInterface* getWebTransport() const {
+      if (session_) {
+        return session_->wt_.get();
+      }
+      return nullptr;
+    }
+#endif
 
     uint64_t getVersion() const {
       return version_;
@@ -332,9 +388,11 @@ class MoQSession : public Subscriber,
       return session_ ? session_->exec_ : nullptr;
     }
 
+#if MOXYGEN_USE_FOLLY
     quic::TransportInfo getTransportInfo() const {
       return session_ ? session_->getTransportInfo() : quic::TransportInfo();
     }
+#endif
 
    protected:
     MoQSession* session_{nullptr};
@@ -349,21 +407,36 @@ class MoQSession : public Subscriber,
     std::optional<uint8_t> publisherPriority_;
   };
 
+#if MOXYGEN_USE_FOLLY
   void onNewUniStream(
       proxygen::WebTransport::StreamReadHandle* rh) noexcept override;
   void onNewBidiStream(
       proxygen::WebTransport::BidiStreamHandle bh) noexcept override;
   void onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept override;
   void onSessionEnd(folly::Optional<uint32_t> err) noexcept override {
-    XLOG(DBG1) << __func__ << "err="
-               << (err ? folly::to<std::string>(*err) : std::string("none"))
-               << " sess=" << this;
+    LOG(INFO) << __func__ << "err="
+              << (err ? folly::to<std::string>(*err) : std::string("none"))
+              << " sess=" << this;
     // The peer closed us, but we can close with NO_ERROR
     close(SessionCloseErrorCode::NO_ERROR);
   }
   void onSessionDrain() noexcept override {
-    XLOG(DBG1) << __func__ << " sess=" << this;
+    LOG(INFO) << __func__ << " sess=" << this;
   }
+#else
+  void onNewUniStream(compat::StreamReadHandle* rh);
+  void onNewBidiStream(compat::BidiStreamHandle* bh);
+  void onDatagram(std::unique_ptr<compat::Payload> datagram);
+  void onSessionEnd(std::optional<uint32_t> err) {
+    LOG(INFO) << __func__ << "err="
+              << (err ? std::to_string(*err) : std::string("none"))
+              << " sess=" << this;
+    close(SessionCloseErrorCode::NO_ERROR);
+  }
+  void onSessionDrain() {
+    LOG(INFO) << __func__ << " sess=" << this;
+  }
+#endif
 
   class TrackReceiveStateBase;
   class SubscribeTrackReceiveState;
@@ -388,6 +461,7 @@ class MoQSession : public Subscriber,
       uint64_t version);
 
  private:
+#if MOXYGEN_USE_FOLLY
   static const folly::RequestToken& sessionRequestToken();
 
   compat::Task<void> controlWriteLoop(
@@ -398,17 +472,33 @@ class MoQSession : public Subscriber,
   compat::Task<void> unidirectionalReadLoop(
       std::shared_ptr<MoQSession> session,
       proxygen::WebTransport::StreamReadHandle* readHandle);
+#else
+  void controlWriteLoop(compat::StreamWriteHandle* writeHandle);
+  void controlReadLoop(compat::StreamReadHandle* readHandle);
+
+  void unidirectionalReadLoop(
+      std::shared_ptr<MoQSession> session,
+      compat::StreamReadHandle* readHandle);
+#endif
 
   class TrackPublisherImpl;
   class FetchPublisherImpl;
 
+#if MOXYGEN_USE_FOLLY
   compat::Task<void> handleTrackStatus(TrackStatus trackStatus);
-  void trackStatusOk(const TrackStatusOk& trackStatusOk);
-  void trackStatusError(const TrackStatusError& trackStatusError);
-
   compat::Task<void> handleSubscribe(
       SubscribeRequest sub,
       std::shared_ptr<TrackPublisherImpl> trackPublisher);
+  compat::Task<void> handleFetch(
+      Fetch fetch,
+      std::shared_ptr<FetchPublisherImpl> fetchPublisher);
+  compat::Task<void> handlePublish(
+      PublishRequest publish,
+      std::shared_ptr<Publisher::SubscriptionHandle> publishHandle);
+#endif
+
+  void trackStatusOk(const TrackStatusOk& trackStatusOk);
+  void trackStatusError(const TrackStatusError& trackStatusError);
   void sendSubscribeOk(const SubscribeOk& subOk);
   void subscribeError(const SubscribeError& subErr);
   void unsubscribe(const Unsubscribe& unsubscribe);
@@ -418,17 +508,9 @@ class MoQSession : public Subscriber,
       const SubscribeUpdateError& requestError,
       RequestID subscriptionRequestID);
   void sendSubscribeDone(const SubscribeDone& subDone);
-
-  compat::Task<void> handleFetch(
-      Fetch fetch,
-      std::shared_ptr<FetchPublisherImpl> fetchPublisher);
   void fetchOk(const FetchOk& fetchOk);
   void fetchError(const FetchError& fetchError);
   void fetchCancel(const FetchCancel& fetchCancel);
-
-  compat::Task<void> handlePublish(
-      PublishRequest publish,
-      std::shared_ptr<Publisher::SubscriptionHandle> publishHandle);
   void publishOk(const PublishOk& pubOk);
   void publishError(const PublishError& publishError);
 
@@ -495,26 +577,36 @@ class MoQSession : public Subscriber,
 
   // Core session state
   MoQControlCodec::Direction dir_;
+#if MOXYGEN_USE_FOLLY
   folly::MaybeManagedPtr<proxygen::WebTransport> wt_;
+#else
+  std::shared_ptr<compat::WebTransportInterface> wt_;
+#endif
   std::shared_ptr<MoQExecutor> exec_;
   std::shared_ptr<MLogger> logger_ = nullptr;
 
   // Control channel state
+#if MOXYGEN_USE_FOLLY
   folly::IOBufQueue controlWriteBuf_{folly::IOBufQueue::cacheChainLength()};
+#else
+  compat::ByteBufferQueue controlWriteBuf_;
+#endif
+#if MOXYGEN_USE_FOLLY
   moxygen::TimedBaton controlWriteEvent_;
+#endif
 
   // Track management maps
-  folly::F14FastMap<
+  compat::FastMap<
       TrackAlias,
       std::shared_ptr<SubscribeTrackReceiveState>,
       TrackAlias::hash>
       subTracks_;
-  folly::F14FastMap<
+  compat::FastMap<
       RequestID,
       std::shared_ptr<FetchTrackReceiveState>,
       RequestID::hash>
       fetches_;
-  folly::F14FastMap<RequestID, TrackAlias, RequestID::hash> reqIdToTrackAlias_;
+  compat::FastMap<RequestID, TrackAlias, RequestID::hash> reqIdToTrackAlias_;
 
   // Protected utility methods
   bool closeSessionIfRequestIDInvalid(
@@ -530,11 +622,13 @@ class MoQSession : public Subscriber,
       Parameters& params,
       const std::optional<uint64_t>& forceVersion = std::nullopt);
   RequestID getNextRequestID();
+#if MOXYGEN_USE_FOLLY
   void setRequestSession() {
     folly::RequestContext::get()->setContextData(
         sessionRequestToken(),
         std::make_unique<MoQSessionRequestData>(shared_from_this()));
   }
+#endif
   void retireRequestID(bool signalWriteLoop);
 
   // Virtual cleanup method for proper inheritance pattern (moved from private)
@@ -553,10 +647,11 @@ class MoQSession : public Subscriber,
   std::shared_ptr<MoQSubscriberStatsCallback> subscriberStatsCallback_{nullptr};
 
   // Handlers and cancellation needed by MoQRelaySession
-  folly::CancellationSource cancellationSource_;
+  compat::CancellationSource cancellationSource_;
   std::shared_ptr<Subscriber> subscribeHandler_;
   std::shared_ptr<Publisher> publishHandler_;
 
+#if MOXYGEN_USE_FOLLY
   // Consolidated pending request state using bespoke discriminated union
   class PendingRequestState {
    public:
@@ -753,31 +848,43 @@ class MoQSession : public Subscriber,
       RequestID,
       std::unique_ptr<PendingRequestState>,
       RequestID::hash>::iterator;
+#endif // MOXYGEN_USE_FOLLY
 
+#if MOXYGEN_USE_FOLLY
   void handleTrackStatusOkFromRequestOk(const RequestOk& requestOk);
   void handleSubscribeUpdateOkFromRequestOk(
       const RequestOk& requestOk,
       PendingRequestIterator reqIt);
+#endif
 
  private:
   // Private implementation methods
   void initializeNegotiatedVersion(uint64_t negotiatedVersion);
+#if MOXYGEN_USE_FOLLY
   void removeBufferedSubgroupBaton(TrackAlias alias, TimedBaton* baton);
+#endif
 
   // Private session state
-  folly::F14FastMap<RequestID, std::shared_ptr<PublisherImpl>, RequestID::hash>
+  compat::FastMap<RequestID, std::shared_ptr<PublisherImpl>, RequestID::hash>
       pubTracks_;
-  folly::F14FastMap<TrackAlias, std::list<Payload>, TrackAlias::hash>
+  compat::FastMap<TrackAlias, std::list<Payload>, TrackAlias::hash>
       bufferedDatagrams_;
-  folly::F14FastMap<TrackAlias, std::list<TimedBaton*>, TrackAlias::hash>
+#if MOXYGEN_USE_FOLLY
+  compat::FastMap<TrackAlias, std::list<TimedBaton*>, TrackAlias::hash>
       bufferedSubgroups_;
   std::list<std::shared_ptr<moxygen::TimedBaton>> subgroupsWaitingForVersion_;
+#endif
 
   uint64_t closedRequests_{0};
   uint64_t maxConcurrentRequests_{100};
   uint64_t peerMaxRequestID_{0};
 
+#if MOXYGEN_USE_FOLLY
   folly::coro::Promise<ServerSetup> setupPromise_;
+#else
+  std::shared_ptr<compat::ResultCallback<ServerSetup, SessionCloseErrorCode>>
+      setupCallback_;
+#endif
   bool setupComplete_{false};
   bool draining_{false};
   bool receivedGoaway_{false};
@@ -794,9 +901,11 @@ class MoQSession : public Subscriber,
   MoQControlCodec controlCodec_;
   MoQTokenCache tokenCache_{1024};
 
+#if MOXYGEN_USE_FOLLY
   // Cached transport info to avoid expensive getTransportInfo calls
   mutable quic::TransportInfo cachedTransportInfo_;
   mutable std::chrono::steady_clock::time_point lastTransportInfoUpdate_{};
+#endif
   bool closed_{false};
 };
 } // namespace moxygen
