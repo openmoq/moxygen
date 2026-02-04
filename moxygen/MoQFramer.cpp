@@ -6,7 +6,6 @@
 
 #include "moxygen/MoQFramer.h"
 #include <moxygen/compat/Containers.h>
-#include <moxygen/compat/Debug.h>
 #include <moxygen/compat/Hash.h>
 
 #if MOXYGEN_USE_FOLLY
@@ -14,6 +13,9 @@
 #endif
 
 #include <utility>
+
+// Include Debug.h last to ensure LOG macro redirects to XLOG
+#include <moxygen/compat/Debug.h>
 
 namespace {
 using namespace moxygen::compat;
@@ -291,12 +293,12 @@ compat::Expected<std::string, ErrorCode> parseFixedString(
     size_t& length) {
   auto strLength = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!strLength) {
-    LOG(DBG4) << "parseFixedString: UNDERFLOW on strLength";
+    XLOG(DBG4) << "parseFixedString: UNDERFLOW on strLength";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= strLength->second;
   if (strLength->first > length) {
-    LOG(DBG4) << "parseFixedString: UNDERFLOW on length check";
+    XLOG(DBG4) << "parseFixedString: UNDERFLOW on length check";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   auto res = cursor.readFixedString(strLength->first);
@@ -313,11 +315,11 @@ compat::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
   token.emplace(); // plan for success
   auto aliasType = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!aliasType) {
-    LOG(DBG4) << "parseToken: UNDERFLOW on aliasType";
+    XLOG(DBG4) << "parseToken: UNDERFLOW on aliasType";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   if (aliasType->first > to_underlying(AliasType::USE_VALUE)) {
-    LOG(ERR) << "aliasType > USE_VALUE =" << aliasType->first;
+    XLOG(ERR) << "aliasType > USE_VALUE =" << aliasType->first;
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   auto aliasTypeVal = static_cast<AliasType>(aliasType->first);
@@ -327,12 +329,12 @@ compat::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
     case AliasType::DELETE_ALIAS:
     case AliasType::USE_ALIAS: {
       if (paramsType == ParamsType::ClientSetup) {
-        LOG(ERR) << "Can't delete/use-alias in client setup";
+        XLOG(ERR) << "Can't delete/use-alias in client setup";
         return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
       }
       auto tokenAlias = quic::follyutils::decodeQuicInteger(cursor, length);
       if (!tokenAlias) {
-        LOG(DBG4) << "parseToken: UNDERFLOW on tokenAlias (DELETE/USE_ALIAS)";
+        XLOG(DBG4) << "parseToken: UNDERFLOW on tokenAlias (DELETE/USE_ALIAS)";
         return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
       }
       length -= tokenAlias->second;
@@ -341,7 +343,7 @@ compat::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
       if (aliasTypeVal == AliasType::DELETE_ALIAS) {
         auto deleteRes = tokenCache.deleteToken(*token->alias);
         if (!deleteRes) {
-          LOG(ERR) << "Unknown Auth Token Alias for delete, alias="
+          XLOG(ERR) << "Unknown Auth Token Alias for delete, alias="
                     << *token->alias
                     << ", paramsType=" << to_underlying(paramsType);
           return compat::makeUnexpected(ErrorCode::UNKNOWN_AUTH_TOKEN_ALIAS);
@@ -350,7 +352,7 @@ compat::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
       } else {
         auto lookupRes = tokenCache.getTokenForAlias(*token->alias);
         if (!lookupRes) {
-          LOG(ERR) << "Unknown Auth Token Alias for use_alias, alias="
+          XLOG(ERR) << "Unknown Auth Token Alias for use_alias, alias="
                     << *token->alias
                     << ", paramsType=" << to_underlying(paramsType);
           return compat::makeUnexpected(ErrorCode::UNKNOWN_AUTH_TOKEN_ALIAS);
@@ -362,7 +364,7 @@ compat::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
     case AliasType::REGISTER: {
       auto tokenAlias = quic::follyutils::decodeQuicInteger(cursor, length);
       if (!tokenAlias) {
-        LOG(DBG4) << "parseToken: UNDERFLOW on tokenAlias (REGISTER)";
+        XLOG(DBG4) << "parseToken: UNDERFLOW on tokenAlias (REGISTER)";
         return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
       }
       length -= tokenAlias->second;
@@ -370,7 +372,7 @@ compat::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
 
       auto tokenType = quic::follyutils::decodeQuicInteger(cursor, length);
       if (!tokenType) {
-        LOG(DBG4) << "parseToken: UNDERFLOW on tokenType (REGISTER)";
+        XLOG(DBG4) << "parseToken: UNDERFLOW on tokenType (REGISTER)";
         return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
       }
       length -= tokenType->second;
@@ -387,21 +389,21 @@ compat::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
         if (!registerRes) {
           if (registerRes.error() ==
               MoQTokenCache::ErrorCode::DUPLICATE_ALIAS) {
-            LOG(ERR) << "Duplicate token alias registered alias="
+            XLOG(ERR) << "Duplicate token alias registered alias="
                       << *token->alias;
             return compat::makeUnexpected(ErrorCode::DUPLICATE_AUTH_TOKEN_ALIAS);
           } else if (
               registerRes.error() == MoQTokenCache::ErrorCode::LIMIT_EXCEEDED) {
-            LOG(ERR) << "Auth token cache overflow";
+            XLOG(ERR) << "Auth token cache overflow";
             return compat::makeUnexpected(ErrorCode::AUTH_TOKEN_CACHE_OVERFLOW);
           } else {
-            LOG(ERR) << "Unknown token registration error="
+            XLOG(ERR) << "Unknown token registration error="
                       << uint32_t(registerRes.error());
             return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
           }
         }
       } else {
-        LOG(WARN)
+        XLOG(WARN)
             << "Converting too-large CLIENT_SETUP register to USE_VALUE alias="
             << *token->alias << " value=" << token->tokenValue;
       }
@@ -409,7 +411,7 @@ compat::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
     case AliasType::USE_VALUE: {
       auto tokenType = quic::follyutils::decodeQuicInteger(cursor, length);
       if (!tokenType) {
-        LOG(DBG4) << "parseToken: UNDERFLOW on tokenType (USE_VALUE)";
+        XLOG(DBG4) << "parseToken: UNDERFLOW on tokenType (USE_VALUE)";
         return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
       }
       length -= tokenType->second;
@@ -418,12 +420,12 @@ compat::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
       length -= token->tokenValue.size();
     } break;
     default:
-      LOG(ERR) << "Unknown Auth Token op code=" << aliasType->first;
+      XLOG(ERR) << "Unknown Auth Token op code=" << aliasType->first;
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
 
   if (length > 0) {
-    LOG(ERR) << "Invalid token length";
+    XLOG(ERR) << "Invalid token length";
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
 
@@ -436,7 +438,7 @@ compat::Expected<AbsoluteLocation, ErrorCode> parseAbsoluteLocation(
   AbsoluteLocation location;
   auto group = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!group) {
-    LOG(DBG4) << "parseAbsoluteLocation: UNDERFLOW on group";
+    XLOG(DBG4) << "parseAbsoluteLocation: UNDERFLOW on group";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   location.group = group->first;
@@ -444,7 +446,7 @@ compat::Expected<AbsoluteLocation, ErrorCode> parseAbsoluteLocation(
 
   auto object = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!object) {
-    LOG(DBG4) << "parseAbsoluteLocation: UNDERFLOW on object";
+    XLOG(DBG4) << "parseAbsoluteLocation: UNDERFLOW on object";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   location.object = object->first;
@@ -461,7 +463,7 @@ compat::Expected<SubscriptionFilter, ErrorCode> parseSubscriptionFilter(
   // Parse filter type
   auto filterType = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!filterType) {
-    LOG(DBG4) << "parseSubscriptionFilter: UNDERFLOW on filterType";
+    XLOG(DBG4) << "parseSubscriptionFilter: UNDERFLOW on filterType";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= filterType->second;
@@ -477,7 +479,7 @@ compat::Expected<SubscriptionFilter, ErrorCode> parseSubscriptionFilter(
     case to_underlying(LocationType::LargestGroup):
       break;
     default:
-      LOG(ERR) << "Invalid filter type in parseSubscriptionFilter, type="
+      XLOG(ERR) << "Invalid filter type in parseSubscriptionFilter, type="
                 << filterType->first;
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
@@ -498,7 +500,7 @@ compat::Expected<SubscriptionFilter, ErrorCode> parseSubscriptionFilter(
   if (filter.filterType == LocationType::AbsoluteRange) {
     auto endGroup = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!endGroup) {
-      LOG(DBG4) << "parseSubscriptionFilter: UNDERFLOW on endGroup";
+      XLOG(DBG4) << "parseSubscriptionFilter: UNDERFLOW on endGroup";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     filter.endGroup = endGroup->first;
@@ -524,12 +526,12 @@ compat::Expected<std::optional<Parameter>, ErrorCode> parseVariableParam(
   if (key == authKey) {
     auto res = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!res) {
-      LOG(DBG4) << "parseVariableParam: UNDERFLOW on authKey length";
+      XLOG(DBG4) << "parseVariableParam: UNDERFLOW on authKey length";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= res->second;
     if (res->first > length || !cursor.canAdvance(res->first)) {
-      LOG(DBG4) << "parseVariableParam: UNDERFLOW on authKey data";
+      XLOG(DBG4) << "parseVariableParam: UNDERFLOW on authKey data";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     auto tokenRes = parseToken(cursor, res->first, tokenCache, paramsType);
@@ -554,7 +556,7 @@ compat::Expected<std::optional<Parameter>, ErrorCode> parseVariableParam(
   else {
     auto res = parseFixedString(cursor, length);
     if (!res) {
-      LOG(DBG4) << "parseVariableParam: UNDERFLOW on parseFixedString";
+      XLOG(DBG4) << "parseVariableParam: UNDERFLOW on parseFixedString";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     p.asString = std::move(res.value());
@@ -571,7 +573,7 @@ compat::Expected<std::optional<Parameter>, ErrorCode> parseIntParam(
   p.key = key;
   auto res = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!res) {
-    LOG(DBG4) << "parseIntParam: UNDERFLOW on integer decode";
+    XLOG(DBG4) << "parseIntParam: UNDERFLOW on integer decode";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= res->second;
@@ -597,7 +599,7 @@ compat::Expected<compat::Unit, ErrorCode> parseParams(
   for (auto i = 0u; i < numParams; i++) {
     auto keyOrDelta = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!keyOrDelta) {
-      LOG(DBG4) << "parseParams: UNDERFLOW on key";
+      XLOG(DBG4) << "parseParams: UNDERFLOW on key";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= keyOrDelta->second;
@@ -629,13 +631,13 @@ compat::Expected<compat::Unit, ErrorCode> parseParams(
     } else if (
         key == to_underlying(TrackRequestParamKey::LARGEST_OBJECT)) {
       if (getDraftMajorVersion(version) < 15) {
-        LOG(ERR) << "Invalid parameter LARGEST_OBJECT for version " << version;
+        XLOG(ERR) << "Invalid parameter LARGEST_OBJECT for version " << version;
         return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
       }
 
       auto largestLocation = parseAbsoluteLocation(cursor, length);
       if (!largestLocation) {
-        LOG(DBG4) << "parseParams: returning error from parseAbsoluteLocation";
+        XLOG(DBG4) << "parseParams: returning error from parseAbsoluteLocation";
         return compat::makeUnexpected(largestLocation.error());
       }
       res = Parameter(key, largestLocation.value());
@@ -644,7 +646,7 @@ compat::Expected<compat::Unit, ErrorCode> parseParams(
           cursor, length, version, key, tokenCache, paramsType);
     }
     if (!res) {
-      LOG(DBG4)
+      XLOG(DBG4)
           << "parseParams: returning error from parseVariableParam/parseIntParam"
           << " at param index=" << i << ", key=" << key
           << ", version=" << version << ", length=" << length;
@@ -659,17 +661,17 @@ compat::Expected<compat::Unit, ErrorCode> parseParams(
         auto insertResult = params.insertParam(std::move(*res.value()));
         if (insertResult.hasError()) {
           // Per spec: invalid params in received messages should be ignored
-          LOG(WARN) << "parseParams: ignoring param not allowed for frame type"
+          XLOG(WARN) << "parseParams: ignoring param not allowed for frame type"
                      << " at param index=" << i << ", key=" << key;
         }
       }
     }
   }
   if (length > 0) {
-    LOG(ERR) << "Invalid key-value length";
+    XLOG(ERR) << "Invalid key-value length";
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
-  LOG(DBG4) << "parseParams: returning success";
+  XLOG(DBG4) << "parseParams: returning success";
   return compat::unit;
 }
 
@@ -684,19 +686,19 @@ compat::Expected<ClientSetup, ErrorCode> MoQFrameParser::parseClientSetup(
   if (!version_ || getDraftMajorVersion(*version_) < 15) {
     auto numVersions = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!numVersions) {
-      LOG(DBG4) << "parseClientSetup: UNDERFLOW on numVersions";
+      XLOG(DBG4) << "parseClientSetup: UNDERFLOW on numVersions";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= numVersions->second;
     for (auto i = 0ul; i < numVersions->first; i++) {
       auto version = quic::follyutils::decodeQuicInteger(cursor, length);
       if (!version) {
-        LOG(DBG4) << "parseClientSetup: UNDERFLOW on version";
+        XLOG(DBG4) << "parseClientSetup: UNDERFLOW on version";
         return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
       }
       length -= version->second;
       if (!isSupportedVersion(version->first)) {
-        LOG(WARN) << "Peer advertised unsupported version " << version->first
+        XLOG(WARN) << "Peer advertised unsupported version " << version->first
                    << ", supported versions are: "
                    << getSupportedVersionsString();
         continue;
@@ -704,14 +706,14 @@ compat::Expected<ClientSetup, ErrorCode> MoQFrameParser::parseClientSetup(
       clientSetup.supportedVersions.push_back(version->first);
     }
   } else {
-    LOG(DBG3)
+    XLOG(DBG3)
         << "Skipped parsing versions from wire for alpn ClientSetup message";
     serializationVersion = *version_;
   }
 
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    LOG(DBG4) << "parseClientSetup: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parseClientSetup: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -744,25 +746,25 @@ compat::Expected<ServerSetup, ErrorCode> MoQFrameParser::parseServerSetup(
   if (!version_ || getDraftMajorVersion(*version_) < 15) {
     auto version = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!version) {
-      LOG(DBG4) << "parseServerSetup: UNDERFLOW on version";
+      XLOG(DBG4) << "parseServerSetup: UNDERFLOW on version";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= version->second;
     if (!isSupportedVersion(version->first)) {
-      LOG(WARN) << "Peer advertised unsupported version " << version->first
+      XLOG(WARN) << "Peer advertised unsupported version " << version->first
                  << ", supported versions are: "
                  << getSupportedVersionsString();
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     serverSetup.selectedVersion = version->first;
   } else {
-    LOG(DBG3)
+    XLOG(DBG3)
         << "Skipped parsing version from wire for alpn ServerSetup message";
   }
 
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    LOG(DBG4) << "parseServerSetup: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parseServerSetup: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -790,7 +792,7 @@ MoQFrameParser::parseFetchHeader(moxygen::Cursor& cursor, size_t length)
     const noexcept {
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parseFetchHeader: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseFetchHeader: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
 
@@ -842,14 +844,14 @@ MoQFrameParser::parseDatagramObjectHeader(
   ObjectHeader objectHeader;
   auto trackAlias = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!trackAlias) {
-    LOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on trackAlias";
+    XLOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on trackAlias";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= trackAlias->second;
 
   auto group = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!group) {
-    LOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on group";
+    XLOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on group";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= group->second;
@@ -858,7 +860,7 @@ MoQFrameParser::parseDatagramObjectHeader(
   if (!datagramObjectIdZero(*version_, datagramType)) {
     auto id = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!id) {
-      LOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on id";
+      XLOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on id";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= id->second;
@@ -870,7 +872,7 @@ MoQFrameParser::parseDatagramObjectHeader(
 
   if (datagramPriorityPresent(*version_, datagramType)) {
     if (length == 0 || !cursor.canAdvance(1)) {
-      LOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on priority";
+      XLOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on priority";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     objectHeader.priority = cursor.readBE<uint8_t>();
@@ -882,7 +884,7 @@ MoQFrameParser::parseDatagramObjectHeader(
   if (datagramTypeHasExtensions(*version_, datagramType)) {
     auto ext = parseExtensions(cursor, length, objectHeader);
     if (!ext) {
-      LOG(DBG4) << "parseDatagramObjectHeader: error in parseExtensions: "
+      XLOG(DBG4) << "parseDatagramObjectHeader: error in parseExtensions: "
                  << uint64_t(ext.error());
       return compat::makeUnexpected(ext.error());
     }
@@ -891,19 +893,19 @@ MoQFrameParser::parseDatagramObjectHeader(
   if (datagramTypeIsStatus(*version_, datagramType)) {
     auto status = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!status) {
-      LOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on status";
+      XLOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on status";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= status->second;
     if (status->first > to_underlying(ObjectStatus::END_OF_TRACK)) {
-      LOG(ERR) << "status > END_OF_TRACK =" << status->first;
+      XLOG(ERR) << "status > END_OF_TRACK =" << status->first;
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     objectHeader.status = ObjectStatus(status->first);
     objectHeader.length = 0;
     if (length != 0) {
       // MUST consume entire datagram
-      LOG(ERR) << "Non-zero length payload in OBJECT_DATAGRAM_STATUS";
+      XLOG(ERR) << "Non-zero length payload in OBJECT_DATAGRAM_STATUS";
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
   } else {
@@ -934,7 +936,7 @@ MoQFrameParser::parseSubgroupHeader(
 
   auto parsedTrackAlias = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!parsedTrackAlias) {
-    LOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on trackAlias";
+    XLOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on trackAlias";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= parsedTrackAlias->second;
@@ -942,7 +944,7 @@ MoQFrameParser::parseSubgroupHeader(
 
   auto group = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!group) {
-    LOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on group";
+    XLOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on group";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= group->second;
@@ -952,7 +954,7 @@ MoQFrameParser::parseSubgroupHeader(
   if (options.subgroupIDFormat == SubgroupIDFormat::Present) {
     auto subgroup = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!subgroup) {
-      LOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on subgroup";
+      XLOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on subgroup";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     objectHeader.subgroup = subgroup->first;
@@ -965,7 +967,7 @@ MoQFrameParser::parseSubgroupHeader(
   // Conditionally parse priority based on version and stream type
   if (options.priorityPresent) {
     if (length == 0 || !cursor.canAdvance(1)) {
-      LOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on priority";
+      XLOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on priority";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     objectHeader.priority = cursor.readBE<uint8_t>();
@@ -979,7 +981,7 @@ MoQFrameParser::parseSubgroupHeader(
     auto tmpCursor = cursor; // we reparse the object ID later
     auto id = quic::follyutils::decodeQuicInteger(tmpCursor, length);
     if (!id) {
-      LOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on id";
+      XLOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on id";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     objectHeader.subgroup = objectHeader.id = id->first;
@@ -999,7 +1001,7 @@ MoQFrameParser::parseFetchObjectHeaderLegacy(
   // Group ID (varint)
   auto group = quic::follyutils::decodeQuicInteger(cursor, remainingLength);
   if (!group) {
-    LOG(DBG4) << "parseFetchObjectHeaderLegacy: UNDERFLOW on group";
+    XLOG(DBG4) << "parseFetchObjectHeaderLegacy: UNDERFLOW on group";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   remainingLength -= group->second;
@@ -1008,7 +1010,7 @@ MoQFrameParser::parseFetchObjectHeaderLegacy(
   // Subgroup ID (varint)
   auto subgroup = quic::follyutils::decodeQuicInteger(cursor, remainingLength);
   if (!subgroup) {
-    LOG(DBG4) << "parseFetchObjectHeaderLegacy: UNDERFLOW on subgroup";
+    XLOG(DBG4) << "parseFetchObjectHeaderLegacy: UNDERFLOW on subgroup";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   remainingLength -= subgroup->second;
@@ -1017,7 +1019,7 @@ MoQFrameParser::parseFetchObjectHeaderLegacy(
   // Object ID (varint)
   auto id = quic::follyutils::decodeQuicInteger(cursor, remainingLength);
   if (!id) {
-    LOG(DBG4) << "parseFetchObjectHeaderLegacy: UNDERFLOW on id";
+    XLOG(DBG4) << "parseFetchObjectHeaderLegacy: UNDERFLOW on id";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   remainingLength -= id->second;
@@ -1025,7 +1027,7 @@ MoQFrameParser::parseFetchObjectHeaderLegacy(
 
   // Priority (8-bit)
   if (remainingLength < 1) {
-    LOG(DBG4) << "parseFetchObjectHeaderLegacy: UNDERFLOW on priority";
+    XLOG(DBG4) << "parseFetchObjectHeaderLegacy: UNDERFLOW on priority";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   objectHeader.priority = cursor.readBE<uint8_t>();
@@ -1034,7 +1036,7 @@ MoQFrameParser::parseFetchObjectHeaderLegacy(
   // Extensions (if present)
   auto ext = parseExtensions(cursor, remainingLength, objectHeader);
   if (!ext) {
-    LOG(DBG4) << "parseFetchObjectHeaderLegacy: error in parseExtensions: "
+    XLOG(DBG4) << "parseFetchObjectHeaderLegacy: error in parseExtensions: "
                << to_underlying(ext.error());
     return compat::makeUnexpected(ext.error());
   }
@@ -1042,7 +1044,7 @@ MoQFrameParser::parseFetchObjectHeaderLegacy(
   // Object status and payload length
   auto res = parseObjectStatusAndLength(cursor, remainingLength, objectHeader);
   if (!res) {
-    LOG(DBG4)
+    XLOG(DBG4)
         << "parseFetchObjectHeaderLegacy: error in parseObjectStatusAndLength: "
         << to_underlying(res.error());
     return compat::makeUnexpected(res.error());
@@ -1067,7 +1069,7 @@ MoQFrameParser::parseFetchObjectDraft15(
 
   // Read Serialization Flags byte
   if (remainingLength < 1 || !cursor.canAdvance(1)) {
-    LOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on flags";
+    XLOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on flags";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   uint8_t flags = cursor.readBE<uint8_t>();
@@ -1076,7 +1078,7 @@ MoQFrameParser::parseFetchObjectDraft15(
   // Check reserved bits (0x40, 0x80)
   if (flags &
       to_underlying(FetchHeaderSerializationBits::RESERVED_BITMASK)) {
-    LOG(ERR) << "parseFetchObjectDraft15: Reserved bits set in flags: 0x"
+    XLOG(ERR) << "parseFetchObjectDraft15: Reserved bits set in flags: 0x"
               << std::hex << static_cast<int>(flags);
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
@@ -1087,7 +1089,7 @@ MoQFrameParser::parseFetchObjectDraft15(
     // Group ID field is present
     auto group = quic::follyutils::decodeQuicInteger(cursor, remainingLength);
     if (!group) {
-      LOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on group";
+      XLOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on group";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     remainingLength -= group->second;
@@ -1095,7 +1097,7 @@ MoQFrameParser::parseFetchObjectDraft15(
   } else {
     // Group ID is same as previous
     if (!previousFetchGroup_.has_value()) {
-      LOG(ERR) << "parseFetchObjectDraft15: First object must have explicit "
+      XLOG(ERR) << "parseFetchObjectDraft15: First object must have explicit "
                    "group ID";
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
@@ -1114,7 +1116,7 @@ MoQFrameParser::parseFetchObjectDraft15(
         FetchHeaderSerializationBits::SUBGROUP_ID_SAME_AS_PRIOR):
       // Subgroup ID is the prior Object's Subgroup ID
       if (!previousFetchSubgroup_.has_value()) {
-        LOG(ERR) << "parseFetchObjectDraft15: First object cannot reference "
+        XLOG(ERR) << "parseFetchObjectDraft15: First object cannot reference "
                      "prior subgroup";
         return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
       }
@@ -1124,7 +1126,7 @@ MoQFrameParser::parseFetchObjectDraft15(
         FetchHeaderSerializationBits::SUBGROUP_ID_INC_BY_ONE):
       // Subgroup ID is the prior Object's Subgroup ID plus one
       if (!previousFetchSubgroup_.has_value()) {
-        LOG(ERR) << "parseFetchObjectDraft15: First object cannot reference "
+        XLOG(ERR) << "parseFetchObjectDraft15: First object cannot reference "
                      "prior subgroup";
         return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
       }
@@ -1136,7 +1138,7 @@ MoQFrameParser::parseFetchObjectDraft15(
       auto subgroup =
           quic::follyutils::decodeQuicInteger(cursor, remainingLength);
       if (!subgroup) {
-        LOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on subgroup";
+        XLOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on subgroup";
         return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
       }
       remainingLength -= subgroup->second;
@@ -1150,7 +1152,7 @@ MoQFrameParser::parseFetchObjectDraft15(
     // Object ID field is present
     auto id = quic::follyutils::decodeQuicInteger(cursor, remainingLength);
     if (!id) {
-      LOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on id";
+      XLOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on id";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     remainingLength -= id->second;
@@ -1158,7 +1160,7 @@ MoQFrameParser::parseFetchObjectDraft15(
   } else {
     // Object ID is the prior Object's ID plus one
     if (!previousObjectID_.has_value()) {
-      LOG(ERR) << "parseFetchObjectDraft15: First object must have explicit "
+      XLOG(ERR) << "parseFetchObjectDraft15: First object must have explicit "
                    "object ID";
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
@@ -1170,7 +1172,7 @@ MoQFrameParser::parseFetchObjectDraft15(
       to_underlying(FetchHeaderSerializationBits::PRIORITY_BITMASK)) {
     // Priority field is present
     if (remainingLength < 1) {
-      LOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on priority";
+      XLOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on priority";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     objectHeader.priority = cursor.readBE<uint8_t>();
@@ -1178,7 +1180,7 @@ MoQFrameParser::parseFetchObjectDraft15(
   } else {
     // Priority is the prior Object's Priority
     if (!previousFetchPriority_.has_value()) {
-      LOG(ERR) << "parseFetchObjectDraft15: First object must have explicit "
+      XLOG(ERR) << "parseFetchObjectDraft15: First object must have explicit "
                    "priority";
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
@@ -1191,7 +1193,7 @@ MoQFrameParser::parseFetchObjectDraft15(
     // Extensions field is present
     auto ext = parseExtensions(cursor, remainingLength, objectHeader);
     if (!ext) {
-      LOG(DBG4) << "parseFetchObjectDraft15: error in parseExtensions: "
+      XLOG(DBG4) << "parseFetchObjectDraft15: error in parseExtensions: "
                  << to_underlying(ext.error());
       return compat::makeUnexpected(ext.error());
     }
@@ -1201,7 +1203,7 @@ MoQFrameParser::parseFetchObjectDraft15(
   // Parse Object Status and Length
   auto res = parseObjectStatusAndLength(cursor, remainingLength, objectHeader);
   if (!res) {
-    LOG(DBG4)
+    XLOG(DBG4)
         << "parseFetchObjectDraft15: error in parseObjectStatusAndLength: "
         << to_underlying(res.error());
     return compat::makeUnexpected(res.error());
@@ -1228,7 +1230,7 @@ MoQFrameParser::parseObjectStatusAndLength(
     ObjectHeader& objectHeader) const noexcept {
   auto payloadLength = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!payloadLength) {
-    LOG(DBG4) << "parseObjectStatusAndLength: UNDERFLOW on payloadLength";
+    XLOG(DBG4) << "parseObjectStatusAndLength: UNDERFLOW on payloadLength";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= payloadLength->second;
@@ -1237,12 +1239,12 @@ MoQFrameParser::parseObjectStatusAndLength(
   if (objectHeader.length == 0) {
     auto objectStatus = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!objectStatus) {
-      LOG(DBG4) << "parseObjectStatusAndLength: UNDERFLOW on objectStatus";
+      XLOG(DBG4) << "parseObjectStatusAndLength: UNDERFLOW on objectStatus";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     if (objectStatus->first >
         to_underlying(ObjectStatus::END_OF_TRACK)) {
-      LOG(ERR) << "status > END_OF_TRACK =" << objectStatus->first;
+      XLOG(ERR) << "status > END_OF_TRACK =" << objectStatus->first;
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     objectHeader.status = ObjectStatus(objectStatus->first);
@@ -1259,7 +1261,7 @@ bool MoQFrameParser::isValidStatusForExtensions(
   if (version_.has_value() && *version_ >= kVersionDraft15 &&
       objectHeader.status != ObjectStatus::NORMAL &&
       !objectHeader.extensions.empty()) {
-    LOG(ERR) << "Extensions present on non-NORMAL status object: status="
+    XLOG(ERR) << "Extensions present on non-NORMAL status object: status="
               << to_underlying(objectHeader.status);
     return false;
   }
@@ -1308,7 +1310,7 @@ MoQFrameParser::parseSubgroupObjectHeader(
   ObjectHeader objectHeader = headerTemplate;
   auto id = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!id) {
-    LOG(DBG4) << "parseSubgroupObjectHeader: UNDERFLOW on id";
+    XLOG(DBG4) << "parseSubgroupObjectHeader: UNDERFLOW on id";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= id->second;
@@ -1333,7 +1335,7 @@ MoQFrameParser::parseSubgroupObjectHeader(
   if (options.hasExtensions) {
     auto ext = parseExtensions(cursor, length, objectHeader);
     if (!ext) {
-      LOG(DBG4) << "parseSubgroupObjectHeader: error in parseExtensions: "
+      XLOG(DBG4) << "parseSubgroupObjectHeader: error in parseExtensions: "
                  << to_underlying(ext.error());
       return compat::makeUnexpected(ext.error());
     }
@@ -1341,7 +1343,7 @@ MoQFrameParser::parseSubgroupObjectHeader(
 
   auto res = parseObjectStatusAndLength(cursor, length, objectHeader);
   if (!res) {
-    LOG(DBG4)
+    XLOG(DBG4)
         << "parseSubgroupObjectHeader: error in parseObjectStatusAndLength: "
         << to_underlying(res.error());
     return compat::makeUnexpected(res.error());
@@ -1390,21 +1392,21 @@ MoQFrameParser::parseSubscribeRequest(moxygen::Cursor& cursor, size_t length)
   SubscribeRequest subscribeRequest;
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
   subscribeRequest.requestID = requestID->first;
   auto res = parseFullTrackName(cursor, length);
   if (!res) {
-    LOG(DBG4) << "parseSubscribeRequest: Failed to parse track name";
+    XLOG(DBG4) << "parseSubscribeRequest: Failed to parse track name";
     return compat::makeUnexpected(res.error());
   }
   subscribeRequest.fullTrackName = std::move(res.value());
 
   if (getDraftMajorVersion(*version_) < 15) {
     if (length < 1) {
-      LOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on priority";
+      XLOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on priority";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     subscribeRequest.priority = cursor.readBE<uint8_t>();
@@ -1417,25 +1419,25 @@ MoQFrameParser::parseSubscribeRequest(moxygen::Cursor& cursor, size_t length)
 
   if (getDraftMajorVersion(*version_) < 15) {
     if (length < 1) {
-      LOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on order";
+      XLOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on order";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
 
     auto order = cursor.readBE<uint8_t>();
     if (order > to_underlying(GroupOrder::NewestFirst)) {
-      LOG(ERR) << "order > NewestFirst =" << order;
+      XLOG(ERR) << "order > NewestFirst =" << order;
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     subscribeRequest.groupOrder = static_cast<GroupOrder>(order);
     length -= 1;
 
     if (length < 1) {
-      LOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on forwardFlag";
+      XLOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on forwardFlag";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     uint8_t forwardFlag = cursor.readBE<uint8_t>();
     if (forwardFlag > 1) {
-      LOG(ERR) << "parseSubscribeRequest: Invalid forward";
+      XLOG(ERR) << "parseSubscribeRequest: Invalid forward";
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     subscribeRequest.forward = (forwardFlag == 1);
@@ -1449,7 +1451,7 @@ MoQFrameParser::parseSubscribeRequest(moxygen::Cursor& cursor, size_t length)
   if (getDraftMajorVersion(*version_) < 15) {
     auto locType = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!locType) {
-      LOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on locType";
+      XLOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on locType";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     switch (locType->first) {
@@ -1460,7 +1462,7 @@ MoQFrameParser::parseSubscribeRequest(moxygen::Cursor& cursor, size_t length)
       case to_underlying(LocationType::NextGroupStart):
         break;
       default:
-        LOG(ERR) << "Invalid locType =" << locType->first;
+        XLOG(ERR) << "Invalid locType =" << locType->first;
         return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     length -= locType->second;
@@ -1469,7 +1471,7 @@ MoQFrameParser::parseSubscribeRequest(moxygen::Cursor& cursor, size_t length)
         subscribeRequest.locType == LocationType::AbsoluteRange) {
       auto location = parseAbsoluteLocation(cursor, length);
       if (!location) {
-        LOG(ERR) << "parseSubscribeRequest: error in parseAbsoluteLocation: "
+        XLOG(ERR) << "parseSubscribeRequest: error in parseAbsoluteLocation: "
                   << to_underlying(location.error());
         return compat::makeUnexpected(location.error());
       }
@@ -1478,7 +1480,7 @@ MoQFrameParser::parseSubscribeRequest(moxygen::Cursor& cursor, size_t length)
     if (subscribeRequest.locType == LocationType::AbsoluteRange) {
       auto endGroup = quic::follyutils::decodeQuicInteger(cursor, length);
       if (!endGroup) {
-        LOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on endGroup";
+        XLOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on endGroup";
         return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
       }
       subscribeRequest.endGroup = endGroup->first;
@@ -1487,7 +1489,7 @@ MoQFrameParser::parseSubscribeRequest(moxygen::Cursor& cursor, size_t length)
   }
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    LOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -1499,13 +1501,13 @@ MoQFrameParser::parseSubscribeRequest(moxygen::Cursor& cursor, size_t length)
       subscribeRequest.params,
       requestSpecificParams);
   if (!res2) {
-    LOG(ERR) << "parseSubscribeRequest: error in parseTrackRequestParams: "
+    XLOG(ERR) << "parseSubscribeRequest: error in parseTrackRequestParams: "
               << to_underlying(res2.error());
     return compat::makeUnexpected(res2.error());
   }
   handleRequestSpecificParams(subscribeRequest, requestSpecificParams);
   if (length > 0) {
-    LOG(ERR) << "parseSubscribeRequest: leftover bytes after parsing: "
+    XLOG(ERR) << "parseSubscribeRequest: leftover bytes after parsing: "
               << length;
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
@@ -1555,7 +1557,7 @@ MoQFrameParser::parseSubscribeUpdate(moxygen::Cursor& cursor, size_t length)
   SubscribeUpdate subscribeUpdate;
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   subscribeUpdate.requestID = requestID->first;
@@ -1565,7 +1567,7 @@ MoQFrameParser::parseSubscribeUpdate(moxygen::Cursor& cursor, size_t length)
     auto subscriptionRequestID =
         quic::follyutils::decodeQuicInteger(cursor, length);
     if (!subscriptionRequestID) {
-      LOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on subscriptionRequestID";
+      XLOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on subscriptionRequestID";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     subscribeUpdate.subscriptionRequestID = subscriptionRequestID->first;
@@ -1581,7 +1583,7 @@ MoQFrameParser::parseSubscribeUpdate(moxygen::Cursor& cursor, size_t length)
 
     auto endGroup = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!endGroup) {
-      LOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on endGroup";
+      XLOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on endGroup";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     subscribeUpdate.endGroup = endGroup->first;
@@ -1590,14 +1592,14 @@ MoQFrameParser::parseSubscribeUpdate(moxygen::Cursor& cursor, size_t length)
 
   if (getDraftMajorVersion(*version_) < 15) {
     if (length < 1) {
-      LOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on priority";
+      XLOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on priority";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     subscribeUpdate.priority = cursor.readBE<uint8_t>();
     length--;
 
     if (length < 1) {
-      LOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on forwardFlag";
+      XLOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on forwardFlag";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     uint8_t forwardFlag = cursor.readBE<uint8_t>();
@@ -1618,7 +1620,7 @@ MoQFrameParser::parseSubscribeUpdate(moxygen::Cursor& cursor, size_t length)
 
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    LOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -1671,14 +1673,14 @@ compat::Expected<SubscribeOk, ErrorCode> MoQFrameParser::parseSubscribeOk(
   SubscribeOk subscribeOk;
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parseSubscribeOk: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
   subscribeOk.requestID = requestID->first;
   auto trackAlias = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!trackAlias) {
-    LOG(DBG4) << "parseSubscribeOk: UNDERFLOW on trackAlias";
+    XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on trackAlias";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= trackAlias->second;
@@ -1688,20 +1690,20 @@ compat::Expected<SubscribeOk, ErrorCode> MoQFrameParser::parseSubscribeOk(
   if (getDraftMajorVersion(*version_) < 15) {
     auto expires = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!expires) {
-      LOG(DBG4) << "parseSubscribeOk: UNDERFLOW on expires";
+      XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on expires";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= expires->second;
     subscribeOk.expires = std::chrono::milliseconds(expires->first);
 
     if (length < 1) {
-      LOG(DBG4) << "parseSubscribeOk: UNDERFLOW on order";
+      XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on order";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
 
     auto order = cursor.readBE<uint8_t>();
     if (order == 0 || order > to_underlying(GroupOrder::NewestFirst)) {
-      LOG(ERR) << "order > NewestFirst or order==0 =" << order;
+      XLOG(ERR) << "order > NewestFirst or order==0 =" << order;
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     length -= sizeof(uint8_t);
@@ -1709,7 +1711,7 @@ compat::Expected<SubscribeOk, ErrorCode> MoQFrameParser::parseSubscribeOk(
   }
 
   if (length < 1) {
-    LOG(DBG4) << "parseSubscribeOk: UNDERFLOW on contentExists";
+    XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on contentExists";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   auto contentExists = cursor.readBE<uint8_t>();
@@ -1723,7 +1725,7 @@ compat::Expected<SubscribeOk, ErrorCode> MoQFrameParser::parseSubscribeOk(
   }
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    LOG(DBG4) << "parseSubscribeOk: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -1735,11 +1737,11 @@ compat::Expected<SubscribeOk, ErrorCode> MoQFrameParser::parseSubscribeOk(
       subscribeOk.params,
       requestSpecificParams);
   if (!res2) {
-    LOG(DBG4) << "parseSubscribeOk: parseTrackRequestParams failed";
+    XLOG(DBG4) << "parseSubscribeOk: parseTrackRequestParams failed";
     return compat::makeUnexpected(res2.error());
   }
   if (length > 0) {
-    LOG(DBG4) << "parseSubscribeOk: excess length";
+    XLOG(DBG4) << "parseSubscribeOk: excess length";
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
 
@@ -1778,7 +1780,7 @@ compat::Expected<Unsubscribe, ErrorCode> MoQFrameParser::parseUnsubscribe(
   Unsubscribe unsubscribe;
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parseUnsubscribe: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseUnsubscribe: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
@@ -1795,7 +1797,7 @@ compat::Expected<SubscribeDone, ErrorCode> MoQFrameParser::parseSubscribeDone(
   SubscribeDone subscribeDone;
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parseSubscribeDone: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseSubscribeDone: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
@@ -1803,7 +1805,7 @@ compat::Expected<SubscribeDone, ErrorCode> MoQFrameParser::parseSubscribeDone(
 
   auto statusCode = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!statusCode) {
-    LOG(DBG4) << "parseSubscribeDone: UNDERFLOW on statusCode";
+    XLOG(DBG4) << "parseSubscribeDone: UNDERFLOW on statusCode";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= statusCode->second;
@@ -1811,7 +1813,7 @@ compat::Expected<SubscribeDone, ErrorCode> MoQFrameParser::parseSubscribeDone(
 
   auto streamCount = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!streamCount) {
-    LOG(DBG4) << "parseSubscribeDone: UNDERFLOW on streamCount";
+    XLOG(DBG4) << "parseSubscribeDone: UNDERFLOW on streamCount";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= streamCount->second;
@@ -1827,7 +1829,7 @@ compat::Expected<SubscribeDone, ErrorCode> MoQFrameParser::parseSubscribeDone(
       << "The version must be set before parsing SUBSCRIBE_DONE";
   if (getDraftMajorVersion(*version_) <= 9) {
     if (length == 0) {
-      LOG(DBG4) << "parseSubscribeDone: UNDERFLOW on contentExists";
+      XLOG(DBG4) << "parseSubscribeDone: UNDERFLOW on contentExists";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     auto contentExists = cursor.readBE<uint8_t>();
@@ -1853,7 +1855,7 @@ compat::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
   PublishRequest publish;
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parsePublish: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parsePublish: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
@@ -1867,7 +1869,7 @@ compat::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
 
   auto trackAlias = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!trackAlias) {
-    LOG(DBG4) << "parsePublish: UNDERFLOW on trackAlias";
+    XLOG(DBG4) << "parsePublish: UNDERFLOW on trackAlias";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= trackAlias->second;
@@ -1875,13 +1877,13 @@ compat::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
 
   if (getDraftMajorVersion(*version_) < 15) {
     if (length < 1) {
-      LOG(DBG4) << "parsePublish: UNDERFLOW on order";
+      XLOG(DBG4) << "parsePublish: UNDERFLOW on order";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
 
     auto order = cursor.readBE<uint8_t>();
     if (order > to_underlying(GroupOrder::NewestFirst)) {
-      LOG(ERR) << "order > NewestFirst =" << order;
+      XLOG(ERR) << "order > NewestFirst =" << order;
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     publish.groupOrder = static_cast<GroupOrder>(order);
@@ -1889,7 +1891,7 @@ compat::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
   }
 
   if (length < 1) {
-    LOG(DBG4) << "parsePublish: UNDERFLOW on contentExists";
+    XLOG(DBG4) << "parsePublish: UNDERFLOW on contentExists";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   uint8_t contentExists = cursor.readBE<uint8_t>();
@@ -1910,7 +1912,7 @@ compat::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
 
   if (getDraftMajorVersion(*version_) < 15) {
     if (length < 1) {
-      LOG(DBG4) << "parsePublish: UNDERFLOW on forward";
+      XLOG(DBG4) << "parsePublish: UNDERFLOW on forward";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
 
@@ -1928,7 +1930,7 @@ compat::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
 
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    LOG(DBG4) << "parsePublish: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parsePublish: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -1974,7 +1976,7 @@ compat::Expected<PublishOk, ErrorCode> MoQFrameParser::parsePublishOk(
   PublishOk publishOk;
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parsePublishOk: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parsePublishOk: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
@@ -1982,7 +1984,7 @@ compat::Expected<PublishOk, ErrorCode> MoQFrameParser::parsePublishOk(
 
   if (getDraftMajorVersion(*version_) < 15) {
     if (length < 1) {
-      LOG(DBG4) << "parsePublishOk: UNDERFLOW on forward/priority/order";
+      XLOG(DBG4) << "parsePublishOk: UNDERFLOW on forward/priority/order";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     uint8_t forwardFlag = cursor.readBE<uint8_t>();
@@ -2008,13 +2010,13 @@ compat::Expected<PublishOk, ErrorCode> MoQFrameParser::parsePublishOk(
 
   if (getDraftMajorVersion(*version_) < 15) {
     if (length < 1) {
-      LOG(DBG4) << "parsePublishOk: UNDERFLOW on order";
+      XLOG(DBG4) << "parsePublishOk: UNDERFLOW on order";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     auto order = cursor.readBE<uint8_t>();
     length--;
     if (order > to_underlying(GroupOrder::NewestFirst)) {
-      LOG(ERR) << "order > NewestFirst =" << order;
+      XLOG(ERR) << "order > NewestFirst =" << order;
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     publishOk.groupOrder = static_cast<GroupOrder>(order);
@@ -2023,7 +2025,7 @@ compat::Expected<PublishOk, ErrorCode> MoQFrameParser::parsePublishOk(
   if (getDraftMajorVersion(*version_) < 15) {
     auto locType = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!locType) {
-      LOG(DBG4) << "parsePublishOk: UNDERFLOW on locType";
+      XLOG(DBG4) << "parsePublishOk: UNDERFLOW on locType";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     switch (locType->first) {
@@ -2034,7 +2036,7 @@ compat::Expected<PublishOk, ErrorCode> MoQFrameParser::parsePublishOk(
       case to_underlying(LocationType::NextGroupStart):
         break;
       default:
-        LOG(ERR) << "Invalid locType =" << locType->first;
+        XLOG(ERR) << "Invalid locType =" << locType->first;
         return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     length -= locType->second;
@@ -2051,7 +2053,7 @@ compat::Expected<PublishOk, ErrorCode> MoQFrameParser::parsePublishOk(
     if (publishOk.locType == LocationType::AbsoluteRange) {
       auto endGroup = quic::follyutils::decodeQuicInteger(cursor, length);
       if (!endGroup) {
-        LOG(DBG4) << "parsePublishOk: UNDERFLOW on endGroup";
+        XLOG(DBG4) << "parsePublishOk: UNDERFLOW on endGroup";
         return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
       }
       publishOk.endGroup = endGroup->first;
@@ -2063,7 +2065,7 @@ compat::Expected<PublishOk, ErrorCode> MoQFrameParser::parsePublishOk(
 
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    LOG(DBG4) << "parsePublishOk: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parsePublishOk: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -2169,7 +2171,7 @@ MoQFrameParser::parsePublishNamespace(moxygen::Cursor& cursor, size_t length)
   PublishNamespace publishNamespace;
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parsePublishNamespace: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parsePublishNamespace: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
@@ -2182,7 +2184,7 @@ MoQFrameParser::parsePublishNamespace(moxygen::Cursor& cursor, size_t length)
   publishNamespace.trackNamespace = TrackNamespace(std::move(res.value()));
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    LOG(DBG4) << "parsePublishNamespace: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parsePublishNamespace: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -2216,7 +2218,7 @@ compat::Expected<PublishNamespaceOk, ErrorCode> MoQFrameParser::parseRequestOk(
   RequestOk requestOk;
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parseRequestOk: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseRequestOk: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
@@ -2225,7 +2227,7 @@ compat::Expected<PublishNamespaceOk, ErrorCode> MoQFrameParser::parseRequestOk(
     // Parse track request params into requestOk.params
     auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!numParams) {
-      LOG(DBG4) << "parseRequestOk: UNDERFLOW on numParams";
+      XLOG(DBG4) << "parseRequestOk: UNDERFLOW on numParams";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= numParams->second;
@@ -2261,7 +2263,7 @@ MoQFrameParser::parsePublishNamespaceDone(
     // v16+: Parse Request ID
     auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!requestID) {
-      LOG(DBG4) << "parsePublishNamespaceDone: UNDERFLOW on requestID";
+      XLOG(DBG4) << "parsePublishNamespaceDone: UNDERFLOW on requestID";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= requestID->second;
@@ -2292,7 +2294,7 @@ MoQFrameParser::parsePublishNamespaceCancel(
     // v16+: Parse Request ID
     auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!requestID) {
-      LOG(DBG4) << "parsePublishNamespaceCancel: UNDERFLOW on requestID";
+      XLOG(DBG4) << "parsePublishNamespaceCancel: UNDERFLOW on requestID";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= requestID->second;
@@ -2309,7 +2311,7 @@ MoQFrameParser::parsePublishNamespaceCancel(
 
   auto errorCode = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!errorCode) {
-    LOG(DBG4) << "parsePublishNamespaceCancel: UNDERFLOW on errorCode";
+    XLOG(DBG4) << "parsePublishNamespaceCancel: UNDERFLOW on errorCode";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   publishNamespaceCancel.errorCode =
@@ -2348,7 +2350,7 @@ compat::Expected<TrackStatus, ErrorCode> MoQFrameParser::parseTrackStatus(
 
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parseTrackStatus: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseTrackStatus: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
@@ -2361,7 +2363,7 @@ compat::Expected<TrackStatus, ErrorCode> MoQFrameParser::parseTrackStatus(
 
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    LOG(DBG4) << "parseTrackStatus: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parseTrackStatus: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -2408,18 +2410,18 @@ compat::Expected<TrackStatusOk, ErrorCode> MoQFrameParser::parseTrackStatusOk(
   trackStatusOk.groupOrder = GroupOrder::OldestFirst;
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parseTrackStatusOk: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseTrackStatusOk: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
   trackStatusOk.requestID = requestID->first;
   auto statusCode = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!statusCode) {
-    LOG(DBG4) << "parseTrackStatusOk: UNDERFLOW on statusCode";
+    XLOG(DBG4) << "parseTrackStatusOk: UNDERFLOW on statusCode";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   if (statusCode->first > to_underlying(TrackStatusCode::UNKNOWN)) {
-    LOG(ERR) << "statusCode > UNKNOWN =" << statusCode->first;
+    XLOG(ERR) << "statusCode > UNKNOWN =" << statusCode->first;
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   trackStatusOk.statusCode = TrackStatusCode(statusCode->first);
@@ -2432,7 +2434,7 @@ compat::Expected<TrackStatusOk, ErrorCode> MoQFrameParser::parseTrackStatusOk(
 
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    LOG(DBG4) << "parseTrackStatusOk: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parseTrackStatusOk: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -2480,7 +2482,7 @@ compat::Expected<MaxRequestID, ErrorCode> MoQFrameParser::parseMaxRequestID(
   MaxRequestID maxRequestID;
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parseMaxRequestID: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseMaxRequestID: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
@@ -2497,7 +2499,7 @@ MoQFrameParser::parseRequestsBlocked(moxygen::Cursor& cursor, size_t length)
   RequestsBlocked subscribesBlocked;
   auto res = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!res) {
-    LOG(DBG4) << "parseRequestsBlocked: UNDERFLOW on maxRequestID";
+    XLOG(DBG4) << "parseRequestsBlocked: UNDERFLOW on maxRequestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   subscribesBlocked.maxRequestID = res->first;
@@ -2514,7 +2516,7 @@ compat::Expected<Fetch, ErrorCode> MoQFrameParser::parseFetch(
   Fetch fetch;
   auto res = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!res) {
-    LOG(DBG4) << "parseFetch: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseFetch: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   fetch.requestID = res->first;
@@ -2522,20 +2524,20 @@ compat::Expected<Fetch, ErrorCode> MoQFrameParser::parseFetch(
 
   if (getDraftMajorVersion(*version_) < 15) {
     if (length < 1) {
-      LOG(DBG4) << "parseFetch: UNDERFLOW on priority";
+      XLOG(DBG4) << "parseFetch: UNDERFLOW on priority";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     fetch.priority = cursor.readBE<uint8_t>();
     length -= sizeof(uint8_t);
 
     if (length < 1) {
-      LOG(DBG4) << "parseFetch: UNDERFLOW on order";
+      XLOG(DBG4) << "parseFetch: UNDERFLOW on order";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
 
     auto order = cursor.readBE<uint8_t>();
     if (order > to_underlying(GroupOrder::NewestFirst)) {
-      LOG(ERR) << "order > NewestFirst =" << order;
+      XLOG(ERR) << "order > NewestFirst =" << order;
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     fetch.groupOrder = static_cast<GroupOrder>(order);
@@ -2554,12 +2556,12 @@ compat::Expected<Fetch, ErrorCode> MoQFrameParser::parseFetch(
 
   auto fetchType = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!fetchType) {
-    LOG(DBG4) << "parseFetch: UNDERFLOW on fetchType";
+    XLOG(DBG4) << "parseFetch: UNDERFLOW on fetchType";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   if (fetchType->first == 0 ||
       fetchType->first > to_underlying(FetchType::ABSOLUTE_JOINING)) {
-    LOG(ERR) << "fetchType = 0 or fetchType > JONING =" << fetchType->first;
+    XLOG(ERR) << "fetchType = 0 or fetchType > JONING =" << fetchType->first;
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   length -= fetchType->second;
@@ -2586,14 +2588,14 @@ compat::Expected<Fetch, ErrorCode> MoQFrameParser::parseFetch(
     // Relative or absolute join
     auto jsid = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!jsid) {
-      LOG(DBG4) << "parseFetch: UNDERFLOW on jsid";
+      XLOG(DBG4) << "parseFetch: UNDERFLOW on jsid";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= jsid->second;
 
     auto joiningStart = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!joiningStart) {
-      LOG(DBG4) << "parseFetch: UNDERFLOW on joiningStart";
+      XLOG(DBG4) << "parseFetch: UNDERFLOW on joiningStart";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= joiningStart->second;
@@ -2604,7 +2606,7 @@ compat::Expected<Fetch, ErrorCode> MoQFrameParser::parseFetch(
   }
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    LOG(DBG4) << "parseFetch: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parseFetch: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -2643,7 +2645,7 @@ compat::Expected<FetchCancel, ErrorCode> MoQFrameParser::parseFetchCancel(
   FetchCancel fetchCancel;
   auto res = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!res) {
-    LOG(DBG4) << "parseFetchCancel: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseFetchCancel: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   fetchCancel.requestID = res->first;
@@ -2660,7 +2662,7 @@ compat::Expected<FetchOk, ErrorCode> MoQFrameParser::parseFetchOk(
   FetchOk fetchOk;
   auto res = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!res) {
-    LOG(DBG4) << "parseFetchOk: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseFetchOk: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   fetchOk.requestID = res->first;
@@ -2668,12 +2670,12 @@ compat::Expected<FetchOk, ErrorCode> MoQFrameParser::parseFetchOk(
 
   // Check for next two bytes
   if (length < 2) {
-    LOG(DBG4) << "parseFetchOk: UNDERFLOW on order/endOfTrack";
+    XLOG(DBG4) << "parseFetchOk: UNDERFLOW on order/endOfTrack";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   auto order = cursor.readBE<uint8_t>();
   if (order > to_underlying(GroupOrder::NewestFirst)) {
-    LOG(ERR) << "order = 0 or order > NewestFirst =" << order;
+    XLOG(ERR) << "order = 0 or order > NewestFirst =" << order;
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   fetchOk.groupOrder = static_cast<GroupOrder>(order);
@@ -2688,7 +2690,7 @@ compat::Expected<FetchOk, ErrorCode> MoQFrameParser::parseFetchOk(
 
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    LOG(DBG4) << "parseFetchOk: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parseFetchOk: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -2714,7 +2716,7 @@ MoQFrameParser::parseSubscribeNamespace(
   // Parse Request ID
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parseSubscribeNamespace: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseSubscribeNamespace: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
@@ -2732,7 +2734,7 @@ MoQFrameParser::parseSubscribeNamespace(
   if (getDraftMajorVersion(*version_) >= 16) {
     auto options = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!options) {
-      LOG(DBG4) << "parseSubscribeNamespace: UNDERFLOW on options";
+      XLOG(DBG4) << "parseSubscribeNamespace: UNDERFLOW on options";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= options->second;
@@ -2743,7 +2745,7 @@ MoQFrameParser::parseSubscribeNamespace(
   // Parse Parameters
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    LOG(DBG4) << "parseSubscribeNamespace: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parseSubscribeNamespace: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -2801,7 +2803,7 @@ compat::Expected<RequestError, ErrorCode> MoQFrameParser::parseRequestError(
   // Parse requestID
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    LOG(DBG4) << "parseRequestError: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseRequestError: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
@@ -2810,7 +2812,7 @@ compat::Expected<RequestError, ErrorCode> MoQFrameParser::parseRequestError(
   // Parse errorCode
   auto errorCode = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!errorCode) {
-    LOG(DBG4) << "parseRequestError: UNDERFLOW on errorCode";
+    XLOG(DBG4) << "parseRequestError: UNDERFLOW on errorCode";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= errorCode->second;
@@ -2873,7 +2875,7 @@ compat::Expected<Namespace, ErrorCode> MoQFrameParser::parseNamespace(
   // Parse Track Namespace Suffix
   auto res = parseFixedTuple(cursor, length);
   if (!res) {
-    LOG(DBG4) << "parseNamespace: error parsing track namespace suffix";
+    XLOG(DBG4) << "parseNamespace: error parsing track namespace suffix";
     return compat::makeUnexpected(res.error());
   }
   ns.trackNamespaceSuffix = TrackNamespace(std::move(res.value()));
@@ -2897,7 +2899,7 @@ compat::Expected<NamespaceDone, ErrorCode> MoQFrameParser::parseNamespaceDone(
   // Parse Track Namespace Suffix
   auto res = parseFixedTuple(cursor, length);
   if (!res) {
-    LOG(DBG4) << "parseNamespaceDone: error parsing track namespace suffix";
+    XLOG(DBG4) << "parseNamespaceDone: error parsing track namespace suffix";
     return compat::makeUnexpected(res.error());
   }
   namespaceDone.trackNamespaceSuffix = TrackNamespace(std::move(res.value()));
@@ -2936,12 +2938,12 @@ compat::Expected<compat::Unit, ErrorCode> MoQFrameParser::parseExtensions(
   // Parse the length of the extension block
   auto extLen = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!extLen) {
-    LOG(DBG4) << "parseExtensions: UNDERFLOW on extLen";
+    XLOG(DBG4) << "parseExtensions: UNDERFLOW on extLen";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= extLen->second;
   if (extLen->first > length) {
-    LOG(DBG4) << "Extension block length provided exceeds remaining length";
+    XLOG(DBG4) << "Extension block length provided exceeds remaining length";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   // Parse the extensions
@@ -2949,7 +2951,7 @@ compat::Expected<compat::Unit, ErrorCode> MoQFrameParser::parseExtensions(
   auto parseExtensionKvPairsResult =
       parseExtensionKvPairs(cursor, objectHeader, extensionBlockLength, true);
   if (!parseExtensionKvPairsResult.hasValue()) {
-    LOG(DBG4) << "parseExtensions: error in parseExtensionKvPairs: "
+    XLOG(DBG4) << "parseExtensions: error in parseExtensionKvPairs: "
                << to_underlying(parseExtensionKvPairsResult.error())
                << " group=" << objectHeader.group
                << " subgroup=" << objectHeader.subgroup
@@ -2977,7 +2979,7 @@ compat::Expected<compat::Unit, ErrorCode> MoQFrameParser::parseExtensionKvPairs(
     auto parseExtensionResult = parseExtension(
         cursor, extensionBlockLength, objectHeader, allowImmutable);
     if (parseExtensionResult.hasError()) {
-      LOG(DBG4) << "parseExtensionKvPairs: error in parseExtension: "
+      XLOG(DBG4) << "parseExtensionKvPairs: error in parseExtension: "
                  << to_underlying(parseExtensionResult.error());
       return compat::makeUnexpected(parseExtensionResult.error());
     }
@@ -2992,7 +2994,7 @@ compat::Expected<compat::Unit, ErrorCode> MoQFrameParser::parseExtension(
     bool allowImmutable) const noexcept {
   auto type = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!type) {
-    LOG(DBG4) << "parseExtension: UNDERFLOW on type";
+    XLOG(DBG4) << "parseExtension: UNDERFLOW on type";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= type->second;
@@ -3012,7 +3014,7 @@ compat::Expected<compat::Unit, ErrorCode> MoQFrameParser::parseExtension(
   // immutable extension.
   if (!allowImmutable && getDraftMajorVersion(*version_) >= 14 &&
       actualType == kImmutableExtensionType) {
-    LOG(ERR) << "Immutable extension encountered when not allowed";
+    XLOG(ERR) << "Immutable extension encountered when not allowed";
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
 
@@ -3032,19 +3034,19 @@ compat::Expected<compat::Unit, ErrorCode> MoQFrameParser::parseExtension(
   if (ext.type & 0x1) {
     auto extLen = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!extLen) {
-      LOG(DBG4) << "parseExtension: UNDERFLOW on extLen, ext.type=" << ext.type
+      XLOG(DBG4) << "parseExtension: UNDERFLOW on extLen, ext.type=" << ext.type
                  << " length=" << length;
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= extLen->second;
     if (length < extLen->first) {
-      LOG(DBG4) << "parseExtension: UNDERFLOW on ext array value"
+      XLOG(DBG4) << "parseExtension: UNDERFLOW on ext array value"
                  << " ext.type=" << ext.type << " length=" << length
                  << " extLen=" << extLen->first;
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     if (extLen->first > kMaxExtensionLength) {
-      LOG(ERR) << "extLen > kMaxExtensionLength =" << extLen->first;
+      XLOG(ERR) << "extLen > kMaxExtensionLength =" << extLen->first;
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
 
@@ -3058,7 +3060,7 @@ compat::Expected<compat::Unit, ErrorCode> MoQFrameParser::parseExtension(
           extLen->first,
           /*allowImmutable=*/false);
       if (parseInnerResult.hasError()) {
-        LOG(DBG4)
+        XLOG(DBG4)
             << "parseExtension: error in parseExtensionKvPairs (immutable): "
             << to_underlying(parseInnerResult.error())
             << " ext.type=" << ext.type << " length=" << length
@@ -3081,7 +3083,7 @@ compat::Expected<compat::Unit, ErrorCode> MoQFrameParser::parseExtension(
     // Even-type extension (integer value)
     auto iVal = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!iVal) {
-      LOG(DBG4) << "parseExtension: UNDERFLOW on intValue"
+      XLOG(DBG4) << "parseExtension: UNDERFLOW on intValue"
                  << " ext.type=" << ext.type << " length=" << length;
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
@@ -3103,11 +3105,11 @@ MoQFrameParser::parseFixedTuple(moxygen::Cursor& cursor, size_t& length)
     const noexcept {
   auto itemCount = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!itemCount) {
-    LOG(DBG4) << "parseFixedTuple: UNDERFLOW on itemCount";
+    XLOG(DBG4) << "parseFixedTuple: UNDERFLOW on itemCount";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   if (itemCount->first > kMaxNamespaceLength) {
-    LOG(ERR) << "tuple length > kMaxNamespaceLength =" << itemCount->first;
+    XLOG(ERR) << "tuple length > kMaxNamespaceLength =" << itemCount->first;
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   length -= itemCount->second;
@@ -3374,7 +3376,7 @@ WriteResult writeClientSetup(
       writeVarint(writeBuf, ver, size, error);
     }
   } else {
-    LOG(DBG3)
+    XLOG(DBG3)
         << "Skipped writing versions to wire for alpn ClientSetup message";
   }
 
@@ -3432,7 +3434,7 @@ WriteResult writeServerSetup(
         << getSupportedVersionsString();
     writeVarint(writeBuf, serverSetup.selectedVersion, size, error);
   } else {
-    LOG(DBG3)
+    XLOG(DBG3)
         << "Skipped writing version to wire for alpn ClientSetup message";
   }
 
@@ -3483,7 +3485,7 @@ WriteResult MoQFrameWriter::writeSubgroupHeader(
 
   bool priorityPresent = objectHeader.priority.has_value();
   if (getDraftMajorVersion(version_.value()) < 15 && !priorityPresent) {
-    LOG(ERR) << "Priority must be set for Draft-14 and earlier versions";
+    XLOG(ERR) << "Priority must be set for Draft-14 and earlier versions";
     return compat::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
   }
 
@@ -3850,7 +3852,7 @@ WriteResult MoQFrameWriter::writeDatagramObject(
 
   if (getDraftMajorVersion(version_.value()) < 15 &&
       !objectHeader.priority.has_value()) {
-    LOG(ERR) << "Priority must be set for Draft-14 and earlier versions";
+    XLOG(ERR) << "Priority must be set for Draft-14 and earlier versions";
     return compat::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
   }
   bool priorityPresent = objectHeader.priority.has_value();

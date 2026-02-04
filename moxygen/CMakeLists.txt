@@ -51,10 +51,15 @@ if(MOXYGEN_USE_FOLLY)
         moqcompat
         Folly::folly
         wangle::wangle
-        proxygen::proxygen
-        mvfst::mvfst_events
-        mlogger
     )
+    # Add mvfst/proxygen deps only when using mvfst backend
+    if(MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
+        target_link_libraries(
+            moxygen PUBLIC
+            proxygen::proxygen
+            mvfst::mvfst_events
+        )
+    endif()
 else()
     # Std-mode: minimal dependencies
     target_link_libraries(
@@ -111,6 +116,11 @@ install(
     ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
     LIBRARY DESTINATION ${LIB_INSTALL_DIR}
 )
+
+add_subdirectory(mlog)
+
+# mvfst-specific components (executor, server, client libraries)
+if(MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
 
 add_library(moqfollyexecutorimpl
     events/MoQFollyExecutorImpl.cpp
@@ -198,17 +208,21 @@ target_link_libraries(
     proxygen::proxygenhqserver
 )
 
-add_subdirectory(mlog)
-add_subdirectory(relay)
-# TODO: Fails with compiler error in ubuntu P1361252588
-# add_subdirectory(samples/chat)
-add_subdirectory(samples/text-client)
-add_subdirectory(samples/date)
-add_subdirectory(samples/flv_streamer_client)
-add_subdirectory(samples/flv_receiver_client)
-add_subdirectory(moq_mi)
-add_subdirectory(moqtest)
-add_subdirectory(flv_parser)
-add_subdirectory(test)
+endif() # MOXYGEN_QUIC_BACKEND == mvfst
+
+# relay and related components require mvfst/proxygen
+if(MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
+  add_subdirectory(relay)
+  # TODO: Fails with compiler error in ubuntu P1361252588
+  # add_subdirectory(samples/chat)
+  add_subdirectory(samples/text-client)
+  add_subdirectory(samples/date)
+  add_subdirectory(samples/flv_streamer_client)
+  add_subdirectory(samples/flv_receiver_client)
+  add_subdirectory(moq_mi)
+  add_subdirectory(moqtest)
+  add_subdirectory(flv_parser)
+  add_subdirectory(test)
+endif()
 
 endif() # MOXYGEN_USE_FOLLY

@@ -11,7 +11,7 @@
 #include "folly/SocketAddress.h"
 #include "folly/json/dynamic.h"
 #include "folly/json/json.h"
-#include "quic/codec/QuicConnectionId.h"
+#include "moxygen/compat/ConnectionId.h"
 #include "moxygen/MoQTypes.h"
 #include "moxygen/mlog/MLogEvents.h"
 #include "moxygen/mlog/MLogTypes.h"
@@ -212,8 +212,8 @@ class MLogger {
   void setPath(const std::string& path);
 
   // Setter APIs for connection metadata (used by ScubaMLogger)
-  void setDcid(const quic::ConnectionId& dcid);
-  void setSrcCid(const quic::ConnectionId& srcCid);
+  void setDcid(const compat::ConnectionId& dcid);
+  void setSrcCid(const compat::ConnectionId& srcCid);
   void setPeerAddress(const folly::SocketAddress& peerAddress);
   void setLocalAddress(const folly::SocketAddress& localAddress);
   void setNegotiatedMoQVersion(uint64_t version);
@@ -227,8 +227,8 @@ class MLogger {
   MLogEventCreator eventCreator_ = MLogEventCreator();
 
   // Connection metadata (populated via setters, consumed by ScubaMLogger)
-  std::optional<quic::ConnectionId> dcid_;
-  std::optional<quic::ConnectionId> srcCid_;
+  std::optional<compat::ConnectionId> dcid_;
+  std::optional<compat::ConnectionId> srcCid_;
   std::optional<folly::SocketAddress> peerAddress_;
   std::optional<folly::SocketAddress> localAddress_;
   std::optional<uint64_t> negotiatedMoQVersion_;

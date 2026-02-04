@@ -157,7 +157,7 @@ void MoQRelaySession::publishNamespaceWithCallback(
     std::shared_ptr<compat::ResultCallback<
         std::shared_ptr<Subscriber::PublishNamespaceHandle>,
         PublishNamespaceError>> callback) {
-  LOG(INFO) << __func__ << " ns=" << ann.trackNamespace << " sess=" << this;
+  XLOG(INFO) << __func__ << " ns=" << ann.trackNamespace << " sess=" << this;
 
   const auto& trackNamespace = ann.trackNamespace;
   ann.requestID = getNextRequestID();
@@ -184,7 +184,7 @@ void MoQRelaySession::subscribeNamespaceWithCallback(
     std::shared_ptr<compat::ResultCallback<
         std::shared_ptr<Publisher::SubscribeNamespaceHandle>,
         SubscribeNamespaceError>> callback) {
-  LOG(INFO) << __func__ << " prefix=" << subAnn.trackNamespacePrefix
+  XLOG(INFO) << __func__ << " prefix=" << subAnn.trackNamespacePrefix
             << " sess=" << this;
 
   const auto& trackNamespace = subAnn.trackNamespacePrefix;
@@ -207,10 +207,10 @@ void MoQRelaySession::subscribeNamespaceWithCallback(
 
 // Incoming message handlers
 void MoQRelaySession::onPublishNamespace(PublishNamespace ann) {
-  LOG(INFO) << __func__ << " ns=" << ann.trackNamespace << " sess=" << this;
+  XLOG(INFO) << __func__ << " ns=" << ann.trackNamespace << " sess=" << this;
 
   if (!subscribeHandler_) {
-    LOG(INFO) << __func__ << " No subscriber callback set";
+    XLOG(INFO) << __func__ << " No subscriber callback set";
     publishNamespaceError(PublishNamespaceError{
         ann.requestID,
         PublishNamespaceErrorCode::NOT_SUPPORTED,
@@ -228,7 +228,7 @@ void MoQRelaySession::onPublishNamespace(PublishNamespace ann) {
 
 void MoQRelaySession::onPublishNamespaceCancel(
     PublishNamespaceCancel publishNamespaceCancel) {
-  LOG(INFO) << __func__ << " sess=" << this;
+  XLOG(INFO) << __func__ << " sess=" << this;
 
   RequestID reqId;
   if (getNegotiatedVersion() &&
@@ -261,7 +261,7 @@ void MoQRelaySession::onPublishNamespaceCancel(
 }
 
 void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone unAnn) {
-  LOG(INFO) << __func__ << " sess=" << this;
+  XLOG(INFO) << __func__ << " sess=" << this;
 
   RequestID reqId;
   if (getNegotiatedVersion() &&
@@ -291,11 +291,11 @@ void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone unAnn) {
 }
 
 void MoQRelaySession::onSubscribeNamespace(SubscribeNamespace sa) {
-  LOG(INFO) << __func__ << " prefix=" << sa.trackNamespacePrefix
+  XLOG(INFO) << __func__ << " prefix=" << sa.trackNamespacePrefix
             << " sess=" << this;
 
   if (!publishHandler_) {
-    LOG(INFO) << __func__ << " No publisher callback set";
+    XLOG(INFO) << __func__ << " No publisher callback set";
     subscribeNamespaceError(SubscribeNamespaceError{
         sa.requestID,
         SubscribeNamespaceErrorCode::NOT_SUPPORTED,
@@ -311,7 +311,7 @@ void MoQRelaySession::onSubscribeNamespace(SubscribeNamespace sa) {
 }
 
 void MoQRelaySession::onRequestOk(RequestOk requestOk, FrameType frameType) {
-  LOG(INFO) << __func__ << " id=" << requestOk.requestID << " sess=" << this;
+  XLOG(INFO) << __func__ << " id=" << requestOk.requestID << " sess=" << this;
 
   // Check pending publishNamespace
   auto pubIt = pendingPublishNamespaces_.find(requestOk.requestID);
@@ -363,7 +363,7 @@ void MoQRelaySession::onRequestOk(RequestOk requestOk, FrameType frameType) {
 }
 
 void MoQRelaySession::onUnsubscribeNamespace(UnsubscribeNamespace unsub) {
-  LOG(INFO) << __func__ << " sess=" << this;
+  XLOG(INFO) << __func__ << " sess=" << this;
 
   RequestID requestID;
   if (getNegotiatedVersion() &&
@@ -400,7 +400,7 @@ void MoQRelaySession::onUnsubscribeNamespace(UnsubscribeNamespace unsub) {
 
 // Internal methods
 void MoQRelaySession::subscribeNamespaceOk(const SubscribeNamespaceOk& saOk) {
-  LOG(INFO) << __func__ << " id=" << saOk.requestID << " sess=" << this;
+  XLOG(INFO) << __func__ << " id=" << saOk.requestID << " sess=" << this;
   auto res = moqFrameWriter_.writeSubscribeNamespaceOk(controlWriteBuf_, saOk);
   if (!res) {
     LOG(ERROR) << "writeSubscribeNamespaceOk failed";
@@ -408,7 +408,7 @@ void MoQRelaySession::subscribeNamespaceOk(const SubscribeNamespaceOk& saOk) {
 }
 
 void MoQRelaySession::unsubscribeNamespace(const UnsubscribeNamespace& unsub) {
-  LOG(INFO) << __func__ << " sess=" << this;
+  XLOG(INFO) << __func__ << " sess=" << this;
   auto res =
       moqFrameWriter_.writeUnsubscribeNamespace(controlWriteBuf_, unsub);
   if (!res) {
@@ -417,7 +417,7 @@ void MoQRelaySession::unsubscribeNamespace(const UnsubscribeNamespace& unsub) {
 }
 
 void MoQRelaySession::publishNamespaceOk(const PublishNamespaceOk& annOk) {
-  LOG(INFO) << __func__ << " reqID=" << annOk.requestID << " sess=" << this;
+  XLOG(INFO) << __func__ << " reqID=" << annOk.requestID << " sess=" << this;
   auto res = moqFrameWriter_.writePublishNamespaceOk(controlWriteBuf_, annOk);
   if (!res) {
     LOG(ERROR) << "writePublishNamespaceOk failed";

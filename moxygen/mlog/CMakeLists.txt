@@ -23,8 +23,13 @@ target_compile_options(
 target_link_libraries(
     mlogger PUBLIC
     Folly::folly
-    mvfst::mvfst_codec_types
+    moqcompat
 )
+
+# Add mvfst dependency only when using mvfst backend
+if(MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
+    target_link_libraries(mlogger PUBLIC mvfst::mvfst_codec_types)
+endif()
 
 install(
     TARGETS mlogger

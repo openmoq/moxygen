@@ -66,7 +66,7 @@ void runSubscribe(
     client->drain();
   });
 
-  LOG(INFO) << "Sent " << trackConsumer->getDataSent()
+  XLOG(INFO) << "Sent " << trackConsumer->getDataSent()
             << " bytes in 10 seconds.";
 }
 
@@ -87,7 +87,7 @@ void runFetch(
     client->drain();
   });
 
-  LOG(INFO) << "Received " << fetchConsumer->getFetchDataSent()
+  XLOG(INFO) << "Received " << fetchConsumer->getFetchDataSent()
             << " bytes in 10 seconds.";
 }
 

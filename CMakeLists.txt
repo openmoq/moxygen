@@ -49,6 +49,17 @@ if(NOT MOXYGEN_QUIC_BACKEND STREQUAL "mvfst" AND NOT MOXYGEN_QUIC_BACKEND STREQU
   message(FATAL_ERROR "MOXYGEN_QUIC_BACKEND must be 'mvfst' or 'picoquic', got '${MOXYGEN_QUIC_BACKEND}'")
 endif()
 
+# TLS backend selection (only relevant for picoquic)
+set(MOXYGEN_TLS_BACKEND "openssl" CACHE STRING "TLS library for picoquic (openssl or mbedtls)")
+set_property(CACHE MOXYGEN_TLS_BACKEND PROPERTY STRINGS "openssl" "mbedtls")
+
+# Validate TLS backend (only for picoquic)
+if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
+  if(NOT MOXYGEN_TLS_BACKEND STREQUAL "openssl" AND NOT MOXYGEN_TLS_BACKEND STREQUAL "mbedtls")
+    message(FATAL_ERROR "MOXYGEN_TLS_BACKEND must be 'openssl' or 'mbedtls', got '${MOXYGEN_TLS_BACKEND}'")
+  endif()
+endif()
+
 # Define compile-time flags for QUIC backend
 if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
   add_compile_definitions(MOXYGEN_QUIC_PICOQUIC=1)
@@ -62,6 +73,9 @@ endif()
 message(STATUS "Moxygen build configuration:")
 message(STATUS "  MOXYGEN_USE_FOLLY: ${MOXYGEN_USE_FOLLY}")
 message(STATUS "  MOXYGEN_QUIC_BACKEND: ${MOXYGEN_QUIC_BACKEND}")
+if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
+  message(STATUS "  MOXYGEN_TLS_BACKEND: ${MOXYGEN_TLS_BACKEND}")
+endif()
 
 # Valid configurations:
 #   1. FOLLY=ON,  QUIC=mvfst    - Default: Full folly + proxygen/mvfst stack
@@ -107,8 +121,20 @@ elseif(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
   # Picoquic - fetch from GitHub
   include(FetchContent)
 
-  # Find OpenSSL first (required by picotls and picoquic)
-  find_package(OpenSSL REQUIRED)
+  # Find TLS library based on selected backend
+  if(MOXYGEN_TLS_BACKEND STREQUAL "openssl")
+    find_package(OpenSSL REQUIRED)
+    set(WITH_OPENSSL ON CACHE BOOL "" FORCE)
+    set(WITH_MBEDTLS OFF CACHE BOOL "" FORCE)
+    message(STATUS "  Using OpenSSL for TLS")
+  elseif(MOXYGEN_TLS_BACKEND STREQUAL "mbedtls")
+    # mbedTLS must be installed
+    find_package(MbedTLS REQUIRED)
+    message(STATUS "  Found mbedTLS: ${MBEDTLS_INCLUDE_DIRS}")
+    set(WITH_OPENSSL OFF CACHE BOOL "" FORCE)
+    set(WITH_MBEDTLS ON CACHE BOOL "" FORCE)
+    message(STATUS "  Using mbedTLS for TLS")
+  endif()
 
   # Picoquic options
   set(picoquic_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -117,8 +143,6 @@ elseif(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
   set(BUILD_LOGREADER OFF CACHE BOOL "" FORCE)
   set(BUILD_PQBENCH OFF CACHE BOOL "" FORCE)
   set(BUILD_LOGLIB OFF CACHE BOOL "" FORCE)
-  set(WITH_OPENSSL ON CACHE BOOL "" FORCE)
-  set(WITH_MBEDTLS OFF CACHE BOOL "" FORCE)
   set(PICOQUIC_FETCH_PTLS ON CACHE BOOL "" FORCE)  # Auto-fetch picotls
 
   FetchContent_Declare(

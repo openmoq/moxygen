@@ -6,13 +6,14 @@
 
 #include "moxygen/MoQCodec.h"
 
-#include <moxygen/compat/Debug.h>
-
 #if MOXYGEN_USE_FOLLY
 #include <quic/folly_utils/Utils.h>
 #endif
 
 #include <iomanip>
+
+// Include Debug.h last to ensure LOG macro redirects to XLOG
+#include <moxygen/compat/Debug.h>
 
 namespace moxygen {
 
@@ -31,7 +32,7 @@ MoQCodec::ParseResult MoQControlCodec::onIngress(
       case ParseState::FRAME_HEADER_TYPE: {
         auto type = quic::follyutils::decodeQuicInteger(cursor);
         if (!type) {
-          LOG(DBG6) << __func__ << " underflow";
+          XLOG(DBG6) << __func__ << " underflow";
           connError_ = ErrorCode::PARSE_UNDERFLOW;
           break;
         }
@@ -39,7 +40,7 @@ MoQCodec::ParseResult MoQControlCodec::onIngress(
         remainingLength -= type->second;
         auto res = checkFrameAllowed(curFrameType_);
         if (!res) {
-          LOG(DBG4) << "Frame not allowed: 0x" << std::setfill('0')
+          XLOG(DBG4) << "Frame not allowed: 0x" << std::setfill('0')
                      << std::setw(sizeof(uint64_t) * 2) << std::hex
                      << (uint64_t)curFrameType_ << " on streamID=" << streamId_;
           connError_.emplace(ErrorCode::PROTOCOL_VIOLATION);
@@ -64,7 +65,7 @@ MoQCodec::ParseResult MoQControlCodec::onIngress(
             curFrameType_ == FrameType::LEGACY_SERVER_SETUP) {
           parseFrameLengthAs16bit = false;
         } else if (!moqFrameParser_.getVersion().has_value()) {
-          LOG(DBG4)
+          XLOG(DBG4)
               << "Received a non-setup frame before knowing the negotiated version";
           connError_.emplace(ErrorCode::PROTOCOL_VIOLATION);
           break;
@@ -75,7 +76,7 @@ MoQCodec::ParseResult MoQControlCodec::onIngress(
 
         if (parseFrameLengthAs16bit) {
           if (remainingLength < 2) {
-            LOG(DBG6) << __func__ << " underflow";
+            XLOG(DBG6) << __func__ << " underflow";
             connError_ = ErrorCode::PARSE_UNDERFLOW;
             break;
           }
@@ -86,7 +87,7 @@ MoQCodec::ParseResult MoQControlCodec::onIngress(
           // Parse the length as a varint
           auto decodeResult = quic::follyutils::decodeQuicInteger(cursor);
           if (!decodeResult) {
-            LOG(DBG6) << __func__ << " underflow";
+            XLOG(DBG6) << __func__ << " underflow";
             connError_ = ErrorCode::PARSE_UNDERFLOW;
             break;
           }
@@ -100,15 +101,15 @@ MoQCodec::ParseResult MoQControlCodec::onIngress(
       }
       case ParseState::FRAME_PAYLOAD: {
         if (remainingLength < curFrameLength_) {
-          LOG(DBG6) << __func__ << " underflow";
+          XLOG(DBG6) << __func__ << " underflow";
           connError_ = ErrorCode::PARSE_UNDERFLOW;
           break;
         }
         auto res = parseFrame(cursor);
         if (res.hasError()) {
-          LOG(DBG6) << __func__ << " " << uint32_t(res.error());
+          XLOG(DBG6) << __func__ << " " << uint32_t(res.error());
           if (res.error() == ErrorCode::PARSE_UNDERFLOW) {
-            LOG(ERR) << "Frame underflow -> parse error";
+            XLOG(ERR) << "Frame underflow -> parse error";
             connError_ = ErrorCode::PROTOCOL_VIOLATION;
           } else {
             connError_ = res.error();
@@ -139,7 +140,7 @@ void MoQCodec::onIngressEnd(
       connError_.reset();
       return;
     } else if (callback) {
-      LOG(ERR) << "Conn error=" << uint32_t(*connError_);
+      XLOG(ERR) << "Conn error=" << uint32_t(*connError_);
       callback->onConnectionError(*connError_);
     }
   }
@@ -190,7 +191,7 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
       case ParseState::STREAM_HEADER_TYPE: {
         auto type = quic::follyutils::decodeQuicInteger(cursor);
         if (!type) {
-          LOG(DBG6) << __func__ << " underflow";
+          XLOG(DBG6) << __func__ << " underflow";
           connError_ = ErrorCode::PARSE_UNDERFLOW;
           break;
         }
@@ -204,7 +205,7 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
           subgroupOptions_ = getSubgroupOptions(*version, streamType_);
           streamType_ = StreamType::SUBGROUP_HEADER_SG;
         } else {
-          LOG(ERR) << "Invalid stream type: 0x" << std::setfill('0')
+          XLOG(ERR) << "Invalid stream type: 0x" << std::setfill('0')
                     << std::setw(sizeof(uint64_t) * 2) << std::hex
                     << (uint64_t)type->first << " on streamID=" << streamId_;
           connError_.emplace(ErrorCode::PROTOCOL_VIOLATION);
@@ -216,7 +217,7 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
         size_t remainingLength = ingress_.chainLength() - totalBytesConsumed;
         auto res = moqFrameParser_.parseFetchHeader(cursor, remainingLength);
         if (res.hasError()) {
-          LOG(DBG4) << __func__ << " " << uint32_t(res.error());
+          XLOG(DBG4) << __func__ << " " << uint32_t(res.error());
           connError_ = res.error();
           break;
         }
@@ -225,7 +226,7 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
         if (callback_) {
           auto result = callback_->onFetchHeader(requestID);
           if (result == ParseResult::ERROR_TERMINATE) {
-            LOG(DBG4) << __func__ << " fetch callback returned terminate";
+            XLOG(DBG4) << __func__ << " fetch callback returned terminate";
             return result;
           }
         }
@@ -238,7 +239,7 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
             cursor, remainingLength, subgroupOptions_);
 
         if (res.hasError()) {
-          LOG(DBG6) << __func__ << " " << uint32_t(res.error());
+          XLOG(DBG6) << __func__ << " " << uint32_t(res.error());
           connError_ = res.error();
           break;
         }
@@ -257,7 +258,7 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
             ingress_.trimStart(ingress_.chainLength() - cursor.totalLength());
             return ParseResult::BLOCKED;
           } else if (result == ParseResult::ERROR_TERMINATE) {
-            LOG(DBG) << "subgroup callback returned ERROR_TERIMNATE";
+            XLOG(DBG) << "subgroup callback returned ERROR_TERIMNATE";
             return result;
           }
         }
@@ -278,14 +279,14 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
               cursor, remainingLength, curObjectHeader_, subgroupOptions_);
         }
         if (res.hasError()) {
-          LOG(DBG4) << __func__ << " " << uint32_t(res.error());
+          XLOG(DBG4) << __func__ << " " << uint32_t(res.error());
           connError_ = res.error();
           break;
         }
         totalBytesConsumed += res->bytesConsumed;
         curObjectHeader_ = res->value;
         if (curObjectHeader_.status == ObjectStatus::NORMAL) {
-          LOG(DBG2) << "Parsing object with length, need="
+          XLOG(DBG2) << "Parsing object with length, need="
                      << *curObjectHeader_.length
                      << " have=" << ingress_.chainLength() - totalBytesConsumed;
           trimStart();
@@ -294,9 +295,9 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
           auto iobuf = splitAndResetCursor(chunkLen);
           auto endOfObject = chunkLen == *curObjectHeader_.length;
           if (endOfStream && !endOfObject) {
-            LOG(ERR) << "End of stream before end of object";
+            XLOG(ERR) << "End of stream before end of object";
             connError_ = ErrorCode::PROTOCOL_VIOLATION;
-            LOG(DBG4) << __func__ << " " << uint32_t(*connError_);
+            XLOG(DBG4) << __func__ << " " << uint32_t(*connError_);
             break;
           }
           if (callback_) {
@@ -310,12 +311,12 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
                 endOfObject,
                 endOfStream && ingress_.chainLength() == 0);
             if (result == ParseResult::BLOCKED) {
-              LOG(ERR)
+              XLOG(ERR)
                   << "onObjectBegin returned BLOCKED, converting to ERROR";
               connError_ = ErrorCode::INTERNAL_ERROR;
               break;
             } else if (result == ParseResult::ERROR_TERMINATE) {
-              LOG(DBG) << "onObjectBegin callback returned ERROR_TERMINATE";
+              XLOG(DBG) << "onObjectBegin callback returned ERROR_TERMINATE";
               return result;
             }
           }
@@ -339,12 +340,12 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
                 curObjectHeader_.priority,
                 curObjectHeader_.status);
             if (result == ParseResult::BLOCKED) {
-              LOG(ERR)
+              XLOG(ERR)
                   << "onObjectStatus returned BLOCKED, converting to ERROR";
               connError_ = ErrorCode::INTERNAL_ERROR;
               break;
             } else if (result == ParseResult::ERROR_TERMINATE) {
-              LOG(DBG) << "onObjectStatus callback returned ERROR_TERMINATE";
+              XLOG(DBG) << "onObjectStatus callback returned ERROR_TERMINATE";
               return result;
             }
           }
@@ -363,13 +364,13 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
         trimStart();
 
         CHECK(curObjectHeader_.length);
-        LOG(DBG2) << "Parsing object with length, need="
+        XLOG(DBG2) << "Parsing object with length, need="
                    << *curObjectHeader_.length;
         auto chunkLen = availableForObject(*curObjectHeader_.length);
         auto iobuf = splitAndResetCursor(chunkLen);
         *curObjectHeader_.length -= chunkLen;
         if (endOfStream && *curObjectHeader_.length != 0) {
-          LOG(ERR) << "End of stream before end of object remaining length="
+          XLOG(ERR) << "End of stream before end of object remaining length="
                     << *curObjectHeader_.length;
           connError_ = ErrorCode::PROTOCOL_VIOLATION;
           break;
@@ -380,12 +381,12 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
           auto result =
               callback_->onObjectPayload(std::move(payload), endOfObject);
           if (result == ParseResult::BLOCKED) {
-            LOG(ERR)
+            XLOG(ERR)
                 << "onObjectPayload returned BLOCKED, converting to ERROR";
             connError_ = ErrorCode::INTERNAL_ERROR;
             break;
           } else if (result == ParseResult::ERROR_TERMINATE) {
-            LOG(DBG) << "onObjectPayload callback returned ERROR_TERMINATE";
+            XLOG(DBG) << "onObjectPayload callback returned ERROR_TERMINATE";
             return result;
           }
         }
@@ -395,7 +396,7 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
         break;
       }
       case ParseState::STREAM_FIN_DELIVERED: {
-        LOG(DBG2) << "Bytes=" << ingress_.chainLength()
+        XLOG(DBG2) << "Bytes=" << ingress_.chainLength()
                    << " remaining in STREAM_FIN_DELIVERED";
         connError_ = ErrorCode::PROTOCOL_VIOLATION;
         break;
@@ -418,12 +419,12 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
 
 compat::Expected<compat::Unit, ErrorCode> MoQControlCodec::parseFrame(
     Cursor& cursor) {
-  LOG(DBG4) << "parsing frame type=" << compat::to_underlying(curFrameType_);
+  XLOG(DBG4) << "parsing frame type=" << compat::to_underlying(curFrameType_);
   if (!seenSetup_) {
     switch (curFrameType_) {
       case FrameType::LEGACY_CLIENT_SETUP:
       case FrameType::LEGACY_SERVER_SETUP:
-        LOG(WARN) << "Skipping unexpected legacy setup frame "
+        XLOG(WARN) << "Skipping unexpected legacy setup frame "
                    << curFrameType_;
         cursor.skip(curFrameLength_);
         break;
@@ -458,7 +459,7 @@ compat::Expected<compat::Unit, ErrorCode> MoQControlCodec::parseFrame(
         break;
       }
       default:
-        LOG(ERR) << "Invalid message before setup type=" << curFrameType_;
+        XLOG(ERR) << "Invalid message before setup type=" << curFrameType_;
         return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     return compat::unit;
@@ -469,7 +470,7 @@ compat::Expected<compat::Unit, ErrorCode> MoQControlCodec::parseFrame(
     case FrameType::CLIENT_SETUP:
     case FrameType::LEGACY_SERVER_SETUP:
     case FrameType::SERVER_SETUP:
-      LOG(ERR) << "Duplicate setup frame";
+      XLOG(ERR) << "Duplicate setup frame";
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     case FrameType::SUBSCRIBE: {
       auto res = moqFrameParser_.parseSubscribeRequest(cursor, curFrameLength_);
@@ -509,7 +510,7 @@ compat::Expected<compat::Unit, ErrorCode> MoQControlCodec::parseFrame(
     case FrameType::SUBSCRIBE_NAMESPACE_ERROR:
     case FrameType::PUBLISH_ERROR:
       if (getDraftMajorVersion(*moqFrameParser_.getVersion()) > 14) {
-        LOG(ERR) << "Old frame type=" << compat::to_underlying(curFrameType_);
+        XLOG(ERR) << "Old frame type=" << compat::to_underlying(curFrameType_);
         return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
       }
       [[fallthrough]];
@@ -638,7 +639,7 @@ compat::Expected<compat::Unit, ErrorCode> MoQControlCodec::parseFrame(
     }
     case FrameType::SUBSCRIBE_NAMESPACE_OK:
       if (getDraftMajorVersion(*moqFrameParser_.getVersion()) > 14) {
-        LOG(ERR) << "Old frame type=" << compat::to_underlying(curFrameType_);
+        XLOG(ERR) << "Old frame type=" << compat::to_underlying(curFrameType_);
         return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
       }
       [[fallthrough]];
@@ -717,7 +718,7 @@ compat::Expected<compat::Unit, ErrorCode> MoQControlCodec::parseFrame(
     case FrameType::TRACK_STATUS_OK: {
       // Version > 14: TRACK_STATUS_OK is deprecated, use REQUEST_OK
       if (getDraftMajorVersion(*moqFrameParser_.getVersion()) > 14) {
-        LOG(ERR) << "Received deprecated TRACK_STATUS_OK frame in version="
+        XLOG(ERR) << "Received deprecated TRACK_STATUS_OK frame in version="
                   << getDraftMajorVersion(*moqFrameParser_.getVersion());
         return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
       }

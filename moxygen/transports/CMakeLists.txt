@@ -41,6 +41,8 @@ endif()
 if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
   add_library(moqtransport_picoquic
     PicoquicWebTransport.cpp
+    PicoquicMoQClient.cpp
+    PicoquicMoQServer.cpp
   )
 
   target_include_directories(

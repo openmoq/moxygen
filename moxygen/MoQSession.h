@@ -31,6 +31,10 @@ namespace moxygen {
 class MoQSession : public MoQSessionBase,
                    public proxygen::WebTransportHandler,
                    public std::enable_shared_from_this<MoQSession> {
+  // Forward declarations for nested classes (private access)
+  class PendingRequestState;
+  class ReceiverFetchHandle;
+
  public:
   struct MoQSessionRequestData : public folly::RequestData {
     explicit MoQSessionRequestData(std::shared_ptr<MoQSession> s)
@@ -83,6 +87,35 @@ class MoQSession : public MoQSessionBase,
   void start() override;
   void drain() override;
   void close(SessionCloseErrorCode error) override;
+  void goaway(Goaway goaway) override;
+  void setLogger(const std::shared_ptr<MLogger>& logger) override;
+  std::shared_ptr<MLogger> getLogger() const override;
+  void deliverBufferedData(TrackAlias trackAlias) override;
+  void trackStatusOk(const TrackStatusOk& trackStatusOk) override;
+  void trackStatusError(const TrackStatusError& trackStatusError) override;
+  void removeSubscriptionState(TrackAlias alias, RequestID id) override;
+  RequestID getNextRequestID() override;
+  void retireRequestID(bool signalWriteLoop) override;
+  void publishNamespaceError(const PublishNamespaceError& e) override;
+  void subscribeNamespaceError(const SubscribeNamespaceError& e) override;
+  void sendSubscribeOk(const SubscribeOk& subOk) override;
+  void subscribeError(const SubscribeError& subErr) override;
+  void unsubscribe(const Unsubscribe& unsubscribe) override;
+  void subscribeUpdate(const SubscribeUpdate& subUpdate) override;
+  void subscribeUpdateOk(const RequestOk& requestOk) override;
+  void subscribeUpdateError(
+      const SubscribeUpdateError& requestError,
+      RequestID subscriptionRequestID) override;
+  void sendSubscribeDone(const SubscribeDone& subDone) override;
+  void fetchOk(const FetchOk& fetchOk) override;
+  void fetchError(const FetchError& fetchError) override;
+  void fetchCancel(const FetchCancel& fetchCancel) override;
+  void publishOk(const PublishOk& pubOk) override;
+  void publishError(const PublishError& publishError) override;
+  void checkForCloseOnDrain() override;
+  void sendMaxRequestID(bool signalWriteLoop) override;
+  void fetchComplete(RequestID requestID) override;
+  void initializeNegotiatedVersion(uint64_t negotiatedVersion) override;
 
   // Async setup using coroutines
   compat::Task<ServerSetup> setup(ClientSetup setup);
@@ -125,18 +158,22 @@ class MoQSession : public MoQSessionBase,
       proxygen::WebTransport::BidiStreamHandle bh) noexcept override;
   void onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept override;
   void onSessionEnd(folly::Optional<uint32_t> err) noexcept override {
-    LOG(INFO) << __func__ << "err="
+    XLOG(INFO) << __func__ << "err="
               << (err ? folly::to<std::string>(*err) : std::string("none"))
               << " sess=" << this;
     close(SessionCloseErrorCode::NO_ERROR);
   }
   void onSessionDrain() noexcept override {
-    LOG(INFO) << __func__ << " sess=" << this;
+    XLOG(INFO) << __func__ << " sess=" << this;
   }
+
+  // Bring base class nested types into MoQSession scope
+  using PublisherImpl = MoQSessionBase::PublisherImpl;
 
   // Extended PublisherImpl with transport access
   class TrackPublisherImpl;
   class FetchPublisherImpl;
+  class ReceiverSubscriptionHandle;
 
   proxygen::WebTransport* getWebTransport() const {
     return wt_.get();
@@ -212,11 +249,12 @@ class MoQSession : public MoQSessionBase,
       const std::shared_ptr<SubscribeTrackReceiveState>& trackPublisher);
 
   void handleTrackStatusOkFromRequestOk(const RequestOk& requestOk);
+  // Forward declare iterator type - full definition after PendingRequestState class
   void handleSubscribeUpdateOkFromRequestOk(
       const RequestOk& requestOk,
       folly::F14FastMap<
           RequestID,
-          std::unique_ptr<class PendingRequestState>,
+          std::unique_ptr<PendingRequestState>,
           RequestID::hash>::iterator reqIt);
 
   // Folly-specific state
@@ -235,7 +273,187 @@ class MoQSession : public MoQSessionBase,
   mutable std::chrono::steady_clock::time_point lastTransportInfoUpdate_{};
 
   // Pending request state management
-  class PendingRequestState;
+  class PendingRequestState {
+   public:
+    enum class Type : uint8_t {
+      SUBSCRIBE_TRACK,
+      PUBLISH,
+      TRACK_STATUS,
+      FETCH,
+      SUBSCRIBE_UPDATE,
+      // PublishNamespace types - only handled by MoQRelaySession subclass
+      PUBLISH_NAMESPACE,
+      SUBSCRIBE_NAMESPACE
+    };
+
+    // Make polymorphic for subclassing - destructor implemented below
+
+   protected:
+    Type type_;
+    union Storage {
+      Storage() {}
+      ~Storage() {}
+
+      std::shared_ptr<SubscribeTrackReceiveState> subscribeTrack_;
+      folly::coro::Promise<folly::Expected<PublishOk, PublishError>> publish_;
+      folly::coro::Promise<folly::Expected<TrackStatusOk, TrackStatusError>>
+          trackStatus_;
+      std::shared_ptr<FetchTrackReceiveState> fetchTrack_;
+      folly::coro::Promise<
+          folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
+          subscribeUpdate_;
+    } storage_;
+
+   public:
+    // Factory methods for type-safe construction returning unique_ptr
+    static std::unique_ptr<PendingRequestState> makeSubscribeTrack(
+        std::shared_ptr<SubscribeTrackReceiveState> state) {
+      auto result = std::make_unique<PendingRequestState>();
+      result->type_ = Type::SUBSCRIBE_TRACK;
+      new (&result->storage_.subscribeTrack_) auto(std::move(state));
+      return result;
+    }
+
+    static std::unique_ptr<PendingRequestState> makePublish(
+        folly::coro::Promise<folly::Expected<PublishOk, PublishError>>
+            promise) {
+      auto result = std::make_unique<PendingRequestState>();
+      result->type_ = Type::PUBLISH;
+      new (&result->storage_.publish_) auto(std::move(promise));
+      return result;
+    }
+
+    static std::unique_ptr<PendingRequestState> makeTrackStatus(
+        folly::coro::Promise<folly::Expected<TrackStatusOk, TrackStatusError>>
+            promise) {
+      auto result = std::make_unique<PendingRequestState>();
+      result->type_ = Type::TRACK_STATUS;
+      new (&result->storage_.trackStatus_) auto(std::move(promise));
+      return result;
+    }
+
+    static std::unique_ptr<PendingRequestState> makeFetch(
+        std::shared_ptr<FetchTrackReceiveState> state) {
+      auto result = std::make_unique<PendingRequestState>();
+      result->type_ = Type::FETCH;
+      new (&result->storage_.fetchTrack_) auto(std::move(state));
+      return result;
+    }
+
+    static std::unique_ptr<PendingRequestState> makeSubscribeUpdate(
+        folly::coro::Promise<
+            folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>> promise) {
+      auto result = std::make_unique<PendingRequestState>();
+      result->type_ = Type::SUBSCRIBE_UPDATE;
+      new (&result->storage_.subscribeUpdate_) auto(std::move(promise));
+      return result;
+    }
+
+    // Delete copy/move operations as this is held in unique_ptr
+    PendingRequestState(const PendingRequestState&) = delete;
+    PendingRequestState(PendingRequestState&&) = delete;
+    PendingRequestState& operator=(const PendingRequestState&) = delete;
+    PendingRequestState& operator=(PendingRequestState&&) = delete;
+
+    // Virtual destructor implementation
+    virtual ~PendingRequestState() {
+      switch (type_) {
+        case Type::SUBSCRIBE_TRACK:
+          storage_.subscribeTrack_.~shared_ptr();
+          break;
+        case Type::PUBLISH:
+          storage_.publish_.~Promise();
+          break;
+        case Type::TRACK_STATUS:
+          storage_.trackStatus_.~Promise();
+          break;
+        case Type::FETCH:
+          storage_.fetchTrack_.~shared_ptr<FetchTrackReceiveState>();
+          break;
+        case Type::SUBSCRIBE_UPDATE:
+          storage_.subscribeUpdate_.~Promise();
+          break;
+        case Type::PUBLISH_NAMESPACE:
+        case Type::SUBSCRIBE_NAMESPACE:
+          // These types are handled by MoQRelaySession subclass destructor
+          break;
+      }
+    }
+
+    // Duck typing access - overloaded functions for each type
+    std::shared_ptr<SubscribeTrackReceiveState>* tryGetSubscribeTrack() {
+      return type_ == Type::SUBSCRIBE_TRACK ? &storage_.subscribeTrack_
+                                            : nullptr;
+    }
+
+    FrameType getFrameType(bool ok) const {
+      switch (type_) {
+        case Type::SUBSCRIBE_TRACK:
+          return ok ? FrameType::SUBSCRIBE_OK : FrameType::SUBSCRIBE_ERROR;
+        case Type::PUBLISH:
+          return ok ? FrameType::PUBLISH_OK : FrameType::PUBLISH_ERROR;
+        case Type::TRACK_STATUS:
+          return ok ? FrameType::TRACK_STATUS_OK : FrameType::TRACK_STATUS;
+        case Type::FETCH:
+          return ok ? FrameType::FETCH_OK : FrameType::FETCH_ERROR;
+        case Type::SUBSCRIBE_UPDATE:
+          return ok ? FrameType::REQUEST_OK : FrameType::REQUEST_ERROR;
+        case Type::PUBLISH_NAMESPACE:
+          return ok ? FrameType::PUBLISH_NAMESPACE_OK
+                    : FrameType::PUBLISH_NAMESPACE_ERROR;
+        case Type::SUBSCRIBE_NAMESPACE:
+          return ok ? FrameType::SUBSCRIBE_NAMESPACE_OK
+                    : FrameType::SUBSCRIBE_NAMESPACE_ERROR;
+      }
+      folly::assume_unreachable();
+    }
+    FrameType getOkFrameType() const {
+      return getFrameType(true);
+    }
+
+    FrameType getErrorFrameType() const {
+      return getFrameType(false);
+    }
+
+    virtual folly::Expected<Type, folly::Unit> setError(
+        RequestError error,
+        FrameType frameType);
+
+    const std::shared_ptr<SubscribeTrackReceiveState>* tryGetSubscribeTrack()
+        const {
+      return type_ == Type::SUBSCRIBE_TRACK ? &storage_.subscribeTrack_
+                                            : nullptr;
+    }
+
+    folly::coro::Promise<folly::Expected<PublishOk, PublishError>>*
+    tryGetPublish() {
+      return type_ == Type::PUBLISH ? &storage_.publish_ : nullptr;
+    }
+
+    folly::coro::Promise<folly::Expected<TrackStatusOk, TrackStatusError>>*
+    tryGetTrackStatus() {
+      return type_ == Type::TRACK_STATUS ? &storage_.trackStatus_ : nullptr;
+    }
+
+    std::shared_ptr<FetchTrackReceiveState>* tryGetFetch() {
+      return type_ == Type::FETCH ? &storage_.fetchTrack_ : nullptr;
+    }
+
+    folly::coro::Promise<
+        folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>*
+    tryGetSubscribeUpdate() {
+      return type_ == Type::SUBSCRIBE_UPDATE ? &storage_.subscribeUpdate_
+                                             : nullptr;
+    }
+
+    Type getType() const {
+      return type_;
+    }
+
+   public:
+    // Default constructor - only use via factory methods
+    PendingRequestState() = default;
+  };
   folly::F14FastMap<
       RequestID,
       std::unique_ptr<PendingRequestState>,
@@ -302,13 +520,13 @@ class MoQSession : public MoQSessionBase,
   void onNewBidiStream(compat::BidiStreamHandle* bh);
   void onDatagram(std::unique_ptr<compat::Payload> datagram);
   void onSessionEnd(std::optional<uint32_t> err) {
-    LOG(INFO) << __func__ << "err="
+    XLOG(INFO) << __func__ << "err="
               << (err ? std::to_string(*err) : std::string("none"))
               << " sess=" << this;
     close(SessionCloseErrorCode::NO_ERROR);
   }
   void onSessionDrain() {
-    LOG(INFO) << __func__ << " sess=" << this;
+    XLOG(INFO) << __func__ << " sess=" << this;
   }
 
   compat::WebTransportInterface* getWebTransport() const {

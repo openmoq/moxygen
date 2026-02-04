@@ -45,9 +45,9 @@ compat::Task<void> MoQServerBase::handleClientSession(
   terminateClientSession(std::move(clientSession));
 }
 
-folly::Try<ServerSetup> MoQServerBase::onClientSetup(
+compat::Try<ServerSetup> MoQServerBase::onClientSetup(
     ClientSetup setup,
-    const std::shared_ptr<MoQSession>& session) {
+    const std::shared_ptr<MoQSessionBase>& session) {
   XLOG(DBG1) << "MoQServerBase::ClientSetup";
 
   uint64_t negotiatedVersion = 0;
@@ -79,12 +79,12 @@ folly::Try<ServerSetup> MoQServerBase::onClientSetup(
       std::string errorMessage = folly::to<std::string>(
           "The only supported versions in client_setup are ",
           getSupportedVersionsString());
-      return folly::Try<ServerSetup>(std::runtime_error(errorMessage));
+      return compat::Try<ServerSetup>(std::runtime_error(errorMessage));
     }
     negotiatedVersion = highestVersion;
   } else {
     // No version available from either ALPN or CLIENT_SETUP
-    return folly::Try<ServerSetup>(
+    return compat::Try<ServerSetup>(
         std::runtime_error("No version negotiated via ALPN or CLIENT_SETUP"));
   }
 
@@ -107,14 +107,14 @@ folly::Try<ServerSetup> MoQServerBase::onClientSetup(
     logger->logServerSetup(serverSetup);
   }
 
-  return folly::Try<ServerSetup>(serverSetup);
+  return compat::Try<ServerSetup>(serverSetup);
 }
 
 compat::Expected<compat::Unit, SessionCloseErrorCode>
 MoQServerBase::validateAuthority(
     const ClientSetup& setup,
     uint64_t negotiatedVersion,
-    std::shared_ptr<MoQSession>) {
+    std::shared_ptr<MoQSessionBase>) {
   if (getDraftMajorVersion(negotiatedVersion) >= 14) {
     // Find and validate AUTHORITY
     auto authorityParam = std::find_if(

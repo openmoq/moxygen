@@ -222,18 +222,18 @@ void MoQSessionTest::TearDown() {
   testTimeout_.cancelTimeout();
 }
 
-folly::Expected<folly::Unit, SessionCloseErrorCode>
+compat::Expected<compat::Unit, SessionCloseErrorCode>
 MoQSessionTest::validateAuthority(
     const ClientSetup& /* clientSetup */,
     uint64_t /* negotiatedVersion */,
-    std::shared_ptr<MoQSession> /* session */) {
+    std::shared_ptr<MoQSessionBase> /* session */) {
   // For test purposes, always return success
-  return folly::unit;
+  return compat::unit;
 }
 
-folly::Try<ServerSetup> MoQSessionTest::onClientSetup(
+compat::Try<ServerSetup> MoQSessionTest::onClientSetup(
     ClientSetup setup,
-    const std::shared_ptr<MoQSession>&) {
+    const std::shared_ptr<MoQSessionBase>&) {
   if (invalidVersion_) {
     return folly::Try<ServerSetup>(std::runtime_error("invalid version"));
   }

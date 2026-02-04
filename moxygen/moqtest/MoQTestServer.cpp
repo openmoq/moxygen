@@ -25,7 +25,7 @@ void MoQTestSubscriptionHandle::unsubscribe() {
 
 folly::coro::Task<folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
 MoQTestSubscriptionHandle::subscribeUpdate(SubscribeUpdate update) {
-  LOG(INFO) << "Received Subscribe Update";
+  XLOG(INFO) << "Received Subscribe Update";
   co_return folly::makeUnexpected(
       SubscribeUpdateError{
           update.requestID,
@@ -55,7 +55,7 @@ MoQTestServer::MoQTestServer(const std::string& cert, const std::string& key)
 folly::coro::Task<MoQSession::SubscribeResult> MoQTestServer::subscribe(
     SubscribeRequest sub,
     std::shared_ptr<TrackConsumer> callback) {
-  LOG(INFO) << "Recieved Subscription";
+  XLOG(INFO) << "Recieved Subscription";
 
   // Ensure Params are valid according to spec, if not return SubscribeError
   auto res = moxygen::convertTrackNamespaceToMoqTestParam(
@@ -255,7 +255,7 @@ folly::coro::Task<void> MoQTestServer::sendTwoSubgroupsPerGroup(
     MoQTestParameters params,
     std::shared_ptr<TrackConsumer> callback) {
   // Iterate through Objects
-  LOG(INFO) << "Starting Two Subgroups Per Group";
+  XLOG(INFO) << "Starting Two Subgroups Per Group";
   auto token = co_await folly::coro::co_current_cancellation_token;
   // Odd number of objects in track means end on subgroupZero
   for (uint64_t groupNum = params.startGroup;
@@ -299,7 +299,7 @@ folly::coro::Task<void> MoQTestServer::sendTwoSubgroupsPerGroup(
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         int index = objectId % 2;
-        LOG(INFO) << "Sending Object " << objectId << " to Subgroup " << index;
+        XLOG(INFO) << "Sending Object " << objectId << " to Subgroup " << index;
         std::string p = std::string(objectSize, 't');
         auto objectPayload = compat::Payload::copyBuffer(p);
         subConsumers[index]->object(
@@ -310,7 +310,7 @@ folly::coro::Task<void> MoQTestServer::sendTwoSubgroupsPerGroup(
 
       } else {
         auto lastSubgroup = objectId % 2;
-        LOG(INFO) << "Sending End of Group Marker to Subgroup " << lastSubgroup;
+        XLOG(INFO) << "Sending End of Group Marker to Subgroup " << lastSubgroup;
         subConsumers[lastSubgroup]->endOfGroup(objectId);
 
         // For case of only 1 object being sent
@@ -403,7 +403,7 @@ folly::coro::Task<void> MoQTestServer::sendDatagram(
 folly::coro::Task<MoQSession::FetchResult> MoQTestServer::fetch(
     Fetch fetch,
     std::shared_ptr<FetchConsumer> fetchCallback) {
-  LOG(INFO) << "Recieved Fetch Request";
+  XLOG(INFO) << "Recieved Fetch Request";
 
   // Ensure Params are valid according to spec, if not return FetchError
   auto res = moxygen::convertTrackNamespaceToMoqTestParam(

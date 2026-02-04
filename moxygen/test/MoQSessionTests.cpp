@@ -128,22 +128,22 @@ TEST(MoQSessionTest, ServerSetupVersion15WithoutAlpnShouldFail) {
   auto [clientWt, serverWt] =
       proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
 
-  class TestServerSetupCallback : public MoQSession::ServerSetupCallback {
+  class TestServerSetupCallback : public MoQSessionBase::ServerSetupCallback {
    public:
-    folly::Try<ServerSetup> onClientSetup(
+    compat::Try<ServerSetup> onClientSetup(
         ClientSetup /*clientSetup*/,
-        const std::shared_ptr<MoQSession>& /*session*/) override {
+        const std::shared_ptr<MoQSessionBase>& /*session*/) override {
       // Server tries to select version >= 15 without ALPN negotiation
       ServerSetup serverSetup;
       serverSetup.selectedVersion = 0xff00000f;
-      return folly::Try<ServerSetup>(serverSetup);
+      return compat::Try<ServerSetup>(serverSetup);
     }
 
-    folly::Expected<folly::Unit, SessionCloseErrorCode> validateAuthority(
+    compat::Expected<compat::Unit, SessionCloseErrorCode> validateAuthority(
         const ClientSetup& /*clientSetup*/,
         uint64_t /*negotiatedVersion*/,
-        std::shared_ptr<MoQSession> /*session*/) override {
-      return folly::unit;
+        std::shared_ptr<MoQSessionBase> /*session*/) override {
+      return compat::unit;
     }
   };
 

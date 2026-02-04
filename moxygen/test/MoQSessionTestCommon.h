@@ -151,19 +151,19 @@ class TestTimeoutCallback : public folly::HHWheelTimer::Callback {
 
 // Main test fixture
 class MoQSessionTest : public testing::TestWithParam<VersionParams>,
-                       public MoQSession::ServerSetupCallback {
+                       public MoQSessionBase::ServerSetupCallback {
  public:
   void SetUp() override;
   void TearDown() override;
 
-  folly::Expected<folly::Unit, SessionCloseErrorCode> validateAuthority(
+  compat::Expected<compat::Unit, SessionCloseErrorCode> validateAuthority(
       const ClientSetup& clientSetup,
       uint64_t negotiatedVersion,
-      std::shared_ptr<MoQSession> session) override;
+      std::shared_ptr<MoQSessionBase> session) override;
 
-  folly::Try<ServerSetup> onClientSetup(
+  compat::Try<ServerSetup> onClientSetup(
       ClientSetup setup,
-      const std::shared_ptr<MoQSession>&) override;
+      const std::shared_ptr<MoQSessionBase>&) override;
 
   virtual folly::coro::Task<void> setupMoQSession();
   virtual folly::coro::Task<void> setupMoQSessionForPublish(

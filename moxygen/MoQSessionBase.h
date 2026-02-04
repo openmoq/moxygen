@@ -89,7 +89,7 @@ class MoQSessionBase : public Subscriber,
    public:
     virtual ~MoQSessionCloseCallback() = default;
     virtual void onMoQSessionClosed() {
-      LOG(INFO) << __func__ << " sess=" << this;
+      XLOG(INFO) << __func__ << " sess=" << this;
     }
   };
 
@@ -131,7 +131,7 @@ class MoQSessionBase : public Subscriber,
   virtual void drain() = 0;
   virtual void close(SessionCloseErrorCode error) = 0;
 
-  void goaway(Goaway goaway) override;
+  virtual void goaway(Goaway goaway) override;
 
   void setMaxConcurrentRequests(uint64_t maxConcurrent);
 
@@ -167,8 +167,8 @@ class MoQSessionBase : public Subscriber,
     MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscriptionStreamClosed);
   }
 
-  void setLogger(const std::shared_ptr<MLogger>& logger);
-  std::shared_ptr<MLogger> getLogger() const;
+  virtual void setLogger(const std::shared_ptr<MLogger>& logger);
+  virtual std::shared_ptr<MLogger> getLogger() const;
 
   RequestID peekNextRequestID() const {
     return nextRequestID_;
@@ -282,6 +282,10 @@ class MoQSessionBase : public Subscriber,
       return session_ ? session_->exec_ : nullptr;
     }
 
+    MoQSessionBase* getSession() const {
+      return session_;
+    }
+
    protected:
     MoQSessionBase* session_{nullptr};
     FullTrackName fullTrackName_;
@@ -342,39 +346,39 @@ class MoQSessionBase : public Subscriber,
     return 2;
   }
 
-  void deliverBufferedData(TrackAlias trackAlias);
+  virtual void deliverBufferedData(TrackAlias trackAlias);
   void aliasifyAuthTokens(
       Parameters& params,
       const std::optional<uint64_t>& forceVersion = std::nullopt);
-  RequestID getNextRequestID();
-  void retireRequestID(bool signalWriteLoop);
+  virtual RequestID getNextRequestID();
+  virtual void retireRequestID(bool signalWriteLoop);
 
   // Virtual cleanup method for proper inheritance pattern
   virtual void cleanup();
 
   // PublishNamespace response methods
-  void publishNamespaceError(
+  virtual void publishNamespaceError(
       const PublishNamespaceError& publishNamespaceError);
-  void subscribeNamespaceError(
+  virtual void subscribeNamespaceError(
       const SubscribeNamespaceError& subscribeNamespaceError);
 
   // Send methods
-  void trackStatusOk(const TrackStatusOk& trackStatusOk);
-  void trackStatusError(const TrackStatusError& trackStatusError);
-  void sendSubscribeOk(const SubscribeOk& subOk);
-  void subscribeError(const SubscribeError& subErr);
-  void unsubscribe(const Unsubscribe& unsubscribe);
-  void subscribeUpdate(const SubscribeUpdate& subUpdate);
-  void subscribeUpdateOk(const RequestOk& requestOk);
-  void subscribeUpdateError(
+  virtual void trackStatusOk(const TrackStatusOk& trackStatusOk);
+  virtual void trackStatusError(const TrackStatusError& trackStatusError);
+  virtual void sendSubscribeOk(const SubscribeOk& subOk);
+  virtual void subscribeError(const SubscribeError& subErr);
+  virtual void unsubscribe(const Unsubscribe& unsubscribe);
+  virtual void subscribeUpdate(const SubscribeUpdate& subUpdate);
+  virtual void subscribeUpdateOk(const RequestOk& requestOk);
+  virtual void subscribeUpdateError(
       const SubscribeUpdateError& requestError,
       RequestID subscriptionRequestID);
-  void sendSubscribeDone(const SubscribeDone& subDone);
-  void fetchOk(const FetchOk& fetchOk);
-  void fetchError(const FetchError& fetchError);
-  void fetchCancel(const FetchCancel& fetchCancel);
-  void publishOk(const PublishOk& pubOk);
-  void publishError(const PublishError& publishError);
+  virtual void sendSubscribeDone(const SubscribeDone& subDone);
+  virtual void fetchOk(const FetchOk& fetchOk);
+  virtual void fetchError(const FetchError& fetchError);
+  virtual void fetchCancel(const FetchCancel& fetchCancel);
+  virtual void publishOk(const PublishOk& pubOk);
+  virtual void publishError(const PublishError& publishError);
 
   // Static helper methods
   static uint64_t getMaxRequestIDIfPresent(const SetupParameters& params);
@@ -385,11 +389,11 @@ class MoQSessionBase : public Subscriber,
   static bool shouldIncludeMoqtImplementationParam(
       const std::vector<uint64_t>& supportedVersions);
 
-  void removeSubscriptionState(TrackAlias alias, RequestID id);
-  void checkForCloseOnDrain();
-  void sendMaxRequestID(bool signalWriteLoop);
-  void fetchComplete(RequestID requestID);
-  void initializeNegotiatedVersion(uint64_t negotiatedVersion);
+  virtual void removeSubscriptionState(TrackAlias alias, RequestID id);
+  virtual void checkForCloseOnDrain();
+  virtual void sendMaxRequestID(bool signalWriteLoop);
+  virtual void fetchComplete(RequestID requestID);
+  virtual void initializeNegotiatedVersion(uint64_t negotiatedVersion);
 
   // Core frame writer and stats callbacks
   MoQFrameWriter moqFrameWriter_;

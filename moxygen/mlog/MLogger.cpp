@@ -15,11 +15,11 @@ void MLogger::setPath(const std::string& path) {
   path_ = path;
 }
 
-void MLogger::setDcid(const quic::ConnectionId& dcid) {
+void MLogger::setDcid(const compat::ConnectionId& dcid) {
   dcid_ = dcid;
 }
 
-void MLogger::setSrcCid(const quic::ConnectionId& srcCid) {
+void MLogger::setSrcCid(const compat::ConnectionId& srcCid) {
   srcCid_ = srcCid;
 }
 

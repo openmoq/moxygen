@@ -367,18 +367,4 @@ Fetch::Fetch(
   }
 }
 
-RequestOk RequestOk::fromTrackStatusOk(const TrackStatusOk& trackStatusOk) {
-  RequestOk requestOk;
-  requestOk.requestID = trackStatusOk.requestID;
-  requestOk.params = trackStatusOk.params;
-  return requestOk;
-}
-
-TrackStatusOk RequestOk::toTrackStatusOk() const {
-  TrackStatusOk trackStatusOk;
-  trackStatusOk.requestID = requestID;
-  trackStatusOk.params = params;
-  return trackStatusOk;
-}
-
 } // namespace moxygen

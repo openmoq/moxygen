@@ -733,7 +733,7 @@ compat::Expected<compat::Unit, MoQPublishError> StreamPublisherImpl::object(
 
   // Start delivery timeout timer when object begins being sent to stream
   if (deliveryTimer_) {
-    deliveryTimer_->startTimer(objectID, publisher_->getTransportInfo().srtt);
+    deliveryTimer_->startTimer(objectID, static_cast<MoQSession*>(publisher_->getSession())->getTransportInfo().srtt);
   }
 
   return writeCurrentObject(
@@ -765,7 +765,7 @@ compat::Expected<compat::Unit, MoQPublishError> StreamPublisherImpl::beginObject
 
   // Start delivery timeout timer when object begins being sent to stream
   if (deliveryTimer_) {
-    deliveryTimer_->startTimer(objectID, publisher_->getTransportInfo().srtt);
+    deliveryTimer_->startTimer(objectID, static_cast<MoQSession*>(publisher_->getSession())->getTransportInfo().srtt);
   }
 
   return writeCurrentObject(
@@ -928,7 +928,7 @@ StreamPublisherImpl::ensureWriteHandle() {
   XCHECK(publisher_) << "publisher_ has not been set";
   // This has to be FETCH, subscribe is created with a writeHandle_ and
   // publisher_ is cleared when the stream FIN's or resets.
-  auto wt = publisher_->getWebTransport();
+  auto wt = static_cast<MoQSession*>(publisher_->getSession())->getWebTransport();
   if (!wt) {
     XLOG(ERR) << "Trying to publish after fetchCancel";
     return compat::makeUnexpected(MoQPublishError(
@@ -981,6 +981,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
             groupOrder,
             version,
             bytesBufferedThreshold),
+        moqSession_(session),
         trackAlias_(std::move(trackAlias)),
         forward_(forward) {
     // Set callback for delivery timeout changes
@@ -1020,9 +1021,9 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       auto subDone = std::move(*pendingSubscribeDone_);
       subDone.streamCount = streamCount_;
       pendingSubscribeDone_.reset();
-      XCHECK(session_);
+      XCHECK(moqSession_);
       subscriptionHandle_.reset();
-      session_->sendSubscribeDone(subDone);
+      moqSession_->sendSubscribeDone(subDone);
     }
   }
 
@@ -1036,14 +1037,14 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
   void onTooManyBytesBuffered() override;
 
   void onSubscribeUpdate(SubscribeUpdate subscribeUpdate) {
-    auto it = session_->pubTracks_.find(requestID_);
-    if (!subscriptionHandle_ || it == session_->pubTracks_.end()) {
+    auto it = moqSession_->pubTracks_.find(requestID_);
+    if (!subscriptionHandle_ || it == moqSession_->pubTracks_.end()) {
       XLOG(ERR) << "Received SubscribeUpdate before sending SUBSCRIBE_OK id="
                 << requestID_ << " trackPub=" << this;
 
       // Only send error response for v15+
       if (getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 15) {
-        session_->subscribeUpdateError(
+        moqSession_->subscribeUpdateError(
             SubscribeUpdateError{
                 subscribeUpdate.requestID,
                 static_cast<RequestErrorCode>(
@@ -1072,7 +1073,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
   folly::coro::Task<void> handleSubscribeUpdate(
       SubscribeUpdate subscribeUpdate) {
     folly::RequestContextScopeGuard guard;
-    session_->setRequestSession();
+    moqSession_->setRequestSession();
 
     auto updateRequestID = subscribeUpdate.requestID;
     auto subscriptionRequestID = requestID_;
@@ -1101,7 +1102,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
 
     // Call application's async subscribeUpdate handler with cancellation
     auto updateResult = co_await co_awaitTry(co_withCancellation(
-        session_->cancellationSource_.getToken(),
+        moqSession_->cancellationSource_.getToken(),
         subscriptionHandle_->subscribeUpdate(std::move(subscribeUpdate))));
 
     // Only send responses for v15+
@@ -1109,7 +1110,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       if (updateResult.hasException()) {
         XLOG(ERR) << "Exception in subscribeUpdate ex="
                   << updateResult.exception().what().toStdString();
-        session_->subscribeUpdateError(
+        moqSession_->subscribeUpdateError(
             SubscribeUpdateError{
                 updateRequestID,
                 RequestErrorCode::INTERNAL_ERROR,
@@ -1124,7 +1125,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
                   << " requestID=" << subscriptionRequestID;
         auto updateErr = std::move(updateResult->error());
         updateErr.requestID = updateRequestID; // In case app got it wrong
-        session_->subscribeUpdateError(updateErr, subscriptionRequestID);
+        moqSession_->subscribeUpdateError(updateErr, subscriptionRequestID);
       } else {
         // send REQUEST_OK with LARGEST_OBJECT if available
         // TODO: Do we relay the params we got from the app?
@@ -1137,7 +1138,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
         RequestOk requestOk{
             .requestID = updateRequestID,
             .requestSpecificParams = std::move(requestSpecificParams)};
-        session_->subscribeUpdateOk(requestOk);
+        moqSession_->subscribeUpdateOk(requestOk);
       }
     }
   }
@@ -1187,13 +1188,13 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
   void terminatePublish(SubscribeDone subDone, ResetStreamErrorCode code)
       override {
     resetAllSubgroups(code);
-    auto session = std::exchange(session_, nullptr);
+    session_ = nullptr;
     if (!subscriptionHandle_) {
-      session->subscribeError(
+      moqSession_->subscribeError(
           {subDone.requestID, SubscribeErrorCode::INTERNAL_ERROR, "terminate"});
     } else {
       subscriptionHandle_.reset();
-      session->sendSubscribeDone(subDone);
+      moqSession_->sendSubscribeDone(subDone);
     }
   }
 
@@ -1243,9 +1244,10 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       std::optional<std::chrono::milliseconds> newTimeout);
 
   std::chrono::microseconds getCurrentRtt() const {
-    return session_->getTransportInfo().srtt;
+    return moqSession_->getTransportInfo().srtt;
   }
 
+  MoQSession* moqSession_;
   std::shared_ptr<MLogger> logger_ = nullptr;
   std::shared_ptr<Subscriber::SubscriptionHandle> subscriptionHandle_;
   std::optional<TrackAlias> trackAlias_;
@@ -1367,7 +1369,7 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
         "Cannot create subgroups for subscriptions with forward flag set to false"));
   }
 
-  auto wt = getWebTransport();
+  auto wt = moqSession_->getWebTransport();
   if (!wt || state_ != State::OPEN) {
     XLOG(ERR) << "Trying to publish after subscribeDone";
     return compat::makeUnexpected(MoQPublishError(
@@ -1417,7 +1419,7 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
 
 compat::Expected<compat::SemiFuture<compat::Unit>, MoQPublishError>
 MoQSession::TrackPublisherImpl::awaitStreamCredit() {
-  auto wt = getWebTransport();
+  auto wt = moqSession_->getWebTransport();
   if (!wt || state_ != State::OPEN) {
     return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "awaitStreamCredit after subscribeDone"));
@@ -1526,7 +1528,7 @@ MoQSession::TrackPublisherImpl::datagram(
         MoQPublishError::API_ERROR,
         "Cannot send datagrams for subscriptions with forward flag set to false"));
   }
-  auto wt = getWebTransport();
+  auto wt = moqSession_->getWebTransport();
   if (!wt || state_ != State::OPEN) {
     XLOG(ERR) << "Trying to publish after subscribeDone";
     return compat::makeUnexpected(MoQPublishError(
@@ -1586,7 +1588,7 @@ MoQSession::TrackPublisherImpl::subscribeDone(SubscribeDone subDone) {
   }
   subDone.streamCount = streamCount_;
   subscriptionHandle_.reset();
-  session_->sendSubscribeDone(subDone);
+  moqSession_->sendSubscribeDone(subDone);
   return compat::unit;
 }
 
@@ -1615,7 +1617,7 @@ void MoQSession::TrackPublisherImpl::onDeliveryTimeoutChanged(
 }
 
 // Receive State
-class MoQSession::TrackReceiveStateBase {
+class MoQSessionBase::TrackReceiveStateBase {
  public:
   TrackReceiveStateBase(FullTrackName fullTrackName, RequestID requestID)
       : fullTrackName_(std::move(fullTrackName)), requestID_(requestID) {}
@@ -1644,8 +1646,8 @@ class MoQSession::TrackReceiveStateBase {
   folly::CancellationSource cancelSource_;
 };
 
-class MoQSession::SubscribeTrackReceiveState
-    : public MoQSession::TrackReceiveStateBase {
+class MoQSessionBase::SubscribeTrackReceiveState
+    : public MoQSessionBase::TrackReceiveStateBase {
  public:
   using SubscribeResult = folly::Expected<SubscribeOk, SubscribeError>;
 
@@ -1865,8 +1867,8 @@ class MoQSession::SubscribeTrackReceiveState
   std::unique_ptr<StreamCountTimeoutCallback> streamCountTimeout_;
 };
 
-class MoQSession::FetchTrackReceiveState
-    : public MoQSession::TrackReceiveStateBase {
+class MoQSessionBase::FetchTrackReceiveState
+    : public MoQSessionBase::TrackReceiveStateBase {
  public:
   using FetchResult = folly::Expected<FetchOk, FetchError>;
   FetchTrackReceiveState(
@@ -1999,28 +2001,39 @@ MoQSession::PendingRequestState::setError(
 using folly::coro::co_awaitTry;
 using folly::coro::co_error;
 
-// Constructors
+// MoQSessionBase constructor and destructor (for Folly mode)
+MoQSessionBase::MoQSessionBase(
+    MoQControlCodec::Direction dir,
+    std::shared_ptr<MoQExecutor> exec,
+    ServerSetupCallback* serverSetupCallback)
+    : dir_(dir),
+      exec_(std::move(exec)),
+      serverSetupCallback_(serverSetupCallback),
+      controlCodec_(dir, this) {}
+
+MoQSessionBase::~MoQSessionBase() = default;
+
+// MoQSession Constructors
 MoQSession::MoQSession(
     folly::MaybeManagedPtr<proxygen::WebTransport> wt,
     std::shared_ptr<MoQExecutor> exec)
-    : dir_(MoQControlCodec::Direction::CLIENT),
-      wt_(std::move(wt)),
-      exec_(std::move(exec)),
-      nextRequestID_(0),
-      nextExpectedPeerRequestID_(1),
-      controlCodec_(dir_, this) {}
+    : MoQSessionBase(MoQControlCodec::Direction::CLIENT, exec),
+      wt_(std::move(wt)) {
+  // Client sends even request IDs, expects odd from server
+  nextRequestID_ = 0;
+  nextExpectedPeerRequestID_ = 1;
+}
 
 MoQSession::MoQSession(
     folly::MaybeManagedPtr<proxygen::WebTransport> wt,
     ServerSetupCallback& serverSetupCallback,
     std::shared_ptr<MoQExecutor> exec)
-    : dir_(MoQControlCodec::Direction::SERVER),
-      wt_(std::move(wt)),
-      exec_(std::move(exec)),
-      nextRequestID_(1),
-      nextExpectedPeerRequestID_(0),
-      serverSetupCallback_(&serverSetupCallback),
-      controlCodec_(dir_, this) {}
+    : MoQSessionBase(MoQControlCodec::Direction::SERVER, exec, &serverSetupCallback),
+      wt_(std::move(wt)) {
+  // Server sends odd request IDs, expects even from client
+  nextRequestID_ = 1;
+  nextExpectedPeerRequestID_ = 0;
+}
 
 MoQSession::~MoQSession() {
   cleanup();
@@ -2430,8 +2443,8 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
   // TODO: close session on control exit
 }
 
-std::shared_ptr<MoQSession::SubscribeTrackReceiveState>
-MoQSession::getSubscribeTrackReceiveState(TrackAlias trackAlias) {
+std::shared_ptr<MoQSessionBase::SubscribeTrackReceiveState>
+MoQSessionBase::getSubscribeTrackReceiveState(TrackAlias trackAlias) {
   auto trackIt = subTracks_.find(trackAlias);
   if (trackIt == subTracks_.end()) {
     // received an object for unknown track alias
@@ -2441,8 +2454,8 @@ MoQSession::getSubscribeTrackReceiveState(TrackAlias trackAlias) {
   return trackIt->second;
 }
 
-std::shared_ptr<MoQSession::FetchTrackReceiveState>
-MoQSession::getFetchTrackReceiveState(RequestID requestID) {
+std::shared_ptr<MoQSessionBase::FetchTrackReceiveState>
+MoQSessionBase::getFetchTrackReceiveState(RequestID requestID) {
   XLOG(DBG3) << "getTrack reqID=" << requestID;
   auto trackIt = fetches_.find(requestID);
   if (trackIt == fetches_.end()) {
@@ -2489,7 +2502,7 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
 
  public:
   using OnSubgroupResult =
-      std::shared_ptr<MoQSession::SubscribeTrackReceiveState>;
+      std::shared_ptr<MoQSessionBase::SubscribeTrackReceiveState>;
 
   using OnSubgroupFunc = std::function<OnSubgroupResult(
       TrackAlias alias,
@@ -2499,7 +2512,7 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       const SubgroupOptions& options)>;
 
   using OnFetchFunc =
-      std::function<std::shared_ptr<MoQSession::FetchTrackReceiveState>(
+      std::function<std::shared_ptr<MoQSessionBase::FetchTrackReceiveState>(
           RequestID requestID)>;
 
   ObjectStreamCallback(
@@ -2515,7 +2528,7 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
   }
 
   void setSubscribeTrackReceiveState(
-      std::shared_ptr<MoQSession::SubscribeTrackReceiveState> state) {
+      std::shared_ptr<MoQSessionBase::SubscribeTrackReceiveState> state) {
     subscribeState_ = std::move(state);
   }
 
@@ -2788,9 +2801,9 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
   MoQSession* session_{nullptr};
   OnSubgroupFunc onSubgroupFunc_;
   OnFetchFunc onFetchFunc_;
-  std::shared_ptr<MoQSession::SubscribeTrackReceiveState> subscribeState_;
+  std::shared_ptr<MoQSessionBase::SubscribeTrackReceiveState> subscribeState_;
   std::shared_ptr<SubgroupConsumer> subgroupCallback_;
-  std::shared_ptr<MoQSession::FetchTrackReceiveState> fetchState_;
+  std::shared_ptr<MoQSessionBase::FetchTrackReceiveState> fetchState_;
   uint64_t currentStreamId_{0};
   TrackAlias trackAlias_{0};
   ObjectHeader currentObj_;
@@ -4930,7 +4943,7 @@ void MoQSession::onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept {
   }
 }
 
-bool MoQSession::closeSessionIfRequestIDInvalid(
+bool MoQSessionBase::closeSessionIfRequestIDInvalid(
     RequestID requestID,
     bool skipCheck,
     bool isNewRequest,
@@ -4970,9 +4983,12 @@ bool MoQSession::closeSessionIfRequestIDInvalid(
 }
 
 void MoQSession::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
+  // Base class initialization
   negotiatedVersion_ = negotiatedVersion;
-  moqFrameWriter_.initializeVersion(*negotiatedVersion_);
-  controlCodec_.initializeVersion(*negotiatedVersion_);
+  moqFrameWriter_.initializeVersion(negotiatedVersion);
+  controlCodec_.initializeVersion(negotiatedVersion);
+
+  // MoQSession-specific: signal any waiting version batons
   for (const auto& versionBaton : subgroupsWaitingForVersion_) {
     versionBaton->signal();
   }
@@ -4984,7 +5000,7 @@ void MoQSession::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
 }
 
 /*static*/
-uint64_t MoQSession::getMaxRequestIDIfPresent(const SetupParameters& params) {
+uint64_t MoQSessionBase::getMaxRequestIDIfPresent(const SetupParameters& params) {
   for (const auto& param : params) {
     if (param.key == folly::to_underlying(SetupKey::MAX_REQUEST_ID)) {
       return param.asUint64;
@@ -4994,7 +5010,7 @@ uint64_t MoQSession::getMaxRequestIDIfPresent(const SetupParameters& params) {
 }
 
 /*static*/
-std::optional<std::string> MoQSession::getMoQTImplementationIfPresent(
+std::optional<std::string> MoQSessionBase::getMoQTImplementationIfPresent(
     const SetupParameters& params) {
   for (const auto& param : params) {
     if (param.key == folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION)) {
@@ -5005,13 +5021,13 @@ std::optional<std::string> MoQSession::getMoQTImplementationIfPresent(
 }
 
 /*static*/
-std::string MoQSession::getMoQTImplementationString() {
+std::string MoQSessionBase::getMoQTImplementationString() {
   return fmt::format(
       "Meta MoQ C++ Draft-{}", getDraftMajorVersion(kVersionDraftCurrent));
 }
 
 /*static*/
-bool MoQSession::shouldIncludeMoqtImplementationParam(
+bool MoQSessionBase::shouldIncludeMoqtImplementationParam(
     const std::vector<uint64_t>& supportedVersions) {
   for (const auto& version : supportedVersions) {
     if (getDraftMajorVersion(version) >= 14) {
@@ -5021,7 +5037,7 @@ bool MoQSession::shouldIncludeMoqtImplementationParam(
   return false;
 }
 
-uint64_t MoQSession::getMaxAuthTokenCacheSizeIfPresent(
+uint64_t MoQSessionBase::getMaxAuthTokenCacheSizeIfPresent(
     const SetupParameters& params) {
   constexpr uint64_t kMaxAuthTokenCacheSize = 4096;
   for (const auto& param : params) {
@@ -5034,7 +5050,7 @@ uint64_t MoQSession::getMaxAuthTokenCacheSizeIfPresent(
 }
 
 /*static*/
-std::optional<uint64_t> MoQSession::getDeliveryTimeoutIfPresent(
+std::optional<uint64_t> MoQSessionBase::getDeliveryTimeoutIfPresent(
     const TrackRequestParameters& params,
     uint64_t version) {
   for (const auto& param : params) {
@@ -5046,7 +5062,7 @@ std::optional<uint64_t> MoQSession::getDeliveryTimeoutIfPresent(
   return std::nullopt;
 }
 
-void MoQSession::aliasifyAuthTokens(
+void MoQSessionBase::aliasifyAuthTokens(
     Parameters& params,
     const std::optional<uint64_t>& forceVersion) {
   auto version = forceVersion ? forceVersion : getNegotiatedVersion();
@@ -5311,19 +5327,19 @@ std::shared_ptr<MoQSession> MoQSession::getRequestSession() {
   return sessionData->session;
 }
 
-GroupOrder MoQSession::resolveGroupOrder(
+GroupOrder MoQSessionBase::resolveGroupOrder(
     GroupOrder pubOrder,
     GroupOrder subOrder) {
   return subOrder == GroupOrder::Default ? pubOrder : subOrder;
 }
 
-void MoQSession::setServerMaxTokenCacheSizeGuess(size_t size) {
+void MoQSessionBase::setServerMaxTokenCacheSizeGuess(size_t size) {
   if (!setupComplete_ && dir_ == MoQControlCodec::Direction::CLIENT) {
     tokenCache_.setMaxSize(size);
   }
 }
 
-void MoQSession::setMaxConcurrentRequests(uint64_t maxConcurrent) {
+void MoQSessionBase::setMaxConcurrentRequests(uint64_t maxConcurrent) {
   if (maxConcurrent > maxConcurrentRequests_) {
     auto delta = maxConcurrent - maxConcurrentRequests_;
     maxRequestID_ += delta;
@@ -5331,28 +5347,163 @@ void MoQSession::setMaxConcurrentRequests(uint64_t maxConcurrent) {
   }
 }
 
-void MoQSession::setVersion(uint64_t version) {
+void MoQSessionBase::setVersion(uint64_t version) {
   negotiatedVersion_ = version;
   setupComplete_ = true;
 }
 
-void MoQSession::setMoqSettings(MoQSettings settings) {
+void MoQSessionBase::setMoqSettings(MoQSettings settings) {
   moqSettings_ = settings;
 }
 
-void MoQSession::setPublishHandler(std::shared_ptr<Publisher> publishHandler) {
+void MoQSessionBase::setPublishHandler(std::shared_ptr<Publisher> publishHandler) {
   publishHandler_ = std::move(publishHandler);
 }
 
-void MoQSession::setSubscribeHandler(
+void MoQSessionBase::setSubscribeHandler(
     std::shared_ptr<Subscriber> subscribeHandler) {
   subscribeHandler_ = std::move(subscribeHandler);
 }
 
-void MoQSession::validateAndSetVersionFromAlpn(const std::string& alpn) {
+void MoQSessionBase::validateAndSetVersionFromAlpn(const std::string& alpn) {
   auto version = getVersionFromAlpn(std::string_view(alpn));
   if (version) {
     initializeNegotiatedVersion(*version);
+  }
+}
+
+void MoQSessionBase::goaway(Goaway /*goaway*/) {
+  // Base implementation - derived classes override for actual functionality
+}
+
+void MoQSessionBase::setLogger(const std::shared_ptr<MLogger>& logger) {
+  logger_ = logger;
+}
+
+std::shared_ptr<MLogger> MoQSessionBase::getLogger() const {
+  return logger_;
+}
+
+void MoQSessionBase::publishOk(const PublishOk& /*pubOk*/) {
+  // Base implementation - derived classes override for actual functionality
+}
+
+void MoQSessionBase::cleanup() {
+  cancellationSource_.requestCancellation();
+  subscribeHandler_.reset();
+  publishHandler_.reset();
+  subTracks_.clear();
+  fetches_.clear();
+  pubTracks_.clear();
+}
+
+void MoQSessionBase::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
+  negotiatedVersion_ = negotiatedVersion;
+  moqFrameWriter_.initializeVersion(negotiatedVersion);
+  controlCodec_.initializeVersion(negotiatedVersion);
+}
+
+void MoQSessionBase::sendSubscribeOk(const SubscribeOk& /*subOk*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::subscribeError(const SubscribeError& /*subErr*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::unsubscribe(const Unsubscribe& /*unsub*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::subscribeUpdate(const SubscribeUpdate& /*subUpdate*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::subscribeUpdateOk(const RequestOk& /*requestOk*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::subscribeUpdateError(
+    const SubscribeUpdateError& /*requestError*/,
+    RequestID /*subscriptionRequestID*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::sendSubscribeDone(const SubscribeDone& /*subDone*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::fetchOk(const FetchOk& /*fetchOk*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::fetchError(const FetchError& /*fetchErr*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::fetchCancel(const FetchCancel& /*fetchCan*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::publishError(const PublishError& /*pubErr*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::trackStatusOk(const TrackStatusOk& /*tsOk*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::trackStatusError(const TrackStatusError& /*tsErr*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::publishNamespaceError(
+    const PublishNamespaceError& /*publishNamespaceErr*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::subscribeNamespaceError(
+    const SubscribeNamespaceError& /*subscribeNamespaceErr*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::removeSubscriptionState(TrackAlias alias, RequestID id) {
+  subTracks_.erase(alias);
+  reqIdToTrackAlias_.erase(id);
+  checkForCloseOnDrain();
+}
+
+void MoQSessionBase::checkForCloseOnDrain() {
+  if (draining_ && subTracks_.empty() && fetches_.empty() && pubTracks_.empty()) {
+    close(SessionCloseErrorCode::NO_ERROR);
+  }
+}
+
+void MoQSessionBase::sendMaxRequestID(bool /*signalWriteLoop*/) {
+  // Base implementation - derived classes override
+}
+
+void MoQSessionBase::fetchComplete(RequestID requestID) {
+  fetches_.erase(requestID);
+  checkForCloseOnDrain();
+}
+
+void MoQSessionBase::deliverBufferedData(TrackAlias /*trackAlias*/) {
+  // Base implementation - derived classes override
+}
+
+RequestID MoQSessionBase::getNextRequestID() {
+  auto id = nextRequestID_;
+  nextRequestID_ += getRequestIDMultiplier();
+  return RequestID(id);
+}
+
+void MoQSessionBase::retireRequestID(bool signalWriteLoop) {
+  closedRequests_++;
+  if (closedRequests_ >= maxConcurrentRequests_ / 2) {
+    maxRequestID_ += closedRequests_ * getRequestIDMultiplier();
+    closedRequests_ = 0;
+    sendMaxRequestID(signalWriteLoop);
   }
 }
 
