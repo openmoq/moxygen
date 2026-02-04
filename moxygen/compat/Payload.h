@@ -149,6 +149,10 @@ class Payload {
   Payload() = default;
   explicit Payload(std::vector<uint8_t> data) : data_(std::move(data)) {}
 
+  // Iterator constructor for convenience
+  template <typename InputIt>
+  Payload(InputIt first, InputIt last) : data_(first, last) {}
+
   // Move-only
   Payload(Payload&&) = default;
   Payload& operator=(Payload&&) = default;
@@ -159,6 +163,7 @@ class Payload {
 
   size_t computeChainDataLength() const { return data_.size(); }
   size_t length() const { return data_.size(); }
+  size_t size() const { return data_.size(); }  // Alias for length()
   const uint8_t* data() const { return data_.data(); }
   uint8_t* writableData() { return data_.data(); }
   bool empty() const { return data_.empty(); }

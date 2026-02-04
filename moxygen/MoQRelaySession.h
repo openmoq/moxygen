@@ -8,8 +8,8 @@
 
 #pragma once
 
-#include <folly/container/F14Map.h>
 #include <moxygen/MoQSession.h>
+#include <moxygen/compat/Containers.h>
 
 namespace moxygen {
 
@@ -26,6 +26,9 @@ namespace moxygen {
  * operations, making it suitable for simple clients that only subscribe to
  * tracks.
  */
+
+#if MOXYGEN_USE_FOLLY
+
 class MoQRelaySession : public MoQSession {
  public:
   // Inherit all base constructors
@@ -125,5 +128,112 @@ class MoQRelaySession : public MoQSession {
   // Extended PendingRequestState for publishNamespace support
   class MoQRelayPendingRequestState;
 };
+
+#else // !MOXYGEN_USE_FOLLY
+
+/**
+ * MoQRelaySession - Std-mode implementation with callback-based API
+ *
+ * Provides namespace functionality using callbacks instead of coroutines.
+ */
+class MoQRelaySession : public MoQSession {
+ public:
+  // Inherit all base constructors
+  using MoQSession::MoQSession;
+
+  // Static factory for creating relay sessions
+  static std::function<std::shared_ptr<MoQSession>(
+      std::shared_ptr<compat::WebTransportInterface>,
+      std::shared_ptr<MoQExecutor>)>
+  createRelaySessionFactory();
+
+  // Override cleanup method
+  void cleanup() override;
+
+  // Callback-based publishNamespace
+  void publishNamespaceWithCallback(
+      PublishNamespace ann,
+      std::shared_ptr<Subscriber::PublishNamespaceCallback> cancelCallback,
+      std::shared_ptr<compat::ResultCallback<
+          std::shared_ptr<Subscriber::PublishNamespaceHandle>,
+          PublishNamespaceError>> callback) override;
+
+  // Callback-based subscribeNamespace
+  void subscribeNamespaceWithCallback(
+      SubscribeNamespace subAnn,
+      std::shared_ptr<compat::ResultCallback<
+          std::shared_ptr<Publisher::SubscribeNamespaceHandle>,
+          SubscribeNamespaceError>> callback) override;
+
+ private:
+  // Forward declarations for inner classes
+  class PublisherPublishNamespaceHandle;
+  class SubscribeNamespaceHandle;
+
+  // Internal methods
+  void subscribeNamespaceOk(const SubscribeNamespaceOk& saOk);
+  void unsubscribeNamespace(const UnsubscribeNamespace& unsubAnn);
+  void publishNamespaceOk(const PublishNamespaceOk& annOk);
+  void publishNamespaceCancel(const PublishNamespaceCancel& annCan);
+  void publishNamespaceDone(const PublishNamespaceDone& publishNamespaceDone);
+
+  // Override incoming message handlers
+  void onPublishNamespace(PublishNamespace ann) override;
+  void onPublishNamespaceCancel(
+      PublishNamespaceCancel publishNamespaceCancel) override;
+  void onPublishNamespaceDone(PublishNamespaceDone unAnn) override;
+  void onSubscribeNamespace(SubscribeNamespace sa) override;
+  void onRequestOk(RequestOk ok, FrameType frameType) override;
+  void onUnsubscribeNamespace(UnsubscribeNamespace unsub) override;
+
+  // Pending namespace callbacks
+  struct PendingPublishNamespace {
+    TrackNamespace trackNamespace;
+    std::shared_ptr<compat::ResultCallback<
+        std::shared_ptr<Subscriber::PublishNamespaceHandle>,
+        PublishNamespaceError>> callback;
+    std::shared_ptr<Subscriber::PublishNamespaceCallback> cancelCallback;
+  };
+
+  struct PendingSubscribeNamespace {
+    TrackNamespace trackNamespacePrefix;
+    std::shared_ptr<compat::ResultCallback<
+        std::shared_ptr<Publisher::SubscribeNamespaceHandle>,
+        SubscribeNamespaceError>> callback;
+  };
+
+  // State management using compat containers
+  compat::FastMap<
+      RequestID,
+      std::shared_ptr<Subscriber::PublishNamespaceHandle>,
+      RequestID::hash>
+      publishNamespaceHandles_;
+  compat::FastMap<
+      RequestID,
+      std::shared_ptr<Subscriber::PublishNamespaceCallback>,
+      RequestID::hash>
+      publishNamespaceCallbacks_;
+  compat::FastMap<
+      RequestID,
+      std::shared_ptr<Publisher::SubscribeNamespaceHandle>,
+      RequestID::hash>
+      subscribeNamespaceHandles_;
+
+  // Pending requests
+  compat::FastMap<RequestID, PendingPublishNamespace, RequestID::hash>
+      pendingPublishNamespaces_;
+  compat::FastMap<RequestID, PendingSubscribeNamespace, RequestID::hash>
+      pendingSubscribeNamespaces_;
+
+  // Legacy namespace to RequestID maps
+  compat::FastMap<TrackNamespace, RequestID, TrackNamespace::hash>
+      legacyPublisherNamespaceToReqId_;
+  compat::FastMap<TrackNamespace, RequestID, TrackNamespace::hash>
+      legacySubscriberNamespaceToReqId_;
+  compat::FastMap<TrackNamespace, RequestID, TrackNamespace::hash>
+      legacySubscribeNamespaceToReqId_;
+};
+
+#endif // MOXYGEN_USE_FOLLY
 
 } // namespace moxygen

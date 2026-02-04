@@ -26,6 +26,7 @@ else()
         MoQFramer.cpp
         MoQCodec.cpp
         MoQSessionCompat.cpp
+        MoQRelaySessionCompat.cpp
         MoQTokenCache.cpp
         MoQTypes.cpp
         MoQVersions.cpp
@@ -69,6 +70,17 @@ install(
     ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
     LIBRARY DESTINATION ${LIB_INSTALL_DIR}
 )
+
+# Transport implementations
+# mvfst/proxygen adapter requires Folly
+if(MOXYGEN_USE_FOLLY AND MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
+  add_subdirectory(transports)
+endif()
+
+# picoquic transport (works with or without Folly)
+if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
+  add_subdirectory(transports)
+endif()
 
 # Folly-dependent targets - only build when MOXYGEN_USE_FOLLY is ON
 if(MOXYGEN_USE_FOLLY)

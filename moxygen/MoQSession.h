@@ -315,6 +315,24 @@ class MoQSession : public MoQSessionBase,
     return wt_.get();
   }
 
+ protected:
+  // Protected for MoQRelaySession subclass access
+  void cleanup() override;
+
+  // MoQControlCodec::ControlCallback overrides - protected for subclass override
+  void onRequestOk(RequestOk requestOk, FrameType frameType) override;
+
+  // PublishNamespace callbacks - protected for subclass override
+  void onPublishNamespace(PublishNamespace publishNamespace) override;
+  void onPublishNamespaceDone(PublishNamespaceDone publishNamespaceDone) override;
+  void onPublishNamespaceCancel(PublishNamespaceCancel publishNamespaceCancel) override;
+  void onSubscribeNamespace(SubscribeNamespace subscribeNamespace) override;
+  void onUnsubscribeNamespace(UnsubscribeNamespace unsubscribeNamespace) override;
+
+  // Protected state for subclass access
+  std::shared_ptr<compat::WebTransportInterface> wt_;
+  compat::ByteBufferQueue controlWriteBuf_;
+
  private:
   void controlWriteLoop(compat::StreamWriteHandle* writeHandle);
   void controlReadLoop(compat::StreamReadHandle* readHandle);
@@ -329,7 +347,6 @@ class MoQSession : public MoQSessionBase,
   void onSubscribe(SubscribeRequest subscribeRequest) override;
   void onSubscribeUpdate(SubscribeUpdate subscribeUpdate) override;
   void onSubscribeOk(SubscribeOk subscribeOk) override;
-  void onRequestOk(RequestOk requestOk, FrameType frameType) override;
   void onRequestError(RequestError requestError, FrameType frameType) override;
   void onUnsubscribe(Unsubscribe unsubscribe) override;
   void onPublish(PublishRequest publish) override;
@@ -345,19 +362,6 @@ class MoQSession : public MoQSessionBase,
   void onTrackStatusError(TrackStatusError trackStatusError) override;
   void onGoaway(Goaway goaway) override;
   void onConnectionError(ErrorCode error) override;
-
-  // PublishNamespace callbacks - default implementations
-  void onPublishNamespace(PublishNamespace publishNamespace) override;
-  void onPublishNamespaceDone(PublishNamespaceDone publishNamespaceDone) override;
-  void onPublishNamespaceCancel(PublishNamespaceCancel publishNamespaceCancel) override;
-  void onSubscribeNamespace(SubscribeNamespace subscribeNamespace) override;
-  void onUnsubscribeNamespace(UnsubscribeNamespace unsubscribeNamespace) override;
-
-  void cleanup() override;
-
-  // Std-mode specific state
-  std::shared_ptr<compat::WebTransportInterface> wt_;
-  compat::ByteBufferQueue controlWriteBuf_;
 
   std::shared_ptr<compat::ResultCallback<ServerSetup, SessionCloseErrorCode>>
       setupCallback_;

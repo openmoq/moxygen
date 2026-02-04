@@ -40,6 +40,38 @@ option(MOXYGEN_USE_FOLLY
   ON
 )
 
+# QUIC backend selection
+set(MOXYGEN_QUIC_BACKEND "mvfst" CACHE STRING "QUIC stack to use (mvfst or picoquic)")
+set_property(CACHE MOXYGEN_QUIC_BACKEND PROPERTY STRINGS "mvfst" "picoquic")
+
+# Validate QUIC backend
+if(NOT MOXYGEN_QUIC_BACKEND STREQUAL "mvfst" AND NOT MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
+  message(FATAL_ERROR "MOXYGEN_QUIC_BACKEND must be 'mvfst' or 'picoquic', got '${MOXYGEN_QUIC_BACKEND}'")
+endif()
+
+# Define compile-time flags for QUIC backend
+if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
+  add_compile_definitions(MOXYGEN_QUIC_PICOQUIC=1)
+  add_compile_definitions(MOXYGEN_QUIC_MVFST=0)
+else()
+  add_compile_definitions(MOXYGEN_QUIC_PICOQUIC=0)
+  add_compile_definitions(MOXYGEN_QUIC_MVFST=1)
+endif()
+
+# Print build configuration
+message(STATUS "Moxygen build configuration:")
+message(STATUS "  MOXYGEN_USE_FOLLY: ${MOXYGEN_USE_FOLLY}")
+message(STATUS "  MOXYGEN_QUIC_BACKEND: ${MOXYGEN_QUIC_BACKEND}")
+
+# Valid configurations:
+#   1. FOLLY=ON,  QUIC=mvfst    - Default: Full folly + proxygen/mvfst stack
+#   2. FOLLY=ON,  QUIC=picoquic - Folly mode with picoquic transport
+#   3. FOLLY=OFF, QUIC=picoquic - Pure std C++ with picoquic transport
+#   4. FOLLY=OFF, QUIC=mvfst    - Std-mode moxygen with pre-built mvfst/proxygen
+#
+# Note: For option 4, mvfst/proxygen must be installed separately (they depend on folly).
+# Moxygen code uses std alternatives but links against the mvfst QUIC stack.
+
 include(FBBuildOptions)
 fb_activate_static_library_option()
 
@@ -52,17 +84,54 @@ set (DEPS_LIBRARIES_DIR ${MOXYGEN_FBCODE_ROOT}/_build/deps/lib)
 #
 # IMPORTANT: If you change this, make the analogous update in:
 #   cmake/moxygen-config.cmake.in
+
+# Common dependencies
+find_package(Threads REQUIRED)
+
+# Folly-mode dependencies
 if(MOXYGEN_USE_FOLLY)
   find_package(folly REQUIRED)
   find_package(wangle REQUIRED)
-  find_package(mvfst REQUIRED)
-  find_package(proxygen REQUIRED)
   find_package(Glog REQUIRED)
   find_package(gflags REQUIRED)
   find_package(Zstd REQUIRED)
-else()
-  # Std-mode: minimal dependencies
-  find_package(Threads REQUIRED)
+endif()
+
+# QUIC backend dependencies
+if(MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
+  # mvfst requires proxygen for WebTransport (only with Folly mode)
+  # Note: We already validated that MOXYGEN_USE_FOLLY=ON when using mvfst
+  find_package(mvfst REQUIRED)
+  find_package(proxygen REQUIRED)
+elseif(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
+  # Picoquic - fetch from GitHub
+  include(FetchContent)
+
+  # Find OpenSSL first (required by picotls and picoquic)
+  find_package(OpenSSL REQUIRED)
+
+  # Picoquic options
+  set(picoquic_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(BUILD_DEMO OFF CACHE BOOL "" FORCE)
+  set(BUILD_HTTP ON CACHE BOOL "" FORCE)  # We need HTTP/3 for WebTransport
+  set(BUILD_LOGREADER OFF CACHE BOOL "" FORCE)
+  set(BUILD_PQBENCH OFF CACHE BOOL "" FORCE)
+  set(BUILD_LOGLIB OFF CACHE BOOL "" FORCE)
+  set(WITH_OPENSSL ON CACHE BOOL "" FORCE)
+  set(WITH_MBEDTLS OFF CACHE BOOL "" FORCE)
+  set(PICOQUIC_FETCH_PTLS ON CACHE BOOL "" FORCE)  # Auto-fetch picotls
+
+  FetchContent_Declare(
+    picoquic
+    GIT_REPOSITORY https://github.com/private-octopus/picoquic.git
+    GIT_TAG        master
+    GIT_SHALLOW    TRUE
+  )
+
+  FetchContent_MakeAvailable(picoquic)
+
+  # picoquic targets: picoquic-core, picohttp-core
+  message(STATUS "Picoquic fetched and configured")
 endif()
 
 list(APPEND

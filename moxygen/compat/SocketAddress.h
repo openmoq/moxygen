@@ -12,7 +12,12 @@
 #include <folly/SocketAddress.h>
 #else
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 namespace folly {
@@ -24,6 +29,16 @@ class SocketAddress {
 
   SocketAddress(const std::string& host, uint16_t port)
       : host_(host), port_(port), initialized_(true) {}
+
+  // Construct from sockaddr
+  explicit SocketAddress(const struct sockaddr* addr) {
+    setFromSockaddr(addr);
+  }
+
+  // Construct from sockaddr_storage
+  explicit SocketAddress(const struct sockaddr_storage& storage) {
+    setFromSockaddr(reinterpret_cast<const struct sockaddr*>(&storage));
+  }
 
   // Check if address is set
   bool isInitialized() const {
@@ -58,6 +73,32 @@ class SocketAddress {
     host_ = host;
     port_ = port;
     initialized_ = true;
+  }
+
+  // Set from sockaddr
+  void setFromSockaddr(const struct sockaddr* addr) {
+    if (!addr) {
+      reset();
+      return;
+    }
+
+    char ipStr[INET6_ADDRSTRLEN];
+
+    if (addr->sa_family == AF_INET) {
+      const auto* addr4 = reinterpret_cast<const struct sockaddr_in*>(addr);
+      inet_ntop(AF_INET, &addr4->sin_addr, ipStr, sizeof(ipStr));
+      host_ = ipStr;
+      port_ = ntohs(addr4->sin_port);
+      initialized_ = true;
+    } else if (addr->sa_family == AF_INET6) {
+      const auto* addr6 = reinterpret_cast<const struct sockaddr_in6*>(addr);
+      inet_ntop(AF_INET6, &addr6->sin6_addr, ipStr, sizeof(ipStr));
+      host_ = ipStr;
+      port_ = ntohs(addr6->sin6_port);
+      initialized_ = true;
+    } else {
+      reset();
+    }
   }
 
   // Reset to uninitialized state

@@ -11,3 +11,24 @@
 #ifndef MOXYGEN_USE_FOLLY
 #define MOXYGEN_USE_FOLLY 1
 #endif
+
+// QUIC backend selection
+// MOXYGEN_QUIC_MVFST - Use mvfst/proxygen QUIC stack
+// MOXYGEN_QUIC_PICOQUIC - Use picoquic QUIC stack
+// Default to mvfst if not explicitly set by CMake.
+#ifndef MOXYGEN_QUIC_MVFST
+#define MOXYGEN_QUIC_MVFST 1
+#endif
+
+#ifndef MOXYGEN_QUIC_PICOQUIC
+#define MOXYGEN_QUIC_PICOQUIC 0
+#endif
+
+// Validate configuration - exactly one QUIC backend must be selected
+#if MOXYGEN_QUIC_MVFST && MOXYGEN_QUIC_PICOQUIC
+#error "Cannot enable both MOXYGEN_QUIC_MVFST and MOXYGEN_QUIC_PICOQUIC"
+#endif
+
+#if !MOXYGEN_QUIC_MVFST && !MOXYGEN_QUIC_PICOQUIC
+#error "Must enable either MOXYGEN_QUIC_MVFST or MOXYGEN_QUIC_PICOQUIC"
+#endif
