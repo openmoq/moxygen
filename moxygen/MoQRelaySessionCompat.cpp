@@ -6,12 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-// Std-mode (non-Folly) implementation of MoQRelaySession
-// This file is only compiled when MOXYGEN_USE_FOLLY=OFF
+// Callback-based (compat) implementation of MoQRelaySession
+// This file is compiled when NOT using mvfst (std-mode or Folly+picoquic)
 
 #include <moxygen/MoQRelaySession.h>
 
-#if !MOXYGEN_USE_FOLLY
+#if !MOXYGEN_QUIC_MVFST
 
 namespace moxygen {
 
@@ -448,4 +448,4 @@ void MoQRelaySession::publishNamespaceDone(
 
 } // namespace moxygen
 
-#endif // !MOXYGEN_USE_FOLLY
+#endif // !MOXYGEN_QUIC_MVFST

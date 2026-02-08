@@ -39,7 +39,7 @@ class MoQClientInterface {
 
   using ConnectError = SessionCloseErrorCode;
 
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
   /**
    * Connect to a MoQ server and establish a session (coroutine version)
    */

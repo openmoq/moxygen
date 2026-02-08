@@ -23,7 +23,6 @@ class MoQSession;
 #include <atomic>
 #include <memory>
 #include <string>
-#include <thread>
 
 namespace moxygen::transports {
 
@@ -57,19 +56,14 @@ class PicoquicMoQClient : public compat::MoQClientInterface {
 
   ~PicoquicMoQClient() override;
 
-#if MOXYGEN_USE_FOLLY
-  compat::Task<compat::Expected<ConnectResult, ConnectError>> connect(
-      std::chrono::milliseconds timeout,
-      std::shared_ptr<Publisher> publishHandler,
-      std::shared_ptr<Subscriber> subscribeHandler) override;
-#else
+  // Picoquic transport uses callback-based API even in Folly mode
+  // (coroutine API is only available with mvfst/proxygen)
   void connectWithCallback(
       std::chrono::milliseconds timeout,
       std::shared_ptr<Publisher> publishHandler,
       std::shared_ptr<Subscriber> subscribeHandler,
       std::shared_ptr<compat::ResultCallback<ConnectResult, ConnectError>>
           callback) override;
-#endif
 
   std::shared_ptr<MoQSession> getSession() const override;
 
@@ -95,11 +89,15 @@ class PicoquicMoQClient : public compat::MoQClientInterface {
       void* callback_ctx,
       void* stream_ctx);
 
+  // Loop callback for network thread events
+  static int picoLoopCallback(
+      picoquic_quic_t* quic,
+      picoquic_packet_loop_cb_enum cb_mode,
+      void* callback_ctx,
+      void* callback_argv);
+
   // Initialize picoquic context
   bool initQuicContext();
-
-  // Run the QUIC connection (blocking)
-  void runConnection();
 
   // Handle connection established
   void onConnected();
@@ -125,15 +123,15 @@ class PicoquicMoQClient : public compat::MoQClientInterface {
   std::atomic<bool> closed_{false};
 
   // Pending connect callback (for callback-based connect)
-#if !MOXYGEN_USE_FOLLY
   std::shared_ptr<compat::ResultCallback<ConnectResult, ConnectError>>
       connectCallback_;
   std::shared_ptr<Publisher> pendingPublishHandler_;
   std::shared_ptr<Subscriber> pendingSubscribeHandler_;
-#endif
 
-  // Event loop thread for picoquic
-  std::thread eventLoopThread_;
+  // Network thread
+  PicoquicThreadDispatcher dispatcher_;
+  picoquic_network_thread_ctx_t* threadCtx_{nullptr};
+  picoquic_packet_loop_param_t loopParam_{};
 };
 
 /**

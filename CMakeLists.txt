@@ -105,6 +105,7 @@ find_package(Threads REQUIRED)
 # Folly-mode dependencies
 if(MOXYGEN_USE_FOLLY)
   find_package(folly REQUIRED)
+  find_package(fizz REQUIRED)  # wangle depends on fizz
   find_package(wangle REQUIRED)
   find_package(Glog REQUIRED)
   find_package(gflags REQUIRED)

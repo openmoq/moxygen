@@ -8,9 +8,10 @@
 add_subdirectory(compat)
 
 # MOQ Core Library
-# Note: In std-mode, only core types and utilities are built.
-# The Framer, Codec, and Session require Folly/Proxygen and are Folly-only.
-if(MOXYGEN_USE_FOLLY)
+# Note: MoQSession (coroutine-based) requires Folly + mvfst/proxygen.
+# MoQSessionCompat (callback-based) is used for std-mode or Folly + picoquic.
+if(MOXYGEN_USE_FOLLY AND MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
+    # Folly + mvfst: full coroutine-based session
     set(MOXYGEN_CORE_SOURCES
         MoQFramer.cpp
         MoQCodec.cpp
@@ -20,8 +21,20 @@ if(MOXYGEN_USE_FOLLY)
         MoQVersions.cpp
         events/MoQDeliveryTimer.cpp
     )
+elseif(MOXYGEN_USE_FOLLY)
+    # Folly + picoquic: use callback-based session with Folly coroutine support
+    set(MOXYGEN_CORE_SOURCES
+        MoQFramer.cpp
+        MoQCodec.cpp
+        MoQSessionCompat.cpp
+        MoQRelaySessionCompat.cpp
+        MoQTokenCache.cpp
+        MoQTypes.cpp
+        MoQVersions.cpp
+        events/MoQDeliveryTimer.cpp
+    )
 else()
-    # Std-mode: core library with parsing support and callback-based session
+    # Std-mode: callback-based session, no Folly dependencies
     set(MOXYGEN_CORE_SOURCES
         MoQFramer.cpp
         MoQCodec.cpp
@@ -91,8 +104,8 @@ if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
   add_subdirectory(transports)
 endif()
 
-# Folly-dependent targets - only build when MOXYGEN_USE_FOLLY is ON
-if(MOXYGEN_USE_FOLLY)
+# Folly + mvfst targets (require proxygen/WebTransport)
+if(MOXYGEN_USE_FOLLY AND MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
 
 add_library(moqrelaysession
     MoQRelaySession.cpp
@@ -229,4 +242,41 @@ if(MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
   add_subdirectory(test)
 endif()
 
-endif() # MOXYGEN_USE_FOLLY
+endif() # MOXYGEN_USE_FOLLY AND MOXYGEN_QUIC_BACKEND == mvfst
+
+# Picoquic-mode components (works with or without Folly)
+if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
+
+# Simple executor for std-mode (no Folly dependency)
+add_library(moqsimpleexecutor
+    events/MoQSimpleExecutor.cpp
+)
+
+target_include_directories(
+    moqsimpleexecutor PUBLIC
+    $<BUILD_INTERFACE:${MOXYGEN_FBCODE_ROOT}>
+)
+
+target_compile_options(
+    moqsimpleexecutor PRIVATE
+    ${_MOXYGEN_COMMON_COMPILE_OPTIONS}
+)
+
+target_link_libraries(
+    moqsimpleexecutor PUBLIC
+    moqcompat
+    Threads::Threads
+)
+
+install(
+    TARGETS moqsimpleexecutor
+    EXPORT moxygen-exports
+    ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
+    LIBRARY DESTINATION ${LIB_INSTALL_DIR}
+)
+
+# Picoquic sample programs
+add_subdirectory(samples/date)
+add_subdirectory(samples/text-client)
+
+endif() # MOXYGEN_QUIC_BACKEND == picoquic

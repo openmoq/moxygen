@@ -12,13 +12,16 @@
 
 #if MOXYGEN_USE_FOLLY
 #include <folly/Executor.h>
+#if MOXYGEN_QUIC_MVFST
 #include <quic/common/events/QuicEventBase.h>
+#endif
 #endif
 
 namespace moxygen {
 
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 
+// Folly + mvfst mode: inherit from folly::Executor, use QuicTimerCallback
 class MoQExecutor : public folly::Executor {
  public:
   virtual ~MoQExecutor() = default;
@@ -38,6 +41,31 @@ class MoQExecutor : public folly::Executor {
   // Timeout scheduling methods
   virtual void scheduleTimeout(
       quic::QuicTimerCallback* callback,
+      std::chrono::milliseconds timeout) = 0;
+};
+
+#elif MOXYGEN_USE_FOLLY // Folly + picoquic
+
+// Folly + picoquic mode: inherit from folly::Executor, use std::function
+class MoQExecutor : public folly::Executor {
+ public:
+  virtual ~MoQExecutor() = default;
+
+  template <
+      typename T,
+      typename = std::enable_if_t<std::is_base_of_v<MoQExecutor, T>>>
+  T* getTypedExecutor() {
+    auto exec = dynamic_cast<T*>(this);
+    if (exec) {
+      return exec;
+    } else {
+      return nullptr;
+    }
+  }
+
+  // Timeout scheduling methods (function-based for picoquic)
+  virtual void scheduleTimeout(
+      std::function<void()> callback,
       std::chrono::milliseconds timeout) = 0;
 };
 

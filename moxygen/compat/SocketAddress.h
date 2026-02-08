@@ -133,4 +133,19 @@ class SocketAddress {
 // Bring into compat namespace
 namespace moxygen::compat {
 using SocketAddress = folly::SocketAddress;
+
+// Helper function to create SocketAddress from sockaddr*
+// This works in both Folly and std mode
+inline SocketAddress makeSocketAddress(const struct sockaddr* addr) {
+  SocketAddress result;
+  if (addr) {
+#if MOXYGEN_USE_FOLLY
+    result.setFromSockaddr(addr);
+#else
+    result.setFromSockaddr(addr);
+#endif
+  }
+  return result;
+}
+
 } // namespace moxygen::compat

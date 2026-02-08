@@ -26,6 +26,7 @@ namespace moxygen::compat {
 // Folly mode: use native types
 using Cursor = folly::io::Cursor;
 using BufQueue = folly::IOBufQueue;
+using ByteBufferQueue = folly::IOBufQueue;  // Alias for compat code
 using WriteResult = folly::Expected<size_t, quic::TransportErrorCode>;
 
 #else // !MOXYGEN_USE_FOLLY

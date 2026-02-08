@@ -2975,7 +2975,6 @@ compat::Expected<compat::Unit, ErrorCode> MoQFrameParser::parseExtensionKvPairs(
   while (extensionBlockLength > 0) {
     // This won't infinite loop because we're parsing out at least a
     // QuicInteger each time.
-
     auto parseExtensionResult = parseExtension(
         cursor, extensionBlockLength, objectHeader, allowImmutable);
     if (parseExtensionResult.hasError()) {
@@ -3193,7 +3192,7 @@ void writeVarint(
   if (error) {
     return;
   }
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
   folly::io::QueueAppender appender(&buf, kMaxFrameHeaderSize);
   auto appenderOp = [appender = std::move(appender)](auto val) mutable {
     appender.writeBE(val);
@@ -3205,7 +3204,7 @@ void writeVarint(
     size += *res;
   }
 #else
-  // Std-mode varint encoding
+  // Varint encoding for std-mode or Folly+picoquic
   uint8_t temp[8];
   size_t written = quic::encodeQuicInteger(value, temp, sizeof(temp));
   if (written == 0) {

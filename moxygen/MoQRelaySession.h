@@ -27,7 +27,7 @@ namespace moxygen {
  * tracks.
  */
 
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 
 class MoQRelaySession : public MoQSession {
  public:
@@ -129,7 +129,7 @@ class MoQRelaySession : public MoQSession {
   class MoQRelayPendingRequestState;
 };
 
-#else // !MOXYGEN_USE_FOLLY
+#else // !MOXYGEN_USE_FOLLY || !MOXYGEN_QUIC_MVFST
 
 /**
  * MoQRelaySession - Std-mode implementation with callback-based API
@@ -156,14 +156,14 @@ class MoQRelaySession : public MoQSession {
       std::shared_ptr<Subscriber::PublishNamespaceCallback> cancelCallback,
       std::shared_ptr<compat::ResultCallback<
           std::shared_ptr<Subscriber::PublishNamespaceHandle>,
-          PublishNamespaceError>> callback) override;
+          PublishNamespaceError>> callback);
 
   // Callback-based subscribeNamespace
   void subscribeNamespaceWithCallback(
       SubscribeNamespace subAnn,
       std::shared_ptr<compat::ResultCallback<
           std::shared_ptr<Publisher::SubscribeNamespaceHandle>,
-          SubscribeNamespaceError>> callback) override;
+          SubscribeNamespaceError>> callback);
 
  private:
   // Forward declarations for inner classes
@@ -234,6 +234,6 @@ class MoQRelaySession : public MoQSession {
       legacySubscribeNamespaceToReqId_;
 };
 
-#endif // MOXYGEN_USE_FOLLY
+#endif // MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 
 } // namespace moxygen

@@ -9,7 +9,7 @@
 #pragma once
 
 #include <moxygen/compat/Config.h>
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 #include <proxygen/lib/http/webtransport/WebTransport.h>
 #endif
 #include <moxygen/MoQPublishError.h>

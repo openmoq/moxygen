@@ -22,9 +22,7 @@ class MoQSession;
 
 #include <atomic>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
 
 namespace moxygen::transports {
@@ -95,11 +93,15 @@ class PicoquicMoQServer : public compat::MoQServerInterface {
       void* callback_ctx,
       void* stream_ctx);
 
+  // Loop callback for network thread events
+  static int picoLoopCallback(
+      picoquic_quic_t* quic,
+      picoquic_packet_loop_cb_enum cb_mode,
+      void* callback_ctx,
+      void* callback_argv);
+
   // Initialize picoquic context
   bool initQuicContext();
-
-  // Run the server event loop (blocking)
-  void runServer(const compat::SocketAddress& addr);
 
   // Handle new connection
   void onNewConnection(picoquic_cnx_t* cnx);
@@ -117,13 +119,16 @@ class PicoquicMoQServer : public compat::MoQServerInterface {
   // Session handler
   std::shared_ptr<SessionHandler> sessionHandler_;
 
-  // Active connections
-  std::mutex connectionsMutex_;
+  // Active connections (accessed only from pico thread after start)
   std::unordered_map<picoquic_cnx_t*, ConnectionState> connections_;
 
   // Server state
   std::atomic<bool> running_{false};
-  std::thread serverThread_;
+
+  // Network thread
+  PicoquicThreadDispatcher dispatcher_;
+  picoquic_network_thread_ctx_t* threadCtx_{nullptr};
+  picoquic_packet_loop_param_t loopParam_{};
 };
 
 /**

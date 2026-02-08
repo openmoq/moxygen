@@ -30,10 +30,10 @@ void MoQDeliveryTimer::startTimer(
 
   if (inserted) {
     auto timeout = calculateTimeout(srtt);
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
     exec_->scheduleTimeout(callbackPtr, timeout);
 #else
-    // Std-mode: use scheduleTimeout from MoQExecutor
+    // Std-mode or Folly+picoquic: use function-based scheduleTimeout
     exec_->scheduleTimeout(
         [callbackPtr]() { callbackPtr->timeoutExpired(); }, timeout);
 #endif

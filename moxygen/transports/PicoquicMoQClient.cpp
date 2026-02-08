@@ -15,6 +15,7 @@
 #include <picoquic_packet_loop.h>
 #include <picosocks.h>
 
+#include <cstdio>
 #include <cstring>
 #include <regex>
 
@@ -27,10 +28,6 @@ PicoquicMoQClient::PicoquicMoQClient(
 
 PicoquicMoQClient::~PicoquicMoQClient() {
   close(SessionCloseErrorCode::NO_ERROR);
-
-  if (eventLoopThread_.joinable()) {
-    eventLoopThread_.join();
-  }
 
   if (quic_) {
     picoquic_free(quic_);
@@ -73,21 +70,7 @@ bool PicoquicMoQClient::initQuicContext() {
   return true;
 }
 
-#if MOXYGEN_USE_FOLLY
-compat::Task<compat::Expected<
-    PicoquicMoQClient::ConnectResult,
-    PicoquicMoQClient::ConnectError>>
-PicoquicMoQClient::connect(
-    std::chrono::milliseconds timeout,
-    std::shared_ptr<Publisher> publishHandler,
-    std::shared_ptr<Subscriber> subscribeHandler) {
-  // Folly mode implementation would use coroutines
-  // For now, return an error since this is primarily for std-mode
-  co_return compat::makeUnexpected(
-      SessionCloseErrorCode::INTERNAL_ERROR);
-}
-#else
-
+// Picoquic uses callback-based API regardless of Folly mode
 void PicoquicMoQClient::connectWithCallback(
     std::chrono::milliseconds timeout,
     std::shared_ptr<Publisher> publishHandler,
@@ -164,29 +147,47 @@ void PicoquicMoQClient::connectWithCallback(
     return;
   }
 
-  // Run the event loop in a separate thread
-  // TODO: Use timeout parameter for connection timeout
-  eventLoopThread_ = std::thread([this]() {
-    runConnection();
-  });
-}
-#endif
+  // Start network thread with loop callback
+  memset(&loopParam_, 0, sizeof(loopParam_));
+  loopParam_.local_port = 0;  // ephemeral port
 
-void PicoquicMoQClient::runConnection() {
-  // Use picoquic's packet loop
-  int ret = picoquic_packet_loop(
-      quic_,
-      0,        // local port (0 = ephemeral)
-      0,        // local_af (0 = auto)
-      0,        // dest_if
-      0,        // socket_buffer_size (0 = default)
-      0,        // do_not_use_gso
-      nullptr,  // loop_callback
-      nullptr); // loop_callback_ctx
+  int startRet = 0;
+  threadCtx_ = picoquic_start_network_thread(
+      quic_, &loopParam_, picoLoopCallback, this, &startRet);
 
-  if (ret != 0 && !closed_) {
-    onConnectionError(static_cast<uint32_t>(ret));
+  if (!threadCtx_ || startRet != 0) {
+    callback->onError(SessionCloseErrorCode::INTERNAL_ERROR);
+    connectCallback_.reset();
+    picoquic_delete_cnx(cnx_);
+    cnx_ = nullptr;
+    return;
   }
+
+  dispatcher_.setThreadContext(threadCtx_);
+}
+
+int PicoquicMoQClient::picoLoopCallback(
+    picoquic_quic_t* /*quic*/,
+    picoquic_packet_loop_cb_enum cb_mode,
+    void* callback_ctx,
+    void* /*callback_argv*/) {
+  auto* client = static_cast<PicoquicMoQClient*>(callback_ctx);
+  if (!client) {
+    return 0;
+  }
+
+  switch (cb_mode) {
+    case picoquic_packet_loop_ready:
+      client->dispatcher_.setPicoThreadId(std::this_thread::get_id());
+      break;
+    case picoquic_packet_loop_wake_up:
+      client->dispatcher_.drainWorkQueue();
+      break;
+    default:
+      break;
+  }
+
+  return 0;
 }
 
 int PicoquicMoQClient::picoquicCallback(
@@ -230,13 +231,13 @@ void PicoquicMoQClient::onConnected() {
     return;  // Already connected
   }
 
-  // Create transport wrapper
-  transport_ = std::make_shared<PicoquicWebTransport>(cnx_, false);
+  // Create transport wrapper with thread dispatcher
+  transport_ = std::make_shared<PicoquicWebTransport>(cnx_, false, &dispatcher_);
 
   // Update connection callback context to use transport directly
   picoquic_set_callback(cnx_, PicoquicWebTransport::picoCallback, transport_.get());
 
-#if !MOXYGEN_USE_FOLLY
+#if !MOXYGEN_QUIC_MVFST
   // Create MoQ session (std-mode)
   session_ = std::make_shared<MoQSession>(transport_, executor_);
 
@@ -309,7 +310,7 @@ void PicoquicMoQClient::onConnectionError(uint32_t errorCode) {
     return;
   }
 
-#if !MOXYGEN_USE_FOLLY
+#if !MOXYGEN_QUIC_MVFST
   if (connectCallback_) {
     connectCallback_->onError(SessionCloseErrorCode::INTERNAL_ERROR);
     connectCallback_.reset();
@@ -341,9 +342,10 @@ void PicoquicMoQClient::close(SessionCloseErrorCode errorCode) {
     transport_.reset();
   }
 
-  // Signal event loop to exit
-  if (cnx_) {
-    picoquic_close(cnx_, static_cast<uint64_t>(errorCode));
+  // Delete the network thread (signals close and waits for thread exit)
+  if (threadCtx_) {
+    picoquic_delete_network_thread(threadCtx_);
+    threadCtx_ = nullptr;
   }
 }
 

@@ -16,8 +16,10 @@
 #if MOXYGEN_USE_FOLLY
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBufQueue.h>
+#if MOXYGEN_QUIC_MVFST
 #include <quic/codec/QuicInteger.h>
 #include <quic/folly_utils/Utils.h>
+#endif
 #endif
 
 namespace moxygen {
@@ -441,7 +443,7 @@ class MoQFrameWriter {
       TrackAlias trackAlias,
       const ObjectHeader& objectHeader,
       SubgroupIDFormat format = SubgroupIDFormat::Present,
-      bool includeExtensions = true) const noexcept;
+      bool includeExtensions = false) const noexcept;
 
   WriteResult writeFetchHeader(BufQueue& writeBuf, RequestID requestID)
       const noexcept;

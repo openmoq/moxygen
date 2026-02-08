@@ -8,7 +8,9 @@
 
 #include <moxygen/MoQSessionBase.h>
 
-#if MOXYGEN_USE_FOLLY
+#include <map>
+
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 #include <folly/MaybeManagedPtr.h>
 #include <folly/coro/Promise.h>
 #include <folly/coro/Task.h>
@@ -20,10 +22,10 @@
 
 namespace moxygen {
 
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 
 /**
- * MoQSession - Folly-based MoQ session implementation
+ * MoQSession - Folly-based MoQ session implementation (requires mvfst/proxygen)
  *
  * Uses folly coroutines for async operations and proxygen::WebTransport
  * for the transport layer.
@@ -551,13 +553,50 @@ class MoQSession : public MoQSessionBase,
   std::shared_ptr<compat::WebTransportInterface> wt_;
   compat::ByteBufferQueue controlWriteBuf_;
 
- private:
-  void controlWriteLoop(compat::StreamWriteHandle* writeHandle);
-  void controlReadLoop(compat::StreamReadHandle* readHandle);
+ public:
+  // Callback-based subscribe (client-side)
+  void subscribeWithCallback(
+      SubscribeRequest sub,
+      std::shared_ptr<TrackConsumer> consumer,
+      std::shared_ptr<compat::ResultCallback<
+          std::shared_ptr<SubscriptionHandle>,
+          SubscribeError>> callback) override;
 
-  void unidirectionalReadLoop(
-      std::shared_ptr<MoQSession> session,
-      compat::StreamReadHandle* readHandle);
+  // Callback-based fetch (client-side)
+  void fetchWithCallback(
+      Fetch fetch,
+      std::shared_ptr<FetchConsumer> consumer,
+      std::shared_ptr<
+          compat::ResultCallback<std::shared_ptr<Publisher::FetchHandle>,
+                                 FetchError>> callback) override;
+
+  // Override send methods from MoQSessionBase (public for track handles)
+  void sendSubscribeOk(const SubscribeOk& subOk) override;
+  void subscribeError(const SubscribeError& subErr) override;
+  void unsubscribe(const Unsubscribe& unsub) override;
+  void subscribeUpdate(const SubscribeUpdate& subUpdate) override;
+  void subscribeUpdateOk(const RequestOk& requestOk) override;
+  void subscribeUpdateError(
+      const SubscribeUpdateError& requestError,
+      RequestID subscriptionRequestID) override;
+  void sendSubscribeDone(const SubscribeDone& subDone) override;
+  void fetchOk(const FetchOk& fetchOkMsg) override;
+  void fetchError(const FetchError& fetchErr) override;
+  void fetchCancel(const FetchCancel& fetchCan) override;
+  void publishOk(const PublishOk& pubOk) override;
+  void publishError(const PublishError& pubErr) override;
+  void trackStatusOk(const TrackStatusOk& tsOk) override;
+  void trackStatusError(const TrackStatusError& tsErr) override;
+  void publishNamespaceError(
+      const PublishNamespaceError& publishNamespaceErr) override;
+  void subscribeNamespaceError(
+      const SubscribeNamespaceError& subscribeNamespaceErr) override;
+  void sendMaxRequestID(bool signalWriteLoop) override;
+
+ protected:
+  // Control stream helpers
+  void flushControlBuf();
+  void setupControlReadCallback(compat::StreamReadHandle* readHandle);
 
   // MoQControlCodec::ControlCallback overrides
   void onClientSetup(ClientSetup clientSetup) override;
@@ -581,10 +620,37 @@ class MoQSession : public MoQSessionBase,
   void onGoaway(Goaway goaway) override;
   void onConnectionError(ErrorCode error) override;
 
+ private:
+  // Pending subscribe/fetch state for client-side operations
+  struct CompatPendingSubscribe {
+    std::shared_ptr<SubscribeTrackReceiveState> trackState;
+    std::shared_ptr<TrackConsumer> consumer;
+    std::shared_ptr<compat::ResultCallback<
+        std::shared_ptr<SubscriptionHandle>,
+        SubscribeError>> callback;
+  };
+
+  struct CompatPendingFetch {
+    std::shared_ptr<FetchTrackReceiveState> fetchState;
+    std::shared_ptr<FetchConsumer> consumer;
+    std::shared_ptr<
+        compat::ResultCallback<std::shared_ptr<Publisher::FetchHandle>,
+                               FetchError>> callback;
+  };
+
+  // Control stream state
+  compat::StreamWriteHandle* controlWriteHandle_{nullptr};
+  compat::StreamReadHandle* controlReadHandle_{nullptr};
+  bool controlStreamReady_{false};
+
+  // Pending requests
+  std::map<RequestID, CompatPendingSubscribe> pendingSubscribes_;
+  std::map<RequestID, CompatPendingFetch> pendingFetches_;
+
   std::shared_ptr<compat::ResultCallback<ServerSetup, SessionCloseErrorCode>>
       setupCallback_;
 };
 
-#endif // MOXYGEN_USE_FOLLY
+#endif // MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 
 } // namespace moxygen

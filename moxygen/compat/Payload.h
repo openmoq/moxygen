@@ -47,6 +47,8 @@ class Payload {
 
   size_t length() const { return buf_ ? buf_->length() : 0; }
 
+  size_t size() const { return length(); }  // Alias for length()
+
   const uint8_t* data() const { return buf_ ? buf_->data() : nullptr; }
 
   uint8_t* writableData() { return buf_ ? buf_->writableData() : nullptr; }

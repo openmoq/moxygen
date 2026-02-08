@@ -16,6 +16,7 @@
 #include <picoquic_packet_loop.h>
 #include <picosocks.h>
 
+#include <cstdio>
 #include <cstring>
 
 namespace moxygen::transports {
@@ -74,6 +75,9 @@ PicoquicMoQServer::PicoquicMoQServer(
 PicoquicMoQServer::~PicoquicMoQServer() {
   stop();
 
+  // Safe to access after pico thread is stopped
+  connections_.clear();
+
   if (quic_) {
     picoquic_free(quic_);
     quic_ = nullptr;
@@ -127,29 +131,26 @@ void PicoquicMoQServer::start(
     return;
   }
 
-  // Start server thread
-  serverThread_ = std::thread([this, addr]() {
-    runServer(addr);
-  });
-}
+  // Configure loop parameters
+  memset(&loopParam_, 0, sizeof(loopParam_));
+  loopParam_.local_port = addr.getPort();
 
-void PicoquicMoQServer::runServer(const compat::SocketAddress& addr) {
-  // Use picoquic's packet loop for server
-  int ret = picoquic_packet_loop(
-      quic_,
-      addr.getPort(),
-      0,        // local_af (0 = auto based on address)
-      0,        // dest_if
-      0,        // socket_buffer_size (0 = default)
-      0,        // do_not_use_gso
-      nullptr,  // loop_callback
-      nullptr); // loop_callback_ctx
+  // Start network thread with loop callback
+  int ret = 0;
+  threadCtx_ = picoquic_start_network_thread(
+      quic_, &loopParam_, picoLoopCallback, this, &ret);
 
-  if (ret != 0) {
-    // Server loop exited with error
+  if (!threadCtx_ || ret != 0) {
+    running_ = false;
+    return;
   }
 
-  running_ = false;
+  // Wait for thread to be ready
+  while (!threadCtx_->thread_is_ready) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  dispatcher_.setThreadContext(threadCtx_);
 }
 
 void PicoquicMoQServer::stop() {
@@ -157,25 +158,35 @@ void PicoquicMoQServer::stop() {
     return;  // Not running
   }
 
-  // Close all connections
-  {
-    std::lock_guard<std::mutex> lock(connectionsMutex_);
-    for (auto& [cnx, state] : connections_) {
-      if (state.session) {
-        state.session->close(SessionCloseErrorCode::NO_ERROR);
-      }
-      if (state.transport) {
-        state.transport->closeSession(0);
-      }
-      picoquic_close(cnx, 0);
-    }
-    connections_.clear();
+  if (threadCtx_) {
+    // Delete the network thread (signals close and waits for thread exit)
+    picoquic_delete_network_thread(threadCtx_);
+    threadCtx_ = nullptr;
+  }
+}
+
+int PicoquicMoQServer::picoLoopCallback(
+    picoquic_quic_t* /*quic*/,
+    picoquic_packet_loop_cb_enum cb_mode,
+    void* callback_ctx,
+    void* /*callback_argv*/) {
+  auto* server = static_cast<PicoquicMoQServer*>(callback_ctx);
+  if (!server) {
+    return 0;
   }
 
-  // Wait for server thread
-  if (serverThread_.joinable()) {
-    serverThread_.join();
+  switch (cb_mode) {
+    case picoquic_packet_loop_ready:
+      server->dispatcher_.setPicoThreadId(std::this_thread::get_id());
+      break;
+    case picoquic_packet_loop_wake_up:
+      server->dispatcher_.drainWorkQueue();
+      break;
+    default:
+      break;
   }
+
+  return 0;
 }
 
 int PicoquicMoQServer::picoquicCallback(
@@ -203,8 +214,7 @@ int PicoquicMoQServer::picoquicCallback(
       break;
 
     default: {
-      // Forward to the connection's transport
-      std::lock_guard<std::mutex> lock(server->connectionsMutex_);
+      // Forward to the connection's transport (safe: pico thread only)
       auto it = server->connections_.find(cnx);
       if (it != server->connections_.end() && it->second.transport) {
         return PicoquicWebTransport::picoCallback(
@@ -219,8 +229,8 @@ int PicoquicMoQServer::picoquicCallback(
 }
 
 void PicoquicMoQServer::onNewConnection(picoquic_cnx_t* cnx) {
-  // Create transport wrapper
-  auto transport = std::make_shared<PicoquicWebTransport>(cnx, true);
+  // Create transport wrapper with thread dispatcher
+  auto transport = std::make_shared<PicoquicWebTransport>(cnx, true, &dispatcher_);
 
 #if !MOXYGEN_USE_FOLLY
   // Create the setup callback wrapper
@@ -229,16 +239,12 @@ void PicoquicMoQServer::onNewConnection(picoquic_cnx_t* cnx) {
   // Create session with setup callback
   auto session = std::make_shared<MoQSession>(transport, *setupCallback, executor_);
 
-  // Store connection state (including setupCallback to keep it alive)
+  // Store connection state (safe: pico thread only)
   ConnectionState state;
   state.transport = transport;
   state.session = session;
   state.setupCallback = setupCallback;
-
-  {
-    std::lock_guard<std::mutex> lock(connectionsMutex_);
-    connections_[cnx] = std::move(state);
-  }
+  connections_[cnx] = std::move(state);
 
   // Set up transport callbacks
   transport->setNewUniStreamCallback([session](compat::StreamReadHandle* stream) {
@@ -270,13 +276,11 @@ void PicoquicMoQServer::onNewConnection(picoquic_cnx_t* cnx) {
 void PicoquicMoQServer::onConnectionClose(picoquic_cnx_t* cnx) {
   std::shared_ptr<MoQSession> session;
 
-  {
-    std::lock_guard<std::mutex> lock(connectionsMutex_);
-    auto it = connections_.find(cnx);
-    if (it != connections_.end()) {
-      session = it->second.session;
-      connections_.erase(it);
-    }
+  // Safe: accessed only from pico thread
+  auto it = connections_.find(cnx);
+  if (it != connections_.end()) {
+    session = it->second.session;
+    connections_.erase(it);
   }
 
   if (session && sessionHandler_) {

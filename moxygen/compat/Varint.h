@@ -8,15 +8,18 @@
 
 #include <moxygen/compat/Config.h>
 
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
+// Use mvfst's QUIC integer implementation when available
 #include <quic/QuicException.h>
 #include <quic/codec/QuicInteger.h>
 #else
+// Standalone QUIC varint implementation for std-mode or picoquic
 
 #include <moxygen/compat/Expected.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <optional>
 
 namespace quic {
@@ -133,8 +136,8 @@ namespace follyutils {
 // Forward declaration - ByteCursor is defined in ByteCursor.h
 // This decodeQuicInteger works with any cursor type that has:
 // - totalLength() returning size_t
-// - data() returning const uint8_t*
-// - skip(size_t)
+// - peek() returning uint8_t (to check first byte without advancing)
+// - read<uint8_t>() to read and advance cursor
 template <typename CursorType>
 inline std::optional<std::pair<uint64_t, size_t>> decodeQuicInteger(
     CursorType& cursor) {
@@ -143,8 +146,8 @@ inline std::optional<std::pair<uint64_t, size_t>> decodeQuicInteger(
     return std::nullopt;
   }
 
-  const uint8_t* data = cursor.data();
-  uint8_t firstByte = *data;
+  // Peek at first byte to determine varint length
+  uint8_t firstByte = cursor.peek();
   uint8_t type = (firstByte >> 6) & 0x3;
   size_t intLen = 1u << type;
 
@@ -152,12 +155,13 @@ inline std::optional<std::pair<uint64_t, size_t>> decodeQuicInteger(
     return std::nullopt;
   }
 
-  uint64_t value = firstByte & 0x3F;
+  // Read bytes one at a time to handle cross-buffer varints correctly
+  // First byte is read and masked
+  uint64_t value = cursor.template read<uint8_t>() & 0x3F;
   for (size_t i = 1; i < intLen; ++i) {
-    value = (value << 8) | data[i];
+    value = (value << 8) | cursor.template read<uint8_t>();
   }
 
-  cursor.skip(intLen);
   return std::make_pair(value, intLen);
 }
 
@@ -177,8 +181,8 @@ inline std::optional<std::pair<uint64_t, size_t>> decodeQuicInteger(
     return std::nullopt;
   }
 
-  const uint8_t* data = cursor.data();
-  uint8_t firstByte = *data;
+  // Peek at first byte to determine varint length
+  uint8_t firstByte = cursor.peek();
   uint8_t type = (firstByte >> 6) & 0x3;
   size_t intLen = 1u << type;
 
@@ -186,13 +190,17 @@ inline std::optional<std::pair<uint64_t, size_t>> decodeQuicInteger(
     return std::nullopt;
   }
 
-  uint64_t value = firstByte & 0x3F;
+  // Read bytes one at a time to handle cross-buffer varints correctly
+  // First byte is read and masked
+  uint64_t value = cursor.template read<uint8_t>() & 0x3F;
   for (size_t i = 1; i < intLen; ++i) {
-    value = (value << 8) | data[i];
+    value = (value << 8) | cursor.template read<uint8_t>();
   }
 
-  cursor.skip(intLen);
-  length -= intLen;
+  // Note: We do NOT modify length here - the caller is expected to do:
+  //   length -= result->second;
+  // This matches Folly's behavior where decodeQuicInteger returns the
+  // byte count but does not modify the length parameter.
   return std::make_pair(value, intLen);
 }
 
@@ -200,4 +208,4 @@ inline std::optional<std::pair<uint64_t, size_t>> decodeQuicInteger(
 
 } // namespace quic
 
-#endif // !MOXYGEN_USE_FOLLY
+#endif // !(MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST)

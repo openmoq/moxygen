@@ -9,17 +9,63 @@
 #if MOXYGEN_QUIC_PICOQUIC
 
 #include <moxygen/compat/Expected.h>
+#include <moxygen/compat/SocketAddress.h>
 #include <moxygen/compat/Unit.h>
+#include <cstdio>
 #include <cstring>
 
 namespace moxygen::transports {
 
+// --- PicoquicThreadDispatcher Implementation ---
+
+void PicoquicThreadDispatcher::setThreadContext(
+    picoquic_network_thread_ctx_t* ctx) {
+  threadCtx_ = ctx;
+}
+
+void PicoquicThreadDispatcher::setPicoThreadId(std::thread::id id) {
+  picoThreadId_ = id;
+}
+
+bool PicoquicThreadDispatcher::isOnPicoThread() const {
+  return std::this_thread::get_id() == picoThreadId_;
+}
+
+void PicoquicThreadDispatcher::runOnPicoThread(std::function<void()> fn) {
+  if (isOnPicoThread()) {
+    fn();
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    workQueue_.push_back(std::move(fn));
+  }
+  if (threadCtx_) {
+    picoquic_wake_up_network_thread(threadCtx_);
+  }
+}
+
+void PicoquicThreadDispatcher::drainWorkQueue() {
+  std::deque<std::function<void()>> pending;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending.swap(workQueue_);
+  }
+  for (auto& fn : pending) {
+    fn();
+  }
+}
+
 // --- PicoquicWebTransport Implementation ---
 
-PicoquicWebTransport::PicoquicWebTransport(picoquic_cnx_t* cnx, bool isServer)
-    : cnx_(cnx), isServer_(isServer) {
-  // Set ourselves as the callback context
-  picoquic_set_callback(cnx_, picoCallback, this);
+PicoquicWebTransport::PicoquicWebTransport(
+    picoquic_cnx_t* cnx,
+    bool isServer,
+    PicoquicThreadDispatcher* dispatcher)
+    : cnx_(cnx), isServer_(isServer), dispatcher_(dispatcher) {
+  // Note: we no longer call picoquic_set_callback here.
+  // The server/client sets the callback after creating the transport
+  // so it can pass the transport as callback_ctx.
 }
 
 PicoquicWebTransport::~PicoquicWebTransport() {
@@ -41,15 +87,16 @@ int PicoquicWebTransport::picoCallback(
     return 0;
   }
 
-  return self->onStreamData(stream_id, bytes, length, fin_or_event, stream_ctx);
+  return self->onStreamEvent(
+      stream_id, bytes, length, fin_or_event, stream_ctx);
 }
 
-int PicoquicWebTransport::onStreamData(
+int PicoquicWebTransport::onStreamEvent(
     uint64_t streamId,
     uint8_t* bytes,
     size_t length,
     picoquic_call_back_event_t event,
-    void* /*streamCtx*/) {
+    void* streamCtx) {
   switch (event) {
     case picoquic_callback_stream_data:
     case picoquic_callback_stream_fin: {
@@ -66,19 +113,21 @@ int PicoquicWebTransport::onStreamData(
       auto bidiIt = bidiStreams_.find(streamId);
       if (bidiIt != bidiStreams_.end()) {
         auto* readHandle =
-            static_cast<PicoquicStreamReadHandle*>(bidiIt->second->readHandle());
+            static_cast<PicoquicStreamReadHandle*>(
+                bidiIt->second->readHandle());
         readHandle->onData(bytes, length, fin);
         return 0;
       }
 
       // New stream - determine type and create handle
-      bool isClientInitiated = (streamId & 1) == 0;
       bool isBidi = (streamId & 2) == 0;
 
       if (isBidi) {
         // New bidirectional stream
-        auto write = std::make_unique<PicoquicStreamWriteHandle>(cnx_, streamId);
-        auto read = std::make_unique<PicoquicStreamReadHandle>(cnx_, streamId);
+        auto write = std::make_unique<PicoquicStreamWriteHandle>(
+            cnx_, streamId, dispatcher_);
+        auto read = std::make_unique<PicoquicStreamReadHandle>(
+            cnx_, streamId, dispatcher_);
         auto* readPtr = read.get();
 
         auto bidi = std::make_unique<PicoquicBidiStreamHandle>(
@@ -86,23 +135,42 @@ int PicoquicWebTransport::onStreamData(
         auto* bidiPtr = bidi.get();
         bidiStreams_[streamId] = std::move(bidi);
 
-        readPtr->onData(bytes, length, fin);
-
+        // Fire new stream callback BEFORE delivering data, so the
+        // application can set the read callback before data arrives
         if (newBidiStreamCb_) {
           newBidiStreamCb_(bidiPtr);
         }
+
+        readPtr->onData(bytes, length, fin);
       } else {
         // New unidirectional stream
-        auto read = std::make_unique<PicoquicStreamReadHandle>(cnx_, streamId);
+        auto read = std::make_unique<PicoquicStreamReadHandle>(
+            cnx_, streamId, dispatcher_);
         auto* readPtr = read.get();
         readStreams_[streamId] = std::move(read);
 
-        readPtr->onData(bytes, length, fin);
-
+        // Fire new stream callback BEFORE delivering data, so the
+        // application can set the read callback before data arrives
         if (newUniStreamCb_) {
           newUniStreamCb_(readPtr);
         }
+
+        readPtr->onData(bytes, length, fin);
       }
+      break;
+    }
+
+    case picoquic_callback_prepare_to_send: {
+      // JIT send: picoquic is ready to send data on this stream.
+      // stream_ctx was set to PicoquicStreamWriteHandle* by
+      // picoquic_mark_active_stream
+      auto* writeHandle =
+          static_cast<PicoquicStreamWriteHandle*>(streamCtx);
+      if (writeHandle) {
+        return writeHandle->onPrepareToSend(bytes, length);
+      }
+      // Renege if handle not found
+      picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
       break;
     }
 
@@ -110,11 +178,21 @@ int PicoquicWebTransport::onStreamData(
       onDatagram(bytes, length);
       break;
 
+    case picoquic_callback_prepare_datagram:
+      return onPrepareDatagram(bytes, length);
+
     case picoquic_callback_stream_reset: {
       // Stream was reset by peer
       auto readIt = readStreams_.find(streamId);
       if (readIt != readStreams_.end()) {
         readIt->second->onError(0); // TODO: get actual error code
+      }
+      auto bidiIt = bidiStreams_.find(streamId);
+      if (bidiIt != bidiStreams_.end()) {
+        auto* readHandle =
+            static_cast<PicoquicStreamReadHandle*>(
+                bidiIt->second->readHandle());
+        readHandle->onError(0);
       }
       break;
     }
@@ -123,7 +201,7 @@ int PicoquicWebTransport::onStreamData(
       // Peer sent STOP_SENDING
       auto writeIt = writeStreams_.find(streamId);
       if (writeIt != writeStreams_.end()) {
-        // TODO: invoke cancel callback
+        // TODO: invoke cancel callback on the write handle
       }
       break;
     }
@@ -145,34 +223,107 @@ int PicoquicWebTransport::onStreamData(
 
 void PicoquicWebTransport::onDatagram(uint8_t* bytes, size_t length) {
   if (datagramCb_ && bytes && length > 0) {
-    auto payload = std::make_unique<compat::Payload>(bytes, bytes + length);
+    auto payload = compat::Payload::copyBuffer(bytes, length);
     datagramCb_(std::move(payload));
   }
 }
 
+int PicoquicWebTransport::onPrepareDatagram(
+    uint8_t* context,
+    size_t maxLength) {
+  std::lock_guard<std::mutex> lock(datagramMutex_);
+  if (datagramQueue_.empty()) {
+    // Nothing to send, mark not ready
+    picoquic_provide_datagram_buffer(context, 0);
+    return 0;
+  }
+
+  auto& front = datagramQueue_.front();
+  size_t dgLen = front->size();
+  if (dgLen > maxLength) {
+    // Datagram too large for this packet, try again in next packet
+    picoquic_provide_datagram_buffer_ex(
+        context, 0, picoquic_datagram_active_any_path);
+    return 0;
+  }
+
+  bool moreReady = datagramQueue_.size() > 1;
+  uint8_t* buf;
+  if (moreReady) {
+    buf = picoquic_provide_datagram_buffer_ex(
+        context, dgLen, picoquic_datagram_active_any_path);
+  } else {
+    buf = picoquic_provide_datagram_buffer(context, dgLen);
+  }
+  if (buf) {
+    memcpy(buf, front->data(), dgLen);
+    datagramQueue_.pop_front();
+  }
+
+  return 0;
+}
+
 compat::Expected<compat::StreamWriteHandle*, compat::WebTransportError>
 PicoquicWebTransport::createUniStream() {
-  uint64_t streamId = picoquic_get_next_local_stream_id(cnx_, false);
+  using ResultType =
+      compat::Expected<compat::StreamWriteHandle*, compat::WebTransportError>;
 
-  auto handle = std::make_unique<PicoquicStreamWriteHandle>(cnx_, streamId);
+  if (dispatcher_) {
+    return dispatcher_->runOnPicoThreadSync<ResultType>(
+        [this]() -> ResultType {
+          // is_unidir=true for unidirectional streams
+          uint64_t streamId =
+              picoquic_get_next_local_stream_id(cnx_, true);
+          auto handle = std::make_unique<PicoquicStreamWriteHandle>(
+              cnx_, streamId, dispatcher_);
+          auto* ptr = handle.get();
+          writeStreams_[streamId] = std::move(handle);
+          return ptr;
+        });
+  }
+
+  // Fallback if no dispatcher (should not happen in practice)
+  uint64_t streamId = picoquic_get_next_local_stream_id(cnx_, true);
+  auto handle = std::make_unique<PicoquicStreamWriteHandle>(
+      cnx_, streamId, dispatcher_);
   auto* ptr = handle.get();
   writeStreams_[streamId] = std::move(handle);
-
   return ptr;
 }
 
 compat::Expected<compat::BidiStreamHandle*, compat::WebTransportError>
 PicoquicWebTransport::createBidiStream() {
-  uint64_t streamId = picoquic_get_next_local_stream_id(cnx_, true);
+  using ResultType =
+      compat::Expected<compat::BidiStreamHandle*, compat::WebTransportError>;
 
-  auto write = std::make_unique<PicoquicStreamWriteHandle>(cnx_, streamId);
-  auto read = std::make_unique<PicoquicStreamReadHandle>(cnx_, streamId);
+  if (dispatcher_) {
+    return dispatcher_->runOnPicoThreadSync<ResultType>(
+        [this]() -> ResultType {
+          // is_unidir=false for bidirectional streams
+          uint64_t streamId =
+              picoquic_get_next_local_stream_id(cnx_, false);
+          auto write = std::make_unique<PicoquicStreamWriteHandle>(
+              cnx_, streamId, dispatcher_);
+          auto read = std::make_unique<PicoquicStreamReadHandle>(
+              cnx_, streamId, dispatcher_);
+          auto bidi = std::make_unique<PicoquicBidiStreamHandle>(
+              std::move(write), std::move(read));
+          auto* ptr = bidi.get();
+          bidiStreams_[streamId] = std::move(bidi);
+          return ptr;
+        });
+  }
 
+  // Fallback if no dispatcher
+  uint64_t streamId = picoquic_get_next_local_stream_id(cnx_, false);
+  auto write = std::make_unique<PicoquicStreamWriteHandle>(
+      cnx_, streamId, dispatcher_);
+  auto read = std::make_unique<PicoquicStreamReadHandle>(
+      cnx_, streamId, dispatcher_);
   auto bidi = std::make_unique<PicoquicBidiStreamHandle>(
       std::move(write), std::move(read));
   auto* ptr = bidi.get();
   bidiStreams_[streamId] = std::move(bidi);
-
   return ptr;
 }
 
@@ -182,11 +333,22 @@ PicoquicWebTransport::sendDatagram(std::unique_ptr<compat::Payload> data) {
     return compat::makeUnexpected(compat::WebTransportError::SEND_ERROR);
   }
 
-  int ret = picoquic_queue_datagram_frame(
-      cnx_, data->size(), const_cast<uint8_t*>(data->data()));
+  // Buffer the datagram
+  {
+    std::lock_guard<std::mutex> lock(datagramMutex_);
+    datagramQueue_.push_back(std::move(data));
+  }
 
-  if (ret != 0) {
-    return compat::makeUnexpected(compat::WebTransportError::SEND_ERROR);
+  // Mark datagrams ready on the picoquic thread
+  if (dispatcher_) {
+    if (dispatcher_->isOnPicoThread()) {
+      picoquic_mark_datagram_ready(cnx_, 1);
+    } else {
+      auto cnx = cnx_;
+      dispatcher_->runOnPicoThread([cnx]() {
+        picoquic_mark_datagram_ready(cnx, 1);
+      });
+    }
   }
 
   return compat::Unit{};
@@ -203,7 +365,14 @@ size_t PicoquicWebTransport::getMaxDatagramSize() const {
 void PicoquicWebTransport::closeSession(uint32_t errorCode) {
   if (!closed_) {
     closed_ = true;
-    picoquic_close(cnx_, errorCode);
+    if (dispatcher_ && !dispatcher_->isOnPicoThread()) {
+      auto cnx = cnx_;
+      dispatcher_->runOnPicoThread([cnx, errorCode]() {
+        picoquic_close(cnx, errorCode);
+      });
+    } else {
+      picoquic_close(cnx_, errorCode);
+    }
   }
 }
 
@@ -215,19 +384,13 @@ void PicoquicWebTransport::drainSession() {
 compat::SocketAddress PicoquicWebTransport::getPeerAddress() const {
   struct sockaddr* addr = nullptr;
   picoquic_get_peer_addr(cnx_, &addr);
-  if (addr) {
-    return compat::SocketAddress(addr);
-  }
-  return compat::SocketAddress();
+  return compat::makeSocketAddress(addr);
 }
 
 compat::SocketAddress PicoquicWebTransport::getLocalAddress() const {
   struct sockaddr* addr = nullptr;
   picoquic_get_local_addr(cnx_, &addr);
-  if (addr) {
-    return compat::SocketAddress(addr);
-  }
-  return compat::SocketAddress();
+  return compat::makeSocketAddress(addr);
 }
 
 std::string PicoquicWebTransport::getALPN() const {
@@ -263,7 +426,8 @@ void PicoquicWebTransport::setSessionCloseCallback(
   sessionCloseCb_ = std::move(cb);
 }
 
-void PicoquicWebTransport::setSessionDrainCallback(std::function<void()> cb) {
+void PicoquicWebTransport::setSessionDrainCallback(
+    std::function<void()> cb) {
   sessionDrainCb_ = std::move(cb);
 }
 
@@ -271,20 +435,47 @@ void PicoquicWebTransport::setSessionDrainCallback(std::function<void()> cb) {
 
 PicoquicStreamWriteHandle::PicoquicStreamWriteHandle(
     picoquic_cnx_t* cnx,
-    uint64_t streamId)
-    : cnx_(cnx), streamId_(streamId) {}
+    uint64_t streamId,
+    PicoquicThreadDispatcher* dispatcher)
+    : cnx_(cnx), streamId_(streamId), dispatcher_(dispatcher) {}
 
 uint64_t PicoquicStreamWriteHandle::getID() const {
   return streamId_;
+}
+
+void PicoquicStreamWriteHandle::markActive() {
+  if (dispatcher_ && !dispatcher_->isOnPicoThread()) {
+    auto cnx = cnx_;
+    auto streamId = streamId_;
+    auto self = this;
+    dispatcher_->runOnPicoThread([cnx, streamId, self]() {
+      picoquic_mark_active_stream(cnx, streamId, 1, self);
+    });
+  } else {
+    picoquic_mark_active_stream(cnx_, streamId_, 1, this);
+  }
 }
 
 void PicoquicStreamWriteHandle::writeStreamData(
     std::unique_ptr<compat::Payload> data,
     bool fin,
     std::function<void(bool success)> callback) {
-  auto result = writeStreamDataSync(std::move(data), fin);
+  // Buffer the data
+  {
+    std::lock_guard<std::mutex> lock(outbuf_.mutex);
+    if (data && !data->empty()) {
+      outbuf_.chunks.push_back(std::move(data));
+    }
+    if (fin) {
+      outbuf_.finQueued = true;
+    }
+  }
+
+  // Mark stream active so picoquic will call prepare_to_send
+  markActive();
+
   if (callback) {
-    callback(result.hasValue());
+    callback(true);
   }
 }
 
@@ -292,20 +483,93 @@ compat::Expected<compat::Unit, compat::WebTransportError>
 PicoquicStreamWriteHandle::writeStreamDataSync(
     std::unique_ptr<compat::Payload> data,
     bool fin) {
-  const uint8_t* bytes = data ? data->data() : nullptr;
-  size_t length = data ? data->size() : 0;
-
-  int ret = picoquic_add_to_stream(cnx_, streamId_, bytes, length, fin ? 1 : 0);
-
-  if (ret != 0) {
-    return compat::makeUnexpected(compat::WebTransportError::SEND_ERROR);
+  // Buffer the data
+  {
+    std::lock_guard<std::mutex> lock(outbuf_.mutex);
+    if (data && !data->empty()) {
+      outbuf_.chunks.push_back(std::move(data));
+    }
+    if (fin) {
+      outbuf_.finQueued = true;
+    }
   }
+
+  // Mark stream active so picoquic will call prepare_to_send
+  markActive();
 
   return compat::Unit{};
 }
 
+int PicoquicStreamWriteHandle::onPrepareToSend(
+    void* context,
+    size_t maxLength) {
+  std::lock_guard<std::mutex> lock(outbuf_.mutex);
+
+  // Calculate available data
+  size_t available = 0;
+  for (auto& chunk : outbuf_.chunks) {
+    available += chunk->size();
+  }
+  available -= outbuf_.firstChunkOffset;
+
+  if (available == 0 && !outbuf_.finQueued) {
+    // Nothing to send — renege
+    picoquic_provide_stream_data_buffer(context, 0, 0, 0);
+    return 0;
+  }
+
+  if (available == 0 && outbuf_.finQueued && !outbuf_.finSent) {
+    // Only FIN to send, no data
+    picoquic_provide_stream_data_buffer(context, 0, 1, 0);
+    outbuf_.finSent = true;
+    return 0;
+  }
+
+  size_t toSend = std::min(available, maxLength);
+  bool isFin = outbuf_.finQueued && (toSend == available);
+  bool stillActive = (toSend < available);
+
+  uint8_t* buf = picoquic_provide_stream_data_buffer(
+      context, toSend, isFin ? 1 : 0, stillActive ? 1 : 0);
+
+  if (!buf || toSend == 0) {
+    return 0;
+  }
+
+  // Copy data from chunks to picoquic buffer
+  size_t written = 0;
+  while (written < toSend && !outbuf_.chunks.empty()) {
+    auto& front = outbuf_.chunks.front();
+    size_t chunkRemaining = front->size() - outbuf_.firstChunkOffset;
+    size_t copyLen = std::min(chunkRemaining, toSend - written);
+
+    memcpy(buf + written, front->data() + outbuf_.firstChunkOffset, copyLen);
+    written += copyLen;
+    outbuf_.firstChunkOffset += copyLen;
+
+    if (outbuf_.firstChunkOffset >= front->size()) {
+      outbuf_.chunks.pop_front();
+      outbuf_.firstChunkOffset = 0;
+    }
+  }
+
+  if (isFin) {
+    outbuf_.finSent = true;
+  }
+
+  return 0;
+}
+
 void PicoquicStreamWriteHandle::resetStream(uint32_t errorCode) {
-  picoquic_reset_stream(cnx_, streamId_, errorCode);
+  if (dispatcher_ && !dispatcher_->isOnPicoThread()) {
+    auto cnx = cnx_;
+    auto streamId = streamId_;
+    dispatcher_->runOnPicoThread([cnx, streamId, errorCode]() {
+      picoquic_reset_stream(cnx, streamId, errorCode);
+    });
+  } else {
+    picoquic_reset_stream(cnx_, streamId_, errorCode);
+  }
 }
 
 void PicoquicStreamWriteHandle::setPriority(
@@ -314,10 +578,11 @@ void PicoquicStreamWriteHandle::setPriority(
   // Would need to use scheduling hints
 }
 
-void PicoquicStreamWriteHandle::awaitWritable(std::function<void()> callback) {
+void PicoquicStreamWriteHandle::awaitWritable(
+    std::function<void()> callback) {
   writableCb_ = std::move(callback);
-  // In picoquic, flow control is handled internally
-  // For now, assume always writable and call immediately
+  // With JIT API, the stream is always "writable" from the app's perspective
+  // (data is buffered and sent when flow credits are available)
   if (writableCb_) {
     writableCb_();
   }
@@ -349,16 +614,20 @@ std::optional<uint32_t> PicoquicStreamWriteHandle::getCancelError() const {
 
 PicoquicStreamReadHandle::PicoquicStreamReadHandle(
     picoquic_cnx_t* cnx,
-    uint64_t streamId)
-    : cnx_(cnx), streamId_(streamId) {}
+    uint64_t streamId,
+    PicoquicThreadDispatcher* dispatcher)
+    : cnx_(cnx), streamId_(streamId), dispatcher_(dispatcher) {}
 
 uint64_t PicoquicStreamReadHandle::getID() const {
   return streamId_;
 }
 
 void PicoquicStreamReadHandle::setReadCallback(
-    std::function<void(compat::StreamData, std::optional<uint32_t> error)> cb) {
+    std::function<void(compat::StreamData, std::optional<uint32_t> error)>
+        cb) {
   readCb_ = std::move(cb);
+  // Deliver any data that was buffered before the callback was set
+  deliverBuffered();
 }
 
 void PicoquicStreamReadHandle::pauseReading() {
@@ -371,6 +640,17 @@ void PicoquicStreamReadHandle::resumeReading() {
 
 compat::Expected<compat::Unit, compat::WebTransportError>
 PicoquicStreamReadHandle::stopSending(uint32_t error) {
+  if (dispatcher_ && !dispatcher_->isOnPicoThread()) {
+    using ResultType =
+        compat::Expected<compat::Unit, compat::WebTransportError>;
+    auto cnx = cnx_;
+    auto streamId = streamId_;
+    return dispatcher_->runOnPicoThreadSync<ResultType>(
+        [cnx, streamId, error]() -> ResultType {
+          picoquic_stop_sending(cnx, streamId, error);
+          return compat::Unit{};
+        });
+  }
   picoquic_stop_sending(cnx_, streamId_, error);
   return compat::Unit{};
 }
@@ -390,10 +670,34 @@ void PicoquicStreamReadHandle::onData(
   if (!paused_ && readCb_) {
     compat::StreamData streamData;
     if (data && length > 0) {
-      streamData.data = std::make_unique<compat::Payload>(data, data + length);
+      streamData.data = compat::Payload::copyBuffer(data, length);
     }
     streamData.fin = fin;
     readCb_(std::move(streamData), std::nullopt);
+  } else if (!readCb_) {
+    // Buffer data until read callback is set
+    BufferedData bd;
+    if (data && length > 0) {
+      bd.data = compat::Payload::copyBuffer(data, length);
+    }
+    bd.fin = fin;
+    buffered_.push_back(std::move(bd));
+  }
+}
+
+void PicoquicStreamReadHandle::deliverBuffered() {
+  if (!readCb_ || buffered_.empty()) {
+    return;
+  }
+  auto pending = std::move(buffered_);
+  buffered_.clear();
+  for (auto& bd : pending) {
+    if (readCb_) {
+      compat::StreamData streamData;
+      streamData.data = std::move(bd.data);
+      streamData.fin = bd.fin;
+      readCb_(std::move(streamData), std::nullopt);
+    }
   }
 }
 

@@ -16,7 +16,7 @@
 #include <memory>
 #include <optional>
 
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 #include <quic/common/events/QuicTimer.h>
 #endif
 
@@ -79,7 +79,7 @@ class MoQDeliveryTimer {
   std::chrono::milliseconds deliveryTimeout_;
 };
 
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 
 class ObjectTimerCallback : public quic::QuicTimerCallback {
  public:
@@ -96,7 +96,7 @@ class ObjectTimerCallback : public quic::QuicTimerCallback {
   MoQDeliveryTimer& owner_;
 };
 
-#else // !MOXYGEN_USE_FOLLY
+#else // !MOXYGEN_USE_FOLLY || !MOXYGEN_QUIC_MVFST
 
 // Std-mode: stub timer callback
 class ObjectTimerCallback {
@@ -112,6 +112,6 @@ class ObjectTimerCallback {
   MoQDeliveryTimer& owner_;
 };
 
-#endif // MOXYGEN_USE_FOLLY
+#endif // MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 
 } // namespace moxygen

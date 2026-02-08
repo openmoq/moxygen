@@ -356,13 +356,12 @@ class MoQSessionBase : public Subscriber,
   // Virtual cleanup method for proper inheritance pattern
   virtual void cleanup();
 
-  // PublishNamespace response methods
+ public:
+  // Send methods - public so track handles and publisher impls can call them
   virtual void publishNamespaceError(
       const PublishNamespaceError& publishNamespaceError);
   virtual void subscribeNamespaceError(
       const SubscribeNamespaceError& subscribeNamespaceError);
-
-  // Send methods
   virtual void trackStatusOk(const TrackStatusOk& trackStatusOk);
   virtual void trackStatusError(const TrackStatusError& trackStatusError);
   virtual void sendSubscribeOk(const SubscribeOk& subOk);
@@ -379,6 +378,8 @@ class MoQSessionBase : public Subscriber,
   virtual void fetchCancel(const FetchCancel& fetchCancel);
   virtual void publishOk(const PublishOk& pubOk);
   virtual void publishError(const PublishError& publishError);
+
+ protected:
 
   // Static helper methods
   static uint64_t getMaxRequestIDIfPresent(const SetupParameters& params);

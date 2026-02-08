@@ -6,7 +6,7 @@
 
 #include "moxygen/MoQCodec.h"
 
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 #include <quic/folly_utils/Utils.h>
 #endif
 
@@ -153,7 +153,12 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
     bool endOfStream) {
   onIngressStart(std::move(data));
   Buffer empty;
+#if MOXYGEN_USE_FOLLY
   Cursor cursor(ingress_.empty() ? &empty : ingress_.front());
+#else
+  // In std mode, construct cursor from queue to access all buffers in chain
+  Cursor cursor(ingress_.empty() ? static_cast<const compat::ByteBufferQueue*>(nullptr) : &ingress_);
+#endif
   size_t totalBytesConsumed = 0;
 
   auto trimStart = [&]() {
@@ -167,13 +172,21 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
     std::unique_ptr<Buffer> payload;
     if (size == ingress_.chainLength()) {
       payload = ingress_.move();
+#if MOXYGEN_USE_FOLLY
       cursor = Cursor(&empty);
+#else
+      cursor = Cursor(static_cast<const compat::ByteBufferQueue*>(nullptr));
+#endif
     } else {
       if (size > 0) {
         payload = ingress_.split(size);
       }
       // Reset cursor after split (or after trimStart if size == 0)
+#if MOXYGEN_USE_FOLLY
       cursor = Cursor(ingress_.front());
+#else
+      cursor = Cursor(&ingress_);
+#endif
     }
     return payload;
   };
@@ -279,6 +292,11 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
               cursor, remainingLength, curObjectHeader_, subgroupOptions_);
         }
         if (res.hasError()) {
+          if (res.error() == ErrorCode::PARSE_UNDERFLOW) {
+            // Not a fatal error, just need more data - exit loop and return
+            trimStart();
+            return ParseResult::CONTINUE;
+          }
           XLOG(DBG4) << __func__ << " " << uint32_t(res.error());
           connError_ = res.error();
           break;
