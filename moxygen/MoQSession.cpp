@@ -4569,6 +4569,53 @@ void MoQSession::unsubscribe(const Unsubscribe& unsubscribe) {
   checkForCloseOnDrain();
 }
 
+void MoQSession::subscribeUpdate(const SubscribeUpdate& subUpdate) {
+  XLOG(DBG1) << __func__ << " reqID=" << subUpdate.requestID << " sess=" << this;
+  auto res = moqFrameWriter_.writeSubscribeUpdate(controlWriteBuf_, subUpdate);
+  if (!res) {
+    XLOG(ERR) << "writeSubscribeUpdate failed sess=" << this;
+    return;
+  }
+  controlWriteEvent_.signal();
+}
+
+void MoQSession::subscribeUpdateOk(const RequestOk& requestOk) {
+  XLOG(DBG1) << __func__ << " reqID=" << requestOk.requestID << " sess=" << this;
+  auto res = moqFrameWriter_.writeRequestOk(
+      controlWriteBuf_, requestOk, FrameType::REQUEST_OK);
+  if (!res) {
+    XLOG(ERR) << "writeRequestOk for SUBSCRIBE_UPDATE failed sess=" << this;
+    return;
+  }
+  controlWriteEvent_.signal();
+}
+
+void MoQSession::subscribeUpdateError(
+    const SubscribeUpdateError& requestError,
+    RequestID subscriptionRequestID) {
+  XLOG(DBG1) << __func__ << " reqID=" << requestError.requestID
+             << " subscriptionReqID=" << subscriptionRequestID << " sess=" << this;
+
+  auto res = moqFrameWriter_.writeRequestError(
+      controlWriteBuf_, requestError, FrameType::SUBSCRIBE_UPDATE);
+  if (!res) {
+    XLOG(ERR) << "writeSubscribeUpdateError failed sess=" << this;
+  } else {
+    controlWriteEvent_.signal();
+  }
+
+  // Terminate subscription
+  auto it = pubTracks_.find(subscriptionRequestID);
+  if (it != pubTracks_.end()) {
+    PublishDone pubDone{
+        subscriptionRequestID,
+        PublishDoneStatusCode::UPDATE_FAILED,
+        static_cast<uint64_t>(requestError.errorCode),
+        requestError.reasonPhrase};
+    it->second->terminatePublish(pubDone, ResetStreamErrorCode::CANCELLED);
+  }
+}
+
 void MoQSession::sendPublishDone(const PublishDone& pubDone) {
   XLOG(DBG1) << __func__ << " sess=" << this;
   MOQ_PUBLISHER_STATS(
