@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <optional>
+#include <type_traits>
 
 namespace quic {
 
@@ -133,10 +134,26 @@ inline size_t encodeQuicInteger(uint64_t value, uint8_t* data, size_t len) {
 // follyutils compatibility namespace
 namespace follyutils {
 
+// Helper to extract first byte from peek() result
+// ByteCursor::peek() returns uint8_t
+// folly::io::Cursor::peek() returns span<const uint8_t>
+namespace detail {
+template <typename T>
+inline uint8_t getFirstByte(T val) {
+  if constexpr (std::is_same_v<T, uint8_t>) {
+    // ByteCursor returns single byte
+    return val;
+  } else {
+    // Folly Cursor returns span - get first element
+    return val[0];
+  }
+}
+} // namespace detail
+
 // Forward declaration - ByteCursor is defined in ByteCursor.h
 // This decodeQuicInteger works with any cursor type that has:
 // - totalLength() returning size_t
-// - peek() returning uint8_t (to check first byte without advancing)
+// - peek() returning uint8_t or span<const uint8_t>
 // - read<uint8_t>() to read and advance cursor
 template <typename CursorType>
 inline std::optional<std::pair<uint64_t, size_t>> decodeQuicInteger(
@@ -147,7 +164,7 @@ inline std::optional<std::pair<uint64_t, size_t>> decodeQuicInteger(
   }
 
   // Peek at first byte to determine varint length
-  uint8_t firstByte = cursor.peek();
+  uint8_t firstByte = detail::getFirstByte(cursor.peek());
   uint8_t type = (firstByte >> 6) & 0x3;
   size_t intLen = 1u << type;
 
@@ -182,7 +199,7 @@ inline std::optional<std::pair<uint64_t, size_t>> decodeQuicInteger(
   }
 
   // Peek at first byte to determine varint length
-  uint8_t firstByte = cursor.peek();
+  uint8_t firstByte = detail::getFirstByte(cursor.peek());
   uint8_t type = (firstByte >> 6) & 0x3;
   size_t intLen = 1u << type;
 

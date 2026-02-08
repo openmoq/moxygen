@@ -55,11 +55,12 @@ class SubscriptionHandle {
   // Updates subscription parameters (start/end locations, priority, forward).
   // This is a coroutine because it may do async work, such as forwarding the
   // update to the upstream publisher in a relay scenario.
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
+  // Coroutine-based API for Folly + mvfst mode
   virtual compat::Task<SubscribeUpdateResult> subscribeUpdate(
       SubscribeUpdate subUpdate) = 0;
 #else
-  // Callback-based API for std-mode
+  // Callback-based API for std-mode and Folly + picoquic
   virtual void subscribeUpdateWithCallback(
       SubscribeUpdate subUpdate,
       std::shared_ptr<
@@ -87,7 +88,7 @@ class Publisher {
 
   // Send/respond to TRACK_STATUS_REQUEST
   using TrackStatusResult = compat::Expected<TrackStatusOk, TrackStatusError>;
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
   virtual compat::Task<TrackStatusResult> trackStatus(
       const TrackStatus trackStatus) {
     return folly::coro::makeTask<TrackStatusResult>(
@@ -97,7 +98,7 @@ class Publisher {
             "Track status not implemented"}));
   }
 #else
-  // Callback-based API for std-mode
+  // Callback-based API for std-mode and Folly + picoquic
   virtual void trackStatusWithCallback(
       const TrackStatus trackStatus,
       std::shared_ptr<compat::ResultCallback<TrackStatusOk, TrackStatusError>>
@@ -114,7 +115,7 @@ class Publisher {
   // Send/respond to a SUBSCRIBE
   using SubscribeResult =
       compat::Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>;
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
   virtual compat::Task<SubscribeResult> subscribe(
       SubscribeRequest sub,
       std::shared_ptr<TrackConsumer> callback) {
@@ -161,7 +162,7 @@ class Publisher {
 
   // Send/respond to a FETCH
   using FetchResult = compat::Expected<std::shared_ptr<FetchHandle>, FetchError>;
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
   virtual compat::Task<FetchResult> fetch(
       Fetch fetch,
       std::shared_ptr<FetchConsumer> fetchCallback) {
@@ -170,7 +171,7 @@ class Publisher {
             fetch.requestID, FetchErrorCode::NOT_SUPPORTED, "unimplemented"}));
   }
 #else
-  // Callback-based API for std-mode
+  // Callback-based API for std-mode and Folly + picoquic
   virtual void fetchWithCallback(
       Fetch fetch,
       std::shared_ptr<FetchConsumer> consumer,
@@ -218,7 +219,7 @@ class Publisher {
   using SubscribeNamespaceResult = compat::Expected<
       std::shared_ptr<SubscribeNamespaceHandle>,
       SubscribeNamespaceError>;
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
   virtual compat::Task<SubscribeNamespaceResult> subscribeNamespace(
       SubscribeNamespace subAnn,
       std::shared_ptr<NamespacePublishHandle>
@@ -231,7 +232,7 @@ class Publisher {
                 "unimplemented"}));
   }
 #else
-  // Callback-based API for std-mode
+  // Callback-based API for std-mode and Folly + picoquic
   virtual void subscribeNamespaceWithCallback(
       SubscribeNamespace subAnn,
       std::shared_ptr<compat::ResultCallback<

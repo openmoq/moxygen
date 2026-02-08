@@ -39,8 +39,9 @@ install(
 
 endif() # MOXYGEN_USE_FOLLY AND mvfst
 
-# Picoquic text client (works with or without Folly)
-if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
+# Picoquic text client (std-mode only for now)
+# TODO: Add Folly + picoquic support
+if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic" AND NOT MOXYGEN_USE_FOLLY)
 
 add_executable(
   picotextclient

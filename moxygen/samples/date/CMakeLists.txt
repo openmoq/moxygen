@@ -40,8 +40,9 @@ install(
 
 endif() # MOXYGEN_USE_FOLLY AND mvfst
 
-# Picoquic date server (works with or without Folly)
-if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
+# Picoquic date server (std-mode only for now)
+# TODO: Add Folly + picoquic support
+if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic" AND NOT MOXYGEN_USE_FOLLY)
 
 add_executable(
   picodateserver

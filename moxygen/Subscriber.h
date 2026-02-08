@@ -89,7 +89,7 @@ class Subscriber {
   // Send/respond to PUBLISH_NAMESPACE
   using PublishNamespaceResult = compat::
       Expected<std::shared_ptr<PublishNamespaceHandle>, PublishNamespaceError>;
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
   virtual compat::Task<PublishNamespaceResult> publishNamespace(
       PublishNamespace ann,
       std::shared_ptr<PublishNamespaceCallback> = nullptr) {
@@ -100,7 +100,7 @@ class Subscriber {
             "unimplemented"}));
   }
 #else
-  // Callback-based API for std-mode
+  // Callback-based API for std-mode and Folly + picoquic
   virtual void publishNamespaceWithCallback(
       PublishNamespace ann,
       std::shared_ptr<PublishNamespaceCallback> cancelCallback,
@@ -115,13 +115,13 @@ class Subscriber {
 #endif
 
   // Result of a PUBLISH request containing consumer and async reply
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
   struct PublishConsumerAndReplyTask {
     std::shared_ptr<TrackConsumer> consumer;
     compat::Task<compat::Expected<PublishOk, PublishError>> reply;
   };
 #else
-  // Callback-based version for std-mode
+  // Callback-based version for std-mode and Folly + picoquic
   struct PublishConsumerAndReplyCallback {
     std::shared_ptr<TrackConsumer> consumer;
     // In std-mode, the caller provides a callback that will be invoked
@@ -133,7 +133,7 @@ class Subscriber {
   // Send/respond to a PUBLISH - synchronous API o that the publisher can
   // immediately start sending data instead of waiting for a PUBLISH_OK from the
   // peer
-#if MOXYGEN_USE_FOLLY
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
   using PublishResult =
       compat::Expected<PublishConsumerAndReplyTask, PublishError>;
   virtual PublishResult publish(

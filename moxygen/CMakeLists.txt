@@ -247,7 +247,8 @@ endif() # MOXYGEN_USE_FOLLY AND MOXYGEN_QUIC_BACKEND == mvfst
 # Picoquic-mode components (works with or without Folly)
 if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
 
-# Simple executor for std-mode (no Folly dependency)
+# Simple executor for std-mode only (no Folly dependency)
+if(NOT MOXYGEN_USE_FOLLY)
 add_library(moqsimpleexecutor
     events/MoQSimpleExecutor.cpp
 )
@@ -274,6 +275,7 @@ install(
     ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
     LIBRARY DESTINATION ${LIB_INSTALL_DIR}
 )
+endif() # NOT MOXYGEN_USE_FOLLY
 
 # Picoquic sample programs
 add_subdirectory(samples/date)

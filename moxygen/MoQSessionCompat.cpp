@@ -12,25 +12,62 @@
 #if !MOXYGEN_QUIC_MVFST
 
 #include <algorithm>
+#include <iostream>
 
 namespace moxygen {
 
 namespace {
 
-// Helper: convert Payload (unique_ptr<compat::Payload>) to Buffer
-// (unique_ptr<ByteBuffer>) for MoQFrameWriter methods
+// Helper: convert compat::Payload to Buffer for MoQFrameWriter methods
+// In Folly mode, Buffer = folly::IOBuf
+// In std mode, Buffer = ByteBuffer
+inline std::unique_ptr<Buffer> payloadToBuffer(
+    const std::unique_ptr<compat::Payload>& p) {
+  if (!p) {
+    return nullptr;
+  }
+#if MOXYGEN_USE_FOLLY
+  // In Folly mode, extract the IOBuf from the wrapper and clone it
+  auto* iobuf = p->getIOBuf();
+  if (!iobuf) {
+    return nullptr;
+  }
+  return iobuf->clone();
+#else
+  return Buffer::copyBuffer(p->data(), p->length());
+#endif
+}
+
+#if MOXYGEN_USE_FOLLY
+// Overload for moxygen::Payload (which is unique_ptr<IOBuf> in Folly mode)
+// In std-mode, Payload = unique_ptr<compat::Payload>, same as above
 inline std::unique_ptr<Buffer> payloadToBuffer(const Payload& p) {
   if (!p) {
     return nullptr;
   }
-  return Buffer::copyBuffer(p->data(), p->length());
+  return p->clone();
 }
+#endif
 
-// Helper: convert ByteBuffer (unique_ptr<ByteBuffer>) to Payload
-// (unique_ptr<compat::Payload>) for writeStreamDataSync
+// Helper: convert ByteBuffer (unique_ptr<ByteBuffer>) to compat::Payload
+// for writeStreamDataSync
 inline std::unique_ptr<compat::Payload> bufferToPayload(
     std::unique_ptr<Buffer> buf) {
   return compat::Payload::wrap(std::move(buf));
+}
+
+// Helper: convert moxygen::Payload to compat::Payload
+// In Folly mode: moxygen::Payload = unique_ptr<IOBuf>
+// In std mode: moxygen::Payload = unique_ptr<compat::Payload>
+inline std::unique_ptr<compat::Payload> toCompatPayload(Payload p) {
+#if MOXYGEN_USE_FOLLY
+  if (!p) {
+    return nullptr;
+  }
+  return std::make_unique<compat::Payload>(std::move(p));
+#else
+  return std::move(p);
+#endif
 }
 
 // =========================================================================
@@ -347,7 +384,8 @@ class CompatStreamPublisher : public SubgroupConsumer,
           MoQPublishError(MoQPublishError::CANCELLED, "stream cancelled"));
     }
     if (payload) {
-      writeHandle_->writeStreamDataSync(std::move(payload), finSubgroup);
+      writeHandle_->writeStreamDataSync(
+          toCompatPayload(std::move(payload)), finSubgroup);
     }
     if (finSubgroup) {
       writeHandle_ = nullptr;
