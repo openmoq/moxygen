@@ -68,7 +68,7 @@ class MoQChatClient : public Publisher,
 
   void publishLoop();
   folly::coro::Task<void> subscribeToUser(TrackNamespace trackNamespace);
-  void subscribeDone(SubscribeDone subDone);
+  void publishDone(PublishDone pubDone);
 
   [[nodiscard]] std::vector<std::string> chatPrefix() const {
     return {"moq-chat", chatID_};
@@ -91,7 +91,7 @@ class MoQChatClient : public Publisher,
   std::string username_;
   std::string deviceId_;
   std::string timestampString_;
-  std::shared_ptr<MoQFollyExecutorImpl> executor_;
+  std::unique_ptr<MoQFollyExecutorImpl> executor_;
   MoQRelayClient moqClient_;
   std::optional<RequestID> chatRequestID_;
   std::optional<TrackAlias> chatTrackAlias_;

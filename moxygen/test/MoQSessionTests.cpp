@@ -72,48 +72,48 @@ INSTANTIATE_TEST_SUITE_P(
         VersionParams{{kVersionDraftCurrent}, kVersionDraftCurrent}));
 TEST(MoQSessionTest, SetVersionFromAlpnLegacy) {
   folly::EventBase eventBase;
-  auto MoQExecutor = std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+  auto MoQExecutor = std::make_unique<MoQFollyExecutorImpl>(&eventBase);
   auto [clientWt, serverWt] =
       proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
   auto session = std::make_shared<MoQRelaySession>(
       folly::MaybeManagedPtr<proxygen::WebTransport>(clientWt.get()),
-      MoQExecutor);
+      MoQExecutor->keepAlive());
 
   session->validateAndSetVersionFromAlpn("moq-00");
   EXPECT_FALSE(session->getNegotiatedVersion().has_value());
 }
 TEST(MoQSessionTest, SetVersionFromAlpnDraft15) {
   folly::EventBase eventBase;
-  auto MoQExecutor = std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+  auto MoQExecutor = std::make_unique<MoQFollyExecutorImpl>(&eventBase);
   auto [clientWt, serverWt] =
       proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
   auto session = std::make_shared<MoQRelaySession>(
       folly::MaybeManagedPtr<proxygen::WebTransport>(clientWt.get()),
-      MoQExecutor);
+      MoQExecutor->keepAlive());
 
   session->validateAndSetVersionFromAlpn("moqt-15");
   EXPECT_EQ(session->getNegotiatedVersion(), 0xff00000f);
 }
 TEST(MoQSessionTest, SetVersionFromAlpnDraft16) {
   folly::EventBase eventBase;
-  auto MoQExecutor = std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+  auto MoQExecutor = std::make_unique<MoQFollyExecutorImpl>(&eventBase);
   auto [clientWt, serverWt] =
       proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
   auto session = std::make_shared<MoQRelaySession>(
       folly::MaybeManagedPtr<proxygen::WebTransport>(clientWt.get()),
-      MoQExecutor);
+      MoQExecutor->keepAlive());
 
   session->validateAndSetVersionFromAlpn("moqt-16");
   EXPECT_EQ(session->getNegotiatedVersion(), 0xff000010);
 }
 TEST(MoQSessionTest, SetVersionFromAlpnInvalidAlpn) {
   folly::EventBase eventBase;
-  auto MoQExecutor = std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+  auto MoQExecutor = std::make_unique<MoQFollyExecutorImpl>(&eventBase);
   auto [clientWt, serverWt] =
       proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
   auto session = std::make_shared<MoQRelaySession>(
       folly::MaybeManagedPtr<proxygen::WebTransport>(clientWt.get()),
-      MoQExecutor);
+      MoQExecutor->keepAlive());
 
   session->validateAndSetVersionFromAlpn("invalid-alpn");
   EXPECT_FALSE(session->getNegotiatedVersion().has_value());
@@ -124,7 +124,7 @@ TEST(MoQSessionTest, ServerSetupVersion15WithoutAlpnShouldFail) {
   // VERSION_NEGOTIATION_FAILED
 
   folly::EventBase eventBase;
-  auto moqExecutor = std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+  auto moqExecutor = std::make_unique<MoQFollyExecutorImpl>(&eventBase);
   auto [clientWt, serverWt] =
       proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
 
@@ -151,11 +151,11 @@ TEST(MoQSessionTest, ServerSetupVersion15WithoutAlpnShouldFail) {
   auto serverSession = std::make_shared<MoQRelaySession>(
       folly::MaybeManagedPtr<proxygen::WebTransport>(serverWt.get()),
       serverSetupCallback,
-      moqExecutor);
+      moqExecutor->keepAlive());
 
   auto clientSession = std::make_shared<MoQRelaySession>(
       folly::MaybeManagedPtr<proxygen::WebTransport>(clientWt.get()),
-      moqExecutor);
+      moqExecutor->keepAlive());
 
   // Setup peer handlers before starting
   clientWt->setPeerHandler(serverSession.get());
@@ -185,15 +185,6 @@ TEST(MoQSessionTest, ServerSetupVersion15WithoutAlpnShouldFail) {
   if (!serverWt->isSessionClosed()) {
     serverSession->close(SessionCloseErrorCode::NO_ERROR);
   }
-}
-CO_TEST_P_X(MoQSessionTest, ClientReceivesBidiStream) {
-  serverWt_->createBidiStream();
-  // Check that the client called stopSending and resetStream on the newly
-  // created stream.
-  EXPECT_TRUE(clientWt_->readHandles.begin()->second->writeException());
-  EXPECT_TRUE(
-      clientWt_->writeHandles.begin()->second->getWriteErr().has_value());
-  co_return;
 }
 CO_TEST_P_X(MoQSessionTest, Goaway) {
   co_await setupMoQSession();
@@ -277,10 +268,10 @@ class DummyMoQClientBase : public MoQClientBase {
 
 TEST(MoQClientBaseTest, CallbacksIgnoredWhenSessionNull) {
   folly::EventBase evb;
-  auto exec = std::make_shared<MoQFollyExecutorImpl>(&evb);
+  auto exec = std::make_unique<MoQFollyExecutorImpl>(&evb);
   proxygen::URL url("https://example.com:443/");
 
-  DummyMoQClientBase client(exec, std::move(url));
+  DummyMoQClientBase client(exec->keepAlive(), std::move(url));
 
   // Ensure no session is set (simulating post-reset state)
   client.moqSession_.reset();
@@ -298,16 +289,17 @@ TEST(MoQClientBaseTest, CallbacksIgnoredWhenSessionNull) {
 }
 TEST(MoQRelayClientTest, ShutdownClearsHandlersAndResetsSession) {
   folly::EventBase evb;
-  auto exec = std::make_shared<MoQFollyExecutorImpl>(&evb);
+  auto exec = std::make_unique<MoQFollyExecutorImpl>(&evb);
 
   // Create a session and wire it into a MoQClient used by MoQRelayClient
   auto [clientWt, serverWt] =
       proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
   auto session = std::make_shared<MoQSession>(
-      folly::MaybeManagedPtr<proxygen::WebTransport>(clientWt.get()), exec);
+      folly::MaybeManagedPtr<proxygen::WebTransport>(clientWt.get()),
+      exec->keepAlive());
 
   auto moqClient = std::make_unique<MoQClient>(
-      exec, proxygen::URL("https://example.com:443/"));
+      exec->keepAlive(), proxygen::URL("https://example.com:443/"));
   moqClient->moqSession_ = session;
 
   MoQRelayClient relay(std::move(moqClient));
@@ -325,35 +317,35 @@ TEST(MoQRelayClientTest, ShutdownClearsHandlersAndResetsSession) {
 class MoQSessionDeleteFromCallbackTest : public MoQSessionTest {};
 
 // Test that demonstrates UAF when application deletes session during
-// subscribeDone callback
-CO_TEST_P_X(MoQSessionDeleteFromCallbackTest, DeleteFromSubscribeDoneCallback) {
+// publishDone callback
+CO_TEST_P_X(MoQSessionDeleteFromCallbackTest, DeleteFromPublishDoneCallback) {
   std::weak_ptr<MoQSession> weakSession;
 
   // Setup the session first
   co_await setupMoQSession();
 
-  // Create a track consumer that we'll use to send subscribeDone
+  // Create a track consumer that we'll use to send publishDone
   std::shared_ptr<TrackConsumer> serverTrackConsumer;
 
   // Setup server publisher to accept subscription and store the TrackConsumer
   expectSubscribe([&](auto sub, auto pub) -> TaskSubscribeResult {
     pub->setTrackAlias(TrackAlias(sub.requestID.value));
-    // Store the TrackConsumer so we can call subscribeDone on it later
+    // Store the TrackConsumer so we can call publishDone on it later
     serverTrackConsumer = pub;
     co_return makeSubscribeOkResult(sub);
   });
 
   // Subscribe to a track using our suicidal consumer
   weakSession = clientSession_;
-  // Create a mock TrackConsumer that deletes the session in subscribeDone
+  // Create a mock TrackConsumer that deletes the session in publishDone
   auto consumer = std::make_shared<testing::StrictMock<MockTrackConsumer>>();
   EXPECT_CALL(*consumer, setTrackAlias(testing::_))
       .WillOnce(testing::Return(folly::unit));
   // Subscribe to track - co_await ensures the mock lambda executes
   auto subResult = co_await clientSession_->subscribe(
       getSubscribe(kTestTrackName), consumer);
-  EXPECT_CALL(*consumer, subscribeDone(testing::_))
-      .WillOnce([&](const SubscribeDone&) {
+  EXPECT_CALL(*consumer, publishDone(testing::_))
+      .WillOnce([&](const PublishDone&) {
         // Delete the session during the callback
         clientSession_.reset();
         subResult->reset();
@@ -366,19 +358,19 @@ CO_TEST_P_X(MoQSessionDeleteFromCallbackTest, DeleteFromSubscribeDoneCallback) {
     co_return; // Skip rest of test if setup failed
   }
 
-  // Now server sends SUBSCRIBE_DONE - this will trigger the chain:
-  // controlCodec_.onIngress() -> onSubscribeDone -> processSubscribeDone
-  // -> callback_->subscribeDone() -> delete session -> return to onIngress ->
+  // Now server sends PUBLISH_DONE - this will trigger the chain:
+  // controlCodec_.onIngress() -> onPublishDone -> processPublishDone
+  // -> callback_->publishDone() -> delete session -> return to onIngress ->
   // UAF!
-  SubscribeDone subDone;
-  subDone.requestID = 1;
-  subDone.statusCode = SubscribeDoneStatusCode::SUBSCRIPTION_ENDED;
-  subDone.reasonPhrase = "test";
-  subDone.streamCount = 0; // No streams in flight
+  PublishDone pubDone;
+  pubDone.requestID = 1;
+  pubDone.statusCode = PublishDoneStatusCode::SUBSCRIPTION_ENDED;
+  pubDone.reasonPhrase = "test";
+  pubDone.streamCount = 0; // No streams in flight
 
   // This should trigger the UAF if the guard is not in place
   // serverTrackConsumer is the client's TrackConsumer on the server side
-  serverTrackConsumer->subscribeDone(subDone);
+  serverTrackConsumer->publishDone(pubDone);
 
   // Process just this one event - with the fix, session stays alive during
   // callback Without the fix, we'd have UAF here
@@ -388,6 +380,61 @@ CO_TEST_P_X(MoQSessionDeleteFromCallbackTest, DeleteFromSubscribeDoneCallback) {
   // If we get here without ASAN detecting UAF, the guard is working
   EXPECT_FALSE(clientSession_);
   EXPECT_TRUE(weakSession.expired()) << "Session should have been deleted";
+
+  // Clean up: close server session
+  if (serverSession_) {
+    serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+  }
+}
+
+// Test that verifies fix for bad_weak_ptr crash
+// Scenario: Session is destroyed while controlReadLoop coroutine is waiting
+// for data. When data arrives, the coroutine should exit gracefully instead
+// of crashing with bad_weak_ptr.
+// See: T254245035
+CO_TEST_P_X(
+    MoQSessionDeleteFromCallbackTest,
+    WeakFromThisGracefulExitOnSessionDestroy) {
+  // Setup the session
+  co_await setupMoQSession();
+
+  // Get weak_ptr to track session lifetime
+  std::weak_ptr<MoQSession> weakClient = clientSession_;
+
+  // The control stream is stream ID 0. We need to:
+  // 1. Pause data delivery so controlReadLoop blocks on co_await
+  // 2. Release the session shared_ptr
+  // 3. Deliver data to trigger the coroutine resume
+  // 4. Verify it exits gracefully (with our fix) instead of crashing
+
+  // Pause data delivery on the control stream (ID 0)
+  // This ensures controlReadLoop is blocked waiting for data
+  serverWt_->writeHandles[0]->setImmediateDelivery(false);
+
+  // Write some data that will be held in the inflight buffer
+  auto data = folly::IOBuf::copyBuffer("test");
+  serverWt_->writeHandles[0]->writeStreamData(std::move(data), false, nullptr);
+
+  // Now release the client session shared_ptr WITHOUT calling close()
+  // This simulates the scenario where all external references are released
+  // but the coroutine is still running
+  clientSession_.reset();
+
+  // Verify session weak_ptr is expired (no more shared_ptr holders)
+  EXPECT_TRUE(weakClient.expired())
+      << "Session should have no shared_ptr holders";
+
+  // Now deliver the data to wake up the controlReadLoop coroutine
+  // Before the fix: shared_from_this() would throw bad_weak_ptr
+  // After the fix: weak_from_this().lock() returns nullptr, coroutine exits
+  // gracefully
+  serverWt_->writeHandles[0]->deliverInflightData();
+
+  // Drive the event loop to let the coroutine process
+  co_await folly::coro::co_reschedule_on_current_executor;
+  co_await folly::coro::co_reschedule_on_current_executor;
+
+  // If we get here without crashing, the fix is working
 
   // Clean up: close server session
   if (serverSession_) {

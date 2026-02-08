@@ -123,7 +123,11 @@ class TextHandler : public ObjectReceiverCallback {
     }
 
     if (payload) {
-      std::cout << payload->moveToString() << std::endl;
+      payload->coalesce();
+      std::cout << std::string(
+                       reinterpret_cast<const char*>(payload->data()),
+                       payload->length())
+                << std::endl;
     }
     return FlowControlState::UNBLOCKED;
   }
@@ -142,7 +146,7 @@ class TextHandler : public ObjectReceiverCallback {
     std::cout << "Stream Error=" << folly::to_underlying(error) << std::endl;
   }
 
-  void onSubscribeDone(SubscribeDone) override {
+  void onPublishDone(PublishDone) override {
     CHECK(!fetch_);
     std::cout << __func__ << std::endl;
     baton.post();
@@ -158,7 +162,7 @@ class MoQTextClient : public Subscriber,
                       public std::enable_shared_from_this<MoQTextClient> {
  public:
   MoQTextClient(
-      std::shared_ptr<MoQFollyExecutorImpl> evb,
+      MoQExecutor::KeepAlive evb,
       proxygen::URL url,
       FullTrackName ftn,
       std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr,
@@ -184,7 +188,8 @@ class MoQTextClient : public Subscriber,
 
   folly::coro::Task<MoQSession::SubscribeNamespaceResult> subscribeNamespace(
       SubscribeNamespace subAnn) {
-    auto res = co_await moqClient_.getSession()->subscribeNamespace(subAnn);
+    auto res =
+        co_await moqClient_.getSession()->subscribeNamespace(subAnn, nullptr);
     if (res.hasValue()) {
       subscribeNamespaceHandle_ = res.value();
     }
@@ -424,15 +429,15 @@ int main(int argc, char* argv[]) {
       << "Can specify at most one of jafetch or jrfetch or fetch";
   TrackNamespace ns =
       TrackNamespace(FLAGS_track_namespace, FLAGS_track_namespace_delimiter);
-  std::shared_ptr<MoQFollyExecutorImpl> moqEvb =
-      std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+  std::unique_ptr<MoQFollyExecutorImpl> moqEvb =
+      std::make_unique<MoQFollyExecutorImpl>(&eventBase);
   std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr;
   if (FLAGS_insecure) {
     verifier = std::make_shared<
         moxygen::test::InsecureVerifierDangerousDoNotUseInProduction>();
   }
   auto textClient = std::make_shared<MoQTextClient>(
-      moqEvb,
+      moqEvb->keepAlive(),
       std::move(url),
       moxygen::FullTrackName({ns, FLAGS_track_name}),
       verifier,

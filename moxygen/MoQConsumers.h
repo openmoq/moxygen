@@ -60,7 +60,7 @@ class SubgroupConsumer {
 
   // SubgroupConsumer enforces API semantics.
   //
-  // It’s an error to deliver any object or status if the object ID isn’t
+  // It's an error to deliver any object or status if the object ID isn't
   // strictly larger than the last delivered one on this subgroup.
   //
   // When using beginObject/objectPayload to deliver a streaming object, the
@@ -69,6 +69,10 @@ class SubgroupConsumer {
   //
   // It's an error to begin delivering any object/status or close the
   // stream in the middle of a streaming object.
+  //
+  // If any method returns a MoQPublishError, the SubgroupConsumer is
+  // implicitly reset and no further API calls should be made on it.
+  // Calling reset() after an error is a no-op.
 
   // Deliver the next object on this subgroup.
   virtual compat::Expected<compat::Unit, MoQPublishError> object(
@@ -149,9 +153,14 @@ class TrackConsumer {
 
   // Begin delivering a new subgroup in the specified group.  If the consumer is
   // writing, this Can fail with MoQPublishError::BLOCKED when out of stream
-  // credit.
+  // credit.  containsLastInGroup indicates this subgroup contains the last
+  // object in the group.
   virtual compat::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
-  beginSubgroup(uint64_t groupID, uint64_t subgroupID, Priority priority) = 0;
+  beginSubgroup(
+      uint64_t groupID,
+      uint64_t subgroupID,
+      Priority priority,
+      bool containsLastInGroup = false) = 0;
 
   // Wait for additional stream credit.
   virtual compat::Expected<compat::SemiFuture<compat::Unit>, MoQPublishError>
@@ -159,21 +168,25 @@ class TrackConsumer {
 
   // Deliver a single-object or object status subgroup.  header.length must
   // equal payload length, or be 0 for non-NORMAL status.  Can fail with
-  // MoQPublishError::BLOCKED when out of stream credit.
+  // MoQPublishError::BLOCKED when out of stream credit.  lastInGroup indicates
+  // the object is the last in the group.
   virtual compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
-      Payload payload) = 0;
+      Payload payload,
+      bool lastInGroup = false) = 0;
 
   // Deliver a datagram in this track.  This can be dropped by the sender or
-  // receiver if resources are low.
+  // receiver if resources are low.  lastInGroup indicates the object is the
+  // last in the group.
   virtual compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
-      Payload payload) = 0;
+      Payload payload,
+      bool lastInGroup = false) = 0;
 
   // Inform the consumer that the publisher will not open any new subgroups or
   // send any new datagrams for this track.
-  virtual compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
-      SubscribeDone subDone) = 0;
+  virtual compat::Expected<compat::Unit, MoQPublishError> publishDone(
+      PublishDone pubDone) = 0;
 
   // Set a callback to be notified when objects are delivered.
   virtual void setDeliveryCallback(std::shared_ptr<DeliveryCallback> callback) {

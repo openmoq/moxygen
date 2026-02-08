@@ -94,7 +94,7 @@ class DatePublisher : public Publisher {
       MoQRelayClient* relayClient,
       TrackNamespace ns,
       uint64_t requestId,
-      std::shared_ptr<MoQExecutor> executor) {
+      MoQExecutor::KeepAlive executor) {
     // Form PublishRequest
     PublishRequest req{
         requestId,
@@ -154,9 +154,9 @@ class DatePublisher : public Publisher {
 
   void removeSubscriber(
       std::shared_ptr<MoQSession> session,
-      std::optional<SubscribeDone> subDone,
+      std::optional<PublishDone> pubDone,
       const std::string& reason) {
-    forwarder_.removeSubscriber(std::move(session), std::move(subDone), reason);
+    forwarder_.removeSubscriber(std::move(session), std::move(pubDone), reason);
   }
 
   std::pair<uint64_t, uint64_t> now() {
@@ -323,14 +323,14 @@ class DatePublisher : public Publisher {
     std::stringstream ss;
     ss << std::put_time(lt, "%Y-%m-%d %H:%M:");
     XLOG(DBG1) << ss.str() << lt->tm_sec;
-    return compat::Payload::wrap(folly::IOBuf::copyBuffer(ss.str()));
+    return folly::IOBuf::copyBuffer(ss.str());
   }
 
   Payload secondPayload(uint64_t object) {
     XCHECK_GT(object, 0llu);
     auto secBuf = folly::to<std::string>(object - 1);
     XLOG(DBG1) << (object - 1);
-    return compat::Payload::wrap(folly::IOBuf::copyBuffer(secBuf));
+    return folly::IOBuf::copyBuffer(secBuf);
   }
 
   folly::coro::Task<void> catchup(
@@ -561,7 +561,7 @@ std::unique_ptr<MoQRelayClient> createRelayClient(
     return nullptr;
   }
 
-  auto moqEvb = std::make_shared<MoQFollyExecutorImpl>(workerEvb);
+  auto moqEvb = std::make_unique<MoQFollyExecutorImpl>(workerEvb);
 
   auto verifier = FLAGS_insecure
       ? std::make_shared<
@@ -570,12 +570,12 @@ std::unique_ptr<MoQRelayClient> createRelayClient(
 
   auto relayClient = std::make_unique<MoQRelayClient>(
       (FLAGS_quic_transport ? std::make_unique<MoQClient>(
-                                  moqEvb,
+                                  moqEvb->keepAlive(),
                                   url,
                                   MoQRelaySession::createRelaySessionFactory(),
                                   verifier)
                             : std::make_unique<MoQWebTransportClient>(
-                                  moqEvb,
+                                  moqEvb->keepAlive(),
                                   url,
                                   MoQRelaySession::createRelaySessionFactory(),
                                   verifier)));
@@ -606,7 +606,10 @@ std::unique_ptr<MoQRelayClient> createRelayClient(
   if (FLAGS_publish) {
     publisher
         ->callPublish(
-            relayClient.get(), TrackNamespace(FLAGS_ns, "/"), 0, moqEvb)
+            relayClient.get(),
+            TrackNamespace(FLAGS_ns, "/"),
+            0,
+            moqEvb->keepAlive())
         .scheduleOn(workerEvb)
         .start();
   }

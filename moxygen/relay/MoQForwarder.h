@@ -101,7 +101,7 @@ class MoQForwarder : public TrackConsumer {
 
     // Returns true if this subscriber is draining and all subgroups are closed
     bool shouldRemove() const {
-      return receivedSubscribeDone_ && subgroups.empty();
+      return receivedPublishDone_ && subgroups.empty();
     }
 
     std::shared_ptr<MoQSession> session;
@@ -114,7 +114,7 @@ class MoQForwarder : public TrackConsumer {
     SubgroupConsumerMap subgroups;
     MoQForwarder& forwarder;
     bool shouldForward;
-    bool receivedSubscribeDone_{false};
+    bool receivedPublishDone_{false};
   };
 
   [[nodiscard]] bool empty() const {
@@ -134,18 +134,18 @@ class MoQForwarder : public TrackConsumer {
       const std::shared_ptr<MoQSession>& session,
       const JoiningFetch& joining) const;
 
-  // Gracefully drains a subscriber - forwards subscribeDone but doesn't reset
+  // Gracefully drains a subscriber - forwards publishDone but doesn't reset
   // open subgroups. Calls removeSubscriber() if no subgroups are open.
   void drainSubscriber(
       const std::shared_ptr<MoQSession>& session,
-      SubscribeDone subDone,
+      PublishDone pubDone,
       const std::string& callsite);
 
   // Immediately removes a session - resets all open subgroups and removes
   // from subscribers map
   void removeSubscriber(
       const std::shared_ptr<MoQSession>& session,
-      std::optional<SubscribeDone> subDone,
+      std::optional<PublishDone> pubDone,
       const std::string& callsite);
 
   template <typename Fn>
@@ -164,22 +164,27 @@ class MoQForwarder : public TrackConsumer {
       TrackAlias alias) override;
 
   folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
-  beginSubgroup(uint64_t groupID, uint64_t subgroupID, Priority priority)
-      override;
+  beginSubgroup(
+      uint64_t groupID,
+      uint64_t subgroupID,
+      Priority priority,
+      bool containsLastInGroup = false) override;
 
   folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
   awaitStreamCredit() override;
 
   compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
-      Payload payload) override;
+      Payload payload,
+      bool lastInGroup = false) override;
 
   compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
-      Payload payload) override;
+      Payload payload,
+      bool lastInGroup = false) override;
 
-  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
-      SubscribeDone subDone) override;
+  compat::Expected<compat::Unit, MoQPublishError> publishDone(
+      PublishDone pubDone) override;
 
   class SubgroupForwarder : public SubgroupConsumer {
     std::optional<uint64_t> currentObjectLength_;
@@ -261,7 +266,17 @@ class MoQForwarder : public TrackConsumer {
   void removeSubscriberIt(
       folly::F14FastMap<MoQSession*, std::shared_ptr<Subscriber>>::iterator
           subIt,
-      std::optional<SubscribeDone> subDone,
+      std::optional<PublishDone> pubDone,
+      const std::string& callsite);
+
+  // Handles errors on a subgroup for a specific subscriber.
+  // Soft errors (CANCELLED - from STOP_SENDING or delivery timeout) tombstone
+  // the subgroup by setting it to nullptr, preventing reopening but keeping
+  // the subscription alive. Hard errors remove the entire subscription.
+  void handleSubgroupError(
+      Subscriber& sub,
+      const SubgroupIdentifier& subgroupId,
+      const MoQPublishError& err,
       const std::string& callsite);
 
   FullTrackName fullTrackName_;

@@ -172,7 +172,7 @@ class MoQFrameParser {
       Cursor& cursor,
       size_t length) const noexcept;
 
-  compat::Expected<SubscribeUpdate, ErrorCode> parseSubscribeUpdate(
+  compat::Expected<RequestUpdate, ErrorCode> parseRequestUpdate(
       Cursor& cursor,
       size_t length) const noexcept;
 
@@ -184,7 +184,7 @@ class MoQFrameParser {
       Cursor& cursor,
       size_t length) const noexcept;
 
-  compat::Expected<SubscribeDone, ErrorCode> parseSubscribeDone(
+  compat::Expected<PublishDone, ErrorCode> parsePublishDone(
       Cursor& cursor,
       size_t length) const noexcept;
 
@@ -373,7 +373,7 @@ class MoQFrameParser {
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
   void handleRequestSpecificParams(
-      SubscribeUpdate& subscribeUpdate,
+      RequestUpdate& requestUpdate,
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
   void handleRequestSpecificParams(
@@ -405,6 +405,11 @@ class MoQFrameParser {
   void handleForwardParam(
       std::optional<bool>& forwardField,
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
+  // Version translation: convert track property params to extensions for < v16
+  void convertTrackPropertyParamsToExtensions(
+      const TrackRequestParameters& params,
+      Extensions& extensions) const noexcept;
 
   std::optional<uint64_t> version_;
   mutable MoQTokenCache tokenCache_;
@@ -458,7 +463,8 @@ class MoQFrameWriter {
       BufQueue& writeBuf,
       TrackAlias trackAlias,
       const ObjectHeader& objectHeader,
-      std::unique_ptr<Buffer> objectPayload) const noexcept;
+      std::unique_ptr<Buffer> objectPayload,
+      bool endOfGroup = false) const noexcept;
 
   WriteResult writeStreamObject(
       BufQueue& writeBuf,
@@ -476,17 +482,24 @@ class MoQFrameWriter {
       BufQueue& writeBuf,
       const SubscribeRequest& subscribeRequest) const noexcept;
 
+  WriteResult writeRequestUpdate(
+      BufQueue& writeBuf,
+      const RequestUpdate& update) const noexcept;
+
+  // Backward compatibility forwarder
   WriteResult writeSubscribeUpdate(
       BufQueue& writeBuf,
-      const SubscribeUpdate& update) const noexcept;
+      const SubscribeUpdate& update) const noexcept {
+    return writeRequestUpdate(writeBuf, update);
+  }
 
   WriteResult writeSubscribeOk(
       BufQueue& writeBuf,
       const SubscribeOk& subscribeOk) const noexcept;
 
-  WriteResult writeSubscribeDone(
+  WriteResult writePublishDone(
       BufQueue& writeBuf,
-      const SubscribeDone& subscribeDone) const noexcept;
+      const PublishDone& publishDone) const noexcept;
 
   WriteResult writeUnsubscribe(
       BufQueue& writeBuf,
@@ -663,6 +676,11 @@ class MoQFrameWriter {
 
   void resetWriterFetchContext() const noexcept;
 
+  // Version translation: convert track property extensions to params for < v16
+  void convertTrackPropertyExtensionsToParams(
+      const Extensions& extensions,
+      TrackRequestParameters& params) const noexcept;
+
   std::optional<uint64_t> version_;
   mutable std::optional<uint64_t> previousObjectID_;
   // Context for FETCH object delta encoding (draft-15+)
@@ -670,5 +688,11 @@ class MoQFrameWriter {
   mutable std::optional<uint64_t> previousFetchSubgroup_;
   mutable std::optional<uint8_t> previousFetchPriority_;
 };
+
+#if MOXYGEN_USE_FOLLY
+// Parses the frame type from the beginning of the buffer without consuming it.
+// Returns folly::none if there isn't enough data to parse the frame type.
+folly::Optional<FrameType> getFrameType(const folly::IOBufQueue& readBuf);
+#endif
 
 } // namespace moxygen

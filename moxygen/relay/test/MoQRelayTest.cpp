@@ -28,7 +28,11 @@ class TestMoQExecutor : public MoQFollyExecutorImpl,
                         public folly::DrivableExecutor {
  public:
   explicit TestMoQExecutor() : MoQFollyExecutorImpl(&evb_) {}
-  ~TestMoQExecutor() override = default;
+  ~TestMoQExecutor() override {
+    // Drive the EventBase to let pending work complete before joinKeepAlive
+    // blocks waiting for all tokens
+    evb_.loopOnce(EVLOOP_NONBLOCK);
+  }
 
   void add(folly::Func func) override {
     MoQFollyExecutorImpl::add(std::move(func));
@@ -60,12 +64,23 @@ class MoQRelayTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    // Clear mock session references to release KeepAlive tokens
+    // Note: Don't call cleanup() here as tests may have already cleaned up
+    // their state, and calling unsubscribe() on already-cleaned objects
+    // causes use-after-free
+    mockSessions_.clear();
+
     relay_.reset();
+    // Drive the executor to release any pending KeepAlive tokens
+    if (exec_) {
+      exec_->drive();
+    }
   }
 
   // Helper to create a mock session
   std::shared_ptr<MockMoQSession> createMockSession() {
-    auto session = std::make_shared<NiceMock<MockMoQSession>>(exec_);
+    auto session =
+        std::make_shared<NiceMock<MockMoQSession>>(exec_->keepAlive());
     ON_CALL(*session, getNegotiatedVersion())
         .WillByDefault(Return(std::optional<uint64_t>(kVersionDraftCurrent)));
     auto state = getOrCreateMockState(session);
@@ -96,7 +111,7 @@ class MoQRelayTest : public ::testing::Test {
     ON_CALL(*consumer, setTrackAlias(_))
         .WillByDefault(
             Return(folly::makeExpected<MoQPublishError>(folly::unit)));
-    ON_CALL(*consumer, subscribeDone(_))
+    ON_CALL(*consumer, publishDone(_))
         .WillByDefault(
             Return(folly::makeExpected<MoQPublishError>(folly::unit)));
     return consumer;
@@ -172,12 +187,12 @@ class MoQRelayTest : public ::testing::Test {
 
     void cleanup() {
       // Simulate MoQSession::cleanup() for publish tracks
-      // This calls subscribeDone on all tracked consumers, which triggers
+      // This calls publishDone on all tracked consumers, which triggers
       // FilterConsumer callbacks that properly clean up relay state
       for (auto& consumer : publishConsumers) {
-        consumer->subscribeDone(
+        consumer->publishDone(
             {RequestID(0),
-             SubscribeDoneStatusCode::SESSION_CLOSED,
+             PublishDoneStatusCode::SESSION_CLOSED,
              0,
              "mock session cleanup"});
       }
@@ -293,7 +308,7 @@ class MoQRelayTest : public ::testing::Test {
     SubscribeNamespace subNs;
     subNs.trackNamespacePrefix = nsPrefix;
     return withSessionContext(session, [&]() {
-      auto task = relay_->subscribeNamespace(std::move(subNs));
+      auto task = relay_->subscribeNamespace(std::move(subNs), nullptr);
       auto res = folly::coro::blockingWait(std::move(task), exec_.get());
       EXPECT_TRUE(res.hasValue());
       if (res.hasValue()) {
@@ -494,9 +509,9 @@ TEST_F(MoQRelayTest, PruneOnPublishDoneBug) {
 
   // End the publish - onPublishDone gets called
   withSessionContext(publisher, [&]() {
-    consumer->subscribeDone(
+    consumer->publishDone(
         {RequestID(0),
-         SubscribeDoneStatusCode::SUBSCRIPTION_ENDED,
+         PublishDoneStatusCode::SUBSCRIPTION_ENDED,
          0,
          "publisher done"});
   });
@@ -830,8 +845,8 @@ TEST_F(MoQRelayTest, ForwarderOnlyCreatesSubgroupsBeforeObjectData) {
   };
 
   // Subscriber 1 and 2 should get beginSubgroup
-  EXPECT_CALL(*mockConsumer1, beginSubgroup(_, _, _))
-      .WillOnce([&](uint64_t, uint64_t, uint8_t) {
+  EXPECT_CALL(*mockConsumer1, beginSubgroup(_, _, _, _))
+      .WillOnce([&](uint64_t, uint64_t, uint8_t, bool) {
         auto sg = std::make_shared<NiceMock<MockSubgroupConsumer>>();
         setupSubgroupConsumer(sg);
         return folly::
@@ -839,8 +854,8 @@ TEST_F(MoQRelayTest, ForwarderOnlyCreatesSubgroupsBeforeObjectData) {
                 sg);
       });
 
-  EXPECT_CALL(*mockConsumer2, beginSubgroup(_, _, _))
-      .WillOnce([&](uint64_t, uint64_t, uint8_t) {
+  EXPECT_CALL(*mockConsumer2, beginSubgroup(_, _, _, _))
+      .WillOnce([&](uint64_t, uint64_t, uint8_t, bool) {
         auto sg = std::make_shared<NiceMock<MockSubgroupConsumer>>();
         setupSubgroupConsumer(sg);
         return folly::
@@ -849,7 +864,7 @@ TEST_F(MoQRelayTest, ForwarderOnlyCreatesSubgroupsBeforeObjectData) {
       });
 
   // Subscriber 3 joins mid-object and should NOT get beginSubgroup
-  EXPECT_CALL(*mockConsumer3, beginSubgroup(_, _, _)).Times(0);
+  EXPECT_CALL(*mockConsumer3, beginSubgroup(_, _, _, _)).Times(0);
 
   // Setup: publish track
   auto publishConsumer = doPublish(publisherSession, kTestTrackName);
@@ -864,7 +879,7 @@ TEST_F(MoQRelayTest, ForwarderOnlyCreatesSubgroupsBeforeObjectData) {
 
   // First object -> goes to subscriber 1
   EXPECT_TRUE(subgroup->beginObject(0, 4, 0).hasValue());
-  EXPECT_TRUE(subgroup->objectPayload(compat::Payload::copyBuffer("test"), false)
+  EXPECT_TRUE(subgroup->objectPayload(folly::IOBuf::copyBuffer("test"), false)
                   .hasValue());
 
   // Subscriber 2 joins after first object
@@ -878,7 +893,7 @@ TEST_F(MoQRelayTest, ForwarderOnlyCreatesSubgroupsBeforeObjectData) {
 
   // Payload and endOfSubgroup -> only to subscribers 1, 2 (NOT 3)
   EXPECT_TRUE(
-      subgroup->objectPayload(compat::Payload::copyBuffer("more data"), false)
+      subgroup->objectPayload(folly::IOBuf::copyBuffer("more data"), false)
           .hasValue());
   EXPECT_TRUE(subgroup->endOfSubgroup().hasValue());
 
@@ -889,8 +904,8 @@ TEST_F(MoQRelayTest, ForwarderOnlyCreatesSubgroupsBeforeObjectData) {
 }
 
 // Test: Graceful session draining - comprehensive test of draining behavior
-// This test verifies that when a publisher calls subscribeDone, subscribers
-// are drained (receive subscribeDone) but their open subgroups are NOT reset.
+// This test verifies that when a publisher calls publishDone, subscribers
+// are drained (receive publishDone) but their open subgroups are NOT reset.
 // Draining subscribers should not receive new subgroups and are removed when
 // their last subgroup closes.
 TEST_F(MoQRelayTest, GracefulSessionDraining) {
@@ -914,8 +929,8 @@ TEST_F(MoQRelayTest, GracefulSessionDraining) {
 
   // Subscriber1: will have 2 open subgroups (0, 1)
   for (uint64_t i = 0; i < 2; ++i) {
-    EXPECT_CALL(*consumers[0], beginSubgroup(i, 0, _))
-        .WillOnce([this, i, &sub0_sgs](uint64_t, uint64_t, uint8_t) {
+    EXPECT_CALL(*consumers[0], beginSubgroup(i, 0, _, _))
+        .WillOnce([this, i, &sub0_sgs](uint64_t, uint64_t, uint8_t, bool) {
           sub0_sgs[i] = createMockSubgroupConsumer();
           return folly::
               makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
@@ -924,8 +939,8 @@ TEST_F(MoQRelayTest, GracefulSessionDraining) {
   }
 
   // Subscriber2: will have 1 open subgroup (1)
-  EXPECT_CALL(*consumers[1], beginSubgroup(1, 0, _))
-      .WillOnce([this, &sub1_sg0](uint64_t, uint64_t, uint8_t) {
+  EXPECT_CALL(*consumers[1], beginSubgroup(1, 0, _, _))
+      .WillOnce([this, &sub1_sg0](uint64_t, uint64_t, uint8_t, bool) {
         sub1_sg0 = createMockSubgroupConsumer();
         return folly::
             makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
@@ -939,11 +954,11 @@ TEST_F(MoQRelayTest, GracefulSessionDraining) {
   sgs[1] = publishConsumer->beginSubgroup(1, 0, 0).value();
   subscribeToTrack(subscribers[2], kTestTrackName, consumers[2], RequestID(3));
 
-  // Trigger draining by calling subscribeDone from publisher
-  // All subscribers should receive subscribeDone but subgroups should NOT reset
-  // Note: subscribeDone may be called multiple times (during drain and cleanup)
+  // Trigger draining by calling publishDone from publisher
+  // All subscribers should receive publishDone but subgroups should NOT reset
+  // Note: publishDone may be called multiple times (during drain and cleanup)
   for (auto& consumer : consumers) {
-    EXPECT_CALL(*consumer, subscribeDone(_))
+    EXPECT_CALL(*consumer, publishDone(_))
         .WillOnce(Return(folly::makeExpected<MoQPublishError>(folly::unit)));
   }
 
@@ -952,10 +967,10 @@ TEST_F(MoQRelayTest, GracefulSessionDraining) {
   EXPECT_CALL(*sub0_sgs[1], reset(_)).Times(0);
   EXPECT_CALL(*sub1_sg0, reset(_)).Times(0);
 
-  publishConsumer->subscribeDone(
-      SubscribeDone{
+  publishConsumer->publishDone(
+      PublishDone{
           RequestID(0),
-          SubscribeDoneStatusCode::SUBSCRIPTION_ENDED,
+          PublishDoneStatusCode::SUBSCRIPTION_ENDED,
           0,
           "publisher ended"});
 
@@ -987,8 +1002,8 @@ TEST_F(MoQRelayTest, RemoveSessionResetsOpenSubgroups) {
   auto consumer = createMockConsumer();
 
   for (uint64_t i = 0; i < sgs.size(); ++i) {
-    EXPECT_CALL(*consumer, beginSubgroup(i, 0, _))
-        .WillOnce([this, i, &sgs](uint64_t, uint64_t, uint8_t) {
+    EXPECT_CALL(*consumer, beginSubgroup(i, 0, _, _))
+        .WillOnce([this, i, &sgs](uint64_t, uint64_t, uint8_t, bool) {
           sgs[i] = createMockSubgroupConsumer();
           EXPECT_CALL(*sgs[i], object(0, testing::_, testing::_, false))
               .WillOnce(testing::Return(folly::unit));
@@ -1039,8 +1054,8 @@ TEST_F(MoQRelayTest, DrainingSubscriberRemovedOnSubgroupError) {
   auto consumer = createMockConsumer();
 
   for (uint64_t i = 0; i < sgs.size(); ++i) {
-    EXPECT_CALL(*consumer, beginSubgroup(i, 0, _))
-        .WillOnce([this, i, &sgs](uint64_t, uint64_t, uint8_t) {
+    EXPECT_CALL(*consumer, beginSubgroup(i, 0, _, _))
+        .WillOnce([this, i, &sgs](uint64_t, uint64_t, uint8_t, bool) {
           sgs[i] = createMockSubgroupConsumer();
           return folly::
               makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
@@ -1058,8 +1073,8 @@ TEST_F(MoQRelayTest, DrainingSubscriberRemovedOnSubgroupError) {
   }
 
   // Drain the subscriber - should mark it draining but not remove
-  // Note: subscribeDone may be called multiple times (during drain and cleanup)
-  EXPECT_CALL(*consumer, subscribeDone(_))
+  // Note: publishDone may be called multiple times (during drain and cleanup)
+  EXPECT_CALL(*consumer, publishDone(_))
       .Times(AtLeast(1))
       .WillRepeatedly(
           Return(folly::makeExpected<MoQPublishError>(folly::unit)));
@@ -1069,10 +1084,10 @@ TEST_F(MoQRelayTest, DrainingSubscriberRemovedOnSubgroupError) {
   EXPECT_CALL(*sgs[1], reset(_)).Times(0);
   EXPECT_CALL(*sgs[2], reset(_)).Times(0);
 
-  publishConsumer->subscribeDone(
-      SubscribeDone{
+  publishConsumer->publishDone(
+      PublishDone{
           RequestID(0),
-          SubscribeDoneStatusCode::SUBSCRIPTION_ENDED,
+          PublishDoneStatusCode::SUBSCRIPTION_ENDED,
           0,
           "publisher ended"});
 
@@ -1093,7 +1108,7 @@ TEST_F(MoQRelayTest, DrainingSubscriberRemovedOnSubgroupError) {
 }
 
 // Test: Subscriber that ends subscription doesn't receive subsequent objects
-// Sequence: publish, sub1 subscribes, beginSubgroup, sub1 ends (subscribeDone),
+// Sequence: publish, sub1 subscribes, beginSubgroup, sub1 ends (publishDone),
 // sub2 subscribes, send object -> only goes to sub1
 TEST_F(MoQRelayTest, SubscriberUnsubscribeDoesNotReceiveNewObjects) {
   auto publisherSession = createMockSession();
@@ -1105,8 +1120,8 @@ TEST_F(MoQRelayTest, SubscriberUnsubscribeDoesNotReceiveNewObjects) {
   auto mockConsumer2 = createMockConsumer();
 
   // Sub1 should get beginSubgroup
-  EXPECT_CALL(*mockConsumer1, beginSubgroup(_, _, _))
-      .WillOnce([&](uint64_t, uint64_t, uint8_t) {
+  EXPECT_CALL(*mockConsumer1, beginSubgroup(_, _, _, _))
+      .WillOnce([&](uint64_t, uint64_t, uint8_t, bool) {
         auto sg = std::make_shared<NiceMock<MockSubgroupConsumer>>();
         EXPECT_CALL(*sg, beginObject(_, _, _, _)).WillOnce(Return(folly::unit));
         EXPECT_CALL(*sg, reset(_));
@@ -1116,7 +1131,7 @@ TEST_F(MoQRelayTest, SubscriberUnsubscribeDoesNotReceiveNewObjects) {
       });
 
   // Sub2 should also get beginSubgroup
-  EXPECT_CALL(*mockConsumer2, beginSubgroup(_, _, _)).Times(0);
+  EXPECT_CALL(*mockConsumer2, beginSubgroup(_, _, _, _)).Times(0);
 
   // Publish track
   auto publishConsumer =
@@ -1131,16 +1146,16 @@ TEST_F(MoQRelayTest, SubscriberUnsubscribeDoesNotReceiveNewObjects) {
   auto subgroup = *sgRes;
 
   // publisher ends subscription
-  EXPECT_CALL(*mockConsumer1, subscribeDone(testing::_));
+  EXPECT_CALL(*mockConsumer1, publishDone(testing::_));
   EXPECT_TRUE(publishConsumer
-                  ->subscribeDone(
+                  ->publishDone(
                       {RequestID(1),
-                       SubscribeDoneStatusCode::TRACK_ENDED,
+                       PublishDoneStatusCode::TRACK_ENDED,
                        0,
                        "track ended"})
                   .hasValue());
 
-  // Subscriber 2 joins after subscribeDone
+  // Subscriber 2 joins after publishDone
   subscribeToTrack(
       subscriber2,
       kTestTrackName,
@@ -1160,7 +1175,7 @@ TEST_F(MoQRelayTest, SubscriberUnsubscribeDoesNotReceiveNewObjects) {
 
 // Test: SubscribeNamespace only receives publishes while active
 // Sequence: subscribeNamespace (sub1), publish (sub1 gets it),
-// beginSubgroup, subscribeDone, subscribeNamespace (sub2), new publish
+// beginSubgroup, publishDone, subscribeNamespace (sub2), new publish
 // (only sub2 gets it)
 TEST_F(MoQRelayTest, SubscribeNamespaceDoesntAddDrainingPublish) {
   auto publisherSession = createMockSession();
@@ -1190,8 +1205,8 @@ TEST_F(MoQRelayTest, SubscribeNamespaceDoesntAddDrainingPublish) {
                 }()});
       });
 
-  EXPECT_CALL(*mockConsumer1, beginSubgroup(_, _, _))
-      .WillOnce([&](uint64_t, uint64_t, uint8_t) {
+  EXPECT_CALL(*mockConsumer1, beginSubgroup(_, _, _, _))
+      .WillOnce([&](uint64_t, uint64_t, uint8_t, bool) {
         auto sg = std::make_shared<NiceMock<MockSubgroupConsumer>>();
         EXPECT_CALL(*sg, endOfSubgroup())
             .WillOnce(testing::Return(folly::unit));
@@ -1212,11 +1227,11 @@ TEST_F(MoQRelayTest, SubscribeNamespaceDoesntAddDrainingPublish) {
   auto subgroup = *subgroupRes;
 
   // publisher ends subscription
-  EXPECT_CALL(*mockConsumer1, subscribeDone(testing::_));
+  EXPECT_CALL(*mockConsumer1, publishDone(testing::_));
   EXPECT_TRUE(pubConsumer
-                  ->subscribeDone(
+                  ->publishDone(
                       {RequestID(1),
-                       SubscribeDoneStatusCode::TRACK_ENDED,
+                       PublishDoneStatusCode::TRACK_ENDED,
                        0,
                        "track ended"})
                   .hasValue());
@@ -1266,8 +1281,8 @@ TEST_F(MoQRelayTest, DataOperationCancelledWhenAllSubscribersFail) {
 
   // Setup both subscribers to succeed on first payload, fail on second
   for (size_t i = 0; i < 2; ++i) {
-    EXPECT_CALL(*consumers[i], beginSubgroup(0, 0, _))
-        .WillOnce([this, i, &sgs](uint64_t, uint64_t, uint8_t) {
+    EXPECT_CALL(*consumers[i], beginSubgroup(0, 0, _, _))
+        .WillOnce([this, i, &sgs](uint64_t, uint64_t, uint8_t, bool) {
           sgs[i] = createMockSubgroupConsumer();
           EXPECT_CALL(*sgs[i], objectPayload(_, false))
               .WillOnce(Return(
@@ -1296,13 +1311,13 @@ TEST_F(MoQRelayTest, DataOperationCancelledWhenAllSubscribersFail) {
   EXPECT_TRUE(subgroup->beginObject(0, 100, 0).hasValue());
 
   // First objectPayload succeeds - both subscribers receive it
-  auto res1 = subgroup->objectPayload(compat::Payload::copyBuffer("data1"), false);
+  auto res1 = subgroup->objectPayload(folly::IOBuf::copyBuffer("data1"), false);
   EXPECT_TRUE(res1.hasValue());
   EXPECT_EQ(*res1, ObjectPublishStatus::IN_PROGRESS);
 
   // Second objectPayload causes both subscribers to fail and get removed
   // This should return CANCELLED because all subscribers are gone
-  auto res2 = subgroup->objectPayload(compat::Payload::copyBuffer("data2"), false);
+  auto res2 = subgroup->objectPayload(folly::IOBuf::copyBuffer("data2"), false);
   EXPECT_FALSE(res2.hasValue());
   EXPECT_EQ(res2.error().code, MoQPublishError::CANCELLED);
 
@@ -1332,8 +1347,8 @@ TEST_F(MoQRelayTest, PartialSubscriberFailureDoesNotCancelData) {
   }
 
   // Setup subscriber 0 - will fail on second objectPayload
-  EXPECT_CALL(*consumers[0], beginSubgroup(0, 0, _))
-      .WillOnce([this, &sgs](uint64_t, uint64_t, uint8_t) {
+  EXPECT_CALL(*consumers[0], beginSubgroup(0, 0, _, _))
+      .WillOnce([this, &sgs](uint64_t, uint64_t, uint8_t, bool) {
         sgs[0] = createMockSubgroupConsumer();
         EXPECT_CALL(*sgs[0], objectPayload(_, false))
             .WillOnce(Return(
@@ -1352,8 +1367,8 @@ TEST_F(MoQRelayTest, PartialSubscriberFailureDoesNotCancelData) {
   // Setup subscribers 1 and 2 - will succeed on objectPayload
   // They will get reset during cleanup when the test calls subgroup->reset()
   for (size_t i = 1; i < 3; ++i) {
-    EXPECT_CALL(*consumers[i], beginSubgroup(0, 0, _))
-        .WillOnce([this, i, &sgs](uint64_t, uint64_t, uint8_t) {
+    EXPECT_CALL(*consumers[i], beginSubgroup(0, 0, _, _))
+        .WillOnce([this, i, &sgs](uint64_t, uint64_t, uint8_t, bool) {
           sgs[i] = createMockSubgroupConsumer();
           EXPECT_CALL(*sgs[i], objectPayload(_, false))
               .WillRepeatedly(Return(
@@ -1382,13 +1397,13 @@ TEST_F(MoQRelayTest, PartialSubscriberFailureDoesNotCancelData) {
   EXPECT_TRUE(subgroup->beginObject(0, 100, 0).hasValue());
 
   // First objectPayload succeeds - all 3 subscribers receive it
-  auto res1 = subgroup->objectPayload(compat::Payload::copyBuffer("data1"), false);
+  auto res1 = subgroup->objectPayload(folly::IOBuf::copyBuffer("data1"), false);
   EXPECT_TRUE(res1.hasValue());
   EXPECT_EQ(*res1, ObjectPublishStatus::IN_PROGRESS);
 
   // Second objectPayload causes subscriber 0 to fail and get removed
   // But subscribers 1 and 2 still exist, so operation succeeds
-  auto res2 = subgroup->objectPayload(compat::Payload::copyBuffer("data2"), false);
+  auto res2 = subgroup->objectPayload(folly::IOBuf::copyBuffer("data2"), false);
   EXPECT_TRUE(res2.hasValue());
   EXPECT_EQ(*res2, ObjectPublishStatus::IN_PROGRESS);
 
@@ -1454,6 +1469,250 @@ TEST_F(MoQRelayTest, SubscribeUpdateStartLocationCanDecrease) {
 
   removeSession(publisherSession);
   removeSession(subscriberSession);
+}
+
+// Test: Subgroup is tombstoned after CANCELLED error (soft error)
+// Verifies that a CANCELLED error on a subgroup sets it to nullptr (tombstone)
+// but keeps the subscription alive
+TEST_F(MoQRelayTest, SubgroupTombstonedAfterCancelledError) {
+  auto publisherSession = createMockSession();
+  auto subscriber = createMockSession();
+
+  // Setup: Publish track
+  auto publishConsumer = doPublish(publisherSession, kTestTrackName);
+
+  // Create subscriber with a mock consumer that will fail with CANCELLED
+  auto consumer = createMockConsumer();
+  std::shared_ptr<MockSubgroupConsumer> sg;
+
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce([this, &sg](uint64_t, uint64_t, uint8_t, bool) {
+        sg = createMockSubgroupConsumer();
+        // First object succeeds, second fails with CANCELLED
+        EXPECT_CALL(*sg, object(0, _, _, false)).WillOnce(Return(folly::unit));
+        EXPECT_CALL(*sg, object(1, _, _, false))
+            .WillOnce(Return(
+                folly::makeUnexpected(MoQPublishError(
+                    MoQPublishError::CANCELLED, "STOP_SENDING"))));
+        // Per API contract, error implies implicit reset - no reset() call
+        return folly::
+            makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                sg);
+      });
+
+  // Second subgroup should still be created (subscription is alive)
+  std::shared_ptr<MockSubgroupConsumer> sg2;
+  EXPECT_CALL(*consumer, beginSubgroup(1, 0, _, _))
+      .WillOnce([this, &sg2](uint64_t, uint64_t, uint8_t, bool) {
+        sg2 = createMockSubgroupConsumer();
+        EXPECT_CALL(*sg2, endOfSubgroup()).WillOnce(Return(folly::unit));
+        return folly::
+            makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                sg2);
+      });
+
+  subscribeToTrack(subscriber, kTestTrackName, consumer, RequestID(1));
+
+  // Begin first subgroup and send objects
+  auto subgroup1Res = publishConsumer->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroup1Res.hasValue());
+  auto subgroup1 = *subgroup1Res;
+
+  // First object succeeds
+  EXPECT_TRUE(subgroup1->object(0, test::makeBuf(10)).hasValue());
+
+  // Second object triggers CANCELLED error - subgroup gets tombstoned
+  EXPECT_TRUE(subgroup1->object(1, test::makeBuf(10)).hasValue());
+
+  // Begin second subgroup - should succeed because subscription is still alive
+  auto subgroup2Res = publishConsumer->beginSubgroup(1, 0, 0);
+  ASSERT_TRUE(subgroup2Res.hasValue());
+  auto subgroup2 = *subgroup2Res;
+
+  // End second subgroup
+  EXPECT_TRUE(subgroup2->endOfSubgroup().hasValue());
+
+  // End first subgroup (after tombstoning)
+  EXPECT_TRUE(subgroup1->endOfSubgroup().hasValue());
+
+  removeSession(publisherSession);
+  removeSession(subscriber);
+}
+
+// Test: Objects published to tombstoned subgroup are skipped for that
+// subscriber
+TEST_F(MoQRelayTest, TombstonedSubgroupIgnoresSubsequentObjects) {
+  auto publisherSession = createMockSession();
+  auto subscriber = createMockSession();
+
+  // Setup: Publish track
+  auto publishConsumer = doPublish(publisherSession, kTestTrackName);
+
+  // Create subscriber that fails with CANCELLED on first object
+  auto consumer = createMockConsumer();
+  std::shared_ptr<MockSubgroupConsumer> sg;
+
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce([this, &sg](uint64_t, uint64_t, uint8_t, bool) {
+        sg = createMockSubgroupConsumer();
+        // First object fails with CANCELLED
+        EXPECT_CALL(*sg, object(0, _, _, false))
+            .WillOnce(Return(
+                folly::makeUnexpected(MoQPublishError(
+                    MoQPublishError::CANCELLED, "delivery timeout"))));
+        // Per API contract, error implies implicit reset - no reset() call
+        // After tombstoning, should NOT receive any more objects
+        EXPECT_CALL(*sg, object(1, _, _, _)).Times(0);
+        EXPECT_CALL(*sg, object(2, _, _, _)).Times(0);
+        return folly::
+            makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                sg);
+      });
+
+  subscribeToTrack(subscriber, kTestTrackName, consumer, RequestID(1));
+
+  // Begin subgroup
+  auto subgroupRes = publishConsumer->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroupRes.hasValue());
+  auto subgroup = *subgroupRes;
+
+  // First object triggers CANCELLED - subgroup gets tombstoned
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+
+  // Subsequent objects should be skipped for this subscriber (tombstoned)
+  // These return CANCELLED because there are no more active subscribers
+  auto res1 = subgroup->object(1, test::makeBuf(10));
+  EXPECT_FALSE(res1.hasValue());
+  EXPECT_EQ(res1.error().code, MoQPublishError::CANCELLED);
+
+  auto res2 = subgroup->object(2, test::makeBuf(10));
+  EXPECT_FALSE(res2.hasValue());
+  EXPECT_EQ(res2.error().code, MoQPublishError::CANCELLED);
+
+  subgroup->reset(ResetStreamErrorCode::SESSION_CLOSED);
+  removeSession(publisherSession);
+  removeSession(subscriber);
+}
+
+// Test: Late joiner gets subgroup even after another subscriber tombstoned it
+TEST_F(MoQRelayTest, LateJoinerGetsSubgroupAfterTombstone) {
+  auto publisherSession = createMockSession();
+  auto subscriber1 = createMockSession();
+  auto subscriber2 = createMockSession();
+
+  // Setup: Publish track
+  auto publishConsumer = doPublish(publisherSession, kTestTrackName);
+
+  // First subscriber fails with CANCELLED (tombstones subgroup)
+  auto consumer1 = createMockConsumer();
+  std::shared_ptr<MockSubgroupConsumer> sg1;
+
+  EXPECT_CALL(*consumer1, beginSubgroup(0, 0, _, _))
+      .WillOnce([this, &sg1](uint64_t, uint64_t, uint8_t, bool) {
+        sg1 = createMockSubgroupConsumer();
+        EXPECT_CALL(*sg1, object(0, _, _, false))
+            .WillOnce(Return(
+                folly::makeUnexpected(MoQPublishError(
+                    MoQPublishError::CANCELLED, "STOP_SENDING"))));
+        // Per API contract, error implies implicit reset - no reset() call
+        return folly::
+            makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                sg1);
+      });
+
+  // Second subscriber (late joiner) should still get the subgroup
+  auto consumer2 = createMockConsumer();
+  std::shared_ptr<MockSubgroupConsumer> sg2;
+
+  EXPECT_CALL(*consumer2, beginSubgroup(0, 0, _, _))
+      .WillOnce([this, &sg2](uint64_t, uint64_t, uint8_t, bool) {
+        sg2 = createMockSubgroupConsumer();
+        EXPECT_CALL(*sg2, object(1, _, _, false)).WillOnce(Return(folly::unit));
+        EXPECT_CALL(*sg2, endOfSubgroup()).WillOnce(Return(folly::unit));
+        return folly::
+            makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                sg2);
+      });
+
+  // Subscribe first subscriber
+  subscribeToTrack(subscriber1, kTestTrackName, consumer1, RequestID(1));
+
+  // Begin subgroup
+  auto subgroupRes = publishConsumer->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroupRes.hasValue());
+  auto subgroup = *subgroupRes;
+
+  // First object triggers CANCELLED for subscriber1 - tombstones their subgroup
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+
+  // Late joiner subscribes after tombstone
+  subscribeToTrack(subscriber2, kTestTrackName, consumer2, RequestID(2));
+
+  // Next object should go to subscriber2 only (subscriber1 is tombstoned)
+  EXPECT_TRUE(subgroup->object(1, test::makeBuf(10)).hasValue());
+
+  // End subgroup
+  EXPECT_TRUE(subgroup->endOfSubgroup().hasValue());
+
+  removeSession(publisherSession);
+  removeSession(subscriber1);
+  removeSession(subscriber2);
+}
+
+// Test: Hard errors (WRITE_ERROR) remove the entire subscription
+TEST_F(MoQRelayTest, HardErrorsRemoveSubscriber) {
+  auto publisherSession = createMockSession();
+  auto subscriber = createMockSession();
+
+  // Setup: Publish track
+  auto publishConsumer = doPublish(publisherSession, kTestTrackName);
+
+  // Create subscriber that fails with WRITE_ERROR (hard error)
+  auto consumer = createMockConsumer();
+  std::shared_ptr<MockSubgroupConsumer> sg;
+
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce([this, &sg](uint64_t, uint64_t, uint8_t, bool) {
+        sg = createMockSubgroupConsumer();
+        EXPECT_CALL(*sg, object(0, _, _, false))
+            .WillOnce(Return(
+                folly::makeUnexpected(MoQPublishError(
+                    MoQPublishError::WRITE_ERROR, "transport broken"))));
+        // Should be reset when subscriber is removed
+        EXPECT_CALL(*sg, reset(_)).Times(1);
+        return folly::
+            makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                sg);
+      });
+
+  // publishDone should be called because subscription is being removed
+  EXPECT_CALL(*consumer, publishDone(_))
+      .WillOnce(Return(folly::makeExpected<MoQPublishError>(folly::unit)));
+
+  // Second subgroup should NOT be created (subscriber removed)
+  EXPECT_CALL(*consumer, beginSubgroup(1, _, _, _)).Times(0);
+
+  subscribeToTrack(subscriber, kTestTrackName, consumer, RequestID(1));
+
+  // Begin first subgroup
+  auto subgroup1Res = publishConsumer->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroup1Res.hasValue());
+  auto subgroup1 = *subgroup1Res;
+
+  // Object triggers WRITE_ERROR - subscriber removed entirely
+  // The call returns CANCELLED because no subscriber received the object
+  auto res = subgroup1->object(0, test::makeBuf(10));
+  EXPECT_FALSE(res.hasValue());
+  EXPECT_EQ(res.error().code, MoQPublishError::CANCELLED);
+
+  // Try to begin second subgroup - also returns CANCELLED (no subscribers)
+  auto subgroup2Res = publishConsumer->beginSubgroup(1, 0, 0);
+  EXPECT_FALSE(subgroup2Res.hasValue());
+  EXPECT_EQ(subgroup2Res.error().code, MoQPublishError::CANCELLED);
+
+  subgroup1->reset(ResetStreamErrorCode::SESSION_CLOSED);
+  removeSession(publisherSession);
+  removeSession(subscriber);
 }
 
 } // namespace moxygen::test

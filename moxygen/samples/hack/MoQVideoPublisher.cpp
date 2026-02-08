@@ -221,8 +221,8 @@ bool MoQVideoPublisher::setup(
     XLOG(ERR) << "Invalid url: " << connectURL;
     return false;
   }
-  relayClient_ = std::make_unique<MoQRelayClient>(
-      std::make_unique<MoQClient>(moqExecutor_, url, std::move(verifier)));
+  relayClient_ = std::make_unique<MoQRelayClient>(std::make_unique<MoQClient>(
+      moqExecutor_->keepAlive(), url, std::move(verifier)));
 
   cancel_ = folly::CancellationSource();
   running_ = true;
@@ -476,8 +476,8 @@ void MoQVideoPublisher::endPublish() {
   evbThread_->getEventBase()->runInEventBaseThreadAndWait([selfWeak] {
     if (auto self = selfWeak.lock()) {
       if (!self->videoForwarder_.empty()) {
-        self->videoForwarder_.subscribeDone(
-            {0, SubscribeDoneStatusCode::TRACK_ENDED, 0, "end of track"});
+        self->videoForwarder_.publishDone(
+            {0, PublishDoneStatusCode::TRACK_ENDED, 0, "end of track"});
       }
       self->audioPublishReady_ = false;
       self->audioTrackPublisher_.reset();

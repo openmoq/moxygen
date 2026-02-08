@@ -9,6 +9,7 @@
 #include <folly/logging/xlog.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
+#include "moxygen/MoQTrackProperties.h"
 #include "moxygen/test/TestUtils.h"
 
 using namespace moxygen;
@@ -90,7 +91,7 @@ class MoQFramerTest : public ::testing::TestWithParam<uint64_t> {
     testUnderflowResult(r3);
 
     skip(cursor, 1);
-    auto r3a = parser_.parseSubscribeUpdate(cursor, frameLength(cursor));
+    auto r3a = parser_.parseRequestUpdate(cursor, frameLength(cursor));
     testUnderflowResult(r3a);
 
     skip(cursor, 1);
@@ -115,14 +116,13 @@ class MoQFramerTest : public ::testing::TestWithParam<uint64_t> {
     testUnderflowResult(r6);
 
     skip(cursor, 1);
-    auto r7 = parser_.parseSubscribeDone(cursor, frameLength(cursor));
+    auto r7 = parser_.parsePublishDone(cursor, frameLength(cursor));
     testUnderflowResult(r7);
 
     skip(cursor, 1);
     auto r8a = parser_.parsePublish(cursor, frameLength(cursor));
     testUnderflowResult(r8a);
-    EXPECT_TRUE(getFirstIntParam(
-        r8a->params, TrackRequestParamKey::PUBLISHER_PRIORITY));
+    EXPECT_TRUE(getPublisherPriority(*r8a).has_value());
 
     skip(cursor, 1);
     auto r8b = parser_.parsePublishOk(cursor, frameLength(cursor));
@@ -1431,7 +1431,7 @@ TEST_P(MoQFramerTest, SubscribeUpdateWithSubscribeReqIDSerialization) {
 
   SubscribeUpdate subscribeUpdate;
   subscribeUpdate.requestID = RequestID(123);
-  subscribeUpdate.subscriptionRequestID = RequestID(456);
+  subscribeUpdate.existingRequestID = RequestID(456);
   subscribeUpdate.start = AbsoluteLocation{10, 20};
   subscribeUpdate.endGroup = 30;
   subscribeUpdate.priority = 5;
@@ -1447,22 +1447,22 @@ TEST_P(MoQFramerTest, SubscribeUpdateWithSubscribeReqIDSerialization) {
   EXPECT_EQ(
       frameType->first, folly::to_underlying(FrameType::SUBSCRIBE_UPDATE));
 
-  auto parseResult = parser_.parseSubscribeUpdate(cursor, frameLength(cursor));
+  auto parseResult = parser_.parseRequestUpdate(cursor, frameLength(cursor));
   EXPECT_TRUE(parseResult.hasValue());
 
   if (getDraftMajorVersion(GetParam()) >= 14) {
-    // Version >= 14: Both requestID and subscriptionRequestID are
+    // Version >= 14: Both requestID and existingRequestID are
     // written/parsed
     EXPECT_EQ(parseResult->requestID.value, 123);
-    EXPECT_EQ(parseResult->subscriptionRequestID.value, 456);
+    EXPECT_EQ(parseResult->existingRequestID.value, 456);
   } else {
-    // Version < 14: Only requestID is on wire, subscriptionRequestID not set by
+    // Version < 14: Only requestID is on wire, existingRequestID not set by
     // parser
     EXPECT_EQ(
         parseResult->requestID.value,
         123); // First field on wire goes to requestID
     EXPECT_EQ(
-        parseResult->subscriptionRequestID.value,
+        parseResult->existingRequestID.value,
         0); // Not set by parser for v<14
   }
 
@@ -1486,7 +1486,7 @@ TEST(MoQFramerTest, SubscribeUpdateDraft15ForwardUnset) {
 
   SubscribeUpdate subscribeUpdate;
   subscribeUpdate.requestID = RequestID(123);
-  subscribeUpdate.subscriptionRequestID = RequestID(456);
+  subscribeUpdate.existingRequestID = RequestID(456);
   subscribeUpdate.start = AbsoluteLocation{0, 0};
   subscribeUpdate.endGroup = 0; // Open-ended subscription
   subscribeUpdate.priority = kDefaultPriority;
@@ -1507,11 +1507,11 @@ TEST(MoQFramerTest, SubscribeUpdateDraft15ForwardUnset) {
   size_t frameLength = cursor.readBE<uint16_t>();
 
   // Parse the SUBSCRIBE_UPDATE
-  auto parseResult = parser.parseSubscribeUpdate(cursor, frameLength);
+  auto parseResult = parser.parseRequestUpdate(cursor, frameLength);
   EXPECT_TRUE(parseResult.hasValue()) << "Failed to parse SUBSCRIBE_UPDATE";
 
   EXPECT_EQ(parseResult->requestID.value, 123);
-  EXPECT_EQ(parseResult->subscriptionRequestID.value, 456);
+  EXPECT_EQ(parseResult->existingRequestID.value, 456);
   EXPECT_EQ(parseResult->start->group, 0);
   EXPECT_EQ(parseResult->start->object, 0);
   EXPECT_EQ(parseResult->endGroup, 0);
@@ -3400,6 +3400,37 @@ TEST_P(MoQFramerV16PlusTest, SubscribeNamespaceWithPublishOption) {
   EXPECT_EQ(parseResult->forward, true);
 }
 
+// Test RequestError with retryInterval (v16+ only)
+TEST_P(MoQFramerV16PlusTest, RequestErrorWithRetryInterval) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  RequestError requestError;
+  requestError.requestID = RequestID(42);
+  requestError.errorCode = RequestErrorCode::INTERNAL_ERROR;
+  requestError.reasonPhrase = "temporary failure";
+  requestError.retryInterval =
+      std::chrono::milliseconds{5000}; // 5 seconds (minus one per spec)
+
+  auto writeResult = writer_.writeRequestError(
+      writeBuf, requestError, FrameType::REQUEST_ERROR);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::REQUEST_ERROR));
+
+  auto parseResult = parser_.parseRequestError(
+      cursor, frameLength(cursor), FrameType::REQUEST_ERROR);
+  EXPECT_TRUE(parseResult.hasValue());
+
+  EXPECT_EQ(parseResult->requestID, requestError.requestID);
+  EXPECT_EQ(parseResult->errorCode, requestError.errorCode);
+  EXPECT_EQ(parseResult->retryInterval, requestError.retryInterval);
+  EXPECT_EQ(parseResult->reasonPhrase, requestError.reasonPhrase);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     MoQFramerV16PlusTest,
     MoQFramerV16PlusTest,
@@ -3470,11 +3501,12 @@ TEST_F(ParametersIsParamAllowedTest, ParamAllowedForAllFrameTypes) {
       paramsFetch.isParamAllowed(TrackRequestParamKey::PUBLISHER_PRIORITY));
 }
 
-TEST_F(ParametersIsParamAllowedTest, UnknownParamKeyReturnsFalse) {
+// TODO: Should return false when we drop v15- support
+TEST_F(ParametersIsParamAllowedTest, UnknownParamKeyReturnsTrue) {
   Parameters params(FrameType::SUBSCRIBE);
   // Cast an unknown value to TrackRequestParamKey
   auto unknownKey = static_cast<TrackRequestParamKey>(9999);
-  EXPECT_FALSE(params.isParamAllowed(unknownKey));
+  EXPECT_TRUE(params.isParamAllowed(unknownKey));
 }
 
 TEST_F(ParametersIsParamAllowedTest, MultipleParamsMixedResults) {

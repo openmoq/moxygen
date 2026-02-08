@@ -48,7 +48,7 @@ class MoQFlvStreamerClient
       public std::enable_shared_from_this<MoQFlvStreamerClient> {
  public:
   MoQFlvStreamerClient(
-      std::shared_ptr<MoQFollyExecutorImpl> evb,
+      MoQExecutor::KeepAlive evb,
       proxygen::URL url,
       FullTrackName fvtn,
       FullTrackName fatn,
@@ -218,6 +218,7 @@ class MoQFlvStreamerClient
             MoQSession::resolveGroupOrder(
                 GroupOrder::OldestFirst, subscribeReq.groupOrder),
             largest,
+            {},
             std::move(params)},
         consumerPtr,
         *this);
@@ -247,7 +248,7 @@ class MoQFlvStreamerClient
 
     XLOG(DBG1) << "Sending audio frame" << objHeader << ", payload size: "
                << moqMiObj->payload->computeChainDataLength();
-    audioPub_->objectStream(objHeader, compat::Payload::wrap(std::move(moqMiObj->payload)));
+    audioPub_->objectStream(objHeader, std::move(moqMiObj->payload));
   }
 
   void publishVideo(std::unique_ptr<flv::FlvStreamParser::MediaItem> item) {
@@ -299,7 +300,7 @@ class MoQFlvStreamerClient
                  << moqMiObj->payload->computeChainDataLength();
       videoSgPub_->object(
           largestVideo_.object++,
-          compat::Payload::wrap(std::move(moqMiObj->payload)),
+          std::move(moqMiObj->payload),
           Extensions(std::move(moqMiObj->extensions), {}));
     } else {
       XLOG(ERR) << "Should not happen";
@@ -384,13 +385,13 @@ int main(int argc, char* argv[]) {
     verifier = std::make_shared<
         moxygen::test::InsecureVerifierDangerousDoNotUseInProduction>();
   }
-  std::shared_ptr<MoQFollyExecutorImpl> moqEvb =
-      std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+  std::unique_ptr<MoQFollyExecutorImpl> moqEvb =
+      std::make_unique<MoQFollyExecutorImpl>(&eventBase);
 
   TrackNamespace ns =
       TrackNamespace(FLAGS_track_namespace, FLAGS_track_namespace_delimiter);
   auto streamerClient = std::make_shared<MoQFlvStreamerClient>(
-      moqEvb,
+      moqEvb->keepAlive(),
       std::move(url),
       moxygen::FullTrackName({ns, FLAGS_video_track_name}),
       moxygen::FullTrackName({ns, FLAGS_audio_track_name}),

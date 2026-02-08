@@ -79,7 +79,8 @@ class MoQPerfClientTrackConsumer : public TrackConsumer {
   beginSubgroup(
       uint64_t /* groupID */,
       uint64_t /* subgroupID */,
-      Priority /* priority */) override {
+      Priority /* priority */,
+      bool /* containsLastInGroup */ = false) override {
     return std::make_shared<MoQPerfClientSubgroupConsumer>(
         [this](uint64_t inc) { dataSent_ += inc; });
   }
@@ -91,20 +92,22 @@ class MoQPerfClientTrackConsumer : public TrackConsumer {
 
   compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& /* header */,
-      Payload payload) override {
+      Payload payload,
+      bool /* lastInGroup */ = false) override {
     dataSent_ += payload->computeChainDataLength();
     return compat::unit;
   }
 
   compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& /* header */,
-      Payload payload) override {
+      Payload payload,
+      bool /* lastInGroup */ = false) override {
     dataSent_ += payload->computeChainDataLength();
     return compat::unit;
   }
 
-  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
-      SubscribeDone /* subDone */) override {
+  compat::Expected<compat::Unit, MoQPublishError> publishDone(
+      PublishDone /* pubDone */) override {
     return compat::unit;
   }
 
@@ -188,7 +191,7 @@ class MoQPerfClient : public moxygen::Subscriber,
   void drain();
 
  private:
-  std::shared_ptr<moxygen::MoQFollyExecutorImpl> moqExecutor_;
+  std::unique_ptr<moxygen::MoQFollyExecutorImpl> moqExecutor_;
   moxygen::MoQClient moqClient_;
   std::chrono::milliseconds connectTimeout_;
   std::chrono::milliseconds transactionTimeout_;

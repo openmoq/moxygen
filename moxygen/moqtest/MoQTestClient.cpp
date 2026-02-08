@@ -28,16 +28,16 @@ MoQTestClient::MoQTestClient(
     folly::EventBase* evb,
     proxygen::URL url,
     bool useQuicTransport)
-    : moqExecutor_(std::make_shared<MoQFollyExecutorImpl>(evb)),
+    : moqExecutor_(std::make_unique<MoQFollyExecutorImpl>(evb)),
       moqClient_(
           useQuicTransport
               ? std::make_unique<MoQClient>(
-                    moqExecutor_,
+                    moqExecutor_->keepAlive(),
                     std::move(url),
                     std::make_shared<
                         test::InsecureVerifierDangerousDoNotUseInProduction>())
               : std::make_unique<MoQWebTransportClient>(
-                    moqExecutor_,
+                    moqExecutor_->keepAlive(),
                     std::move(url),
                     std::make_shared<
                         test::
@@ -324,7 +324,7 @@ void MoQTestClient::onAllDataReceived() {
   // For non-datagram: success == scoreboard.empty()
   if (!expectedObjects_.empty()) {
     XLOG(ERR)
-        << "MoQTest verification result: FAILURE! reason: SubscribeDone recieved while "
+        << "MoQTest verification result: FAILURE! reason: PublishDone recieved while "
         << expectedObjects_.size() << " objects are still expected";
     for (const auto& [group, objId] : expectedObjects_) {
       XLOG(ERR) << "  Missing object: group=" << group << " id=" << objId;

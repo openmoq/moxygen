@@ -37,7 +37,7 @@ class MoQRelaySession : public MoQSession {
   // Static factory for creating relay sessions in clients
   static std::function<std::shared_ptr<MoQSession>(
       folly::MaybeManagedPtr<proxygen::WebTransport>,
-      std::shared_ptr<MoQExecutor>)>
+      MoQExecutor::KeepAlive)>
   createRelaySessionFactory();
 
   // Override cleanup method for proper inheritance pattern
@@ -50,13 +50,26 @@ class MoQRelaySession : public MoQSession {
           nullptr) override;
 
   folly::coro::Task<Publisher::SubscribeNamespaceResult> subscribeNamespace(
-      SubscribeNamespace subAnn) override;
+      SubscribeNamespace subAnn,
+      std::shared_ptr<NamespacePublishHandle> namespacePublishHandle) override;
 
  private:
   // Forward declarations for inner classes
   class SubscriberPublishNamespaceCallback;
   class PublisherPublishNamespaceHandle;
   class SubscribeNamespaceHandle;
+
+  // Override to handle ANNOUNCE and SUBSCRIBE_ANNOUNCES updates
+  void onRequestUpdate(RequestUpdate requestUpdate) override;
+
+  // REQUEST_UPDATE handlers for announcement types - take handles directly
+  void handlePublishNamespaceRequestUpdate(
+      const RequestUpdate& requestUpdate,
+      std::shared_ptr<Subscriber::PublishNamespaceHandle> announceHandle);
+  void handleSubscribeNamespaceRequestUpdate(
+      const RequestUpdate& requestUpdate,
+      std::shared_ptr<Publisher::SubscribeNamespaceHandle>
+          subscribeNamespaceHandle);
 
   // Internal publishNamespace handling methods
   folly::coro::Task<void> handleSubscribeNamespace(SubscribeNamespace sa);
@@ -101,7 +114,7 @@ class MoQRelaySession : public MoQSession {
       RequestID,
       std::shared_ptr<Subscriber::PublishNamespaceHandle>,
       RequestID::hash>
-      publishNamespaceHanldes_;
+      publishNamespaceHandles_;
   folly::F14FastMap<
       RequestID,
       std::shared_ptr<Subscriber::PublishNamespaceCallback>,

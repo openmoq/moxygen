@@ -26,9 +26,9 @@ class ObjectReceiverCallback {
       const ObjectHeader& objHeader) = 0;
   virtual void onEndOfStream() = 0;
   virtual void onError(ResetStreamErrorCode) = 0;
-  virtual void onSubscribeDone(SubscribeDone done) = 0;
+  virtual void onPublishDone(PublishDone done) = 0;
   // For SUBSCRIBEs:
-  // Called when SUBSCRIBE_DONE has arrived AND all outstanding subgroup
+  // Called when PUBLISH_DONE has arrived AND all outstanding subgroup
   // streams have closed.
   //
   // For FETCHes:
@@ -111,10 +111,14 @@ class ObjectSubgroupReceiver : public SubgroupConsumer {
       bool /*finSubgroup*/) override {
     // TODO: add common component for state verification
     if (payload) {
+#if MOXYGEN_USE_FOLLY
+      payload_.append(std::move(payload));
+#else
       payload_.append(payload->releaseIOBuf());
+#endif
     }
     if (payload_.chainLength() == header_.length) {
-      auto fcState = callback_->onObject(trackAlias_, header_, compat::Payload::wrap(payload_.move()));
+      auto fcState = callback_->onObject(trackAlias_, header_, toPayload(payload_.move()));
       if (fcState == ObjectReceiverCallback::FlowControlState::BLOCKED) {
         // Is it bad that we can't return DONE here?
         if (streamType_ == StreamType::FETCH_HEADER) {
@@ -172,7 +176,7 @@ class ObjectReceiver : public TrackConsumer,
   std::optional<TrackAlias> trackAlias_;
   // Tracking for onAllDataReceived callback (subscription mode only)
   size_t openSubgroups_{0};
-  bool subscribeDoneDelivered_{false};
+  bool publishDoneDelivered_{false};
   bool allDataCallbackSent_{false};
 
  public:
@@ -193,8 +197,11 @@ class ObjectReceiver : public TrackConsumer,
   }
 
   compat::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
-  beginSubgroup(uint64_t groupID, uint64_t subgroupID, Priority priority)
-      override {
+  beginSubgroup(
+      uint64_t groupID,
+      uint64_t subgroupID,
+      Priority priority,
+      bool /*containsLastInGroup*/ = false) override {
     ++openSubgroups_;
     auto receiver = std::make_shared<ObjectSubgroupReceiver>(
         callback_, trackAlias_, groupID, subgroupID, priority);
@@ -211,11 +218,10 @@ class ObjectReceiver : public TrackConsumer,
   }
 
   // Fire onAllDataReceived callback once when both conditions are met:
-  // 1. SUBSCRIBE_DONE has been received
+  // 1. PUBLISH_DONE has been received
   // 2. All subgroup streams have closed
   void maybeFireAllDataReceived() {
-    if (!allDataCallbackSent_ && subscribeDoneDelivered_ &&
-        openSubgroups_ == 0) {
+    if (!allDataCallbackSent_ && publishDoneDelivered_ && openSubgroups_ == 0) {
       allDataCallbackSent_ = true;
       callback_->onAllDataReceived();
     }
@@ -228,7 +234,8 @@ class ObjectReceiver : public TrackConsumer,
 
   compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
-      Payload payload) override {
+      Payload payload,
+      bool /*lastInGroup*/ = false) override {
     auto fcState = callback_->onObject(trackAlias_, header, std::move(payload));
     if (fcState == ObjectReceiverCallback::FlowControlState::BLOCKED) {
       if (fetchPublisher_) {
@@ -243,15 +250,16 @@ class ObjectReceiver : public TrackConsumer,
 
   compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
-      Payload payload) override {
+      Payload payload,
+      bool /*lastInGroup*/ = false) override {
     (void)callback_->onObject(trackAlias_, header, std::move(payload));
     return compat::unit;
   }
 
-  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
-      SubscribeDone subDone) override {
-    callback_->onSubscribeDone(std::move(subDone));
-    subscribeDoneDelivered_ = true;
+  compat::Expected<compat::Unit, MoQPublishError> publishDone(
+      PublishDone pubDone) override {
+    callback_->onPublishDone(std::move(pubDone));
+    publishDoneDelivered_ = true;
     maybeFireAllDataReceived();
     return compat::unit;
   }

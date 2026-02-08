@@ -66,11 +66,11 @@ class MoQControlCodec : public MoQCodec {
     virtual void onClientSetup(ClientSetup clientSetup) = 0;
     virtual void onServerSetup(ServerSetup serverSetup) = 0;
     virtual void onSubscribe(SubscribeRequest subscribeRequest) = 0;
-    virtual void onSubscribeUpdate(SubscribeUpdate subscribeUpdate) = 0;
+    virtual void onRequestUpdate(RequestUpdate requestUpdate) = 0;
     virtual void onSubscribeOk(SubscribeOk subscribeOk) = 0;
     virtual void onRequestOk(RequestOk ok, FrameType frameType) = 0;
     virtual void onRequestError(RequestError error, FrameType frameType) = 0;
-    virtual void onSubscribeDone(SubscribeDone subscribeDone) = 0;
+    virtual void onPublishDone(PublishDone publishDone) = 0;
     virtual void onUnsubscribe(Unsubscribe unsubscribe) = 0;
     virtual void onPublish(PublishRequest publish) = 0;
     virtual void onPublishOk(PublishOk publishOk) = 0;
@@ -119,7 +119,7 @@ class MoQControlCodec : public MoQCodec {
       case FrameType::PUBLISH_NAMESPACE_ERROR:
       case FrameType::PUBLISH_NAMESPACE_DONE:
       case FrameType::UNSUBSCRIBE:
-      case FrameType::SUBSCRIBE_DONE:
+      case FrameType::PUBLISH_DONE:
       case FrameType::PUBLISH:
       case FrameType::PUBLISH_OK:
       case FrameType::PUBLISH_ERROR:

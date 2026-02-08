@@ -31,16 +31,16 @@ folly::coro::Task<void> MoQSessionTest::publishValidationTest(
       });
 
   folly::coro::Baton resetBaton;
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Return(sg1));
   EXPECT_CALL(*sg1, reset(ResetStreamErrorCode::INTERNAL_ERROR))
       .WillOnce([&](auto) { resetBaton.post(); });
-  expectSubscribeDone();
+  expectPublishDone();
   EXPECT_CALL(*serverPublisherStatsCallback_, onSubscriptionStreamClosed());
   EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscriptionStreamClosed());
   auto res = co_await clientSession_->subscribe(
       getSubscribe(kTestTrackName), subscribeCallback_);
-  co_await subscribeDone_;
+  co_await publishDone_;
   co_await resetBaton;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
@@ -59,7 +59,7 @@ CO_TEST_P_X(MoQSessionTest, DoubleBeginObject) {
     EXPECT_EQ(
         sgp->beginObject(2, 100, test::makeBuf(10)).error().code,
         MoQPublishError::API_ERROR);
-    pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+    pub->publishDone(getTrackEndedPublishDone(sub.requestID));
   });
 }
 CO_TEST_P_X(MoQSessionTest, ObjectPayloadTooLong) {
@@ -70,9 +70,9 @@ CO_TEST_P_X(MoQSessionTest, ObjectPayloadTooLong) {
                 folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
     EXPECT_TRUE(sgp->beginObject(1, 100, test::makeBuf(10)).hasValue());
     auto payloadFail =
-        sgp->objectPayload(compat::Payload::copyBuffer(std::string(200, 'x')));
+        sgp->objectPayload(folly::IOBuf::copyBuffer(std::string(200, 'x')));
     EXPECT_EQ(payloadFail.error().code, MoQPublishError::API_ERROR);
-    pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+    pub->publishDone(getTrackEndedPublishDone(sub.requestID));
   });
 }
 CO_TEST_P_X(MoQSessionTest, ObjectPayloadEarlyFin) {
@@ -86,10 +86,10 @@ CO_TEST_P_X(MoQSessionTest, ObjectPayloadEarlyFin) {
     // Attempt to send an object payload with length 20 and fin=true, which
     // should fail
     auto payloadFinFail = sgp->objectPayload(
-        compat::Payload::copyBuffer(std::string(20, 'x')), true);
+        folly::IOBuf::copyBuffer(std::string(20, 'x')), true);
     EXPECT_EQ(payloadFinFail.error().code, MoQPublishError::API_ERROR);
 
-    pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+    pub->publishDone(getTrackEndedPublishDone(sub.requestID));
   });
 }
 CO_TEST_P_X(MoQSessionTest, PublisherResetAfterBeginObject) {
@@ -105,10 +105,10 @@ CO_TEST_P_X(MoQSessionTest, PublisherResetAfterBeginObject) {
 
     // Attempt to send an object payload after reset, which should fail
     auto payloadFail =
-        sgp->objectPayload(compat::Payload::copyBuffer(std::string(20, 'x')));
+        sgp->objectPayload(folly::IOBuf::copyBuffer(std::string(20, 'x')));
     EXPECT_EQ(payloadFail.error().code, MoQPublishError::CANCELLED);
 
-    pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+    pub->publishDone(getTrackEndedPublishDone(sub.requestID));
   });
 }
 CO_TEST_P_X(MoQSessionTest, ObjectStatus) {
@@ -129,7 +129,7 @@ CO_TEST_P_X(MoQSessionTest, ObjectStatus) {
         co_return makeSubscribeOkResult(sub);
       });
   auto sg1 = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Return(sg1));
   EXPECT_CALL(*sg1, object(0, _, _, false))
       .WillOnce(testing::Return(folly::unit));
@@ -138,7 +138,7 @@ CO_TEST_P_X(MoQSessionTest, ObjectStatus) {
   EXPECT_CALL(*sg1, endOfGroup(3)).WillOnce(testing::Return(folly::unit));
 
   auto sg3 = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(2, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(2, 0, 0, _))
       .WillOnce(testing::Return(sg3));
   EXPECT_CALL(*sg3, object(0, _, _, false))
       .WillOnce(testing::Return(folly::unit));
@@ -151,41 +151,86 @@ CO_TEST_P_X(MoQSessionTest, ObjectStatus) {
   auto res =
       co_await clientSession_->subscribe(subscribeRequest, subscribeCallback_);
   co_await endOfTrackAndGroupBaton;
-  expectSubscribeDone();
-  trackConsumer->subscribeDone(
-      getTrackEndedSubscribeDone(subscribeRequest.requestID));
-  co_await subscribeDone_;
+  expectPublishDone();
+  trackConsumer->publishDone(
+      getTrackEndedPublishDone(subscribeRequest.requestID));
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 CO_TEST_P_X(MoQSessionTest, Datagrams) {
   co_await setupMoQSession();
   expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
     pub->datagram(
-        ObjectHeader(0, 0, 1, 0, 11), compat::Payload::copyBuffer("hello world"));
+        ObjectHeader(0, 0, 1, 0, 11), folly::IOBuf::copyBuffer("hello world"));
     pub->datagram(
         ObjectHeader(0, 0, 2, 0, ObjectStatus::OBJECT_NOT_EXIST), nullptr);
-    pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+    pub->publishDone(getTrackEndedPublishDone(sub.requestID));
     co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
   });
   {
     testing::InSequence enforceOrder;
-    EXPECT_CALL(*subscribeCallback_, datagram(_, _))
-        .WillOnce(testing::Invoke([&](const auto& header, auto) {
+    EXPECT_CALL(*subscribeCallback_, datagram(_, _, _))
+        .WillOnce([&](const auto& header, auto, bool) {
           EXPECT_EQ(header.length, 11);
           return folly::unit;
-        }));
-    EXPECT_CALL(*subscribeCallback_, datagram(_, _))
-        .WillOnce(testing::Invoke([&](const auto& header, auto) {
+        });
+    EXPECT_CALL(*subscribeCallback_, datagram(_, _, _))
+        .WillOnce([&](const auto& header, auto, bool) {
           EXPECT_EQ(header.status, ObjectStatus::OBJECT_NOT_EXIST);
           return folly::unit;
-        }));
+        });
   }
-  expectSubscribeDone();
+  expectPublishDone();
   auto res = co_await clientSession_->subscribe(
       getSubscribe(kTestTrackName), subscribeCallback_);
   EXPECT_FALSE(res.hasError());
-  co_await subscribeDone_;
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+CO_TEST_P_X(MoQSessionTest, MixSubgroupsAndDatagrams) {
+  // Test that subgroups and datagrams can be mixed on the same track
+  co_await setupMoQSession();
+  expectSubscribe(
+      [this](auto sub, auto pub) -> TaskSubscribeResult {
+        eventBase_.add([pub, sub] {
+          auto sgp = pub->beginSubgroup(0, 0, 0).value();
+          sgp->object(0, moxygen::test::makeBuf(10));
+          sgp->object(1, moxygen::test::makeBuf(10), noExtensions(), true);
+
+          // Send a datagram after the subgroup
+          pub->datagram(
+              ObjectHeader(1, 0, 0, 0, 11),
+              folly::IOBuf::copyBuffer("hello world"));
+
+          pub->publishDone(getTrackEndedPublishDone(sub.requestID));
+        });
+        co_return makeSubscribeOkResult(sub);
+      },
+      MoQControlCodec::Direction::CLIENT);
+
+  auto sg1 = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
+      .WillOnce(testing::Return(sg1));
+  EXPECT_CALL(*sg1, object(0, _, _, false))
+      .WillOnce(testing::Return(folly::unit));
+  EXPECT_CALL(*sg1, object(1, _, _, true))
+      .WillOnce(testing::Return(folly::unit));
+
+  EXPECT_CALL(*subscribeCallback_, datagram(_, _, _))
+      .WillOnce(
+          [](const auto& header,
+             auto,
+             bool) -> folly::Expected<folly::Unit, MoQPublishError> {
+            EXPECT_EQ(header.group, 1);
+            EXPECT_EQ(header.length, 11);
+            return folly::unit;
+          });
+
+  expectPublishDone(MoQControlCodec::Direction::SERVER);
+  auto res = co_await serverSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  co_await publishDone_;
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 CO_TEST_P_X(MoQSessionTest, DatagramBeforeSessionSetup) {
   clientSession_->start();
@@ -227,17 +272,17 @@ CO_TEST_P_X(MoQSessionTest, TooFarBehindOneSubgroup) {
 
   EXPECT_CALL(*serverPublisherStatsCallback_, onSubscriptionStreamClosed());
   EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscriptionStreamClosed());
-  expectSubscribeDone();
+  expectPublishDone();
   auto mockSubgroupConsumer =
       std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Return(mockSubgroupConsumer));
   EXPECT_CALL(*mockSubgroupConsumer, object(0, _, _, _))
       .WillOnce(testing::Return(folly::unit));
   EXPECT_CALL(*mockSubgroupConsumer, reset(_));
   auto res = co_await clientSession_->subscribe(
       getSubscribe(kTestTrackName), subscribeCallback_);
-  co_await subscribeDone_;
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 CO_TEST_P_X(MoQSessionTest, FreeUpBufferSpaceOneSubgroup) {
@@ -266,24 +311,24 @@ CO_TEST_P_X(MoQSessionTest, FreeUpBufferSpaceOneSubgroup) {
         serverWt->writeHandles[2]->deliverInflightData();
         EXPECT_FALSE(objectResult.hasError());
       }
-      pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+      pub->publishDone(getTrackEndedPublishDone(sub.requestID));
     });
     co_return makeSubscribeOkResult(sub);
   });
 
   EXPECT_CALL(*serverPublisherStatsCallback_, onSubscriptionStreamClosed());
   EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscriptionStreamClosed());
-  expectSubscribeDone();
+  expectPublishDone();
   auto mockSubgroupConsumer =
       std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Return(mockSubgroupConsumer));
   EXPECT_CALL(*mockSubgroupConsumer, object(_, _, _, _))
       .WillRepeatedly(testing::Return(folly::unit));
   EXPECT_CALL(*mockSubgroupConsumer, reset(_));
   auto res = co_await clientSession_->subscribe(
       getSubscribe(kTestTrackName), subscribeCallback_);
-  co_await subscribeDone_;
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 CO_TEST_P_X(MoQSessionTest, TooFarBehindMultipleSubgroups) {
@@ -339,17 +384,17 @@ CO_TEST_P_X(MoQSessionTest, TooFarBehindMultipleSubgroups) {
     co_return makeSubscribeOkResult(sub);
   });
 
-  expectSubscribeDone();
+  expectPublishDone();
   auto mockSubgroupConsumer =
       std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(_, _, _))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(_, _, _, _))
       .WillRepeatedly(testing::Return(mockSubgroupConsumer));
   EXPECT_CALL(*mockSubgroupConsumer, object(_, _, _, _))
       .WillRepeatedly(testing::Return(folly::unit));
   EXPECT_CALL(*mockSubgroupConsumer, reset(_)).Times(3);
   auto res = co_await clientSession_->subscribe(
       getSubscribe(kTestTrackName), subscribeCallback_);
-  co_await subscribeDone_;
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 CO_TEST_P_X(MoQSessionTest, PublisherAliveUntilAllBytesDelivered) {
@@ -370,7 +415,7 @@ CO_TEST_P_X(MoQSessionTest, PublisherAliveUntilAllBytesDelivered) {
         co_return makeSubscribeOkResult(sub);
       });
   auto sg = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Invoke([&] {
         eventBase_.add([&] {
           serverWt_->writeHandles[2]->setImmediateDelivery(false);
@@ -396,7 +441,7 @@ CO_TEST_P_X(MoQSessionTest, PublisherAliveUntilAllBytesDelivered) {
   barricade.reset();
   serverWt_->writeHandles[2]->deliverInflightData();
 
-  EXPECT_CALL(*subscribeCallback_, subscribeDone(_))
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
       .WillOnce(testing::Return(folly::unit));
   co_await barricade;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
@@ -415,7 +460,7 @@ CO_TEST_P_X(MoQSessionTest, TestOnObjectPayload) {
   });
 
   auto sg = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Return(sg));
 
   folly::coro::Baton receivedBeginObject;
@@ -432,7 +477,7 @@ CO_TEST_P_X(MoQSessionTest, TestOnObjectPayload) {
   co_await receivedBeginObject;
 
   auto payloadSendResult = subgroupPublisher->objectPayload(
-      compat::Payload::copyBuffer(std::string(90, 'x')), true);
+      folly::IOBuf::copyBuffer(std::string(90, 'x')), true);
   EXPECT_TRUE(payloadSendResult.hasValue());
   folly::coro::Baton receivedObjectPayload;
   EXPECT_CALL(*sg, objectPayload(_, _))
@@ -443,10 +488,10 @@ CO_TEST_P_X(MoQSessionTest, TestOnObjectPayload) {
   EXPECT_CALL(*sg, endOfSubgroup());
   co_await receivedObjectPayload;
 
-  expectSubscribeDone();
-  trackConsumer->subscribeDone(
-      getTrackEndedSubscribeDone(subscribeRequest.requestID));
-  co_await subscribeDone_;
+  expectPublishDone();
+  trackConsumer->publishDone(
+      getTrackEndedPublishDone(subscribeRequest.requestID));
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
@@ -504,20 +549,20 @@ CO_TEST_P_X(MoQSessionTest, DeliveryCallbackBasic) {
 
               sgp->endOfSubgroup();
               serverWt->writeHandles[2]->deliverInflightData();
-              pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+              pub->publishDone(getTrackEndedPublishDone(sub.requestID));
             });
         co_return makeSubscribeOkResult(sub);
       });
 
   auto sg = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Return(sg));
   EXPECT_CALL(*sg, object(0, _, _, _)).WillOnce(testing::Return(folly::unit));
-  expectSubscribeDone();
+  expectPublishDone();
 
   auto res = co_await clientSession_->subscribe(
       getSubscribe(kTestTrackName), subscribeCallback_);
-  co_await subscribeDone_;
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 CO_TEST_P_X(MoQSessionTest, DeliveryCallbackObjectSplitInTwo) {
@@ -561,20 +606,20 @@ CO_TEST_P_X(MoQSessionTest, DeliveryCallbackObjectSplitInTwo) {
 
               sgp->endOfSubgroup();
               serverWt->writeHandles[2]->deliverInflightData();
-              pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+              pub->publishDone(getTrackEndedPublishDone(sub.requestID));
             });
         co_return makeSubscribeOkResult(sub);
       });
 
   auto sg = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Return(sg));
   EXPECT_CALL(*sg, object(0, _, _, _)).WillOnce(testing::Return(folly::unit));
-  expectSubscribeDone();
+  expectPublishDone();
 
   auto res = co_await clientSession_->subscribe(
       getSubscribe(kTestTrackName), subscribeCallback_);
-  co_await subscribeDone_;
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 CO_TEST_P_X(MoQSessionTest, DeliveryCallbackMultipleStreams) {
@@ -617,7 +662,7 @@ CO_TEST_P_X(MoQSessionTest, DeliveryCallbackMultipleStreams) {
           EXPECT_TRUE(objectResult4.hasValue());
           sgp3->endOfSubgroup();
 
-          pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+          pub->publishDone(getTrackEndedPublishDone(sub.requestID));
         });
         co_return makeSubscribeOkResult(sub);
       });
@@ -627,20 +672,20 @@ CO_TEST_P_X(MoQSessionTest, DeliveryCallbackMultipleStreams) {
   auto sg2 = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
   auto sg3 = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
 
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Return(sg1));
   EXPECT_CALL(*sg1, object(0, _, _, _)).WillOnce(testing::Return(folly::unit));
   EXPECT_CALL(*sg1, object(1, _, _, _)).WillOnce(testing::Return(folly::unit));
 
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 1, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 1, 0, _))
       .WillOnce(testing::Return(sg2));
   EXPECT_CALL(*sg2, object(0, _, _, _)).WillOnce(testing::Return(folly::unit));
 
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(1, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(1, 0, 0, _))
       .WillOnce(testing::Return(sg3));
   EXPECT_CALL(*sg3, object(0, _, _, _)).WillOnce(testing::Return(folly::unit));
 
-  expectSubscribeDone();
+  expectPublishDone();
 
   EXPECT_CALL(*deliveryCallback, onDelivered(_, 0, 0, 0));
   EXPECT_CALL(*deliveryCallback, onDelivered(_, 0, 0, 1));
@@ -650,7 +695,7 @@ CO_TEST_P_X(MoQSessionTest, DeliveryCallbackMultipleStreams) {
   auto res = co_await clientSession_->subscribe(
       getSubscribe(kTestTrackName), subscribeCallback_);
 
-  co_await subscribeDone_;
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 using V15PlusTests = MoQSessionTest;
@@ -677,7 +722,7 @@ CO_TEST_P_X(V15PlusTests, SubgroupPriorityFallback) {
           auto sgp = pub->beginSubgroup(0, 0, kDefaultPriority).value();
           sgp->object(0, moxygen::test::makeBuf(10));
           sgp->endOfTrackAndGroup(1);
-          pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+          pub->publishDone(getTrackEndedPublishDone(sub.requestID));
         });
         // Return SubscribeOk with PUBLISHER_PRIORITY parameter
         co_return makeSubscribeOkResult(sub, std::nullopt, kPublisherPriority);
@@ -686,7 +731,7 @@ CO_TEST_P_X(V15PlusTests, SubgroupPriorityFallback) {
   auto sg1 = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
   folly::coro::Baton endOfTrackReceived;
   // Subgroup has kDefaultPriority (128)
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, kDefaultPriority))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, kDefaultPriority, _))
       .WillOnce(testing::Return(sg1));
   EXPECT_CALL(*sg1, object(0, _, _, false))
       .WillOnce(testing::Return(folly::unit));
@@ -694,14 +739,14 @@ CO_TEST_P_X(V15PlusTests, SubgroupPriorityFallback) {
     endOfTrackReceived.post();
     return folly::unit;
   }));
-  expectSubscribeDone();
+  expectPublishDone();
 
   auto subscribeRequest = getSubscribe(kTestTrackName);
   auto res =
       co_await clientSession_->subscribe(subscribeRequest, subscribeCallback_);
 
   co_await endOfTrackReceived;
-  co_await subscribeDone_;
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 CO_TEST_P_X(V15PlusTests, SubgroupExplicitPriority) {
@@ -719,7 +764,7 @@ CO_TEST_P_X(V15PlusTests, SubgroupExplicitPriority) {
           auto sgp = pub->beginSubgroup(0, 0, kObjectPriority).value();
           sgp->object(0, moxygen::test::makeBuf(10));
           sgp->endOfTrackAndGroup(1);
-          pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+          pub->publishDone(getTrackEndedPublishDone(sub.requestID));
         });
         // Return SubscribeOk with PUBLISHER_PRIORITY parameter
         constexpr uint8_t kPublisherPriority = 64;
@@ -730,7 +775,7 @@ CO_TEST_P_X(V15PlusTests, SubgroupExplicitPriority) {
   folly::coro::Baton endOfTrackReceived;
   // When object has explicit priority, it should use that (32) not publisher
   // priority
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, kObjectPriority))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, kObjectPriority, _))
       .WillOnce(testing::Return(sg1));
   EXPECT_CALL(*sg1, object(0, _, _, false))
       .WillOnce(testing::Return(folly::unit));
@@ -738,14 +783,14 @@ CO_TEST_P_X(V15PlusTests, SubgroupExplicitPriority) {
     endOfTrackReceived.post();
     return folly::unit;
   }));
-  expectSubscribeDone();
+  expectPublishDone();
 
   auto subscribeRequest = getSubscribe(kTestTrackName);
   auto res =
       co_await clientSession_->subscribe(subscribeRequest, subscribeCallback_);
 
   co_await endOfTrackReceived;
-  co_await subscribeDone_;
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 CO_TEST_P_X(V15PlusTests, ObjectStatusPriorityFallback) {
@@ -762,7 +807,7 @@ CO_TEST_P_X(V15PlusTests, ObjectStatusPriorityFallback) {
           // Send endOfTrackAndGroup with default priority
           auto sgp = pub->beginSubgroup(0, 0, kDefaultPriority).value();
           sgp->endOfTrackAndGroup(0);
-          pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+          pub->publishDone(getTrackEndedPublishDone(sub.requestID));
         });
         // Return SubscribeOk with PUBLISHER_PRIORITY parameter
         co_return makeSubscribeOkResult(sub, std::nullopt, kPublisherPriority);
@@ -771,20 +816,20 @@ CO_TEST_P_X(V15PlusTests, ObjectStatusPriorityFallback) {
   auto sg1 = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
   folly::coro::Baton endOfTrackReceived;
   // Object status with no explicit priority should use publisher priority
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, kDefaultPriority))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, kDefaultPriority, _))
       .WillOnce(testing::Return(sg1));
   EXPECT_CALL(*sg1, endOfTrackAndGroup(0)).WillOnce(testing::Invoke([&]() {
     endOfTrackReceived.post();
     return folly::unit;
   }));
-  expectSubscribeDone();
+  expectPublishDone();
 
   auto subscribeRequest = getSubscribe(kTestTrackName);
   auto res =
       co_await clientSession_->subscribe(subscribeRequest, subscribeCallback_);
 
   co_await endOfTrackReceived;
-  co_await subscribeDone_;
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 CO_TEST_P_X(V15PlusTests, PublisherPriorityDefaultValue) {
@@ -799,7 +844,7 @@ CO_TEST_P_X(V15PlusTests, PublisherPriorityDefaultValue) {
           auto sgp = pub->beginSubgroup(0, 0, kDefaultPriority).value();
           sgp->object(0, moxygen::test::makeBuf(10));
           sgp->endOfTrackAndGroup(1);
-          pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+          pub->publishDone(getTrackEndedPublishDone(sub.requestID));
         });
         // Return SubscribeOk WITHOUT PUBLISHER_PRIORITY parameter
         // Should default to 128
@@ -809,7 +854,7 @@ CO_TEST_P_X(V15PlusTests, PublisherPriorityDefaultValue) {
   auto sg1 = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
   folly::coro::Baton endOfTrackReceived;
   // Without PUBLISHER_PRIORITY param, should default to kDefaultPriority (128)
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, kDefaultPriority))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, kDefaultPriority, _))
       .WillOnce(testing::Return(sg1));
   EXPECT_CALL(*sg1, object(0, _, _, false))
       .WillOnce(testing::Return(folly::unit));
@@ -817,14 +862,14 @@ CO_TEST_P_X(V15PlusTests, PublisherPriorityDefaultValue) {
     endOfTrackReceived.post();
     return folly::unit;
   }));
-  expectSubscribeDone();
+  expectPublishDone();
 
   auto subscribeRequest = getSubscribe(kTestTrackName);
   auto res =
       co_await clientSession_->subscribe(subscribeRequest, subscribeCallback_);
 
   co_await endOfTrackReceived;
-  co_await subscribeDone_;
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
@@ -854,9 +899,9 @@ CO_TEST_P_X(MoQSessionTest, SubscriberCallbackErrorTerminatesStream) {
       });
 
   auto sg1 = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Return(sg1));
-  EXPECT_CALL(*subscribeCallback_, subscribeDone(testing::_))
+  EXPECT_CALL(*subscribeCallback_, publishDone(testing::_))
       .WillOnce(testing::Return(folly::unit));
 
   {

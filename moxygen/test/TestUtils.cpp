@@ -9,6 +9,7 @@
 #include <folly/Random.h>
 #include <folly/io/Cursor.h>
 #include "moxygen/MoQFramer.h"
+#include "moxygen/MoQTrackProperties.h"
 
 namespace moxygen::test {
 
@@ -103,7 +104,7 @@ std::unique_ptr<folly::IOBuf> writeAllControlMessages(
   // SubscribeUpdate
   SubscribeUpdate subscribeUpdate;
   subscribeUpdate.requestID = RequestID(0);
-  subscribeUpdate.subscriptionRequestID = RequestID(0);
+  subscribeUpdate.existingRequestID = RequestID(0);
   subscribeUpdate.start = AbsoluteLocation{1, 2};
   subscribeUpdate.endGroup = std::optional<uint64_t>(3);
   subscribeUpdate.priority = 255;
@@ -118,8 +119,12 @@ std::unique_ptr<folly::IOBuf> writeAllControlMessages(
   subscribeOk.expires = std::chrono::milliseconds(0);
   subscribeOk.groupOrder = GroupOrder::OldestFirst;
   subscribeOk.largest = AbsoluteLocation{2, 5};
-  subscribeOk.params.insertParam(Parameter(
-      folly::to_underlying(TrackRequestParamKey::MAX_CACHE_DURATION), 3600000));
+  // Draft 16+: Add extensions
+  if (getDraftMajorVersion(version) >= 16) {
+    subscribeOk.extensions.insertMutableExtensions(getTestExtensions());
+  }
+  // Use setter which stores in extensions; framer converts to params for < v16
+  setPublisherMaxCacheDuration(subscribeOk, std::chrono::milliseconds(3600000));
   res = moqFrameWriter.writeSubscribeOk(writeBuf, subscribeOk);
 
   res = moqFrameWriter.writeMaxRequestID(writeBuf, {.requestID = 50000});
@@ -134,10 +139,10 @@ std::unique_ptr<folly::IOBuf> writeAllControlMessages(
       Unsubscribe({
           0,
       }));
-  res = moqFrameWriter.writeSubscribeDone(
+  res = moqFrameWriter.writePublishDone(
       writeBuf,
-      SubscribeDone(
-          {RequestID(0), SubscribeDoneStatusCode::SUBSCRIPTION_ENDED, 7, ""}));
+      PublishDone(
+          {RequestID(0), PublishDoneStatusCode::SUBSCRIPTION_ENDED, 7, ""}));
 
   // PublishRequest
   PublishRequest publishRequest;
@@ -147,9 +152,17 @@ std::unique_ptr<folly::IOBuf> writeAllControlMessages(
   publishRequest.groupOrder = GroupOrder::Default;
   publishRequest.largest = std::nullopt;
   publishRequest.forward = true;
-  addTestParams(publishRequest.params, moqFrameWriter);
-  publishRequest.params.insertParam(Parameter(
-      folly::to_underlying(TrackRequestParamKey::PUBLISHER_PRIORITY), 100));
+  // Draft 16+: Add extensions
+  if (getDraftMajorVersion(version) >= 16) {
+    publishRequest.extensions.insertMutableExtensions(getTestExtensions());
+  }
+  // Auth param stays as param (not a track property)
+  publishRequest.params.insertParam(getTestAuthParam(moqFrameWriter, "binky"));
+  // Use setters which store in extensions; framer converts to params for < v16
+  setPublisherDeliveryTimeout(publishRequest, std::chrono::milliseconds(1000));
+  setPublisherMaxCacheDuration(
+      publishRequest, std::chrono::milliseconds(3600000));
+  setPublisherPriority(publishRequest, 100);
   res = moqFrameWriter.writePublish(writeBuf, publishRequest);
 
   // PublishOk
@@ -277,8 +290,12 @@ std::unique_ptr<folly::IOBuf> writeAllControlMessages(
   fetchOk.groupOrder = GroupOrder::NewestFirst;
   fetchOk.endOfTrack = 1;
   fetchOk.endLocation = AbsoluteLocation({0, 0});
-  fetchOk.params.insertParam(Parameter(
-      folly::to_underlying(TrackRequestParamKey::MAX_CACHE_DURATION), 1000));
+  // Draft 16+: Add extensions
+  if (getDraftMajorVersion(version) >= 16) {
+    fetchOk.extensions.insertMutableExtensions(getTestExtensions());
+  }
+  // Use setter which stores in extensions; framer converts to params for < v16
+  setPublisherMaxCacheDuration(fetchOk, std::chrono::milliseconds(1000));
   res = moqFrameWriter.writeFetchOk(writeBuf, fetchOk);
   res = moqFrameWriter.writeRequestError(
       writeBuf,
@@ -400,7 +417,7 @@ Payload makeBuf(uint32_t size) {
   while (cursor.length()) {
     cursor.write<uint8_t>((uint8_t)folly::Random::rand32());
   }
-  return compat::Payload::wrap(std::move(out));
+  return std::move(out);
 }
 
 } // namespace moxygen::test

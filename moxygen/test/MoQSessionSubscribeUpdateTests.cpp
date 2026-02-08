@@ -19,7 +19,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateFilterStartDecreases) {
   co_await setupMoQSession();
   std::shared_ptr<MockSubscriptionHandle> mockSubscriptionHandle = nullptr;
   std::shared_ptr<TrackConsumer> trackConsumer = nullptr;
-  expectSubscribeDone();
+  expectPublishDone();
   expectSubscribe(
       [&mockSubscriptionHandle, &trackConsumer](
           auto sub, auto pub) -> TaskSubscribeResult {
@@ -45,8 +45,8 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateFilterStartDecreases) {
       kDefaultPriority,
       true};
 
-  EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeUpdate());
-  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeUpdate());
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate());
+  EXPECT_CALL(*serverPublisherStatsCallback_, onRequestUpdate());
   folly::coro::Baton subscribeUpdateInvoked;
   EXPECT_CALL(*mockSubscriptionHandle, subscribeUpdateCalled)
       .WillOnce([&subscribeUpdateInvoked](const auto& actualUpdate) {
@@ -60,12 +60,12 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateFilterStartDecreases) {
       .WillOnce(
           testing::Return(
               SubscribeUpdateOk{
-                  .requestID = subscribeUpdate.subscriptionRequestID}));
+                  .requestID = subscribeUpdate.existingRequestID}));
   co_await subscribeHandler->subscribeUpdate(subscribeUpdate);
   co_await subscribeUpdateInvoked;
-  trackConsumer->subscribeDone(
-      getTrackEndedSubscribeDone(subscribeRequest.requestID));
-  co_await subscribeDone_;
+  trackConsumer->publishDone(
+      getTrackEndedPublishDone(subscribeRequest.requestID));
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
@@ -74,7 +74,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateFilterEndLessThanStart) {
   co_await setupMoQSession();
   std::shared_ptr<MockSubscriptionHandle> mockSubscriptionHandle = nullptr;
   std::shared_ptr<TrackConsumer> trackConsumer = nullptr;
-  expectSubscribeDone();
+  expectPublishDone();
   expectSubscribe(
       [&mockSubscriptionHandle, &trackConsumer](
           auto sub, auto pub) -> TaskSubscribeResult {
@@ -100,8 +100,8 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateFilterEndLessThanStart) {
       kDefaultPriority,
       true};
 
-  EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeUpdate());
-  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeUpdate());
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate());
+  EXPECT_CALL(*serverPublisherStatsCallback_, onRequestUpdate());
   folly::coro::Baton subscribeUpdateInvoked;
   EXPECT_CALL(*mockSubscriptionHandle, subscribeUpdateCalled)
       .WillOnce([&subscribeUpdateInvoked](const auto& actualUpdate) {
@@ -117,12 +117,12 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateFilterEndLessThanStart) {
       .WillOnce(
           testing::Return(
               SubscribeUpdateOk{
-                  .requestID = subscribeUpdate.subscriptionRequestID}));
+                  .requestID = subscribeUpdate.existingRequestID}));
   co_await subscribeHandler->subscribeUpdate(subscribeUpdate);
   co_await subscribeUpdateInvoked;
-  trackConsumer->subscribeDone(
-      getTrackEndedSubscribeDone(subscribeRequest.requestID));
-  co_await subscribeDone_;
+  trackConsumer->publishDone(
+      getTrackEndedPublishDone(subscribeRequest.requestID));
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
@@ -131,7 +131,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateFilterSuccess) {
   co_await setupMoQSession();
   std::shared_ptr<MockSubscriptionHandle> mockSubscriptionHandle = nullptr;
   std::shared_ptr<TrackConsumer> trackConsumer = nullptr;
-  expectSubscribeDone();
+  expectPublishDone();
   expectSubscribe(
       [&mockSubscriptionHandle, &trackConsumer](
           auto sub, auto pub) -> TaskSubscribeResult {
@@ -164,8 +164,8 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateFilterSuccess) {
       kDefaultPriority + 1,
       true};
 
-  EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeUpdate());
-  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeUpdate());
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate());
+  EXPECT_CALL(*serverPublisherStatsCallback_, onRequestUpdate());
   folly::coro::Baton subscribeUpdateInvoked;
   EXPECT_CALL(*mockSubscriptionHandle, subscribeUpdateCalled)
       .WillOnce([&subscribeUpdateInvoked](const auto& actualUpdate) {
@@ -192,12 +192,12 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateFilterSuccess) {
       .WillOnce(
           testing::Return(
               SubscribeUpdateOk{
-                  .requestID = subscribeUpdate.subscriptionRequestID}));
+                  .requestID = subscribeUpdate.existingRequestID}));
   co_await subscribeHandler->subscribeUpdate(subscribeUpdate);
   co_await subscribeUpdateInvoked;
-  trackConsumer->subscribeDone(
-      getTrackEndedSubscribeDone(subscribeRequest.requestID));
-  co_await subscribeDone_;
+  trackConsumer->publishDone(
+      getTrackEndedPublishDone(subscribeRequest.requestID));
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
@@ -206,7 +206,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateFilterMissingFieldsPreserved) {
   co_await setupMoQSession();
   std::shared_ptr<MockSubscriptionHandle> mockSubscriptionHandle = nullptr;
   std::shared_ptr<TrackConsumer> trackConsumer = nullptr;
-  expectSubscribeDone();
+  expectPublishDone();
 
   // Initial values
   const AbsoluteLocation initialStart{10, 5};
@@ -242,8 +242,8 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateFilterMissingFieldsPreserved) {
       initialForward,   // Keep forward the same
   };
 
-  EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeUpdate());
-  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeUpdate());
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate());
+  EXPECT_CALL(*serverPublisherStatsCallback_, onRequestUpdate());
   folly::coro::Baton subscribeUpdateInvoked;
   EXPECT_CALL(*mockSubscriptionHandle, subscribeUpdateCalled)
       .WillOnce([&subscribeUpdateInvoked,
@@ -266,12 +266,12 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateFilterMissingFieldsPreserved) {
       .WillOnce(
           testing::Return(
               SubscribeUpdateOk{
-                  .requestID = subscribeUpdate.subscriptionRequestID}));
+                  .requestID = subscribeUpdate.existingRequestID}));
   co_await subscribeHandler->subscribeUpdate(subscribeUpdate);
   co_await subscribeUpdateInvoked;
-  trackConsumer->subscribeDone(
-      getTrackEndedSubscribeDone(subscribeRequest.requestID));
-  co_await subscribeDone_;
+  trackConsumer->publishDone(
+      getTrackEndedPublishDone(subscribeRequest.requestID));
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 

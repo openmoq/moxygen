@@ -21,10 +21,10 @@ namespace moxygen {
 
 std::function<std::shared_ptr<MoQSession>(
     folly::MaybeManagedPtr<proxygen::WebTransport>,
-    std::shared_ptr<MoQExecutor>)>
+    MoQExecutor::KeepAlive)>
 MoQRelaySession::createRelaySessionFactory() {
   static auto factory = [](folly::MaybeManagedPtr<proxygen::WebTransport> wt,
-                           std::shared_ptr<MoQExecutor> exec) {
+                           MoQExecutor::KeepAlive exec) {
     return std::static_pointer_cast<MoQSession>(
         std::make_shared<MoQRelaySession>(wt, std::move(exec)));
   };
@@ -269,10 +269,10 @@ void MoQRelaySession::cleanup() {
   publishNamespaceCallbacks_.clear();
   legacyPublisherNamespaceToReqId_.clear();
 
-  for (auto& ann : publishNamespaceHanldes_) {
+  for (auto& ann : publishNamespaceHandles_) {
     ann.second->publishNamespaceDone();
   }
-  publishNamespaceHanldes_.clear();
+  publishNamespaceHandles_.clear();
   legacySubscriberNamespaceToReqId_.clear();
 
   // Clean up subscribeNamespace handles
@@ -286,6 +286,67 @@ void MoQRelaySession::cleanup() {
 
   // Call parent cleanup to handle base class cleanup
   MoQSession::cleanup();
+}
+
+void MoQRelaySession::onRequestUpdate(RequestUpdate requestUpdate) {
+  // Only intercept for v16+ and announcement types
+  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 16) {
+    auto existingRequestID = requestUpdate.existingRequestID;
+
+    // Check publishNamespaceHandles_ for PUBLISH_NAMESPACE (formerly ANNOUNCE)
+    auto announceIt = publishNamespaceHandles_.find(existingRequestID);
+    if (announceIt != publishNamespaceHandles_.end()) {
+      handlePublishNamespaceRequestUpdate(requestUpdate, announceIt->second);
+      return;
+    }
+
+    // Check subscribeNamespaceHandles_ for SUBSCRIBE_NAMESPACE (formerly
+    // SUBSCRIBE_ANNOUNCES)
+    auto subAnnIt = subscribeNamespaceHandles_.find(existingRequestID);
+    if (subAnnIt != subscribeNamespaceHandles_.end()) {
+      handleSubscribeNamespaceRequestUpdate(requestUpdate, subAnnIt->second);
+      return;
+    }
+  }
+
+  // Delegate to base class for all other cases
+  MoQSession::onRequestUpdate(std::move(requestUpdate));
+}
+
+void MoQRelaySession::handlePublishNamespaceRequestUpdate(
+    const RequestUpdate& requestUpdate,
+    std::shared_ptr<Subscriber::PublishNamespaceHandle> announceHandle) {
+  XLOG(DBG1) << __func__ << " requestID=" << requestUpdate.existingRequestID
+             << " sess=" << this;
+
+  // TODO: Implement full ANNOUNCE update handling (forward, auth_token)
+  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
+    requestUpdateError(
+        SubscribeUpdateError{
+            requestUpdate.requestID,
+            RequestErrorCode::NOT_SUPPORTED,
+            "ANNOUNCE REQUEST_UPDATE not yet implemented"},
+        requestUpdate.existingRequestID);
+  }
+}
+
+void MoQRelaySession::handleSubscribeNamespaceRequestUpdate(
+    const RequestUpdate& requestUpdate,
+    std::shared_ptr<Publisher::SubscribeNamespaceHandle>
+    /*subscribeNamespaceHandle*/) {
+  XLOG(DBG1) << __func__ << " requestID=" << requestUpdate.existingRequestID
+             << " sess=" << this;
+
+  // TODO: Implement full SUBSCRIBE_ANNOUNCES update handling (forward,
+  // auth_token)
+  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
+    requestUpdateError(
+        SubscribeUpdateError{
+            requestUpdate.requestID,
+            RequestErrorCode::NOT_SUPPORTED,
+            "SUBSCRIBE_ANNOUNCES REQUEST_UPDATE not yet implemented"},
+        requestUpdate.existingRequestID);
+  }
 }
 
 // PublishNamespace publisher methods
@@ -602,7 +663,7 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
     auto handle = std::move(publishNamespaceResult->value());
     auto publishNamespaceOkMsg = handle->publishNamespaceOk();
     publishNamespaceOk(publishNamespaceOkMsg);
-    publishNamespaceHanldes_[publishNamespace.requestID] = std::move(handle);
+    publishNamespaceHandles_[publishNamespace.requestID] = std::move(handle);
     if (getDraftMajorVersion(*getNegotiatedVersion()) < 16) {
       // Legacy: also store NS->RequestID mapping for lookups
       legacySubscriberNamespaceToReqId_[publishNamespace.trackNamespace] =
@@ -638,7 +699,7 @@ void MoQRelaySession::publishNamespaceCancel(
   controlWriteEvent_.signal();
 
   if (annCan.requestID.has_value()) {
-    publishNamespaceHanldes_.erase(*annCan.requestID);
+    publishNamespaceHandles_.erase(*annCan.requestID);
   }
   retireRequestID(/*signalWriteLoop=*/false);
 
@@ -684,22 +745,24 @@ void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone unAnn) {
     legacySubscriberNamespaceToReqId_.erase(nsIt);
   }
 
-  auto it = publishNamespaceHanldes_.find(reqId);
-  if (it == publishNamespaceHanldes_.end()) {
+  auto it = publishNamespaceHandles_.find(reqId);
+  if (it == publishNamespaceHandles_.end()) {
     XLOG(ERR) << "PublishNamespaceDone for unknown requestID=" << reqId;
     return;
   }
   handle = std::move(it->second);
-  publishNamespaceHanldes_.erase(it);
+  publishNamespaceHandles_.erase(it);
 
   // Common action
   handle->publishNamespaceDone();
   retireRequestID(/*signalWriteLoop=*/true);
 }
 
-// SubscribeNamespace subscriber methods
+// SubscribeAnnounces subscriber methods
 folly::coro::Task<Publisher::SubscribeNamespaceResult>
-MoQRelaySession::subscribeNamespace(SubscribeNamespace sa) {
+MoQRelaySession::subscribeNamespace(
+    SubscribeNamespace sa,
+    std::shared_ptr<NamespacePublishHandle> namespacePublishHandle) {
   XLOG(DBG1) << __func__ << " prefix=" << sa.trackNamespacePrefix
              << " sess=" << this;
   const auto& trackNamespace = sa.trackNamespacePrefix;
@@ -796,7 +859,7 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
   setRequestSession();
   auto subAnnResult = co_await co_awaitTry(co_withCancellation(
       cancellationSource_.getToken(),
-      publishHandler_->subscribeNamespace(subAnn)));
+      publishHandler_->subscribeNamespace(subAnn, nullptr)));
   if (subAnnResult.hasException()) {
     XLOG(ERR) << "Exception in Publisher callback ex="
               << subAnnResult.exception().what().toStdString();

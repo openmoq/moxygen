@@ -26,11 +26,11 @@ class MockMoQCodecCallback : public MoQControlCodec::ControlCallback,
   MOCK_METHOD(void, onClientSetup, (ClientSetup clientSetup));
   MOCK_METHOD(void, onServerSetup, (ServerSetup serverSetup));
   MOCK_METHOD(void, onSubscribe, (SubscribeRequest subscribeRequest));
-  MOCK_METHOD(void, onSubscribeUpdate, (SubscribeUpdate subscribeUpdate));
+  MOCK_METHOD(void, onRequestUpdate, (RequestUpdate requestUpdate));
   MOCK_METHOD(void, onSubscribeOk, (SubscribeOk subscribeOk));
   MOCK_METHOD(void, onRequestOk, (RequestOk reqOk, FrameType frameType));
   MOCK_METHOD(void, onRequestError, (RequestError error, FrameType frameType));
-  MOCK_METHOD(void, onSubscribeDone, (SubscribeDone subscribeDone));
+  MOCK_METHOD(void, onPublishDone, (PublishDone publishDone));
   MOCK_METHOD(void, onUnsubscribe, (Unsubscribe unsubscribe));
   MOCK_METHOD(void, onPublish, (PublishRequest publish));
   MOCK_METHOD(void, onPublishOk, (PublishOk publishOk));
@@ -102,7 +102,10 @@ class MockTrackConsumer : public TrackConsumer {
   MOCK_METHOD(
       (folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>),
       beginSubgroup,
-      (uint64_t groupID, uint64_t subgroupID, Priority priority),
+      (uint64_t groupID,
+       uint64_t subgroupID,
+       Priority priority,
+       bool containsLastInGroup),
       (override));
 
   MOCK_METHOD(
@@ -114,19 +117,19 @@ class MockTrackConsumer : public TrackConsumer {
   MOCK_METHOD(
       (folly::Expected<folly::Unit, MoQPublishError>),
       objectStream,
-      (const ObjectHeader& header, Payload payload),
+      (const ObjectHeader& header, Payload payload, bool lastInGroup),
       (override));
 
   MOCK_METHOD(
       (folly::Expected<folly::Unit, MoQPublishError>),
       datagram,
-      (const ObjectHeader& header, Payload payload),
+      (const ObjectHeader& header, Payload payload, bool lastInGroup),
       (override));
 
   MOCK_METHOD(
       (folly::Expected<folly::Unit, MoQPublishError>),
-      subscribeDone,
-      (SubscribeDone),
+      publishDone,
+      (PublishDone),
       (override));
 };
 
@@ -305,7 +308,7 @@ class MockPublisher : public Publisher {
   MOCK_METHOD(
       folly::coro::Task<SubscribeNamespaceResult>,
       subscribeNamespace,
-      (SubscribeNamespace),
+      (SubscribeNamespace, std::shared_ptr<NamespacePublishHandle>),
       (override));
 
   MOCK_METHOD(void, goaway, (Goaway), (override));
@@ -334,7 +337,7 @@ class MockPublisherStats : public MoQPublisherStatsCallback {
 
   MOCK_METHOD(void, onSubscribeError, (SubscribeErrorCode), (override));
 
-  MOCK_METHOD(void, onSubscribeUpdate, (), (override));
+  MOCK_METHOD(void, onRequestUpdate, (), (override));
 
   MOCK_METHOD(void, onFetchSuccess, (), (override));
 
@@ -366,7 +369,7 @@ class MockPublisherStats : public MoQPublisherStatsCallback {
 
   MOCK_METHOD(void, onUnsubscribe, (), (override));
 
-  MOCK_METHOD(void, onSubscribeDone, (SubscribeDoneStatusCode), (override));
+  MOCK_METHOD(void, onPublishDone, (PublishDoneStatusCode), (override));
 
   MOCK_METHOD(void, onSubscriptionStreamOpened, (), (override));
 
@@ -389,7 +392,7 @@ class MockSubscriberStats : public MoQSubscriberStatsCallback {
 
   MOCK_METHOD(void, onSubscribeError, (SubscribeErrorCode), (override));
 
-  MOCK_METHOD(void, onSubscribeUpdate, (), (override));
+  MOCK_METHOD(void, onRequestUpdate, (), (override));
 
   MOCK_METHOD(void, onFetchSuccess, (), (override));
 
@@ -421,7 +424,7 @@ class MockSubscriberStats : public MoQSubscriberStatsCallback {
 
   MOCK_METHOD(void, onUnsubscribe, (), (override));
 
-  MOCK_METHOD(void, onSubscribeDone, (SubscribeDoneStatusCode), (override));
+  MOCK_METHOD(void, onPublishDone, (PublishDoneStatusCode), (override));
 
   MOCK_METHOD(void, onSubscriptionStreamOpened, (), (override));
 

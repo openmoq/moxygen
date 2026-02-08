@@ -17,7 +17,7 @@ std::string kEndpointName = "/test";
 namespace moxygen {
 
 const int kDefaultExpires = 0;
-const std::string kDefaultSubscribeDoneReason = "Testing";
+const std::string kDefaultPublishDoneReason = "Testing";
 
 void MoQTestSubscriptionHandle::unsubscribe() {
   cancelSource_.requestCancellation();
@@ -137,13 +137,13 @@ folly::coro::Task<void> MoQTestServer::onSubscribe(
   }
 
   // Inform Consumer that publisher is finished opening subgroups/datagrams
-  // Default SubscribeDone For Now
+  // Default PublishDone For Now
 
-  SubscribeDone done;
+  PublishDone done;
   done.requestID = sub.requestID;
-  done.statusCode = SubscribeDoneStatusCode::TRACK_ENDED;
-  done.reasonPhrase = kDefaultSubscribeDoneReason;
-  callback->subscribeDone(std::move(done));
+  done.statusCode = PublishDoneStatusCode::TRACK_ENDED;
+  done.reasonPhrase = kDefaultPublishDoneReason;
+  callback->publishDone(std::move(done));
 }
 
 folly::coro::Task<void> MoQTestServer::sendOneSubgroupPerGroup(
@@ -179,7 +179,7 @@ folly::coro::Task<void> MoQTestServer::sendOneSubgroupPerGroup(
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         std::string p = std::string(objectSize, 't');
-        auto objectPayload = compat::Payload::copyBuffer(p);
+        auto objectPayload = folly::IOBuf::copyBuffer(p);
         subConsumer->object(
             objectId,
             std::move(objectPayload),
@@ -233,7 +233,7 @@ folly::coro::Task<void> MoQTestServer::sendOneSubgroupPerObject(
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         std::string p = std::string(objectSize, 't');
-        auto objectPayload = compat::Payload::copyBuffer(p);
+        auto objectPayload = folly::IOBuf::copyBuffer(p);
         subConsumer->object(
             objectId,
             std::move(objectPayload),
@@ -301,7 +301,7 @@ folly::coro::Task<void> MoQTestServer::sendTwoSubgroupsPerGroup(
         int index = objectId % 2;
         XLOG(INFO) << "Sending Object " << objectId << " to Subgroup " << index;
         std::string p = std::string(objectSize, 't');
-        auto objectPayload = compat::Payload::copyBuffer(p);
+        auto objectPayload = folly::IOBuf::copyBuffer(p);
         subConsumers[index]->object(
             objectId,
             std::move(objectPayload),
@@ -353,12 +353,12 @@ folly::coro::Task<void> MoQTestServer::sendDatagram(
          objectId <= params.lastObjectInTrack;
          objectId += params.objectIncrement) {
       if (token.isCancellationRequested()) {
-        // Instead of returning an error, callback->subscribeDone with error
-        SubscribeDone done;
+        // Instead of returning an error, callback->publishDone with error
+        PublishDone done;
         done.requestID = sub.requestID;
         done.reasonPhrase = "Datagram Subscription Cancelled";
-        done.statusCode = SubscribeDoneStatusCode::INTERNAL_ERROR;
-        callback->subscribeDone(std::move(done));
+        done.statusCode = PublishDoneStatusCode::INTERNAL_ERROR;
+        callback->publishDone(std::move(done));
         co_return;
       }
       // Add Integer/Variable Extensions if needed
@@ -369,7 +369,7 @@ folly::coro::Task<void> MoQTestServer::sendDatagram(
       int objectSize = getObjectSize(objectId, &params);
 
       std::string p = std::string(objectSize, 't');
-      auto objectPayload = compat::Payload::copyBuffer(p);
+      auto objectPayload = folly::IOBuf::copyBuffer(p);
 
       // Build object header
       ObjectHeader header;
@@ -377,14 +377,14 @@ folly::coro::Task<void> MoQTestServer::sendDatagram(
       header.id = objectId;
       header.extensions = Extensions(extensions, {});
 
-      auto res = callback->datagram(header, std::move(objectPayload));
+      auto res = callback->datagram(header, std::move(objectPayload), false);
       if (res.hasError()) {
-        // If sending datagram fails, callback->subscribeDone with error
-        SubscribeDone done;
+        // If sending datagram fails, callback->publishDone with error
+        PublishDone done;
         done.requestID = sub.requestID;
         done.reasonPhrase = "Error Sending Datagram Objects";
-        done.statusCode = SubscribeDoneStatusCode::INTERNAL_ERROR;
-        callback->subscribeDone(std::move(done));
+        done.statusCode = PublishDoneStatusCode::INTERNAL_ERROR;
+        callback->publishDone(std::move(done));
         co_return;
       }
 
@@ -503,7 +503,7 @@ folly::coro::Task<void> MoQTestServer::fetchOneSubgroupPerGroup(
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         std::string p = std::string(objectSize, 't');
-        auto objectPayload = compat::Payload::copyBuffer(p);
+        auto objectPayload = folly::IOBuf::copyBuffer(p);
         callback->object(
             groupNum,
             0 /* subgroupId */,
@@ -553,7 +553,7 @@ folly::coro::Task<void> MoQTestServer::fetchOneSubgroupPerObject(
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         std::string p = std::string(objectSize, 't');
-        auto objectPayload = compat::Payload::copyBuffer(p);
+        auto objectPayload = folly::IOBuf::copyBuffer(p);
         callback->object(
             groupNum,
             objectId,
@@ -609,7 +609,7 @@ folly::coro::Task<void> MoQTestServer::fetchTwoSubgroupsPerGroup(
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         std::string p = std::string(objectSize, 't');
-        auto objectPayload = compat::Payload::copyBuffer(p);
+        auto objectPayload = folly::IOBuf::copyBuffer(p);
         callback->object(
             groupNum,
             subgroupId,
@@ -690,20 +690,20 @@ bool MoQTestServer::startRelayClient(
   // Get event base and create executor
   auto evb = getWorkerEvbs()[0];
   if (!moqEvb_) {
-    moqEvb_ = std::make_shared<MoQFollyExecutorImpl>(evb);
+    moqEvb_ = std::make_unique<MoQFollyExecutorImpl>(evb);
   }
 
   // Create client connection with MoQRelaySession factory
   if (useQuicTransport) {
     relayClient_ = std::make_unique<MoQClient>(
-        moqEvb_,
+        moqEvb_->keepAlive(),
         url,
         MoQRelaySession::createRelaySessionFactory(),
         std::make_shared<
             test::InsecureVerifierDangerousDoNotUseInProduction>());
   } else {
     relayClient_ = std::make_unique<MoQWebTransportClient>(
-        moqEvb_,
+        moqEvb_->keepAlive(),
         url,
         MoQRelaySession::createRelaySessionFactory(),
         std::make_shared<

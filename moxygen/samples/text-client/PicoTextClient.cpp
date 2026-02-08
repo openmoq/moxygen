@@ -203,7 +203,8 @@ class SimpleTrackReceiver : public TrackConsumer {
   beginSubgroup(
       uint64_t groupID,
       uint64_t subgroupID,
-      Priority priority) override {
+      Priority priority,
+      bool /*containsLastInGroup*/ = false) override {
     return std::make_shared<SimpleSubgroupReceiver>(groupID, subgroupID);
   }
 
@@ -214,7 +215,8 @@ class SimpleTrackReceiver : public TrackConsumer {
 
   compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
-      Payload payload) override {
+      Payload payload,
+      bool /*lastInGroup*/ = false) override {
     if (header.status != ObjectStatus::NORMAL) {
       std::cout << "[ObjectStatus g=" << header.group
                 << " obj=" << header.id
@@ -232,16 +234,17 @@ class SimpleTrackReceiver : public TrackConsumer {
 
   compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
-      Payload payload) override {
+      Payload payload,
+      bool /*lastInGroup*/ = false) override {
     if (payload) {
       std::cout << payload->moveToString() << std::flush;
     }
     return compat::unit;
   }
 
-  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
-      SubscribeDone subDone) override {
-    std::cout << "\n[SubscribeDone requestID=" << subDone.requestID << "]\n"
+  compat::Expected<compat::Unit, MoQPublishError> publishDone(
+      PublishDone pubDone) override {
+    std::cout << "\n[PublishDone requestID=" << pubDone.requestID << "]\n"
               << std::flush;
     done_ = true;
     return compat::unit;

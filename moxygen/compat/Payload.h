@@ -221,3 +221,21 @@ class Payload {
 #endif // MOXYGEN_USE_FOLLY
 
 } // namespace moxygen::compat
+
+namespace moxygen {
+
+// Helper function to create Payload from IOBuf (Folly mode) or ByteBuffer (std mode)
+// This abstracts away the type difference between modes
+#if MOXYGEN_USE_FOLLY
+// In Folly mode, Payload is std::unique_ptr<folly::IOBuf>, so just return the IOBuf
+inline std::unique_ptr<folly::IOBuf> toPayload(std::unique_ptr<folly::IOBuf> buf) {
+  return buf;
+}
+#else
+// In std mode, Payload is std::unique_ptr<compat::Payload>
+inline std::unique_ptr<compat::Payload> toPayload(std::unique_ptr<compat::ByteBuffer> buf) {
+  return compat::Payload::wrap(std::move(buf));
+}
+#endif
+
+} // namespace moxygen

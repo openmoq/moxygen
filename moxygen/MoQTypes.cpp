@@ -24,8 +24,8 @@ const char* getFrameTypeString(moxygen::FrameType type) {
       return "SUBSCRIBE_OK";
     case moxygen::FrameType::SUBSCRIBE_ERROR:
       return "SUBSCRIBE_ERROR";
-    case moxygen::FrameType::SUBSCRIBE_DONE:
-      return "SUBSCRIBE_DONE";
+    case moxygen::FrameType::PUBLISH_DONE:
+      return "PUBLISH_DONE";
     case moxygen::FrameType::MAX_REQUEST_ID:
       return "MAX_REQUEST_ID";
     case moxygen::FrameType::UNSUBSCRIBE:
@@ -264,7 +264,8 @@ bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
 
   auto it = kParamAllowlist.find(key);
   if (it == kParamAllowlist.end()) {
-    return false;
+    // TODO: Make this strict when we drop V15- support
+    return true;
   }
 
   const auto& allowedFrameTypes = it->second;

@@ -6,6 +6,7 @@
 
 #include "moxygen/relay/MoQRelay.h"
 #include "moxygen/MoQFilters.h"
+#include "moxygen/MoQTrackProperties.h"
 
 namespace {
 constexpr uint8_t kDefaultUpstreamPriority = 128;
@@ -344,9 +345,9 @@ Subscriber::PublishResult MoQRelay::publish(
     XLOG(DBG1) << "New publisher for existing subscription";
     nodePtr->publishes.erase(pub.fullTrackName.trackName);
     it->second.handle->unsubscribe();
-    it->second.forwarder->subscribeDone(
+    it->second.forwarder->publishDone(
         {RequestID(0),
-         SubscribeDoneStatusCode::SUBSCRIPTION_ENDED,
+         PublishDoneStatusCode::SUBSCRIPTION_ENDED,
          0, // filled in by session
          "upstream disconnect"});
     XLOG(DBG4) << "Erasing subscription to " << it->first;
@@ -367,11 +368,11 @@ Subscriber::PublishResult MoQRelay::publish(
   // Set Forwarder Params
   forwarder->setGroupOrder(pub.groupOrder);
 
-  // Extract delivery timeout from publish request params and store in forwarder
-  auto deliveryTimeout = MoQSession::getDeliveryTimeoutIfPresent(
-      pub.params, session->getNegotiatedVersion().value());
-  if (deliveryTimeout && *deliveryTimeout > 0) {
-    forwarder->setDeliveryTimeout(*deliveryTimeout);
+  // Extract delivery timeout from publish request extensions and store in
+  // forwarder
+  auto deliveryTimeout = getPublisherDeliveryTimeout(pub);
+  if (deliveryTimeout && deliveryTimeout->count() > 0) {
+    forwarder->setDeliveryTimeout(deliveryTimeout->count());
   }
 
   auto subRes = subscriptions_.emplace(
@@ -396,7 +397,7 @@ Subscriber::PublishResult MoQRelay::publish(
   }
   forwarder->setCallback(shared_from_this());
 
-  // Wrap forwarder in filter to intercept subscribeDone
+  // Wrap forwarder in filter to intercept publishDone
   auto filterImpl = std::make_shared<TerminationFilter>(
       shared_from_this(), pub.fullTrackName, forwarder);
   std::shared_ptr<TrackConsumer> filter =
@@ -487,7 +488,7 @@ class MoQRelay::NamespaceSubscription
   TrackNamespace trackNamespacePrefix_;
 };
 
-// Filter TrackConsumer that intercepts subscribeDone to clean up relay state
+// Filter TrackConsumer that intercepts publishDone to clean up relay state
 class MoQRelay::TerminationFilter : public TrackConsumerFilter {
  public:
   TerminationFilter(
@@ -498,8 +499,8 @@ class MoQRelay::TerminationFilter : public TrackConsumerFilter {
         relay_(std::move(relay)),
         ftn_(std::move(ftn)) {}
 
-  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
-      SubscribeDone subDone) override {
+  compat::Expected<compat::Unit, MoQPublishError> publishDone(
+      PublishDone pubDone) override {
     // Notify relay that publisher is done - this will:
     // 1. Remove from nodePtr->publishes
     // 2. Clear subscription.handle
@@ -507,7 +508,7 @@ class MoQRelay::TerminationFilter : public TrackConsumerFilter {
       relay_->onPublishDone(ftn_);
     }
     // Change the downstream code to something like "upstream ended"?
-    return TrackConsumerFilter::subscribeDone(std::move(subDone));
+    return TrackConsumerFilter::publishDone(std::move(pubDone));
   }
 
  private:
@@ -527,7 +528,9 @@ std::shared_ptr<TrackConsumer> MoQRelay::getSubscribeWriteback(
 }
 
 folly::coro::Task<Publisher::SubscribeNamespaceResult>
-MoQRelay::subscribeNamespace(SubscribeNamespace subNs) {
+MoQRelay::subscribeNamespace(
+    SubscribeNamespace subNs,
+    std::shared_ptr<NamespacePublishHandle> namespacePublishHandle) {
   XLOG(DBG1) << __func__ << " nsp=" << subNs.trackNamespacePrefix;
   // check auth
   if (subNs.trackNamespacePrefix.empty()) {
@@ -725,7 +728,6 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
       }
     });
     // Add subscriber first in case objects come before subscribe OK.
-    auto sessionVersion = session->getNegotiatedVersion();
     auto subscriber = forwarder->addSubscriber(
         std::move(session), subReq, std::move(consumer));
     if (!subscriber) {
@@ -764,16 +766,16 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     forwarder->setGroupOrder(pubGroupOrder);
 
     // Store upstream delivery timeout in forwarder
-    auto deliveryTimeout = MoQSession::getDeliveryTimeoutIfPresent(
-        subRes.value()->subscribeOk().params, sessionVersion.value());
+    auto deliveryTimeout =
+        getPublisherDeliveryTimeout(subRes.value()->subscribeOk());
 
     // Add delivery timeout to downstream subscriber explicitly as this is the
     // first subscriber. Forwarder can add it to subsequent subscribers
-    if (deliveryTimeout && *deliveryTimeout > 0) {
-      forwarder->setDeliveryTimeout(*deliveryTimeout);
+    if (deliveryTimeout && deliveryTimeout->count() > 0) {
+      forwarder->setDeliveryTimeout(deliveryTimeout->count());
       subscriber->setParam(
           {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
-           *deliveryTimeout});
+           static_cast<uint64_t>(deliveryTimeout->count())});
     }
 
     subscriber->setPublisherGroupOrder(pubGroupOrder);

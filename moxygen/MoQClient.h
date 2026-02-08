@@ -16,7 +16,7 @@ namespace moxygen {
 class MoQClient : public MoQClientBase {
  public:
   MoQClient(
-      std::shared_ptr<MoQExecutor> exec,
+      MoQExecutor::KeepAlive exec,
       proxygen::URL url,
       std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr)
       : MoQClientBase(std::move(exec), std::move(url), std::move(verifier)) {}
@@ -38,7 +38,7 @@ class MoQClient : public MoQClientBase {
   }
 
   MoQClient(
-      std::shared_ptr<MoQExecutor> exec,
+      MoQExecutor::KeepAlive exec,
       proxygen::URL url,
       SessionFactory sessionFactory,
       std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr)

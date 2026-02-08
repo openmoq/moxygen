@@ -325,7 +325,7 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
                 curObjectHeader_.id,
                 std::move(curObjectHeader_.extensions),
                 *curObjectHeader_.length,
-                compat::Payload::wrap(std::move(iobuf)),
+                toPayload(std::move(iobuf)),
                 endOfObject,
                 endOfStream && ingress_.chainLength() == 0);
             if (result == ParseResult::BLOCKED) {
@@ -394,7 +394,7 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
           break;
         }
         bool endOfObject = (*curObjectHeader_.length == 0);
-        auto payload = iobuf ? compat::Payload::wrap(std::move(iobuf)) : nullptr;
+        auto payload = iobuf ? toPayload(std::move(iobuf)) : nullptr;
         if (callback_ && (payload || endOfObject)) {
           auto result =
               callback_->onObjectPayload(std::move(payload), endOfObject);
@@ -502,10 +502,10 @@ compat::Expected<compat::Unit, ErrorCode> MoQControlCodec::parseFrame(
       break;
     }
     case FrameType::SUBSCRIBE_UPDATE: {
-      auto res = moqFrameParser_.parseSubscribeUpdate(cursor, curFrameLength_);
+      auto res = moqFrameParser_.parseRequestUpdate(cursor, curFrameLength_);
       if (res) {
         if (callback_) {
-          callback_->onSubscribeUpdate(std::move(res.value()));
+          callback_->onRequestUpdate(std::move(res.value()));
         }
       } else {
         return compat::makeUnexpected(res.error());
@@ -556,11 +556,11 @@ compat::Expected<compat::Unit, ErrorCode> MoQControlCodec::parseFrame(
       }
       break;
     }
-    case FrameType::SUBSCRIBE_DONE: {
-      auto res = moqFrameParser_.parseSubscribeDone(cursor, curFrameLength_);
+    case FrameType::PUBLISH_DONE: {
+      auto res = moqFrameParser_.parsePublishDone(cursor, curFrameLength_);
       if (res) {
         if (callback_) {
-          callback_->onSubscribeDone(std::move(res.value()));
+          callback_->onPublishDone(std::move(res.value()));
         }
       } else {
         return compat::makeUnexpected(res.error());

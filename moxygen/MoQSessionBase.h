@@ -70,6 +70,13 @@ class MoQSessionBase : public Subscriber,
                        public Publisher,
                        public MoQControlCodec::ControlCallback {
  public:
+  // Executor pointer type - KeepAlive in Folly+mvfst mode, shared_ptr otherwise
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
+  using ExecutorPtr = MoQExecutor::KeepAlive;
+#else
+  using ExecutorPtr = std::shared_ptr<MoQExecutor>;
+#endif
+
   class ServerSetupCallback {
    public:
     virtual ~ServerSetupCallback() = default;
@@ -119,6 +126,15 @@ class MoQSessionBase : public Subscriber,
 
   compat::CancellationToken getCancelToken() const {
     return cancellationSource_.getToken();
+  }
+
+  compat::CancellationSource& getCancellationSource() {
+    return cancellationSource_;
+  }
+
+  // Access to publisher tracks map (for nested classes that need to access)
+  auto& getPubTracks() {
+    return pubTracks_;
   }
 
   uint64_t maxRequestID() const {
@@ -241,7 +257,7 @@ class MoQSessionBase : public Subscriber,
     }
 
     virtual void terminatePublish(
-        SubscribeDone subDone,
+        PublishDone pubDone,
         ResetStreamErrorCode error = ResetStreamErrorCode::INTERNAL_ERROR) = 0;
 
     virtual void onStreamCreated() {}
@@ -278,8 +294,8 @@ class MoQSessionBase : public Subscriber,
       return nullptr;
     }
 
-    std::shared_ptr<MoQExecutor> getExecutor() const {
-      return session_ ? session_->exec_ : nullptr;
+    MoQExecutor* getExecutor() const {
+      return session_ ? session_->exec_.get() : nullptr;
     }
 
     MoQSessionBase* getSession() const {
@@ -314,12 +330,12 @@ class MoQSessionBase : public Subscriber,
   // Protected constructor - only derived classes can instantiate
   MoQSessionBase(
       MoQControlCodec::Direction dir,
-      std::shared_ptr<MoQExecutor> exec,
+      ExecutorPtr exec,
       ServerSetupCallback* serverSetupCallback = nullptr);
 
   // Core session state
   MoQControlCodec::Direction dir_;
-  std::shared_ptr<MoQExecutor> exec_;
+  ExecutorPtr exec_;
   std::shared_ptr<MLogger> logger_ = nullptr;
 
   // Track management maps
@@ -372,7 +388,7 @@ class MoQSessionBase : public Subscriber,
   virtual void subscribeUpdateError(
       const SubscribeUpdateError& requestError,
       RequestID subscriptionRequestID);
-  virtual void sendSubscribeDone(const SubscribeDone& subDone);
+  virtual void sendPublishDone(const PublishDone& pubDone);
   virtual void fetchOk(const FetchOk& fetchOk);
   virtual void fetchError(const FetchError& fetchError);
   virtual void fetchCancel(const FetchCancel& fetchCancel);

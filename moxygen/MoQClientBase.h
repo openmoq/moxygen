@@ -29,10 +29,10 @@ class MoQClientBase : public proxygen::WebTransportHandler {
  public:
   using SessionFactory = std::function<std::shared_ptr<MoQSession>(
       folly::MaybeManagedPtr<proxygen::WebTransport>,
-      std::shared_ptr<MoQExecutor>)>;
+      MoQExecutor::KeepAlive)>;
 
   MoQClientBase(
-      std::shared_ptr<MoQExecutor> exec,
+      MoQExecutor::KeepAlive exec,
       proxygen::URL url,
       std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr)
       : exec_(std::move(exec)),
@@ -41,7 +41,7 @@ class MoQClientBase : public proxygen::WebTransportHandler {
         verifier_(std::move(verifier)) {}
 
   MoQClientBase(
-      std::shared_ptr<MoQExecutor> exec,
+      MoQExecutor::KeepAlive exec,
       proxygen::URL url,
       SessionFactory sessionFactory,
       std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr)
@@ -60,7 +60,7 @@ class MoQClientBase : public proxygen::WebTransportHandler {
     }
   }
 
-  std::shared_ptr<MoQExecutor> getEventBase() {
+  MoQExecutor::KeepAlive getEventBase() {
     return exec_;
   }
 
@@ -109,7 +109,7 @@ class MoQClientBase : public proxygen::WebTransportHandler {
       proxygen::WebTransport::StreamReadHandle* handle) noexcept override;
   void onDatagram(std::unique_ptr<folly::IOBuf>) noexcept override;
 
-  std::shared_ptr<MoQExecutor> exec_;
+  MoQExecutor::KeepAlive exec_;
   proxygen::URL url_;
   SessionFactory sessionFactory_;
   std::shared_ptr<proxygen::QuicWebTransport> quicWebTransport_;

@@ -1548,30 +1548,30 @@ void MoQFrameParser::handleRequestSpecificParams(
   }
 }
 
-compat::Expected<SubscribeUpdate, ErrorCode>
-MoQFrameParser::parseSubscribeUpdate(moxygen::Cursor& cursor, size_t length)
-    const noexcept {
+compat::Expected<RequestUpdate, ErrorCode> MoQFrameParser::parseRequestUpdate(
+    moxygen::Cursor& cursor,
+    size_t length) const noexcept {
   CHECK(version_.has_value())
-      << "The version must be set before parsing a subscribe update";
+      << "The version must be set before parsing a request update";
 
-  SubscribeUpdate subscribeUpdate;
+  RequestUpdate requestUpdate;
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    XLOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parseRequestUpdate: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
-  subscribeUpdate.requestID = requestID->first;
+  requestUpdate.requestID = requestID->first;
   length -= requestID->second;
 
   if (getDraftMajorVersion(*version_) >= 14) {
-    auto subscriptionRequestID =
+    auto existingRequestID =
         quic::follyutils::decodeQuicInteger(cursor, length);
-    if (!subscriptionRequestID) {
-      XLOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on subscriptionRequestID";
+    if (!existingRequestID) {
+      XLOG(DBG4) << "parseRequestUpdate: UNDERFLOW on existingRequestID";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
-    subscribeUpdate.subscriptionRequestID = subscriptionRequestID->first;
-    length -= subscriptionRequestID->second;
+    requestUpdate.existingRequestID = existingRequestID->first;
+    length -= existingRequestID->second;
   }
 
   if (getDraftMajorVersion(*version_) < 15) {
@@ -1579,39 +1579,39 @@ MoQFrameParser::parseSubscribeUpdate(moxygen::Cursor& cursor, size_t length)
     if (!start) {
       return compat::makeUnexpected(start.error());
     }
-    subscribeUpdate.start = start.value();
+    requestUpdate.start = start.value();
 
     auto endGroup = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!endGroup) {
-      XLOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on endGroup";
+      XLOG(DBG4) << "parseRequestUpdate: UNDERFLOW on endGroup";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
-    subscribeUpdate.endGroup = endGroup->first;
+    requestUpdate.endGroup = endGroup->first;
     length -= endGroup->second;
   }
 
   if (getDraftMajorVersion(*version_) < 15) {
     if (length < 1) {
-      XLOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on priority";
+      XLOG(DBG4) << "parseRequestUpdate: UNDERFLOW on priority";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
-    subscribeUpdate.priority = cursor.readBE<uint8_t>();
+    requestUpdate.priority = cursor.readBE<uint8_t>();
     length--;
 
     if (length < 1) {
-      XLOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on forwardFlag";
+      XLOG(DBG4) << "parseRequestUpdate: UNDERFLOW on forwardFlag";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     uint8_t forwardFlag = cursor.readBE<uint8_t>();
     if (forwardFlag > 1) {
       return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
-    subscribeUpdate.forward = (forwardFlag == 1);
+    requestUpdate.forward = (forwardFlag == 1);
     length--;
   } else {
     // For draft >= 15, set default priority to 128
     // It will be overridden in handleRequestSpecificParams if present
-    subscribeUpdate.priority = kDefaultPriority;
+    requestUpdate.priority = kDefaultPriority;
     // For draft >= 15, forward field is left unset (std::nullopt) by default
     // It will be set in handleRequestSpecificParams only if FORWARD param
     // present This allows existing forward state to be preserved when param is
@@ -1620,7 +1620,7 @@ MoQFrameParser::parseSubscribeUpdate(moxygen::Cursor& cursor, size_t length)
 
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
-    XLOG(DBG4) << "parseSubscribeUpdate: UNDERFLOW on numParams";
+    XLOG(DBG4) << "parseRequestUpdate: UNDERFLOW on numParams";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
@@ -1630,40 +1630,40 @@ MoQFrameParser::parseSubscribeUpdate(moxygen::Cursor& cursor, size_t length)
       cursor,
       length,
       numParams->first,
-      subscribeUpdate.params,
+      requestUpdate.params,
       requestSpecificParams);
   if (!res2) {
     return compat::makeUnexpected(res2.error());
   }
-  handleRequestSpecificParams(subscribeUpdate, requestSpecificParams);
+  handleRequestSpecificParams(requestUpdate, requestSpecificParams);
   if (length > 0) {
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
-  return subscribeUpdate;
+  return requestUpdate;
 }
 
 void MoQFrameParser::handleRequestSpecificParams(
-    SubscribeUpdate& subscribeUpdate,
+    RequestUpdate& requestUpdate,
     const std::vector<Parameter>& requestSpecificParams) const noexcept {
   if (getDraftMajorVersion(*version_) >= 15) {
     auto filter = extractSubscriptionFilter(requestSpecificParams);
     if (filter.has_value()) {
       if (filter->location.has_value()) {
-        subscribeUpdate.start = filter->location.value();
+        requestUpdate.start = filter->location.value();
       }
       if (filter->endGroup.has_value()) {
-        subscribeUpdate.endGroup = filter->endGroup.value() + 1;
+        requestUpdate.endGroup = filter->endGroup.value() + 1;
       } else if (filter->filterType == LocationType::AbsoluteStart) {
-        subscribeUpdate.endGroup = 0;
+        requestUpdate.endGroup = 0;
       }
     }
 
     // SUBSCRIBER_PRIORITY
     handleSubscriberPriorityParam(
-        subscribeUpdate.priority, requestSpecificParams);
+        requestUpdate.priority, requestSpecificParams);
 
     // FORWARD
-    handleForwardParam(subscribeUpdate.forward, requestSpecificParams);
+    handleForwardParam(requestUpdate.forward, requestSpecificParams);
   }
 }
 
@@ -1723,6 +1723,19 @@ compat::Expected<SubscribeOk, ErrorCode> MoQFrameParser::parseSubscribeOk(
     }
     subscribeOk.largest = *res;
   }
+
+  // Draft 16+: Parse extensions
+  if (getDraftMajorVersion(*version_) >= 16) {
+    ObjectHeader tempHeader;
+    auto ext = parseExtensions(cursor, length, tempHeader);
+    if (!ext) {
+      XLOG(DBG4) << "parseSubscribeOk: error in parseExtensions: "
+                 << to_underlying(ext.error());
+      return makeUnexpected(ext.error());
+    }
+    subscribeOk.extensions = std::move(tempHeader.extensions);
+  }
+
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on numParams";
@@ -1752,6 +1765,13 @@ compat::Expected<SubscribeOk, ErrorCode> MoQFrameParser::parseSubscribeOk(
     // Override from parameters if present
     handleRequestSpecificParams(subscribeOk, requestSpecificParams);
   }
+
+  // For < v16: convert track property params to extensions for uniform access
+  if (getDraftMajorVersion(*version_) < 16) {
+    convertTrackPropertyParamsToExtensions(
+        subscribeOk.params, subscribeOk.extensions);
+  }
+
   return subscribeOk;
 }
 
@@ -1791,45 +1811,45 @@ compat::Expected<Unsubscribe, ErrorCode> MoQFrameParser::parseUnsubscribe(
   return unsubscribe;
 }
 
-compat::Expected<SubscribeDone, ErrorCode> MoQFrameParser::parseSubscribeDone(
+compat::Expected<PublishDone, ErrorCode> MoQFrameParser::parsePublishDone(
     moxygen::Cursor& cursor,
     size_t length) const noexcept {
-  SubscribeDone subscribeDone;
+  PublishDone publishDone;
   auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!requestID) {
-    XLOG(DBG4) << "parseSubscribeDone: UNDERFLOW on requestID";
+    XLOG(DBG4) << "parsePublishDone: UNDERFLOW on requestID";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
-  subscribeDone.requestID = requestID->first;
+  publishDone.requestID = requestID->first;
 
   auto statusCode = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!statusCode) {
-    XLOG(DBG4) << "parseSubscribeDone: UNDERFLOW on statusCode";
+    XLOG(DBG4) << "parsePublishDone: UNDERFLOW on statusCode";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= statusCode->second;
-  subscribeDone.statusCode = SubscribeDoneStatusCode(statusCode->first);
+  publishDone.statusCode = PublishDoneStatusCode(statusCode->first);
 
   auto streamCount = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!streamCount) {
-    XLOG(DBG4) << "parseSubscribeDone: UNDERFLOW on streamCount";
+    XLOG(DBG4) << "parsePublishDone: UNDERFLOW on streamCount";
     return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= streamCount->second;
-  subscribeDone.streamCount = streamCount->first;
+  publishDone.streamCount = streamCount->first;
 
   auto reas = parseFixedString(cursor, length);
   if (!reas) {
     return compat::makeUnexpected(reas.error());
   }
-  subscribeDone.reasonPhrase = std::move(reas.value());
+  publishDone.reasonPhrase = std::move(reas.value());
 
   CHECK(version_.has_value())
-      << "The version must be set before parsing SUBSCRIBE_DONE";
+      << "The version must be set before parsing PUBLISH_DONE";
   if (getDraftMajorVersion(*version_) <= 9) {
     if (length == 0) {
-      XLOG(DBG4) << "parseSubscribeDone: UNDERFLOW on contentExists";
+      XLOG(DBG4) << "parsePublishDone: UNDERFLOW on contentExists";
       return compat::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     auto contentExists = cursor.readBE<uint8_t>();
@@ -1844,7 +1864,7 @@ compat::Expected<SubscribeDone, ErrorCode> MoQFrameParser::parseSubscribeDone(
   if (length > 0) {
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
-  return subscribeDone;
+  return publishDone;
 }
 
 compat::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
@@ -1928,6 +1948,18 @@ compat::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
     publish.forward = true;
   }
 
+  // Draft 16+: Parse extensions
+  if (getDraftMajorVersion(*version_) >= 16) {
+    ObjectHeader tempHeader;
+    auto ext = parseExtensions(cursor, length, tempHeader);
+    if (!ext) {
+      XLOG(DBG4) << "parsePublish: error in parseExtensions: "
+                 << to_underlying(ext.error());
+      return makeUnexpected(ext.error());
+    }
+    publish.extensions = std::move(tempHeader.extensions);
+  }
+
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parsePublish: UNDERFLOW on numParams";
@@ -1950,6 +1982,11 @@ compat::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
     // this might be overridden in handleRequestSpecificParams.
     publish.groupOrder = GroupOrder::OldestFirst;
     handleRequestSpecificParams(publish, requestSpecificParams);
+  }
+
+  // For < v16: convert track property params to extensions for uniform access
+  if (getDraftMajorVersion(*version_) < 16) {
+    convertTrackPropertyParamsToExtensions(publish.params, publish.extensions);
   }
 
   return publish;
@@ -2688,6 +2725,18 @@ compat::Expected<FetchOk, ErrorCode> MoQFrameParser::parseFetchOk(
   }
   fetchOk.endLocation = std::move(res2.value());
 
+  // Draft 16+: Parse extensions
+  if (getDraftMajorVersion(*version_) >= 16) {
+    ObjectHeader tempHeader;
+    auto ext = parseExtensions(cursor, length, tempHeader);
+    if (!ext) {
+      XLOG(DBG4) << "parseFetchOk: error in parseExtensions: "
+                 << to_underlying(ext.error());
+      return makeUnexpected(ext.error());
+    }
+    fetchOk.extensions = std::move(tempHeader.extensions);
+  }
+
   auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parseFetchOk: UNDERFLOW on numParams";
@@ -2702,6 +2751,11 @@ compat::Expected<FetchOk, ErrorCode> MoQFrameParser::parseFetchOk(
   }
   if (length > 0) {
     return compat::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+
+  // For < v16: convert track property params to extensions for uniform access
+  if (getDraftMajorVersion(*version_) < 16) {
+    convertTrackPropertyParamsToExtensions(fetchOk.params, fetchOk.extensions);
   }
 
   return fetchOk;
@@ -2817,6 +2871,18 @@ compat::Expected<RequestError, ErrorCode> MoQFrameParser::parseRequestError(
   }
   length -= errorCode->second;
   requestError.errorCode = RequestErrorCode(errorCode->first);
+
+  // Parse retryInterval (version 16+)
+  if (getDraftMajorVersion(*version_) >= 16) {
+    auto retryInterval = quic::follyutils::decodeQuicInteger(cursor, length);
+    if (!retryInterval) {
+      XLOG(DBG4) << "parseRequestError: UNDERFLOW on retryInterval";
+      return makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    length -= retryInterval->second;
+    requestError.retryInterval =
+        std::chrono::milliseconds(retryInterval->first);
+  }
 
   // Parse reasonPhrase
   auto reasonPhrase = parseFixedString(cursor, length);
@@ -3843,7 +3909,8 @@ WriteResult MoQFrameWriter::writeDatagramObject(
     moxygen::BufQueue& writeBuf,
     TrackAlias trackAlias,
     const ObjectHeader& objectHeader,
-    std::unique_ptr<Buffer> objectPayload) const noexcept {
+    std::unique_ptr<Buffer> objectPayload,
+    bool endOfGroup) const noexcept {
   size_t size = 0;
   bool error = false;
   bool hasLength = objectHeader.length && *objectHeader.length > 0;
@@ -3871,7 +3938,7 @@ WriteResult MoQFrameWriter::writeDatagramObject(
             *version_,
             true,
             hasExtensions,
-            false,
+            endOfGroup,
             isObjectIdZero,
             priorityPresent)),
         size,
@@ -3901,7 +3968,7 @@ WriteResult MoQFrameWriter::writeDatagramObject(
             *version_,
             false,
             hasExtensions,
-            false,
+            endOfGroup,
             isObjectIdZero,
             priorityPresent)),
         size,
@@ -4233,17 +4300,17 @@ WriteResult MoQFrameWriter::writeSubscribeRequestHelper(
   return size;
 }
 
-WriteResult MoQFrameWriter::writeSubscribeUpdate(
+WriteResult MoQFrameWriter::writeRequestUpdate(
     moxygen::BufQueue& writeBuf,
-    const SubscribeUpdate& update) const noexcept {
+    const RequestUpdate& update) const noexcept {
   CHECK(version_.has_value())
-      << "Version needs to be set to write subscribe update";
+      << "Version needs to be set to write request update";
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::SUBSCRIBE_UPDATE, error);
   writeVarint(writeBuf, update.requestID.value, size, error);
   if (getDraftMajorVersion(*version_) >= 14) {
-    writeVarint(writeBuf, update.subscriptionRequestID.value, size, error);
+    writeVarint(writeBuf, update.existingRequestID.value, size, error);
   }
 
   std::vector<Parameter> requestSpecificParams;
@@ -4357,6 +4424,19 @@ WriteResult MoQFrameWriter::writeSubscribeOkHelper(
     writeVarint(writeBuf, subscribeOk.largest->object, size, error);
   }
 
+  // Draft 16+: Write extensions
+  if (getDraftMajorVersion(*version_) >= 16) {
+    writeExtensions(writeBuf, subscribeOk.extensions, size, error);
+  }
+
+  // Make a mutable copy of params for potential extension->param conversion
+  TrackRequestParameters params = subscribeOk.params;
+
+  // For < v16: convert track property extensions to params
+  if (getDraftMajorVersion(*version_) < 16) {
+    convertTrackPropertyExtensionsToParams(subscribeOk.extensions, params);
+  }
+
   std::vector<Parameter> requestSpecificParams;
   if (getDraftMajorVersion(*version_) >= 15) {
     // Add EXPIRES parameter (only if non-zero)
@@ -4377,8 +4457,7 @@ WriteResult MoQFrameWriter::writeSubscribeOkHelper(
       requestSpecificParams.push_back(groupOrderParam);
     }
   }
-  writeTrackRequestParams(
-      writeBuf, subscribeOk.params, requestSpecificParams, size, error);
+  writeTrackRequestParams(writeBuf, params, requestSpecificParams, size, error);
   return size;
 }
 
@@ -4429,19 +4508,19 @@ WriteResult MoQFrameWriter::writeUnsubscribe(
   return size;
 }
 
-WriteResult MoQFrameWriter::writeSubscribeDone(
+WriteResult MoQFrameWriter::writePublishDone(
     moxygen::BufQueue& writeBuf,
-    const SubscribeDone& subscribeDone) const noexcept {
+    const PublishDone& publishDone) const noexcept {
   CHECK(version_.has_value())
-      << "Version needs to be set to write subscribe done";
+      << "Version needs to be set to write publish done";
   size_t size = 0;
   bool error = false;
-  auto sizePtr = writeFrameHeader(writeBuf, FrameType::SUBSCRIBE_DONE, error);
-  writeVarint(writeBuf, subscribeDone.requestID.value, size, error);
+  auto sizePtr = writeFrameHeader(writeBuf, FrameType::PUBLISH_DONE, error);
+  writeVarint(writeBuf, publishDone.requestID.value, size, error);
   writeVarint(
-      writeBuf, to_underlying(subscribeDone.statusCode), size, error);
-  writeVarint(writeBuf, subscribeDone.streamCount, size, error);
-  writeFixedString(writeBuf, subscribeDone.reasonPhrase, size, error);
+      writeBuf, to_underlying(publishDone.statusCode), size, error);
+  writeVarint(writeBuf, publishDone.streamCount, size, error);
+  writeFixedString(writeBuf, publishDone.reasonPhrase, size, error);
   if (getDraftMajorVersion(*version_) <= 9) {
     writeVarint(writeBuf, 0, size, error);
   }
@@ -4504,8 +4583,20 @@ WriteResult MoQFrameWriter::writePublish(
     size += 1;
   }
 
-  writeTrackRequestParams(
-      writeBuf, publish.params, requestSpecificParams, size, error);
+  // Draft 16+: Write extensions
+  if (getDraftMajorVersion(*version_) >= 16) {
+    writeExtensions(writeBuf, publish.extensions, size, error);
+  }
+
+  // Make a mutable copy of params for potential extension->param conversion
+  TrackRequestParameters params = publish.params;
+
+  // For < v16: convert track property extensions to params
+  if (getDraftMajorVersion(*version_) < 16) {
+    convertTrackPropertyExtensionsToParams(publish.extensions, params);
+  }
+
+  writeTrackRequestParams(writeBuf, params, requestSpecificParams, size, error);
   writeSize(sizePtr, size, error, *version_);
   if (error) {
     return compat::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
@@ -4783,6 +4874,7 @@ WriteResult MoQFrameWriter::writeTrackStatusOk(
              trackStatusOk.expires,
              trackStatusOk.groupOrder,
              trackStatusOk.largest,
+             Extensions{},
              trackStatusOk.params}));
     if (!res) {
       return res;
@@ -5040,7 +5132,21 @@ WriteResult MoQFrameWriter::writeFetchOk(
   size += 1;
   writeVarint(writeBuf, fetchOk.endLocation.group, size, error);
   writeVarint(writeBuf, fetchOk.endLocation.object, size, error);
-  writeTrackRequestParams(writeBuf, fetchOk.params, {}, size, error);
+
+  // Draft 16+: Write extensions
+  if (getDraftMajorVersion(*version_) >= 16) {
+    writeExtensions(writeBuf, fetchOk.extensions, size, error);
+  }
+
+  // Make a mutable copy of params for potential extension->param conversion
+  TrackRequestParameters params = fetchOk.params;
+
+  // For < v16: convert track property extensions to params
+  if (getDraftMajorVersion(*version_) < 16) {
+    convertTrackPropertyExtensionsToParams(fetchOk.extensions, params);
+  }
+
+  writeTrackRequestParams(writeBuf, params, {}, size, error);
   writeSize(sizePtr, size, error, *version_);
   if (error) {
     return compat::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
@@ -5078,6 +5184,14 @@ WriteResult MoQFrameWriter::writeRequestError(
   writeVarint(writeBuf, requestError.requestID.value, size, error);
   writeVarint(
       writeBuf, to_underlying(requestError.errorCode), size, error);
+  // Write retryInterval for version 16+
+  if (getDraftMajorVersion(*version_) >= 16) {
+    writeVarint(
+        writeBuf,
+        requestError.retryInterval ? requestError.retryInterval->count() : 0,
+        size,
+        error);
+  }
   writeFixedString(writeBuf, requestError.reasonPhrase, size, error);
 
   writeSize(sizePtr, size, error, *version_);
@@ -5128,6 +5242,79 @@ bool isValidDatagramType(uint64_t version, uint64_t datagramType) {
          datagramType <=
              to_underlying(
                  DatagramType::OBJECT_DATAGRAM_STATUS_EXT_ID_ZERO_NO_PRI)));
+  }
+}
+
+#if MOXYGEN_USE_FOLLY
+folly::Optional<FrameType> getFrameType(const folly::IOBufQueue& readBuf) {
+  if (readBuf.empty()) {
+    return folly::none;
+  }
+  folly::io::Cursor cursor(readBuf.front());
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  if (!frameType) {
+    return folly::none;
+  }
+  return static_cast<FrameType>(frameType->first);
+}
+#endif
+
+// Version translation helpers for track property extensions <-> params
+// These are used when communicating with < v16 peers
+
+void MoQFrameWriter::convertTrackPropertyExtensionsToParams(
+    const Extensions& extensions,
+    TrackRequestParameters& params) const noexcept {
+  // Convert track property extensions to params for < v16 compatibility
+  // Properties: DELIVERY_TIMEOUT, MAX_CACHE_DURATION, PUBLISHER_PRIORITY,
+  //             GROUP_ORDER, DYNAMIC_GROUPS
+
+  auto checkAndAddIfPresent = [&params](uint64_t paramKey, auto val) {
+    if (val) {
+      params.insertParam(Parameter(paramKey, *val));
+    }
+  };
+
+  checkAndAddIfPresent(
+      to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
+      extensions.getIntExtension(kDeliveryTimeoutExtensionType));
+
+  checkAndAddIfPresent(
+      to_underlying(TrackRequestParamKey::MAX_CACHE_DURATION),
+      extensions.getIntExtension(kMaxCacheDurationExtensionType));
+
+  checkAndAddIfPresent(
+      to_underlying(TrackRequestParamKey::PUBLISHER_PRIORITY),
+      extensions.getIntExtension(kPublisherPriorityExtensionType));
+
+  // Note: GROUP_ORDER and DYNAMIC_GROUPS are v16+ only extensions,
+  // they don't have param equivalents in older versions
+}
+
+void MoQFrameParser::convertTrackPropertyParamsToExtensions(
+    const TrackRequestParameters& params,
+    Extensions& extensions) const noexcept {
+  // Convert track property params to extensions for uniform access
+  // Properties: DELIVERY_TIMEOUT, MAX_CACHE_DURATION, PUBLISHER_PRIORITY
+
+  for (const auto& param : params) {
+    switch (param.key) {
+      case to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT):
+        extensions.insertMutableExtension(
+            Extension{kDeliveryTimeoutExtensionType, param.asUint64});
+        break;
+      case to_underlying(TrackRequestParamKey::MAX_CACHE_DURATION):
+        extensions.insertMutableExtension(
+            Extension{kMaxCacheDurationExtensionType, param.asUint64});
+        break;
+      case to_underlying(TrackRequestParamKey::PUBLISHER_PRIORITY):
+        extensions.insertMutableExtension(
+            Extension{kPublisherPriorityExtensionType, param.asUint64});
+        break;
+      default:
+        // Other params are not track properties, skip
+        break;
+    }
   }
 }
 

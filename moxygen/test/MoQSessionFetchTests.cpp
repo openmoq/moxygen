@@ -48,8 +48,8 @@ CO_TEST_P_X(MoQSessionTest, RelativeJoiningFetch) {
   co_await setupMoQSession();
   expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
     pub->datagram(
-        ObjectHeader(0, 0, 1, 0, 11), compat::Payload::copyBuffer("hello world"));
-    pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+        ObjectHeader(0, 0, 1, 0, 11), folly::IOBuf::copyBuffer("hello world"));
+    pub->publishDone(getTrackEndedPublishDone(sub.requestID));
     co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
   });
   expectFetch([](Fetch fetch, auto fetchPub) -> TaskFetchResult {
@@ -65,12 +65,12 @@ CO_TEST_P_X(MoQSessionTest, RelativeJoiningFetch) {
         /*finFetch=*/true);
     co_return makeFetchOkResult(fetch, AbsoluteLocation{100, 100});
   });
-  EXPECT_CALL(*subscribeCallback_, datagram(_, _))
-      .WillOnce([&](const auto& header, auto) {
+  EXPECT_CALL(*subscribeCallback_, datagram(_, _, _))
+      .WillOnce([&](const auto& header, auto, bool) {
         EXPECT_EQ(header.length, 11);
         return folly::unit;
       });
-  expectSubscribeDone();
+  expectPublishDone();
   folly::coro::Baton fetchBaton;
   EXPECT_CALL(
       *fetchCallback_, object(0, 0, 0, HasChainDataLengthOf(100), _, true))
@@ -89,7 +89,7 @@ CO_TEST_P_X(MoQSessionTest, RelativeJoiningFetch) {
       FetchType::RELATIVE_JOINING);
   EXPECT_FALSE(res.subscribeResult.hasError());
   EXPECT_FALSE(res.fetchResult.hasError());
-  co_await subscribeDone_;
+  co_await publishDone_;
   co_await fetchBaton;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
@@ -113,9 +113,9 @@ CO_TEST_P_X(MoQSessionTest, AbsoluteJoiningFetch) {
     for (uint32_t group = 6; group < 10; group++) {
       pub->datagram(
           ObjectHeader(group, 0, 0, 0, 11),
-          compat::Payload::copyBuffer("hello world"));
+          folly::IOBuf::copyBuffer("hello world"));
     }
-    pub->subscribeDone(getTrackEndedSubscribeDone(sub.requestID));
+    pub->publishDone(getTrackEndedPublishDone(sub.requestID));
     co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
   });
   expectFetch([](Fetch fetch, auto fetchPub) -> TaskFetchResult {
@@ -134,12 +134,12 @@ CO_TEST_P_X(MoQSessionTest, AbsoluteJoiningFetch) {
     }
     co_return makeFetchOkResult(fetch, AbsoluteLocation{100, 100});
   });
-  EXPECT_CALL(*subscribeCallback_, datagram(_, _))
-      .WillRepeatedly([&](const auto& header, auto) {
+  EXPECT_CALL(*subscribeCallback_, datagram(_, _, _))
+      .WillRepeatedly([&](const auto& header, auto, bool) {
         EXPECT_EQ(header.length, 11);
         return folly::unit;
       });
-  expectSubscribeDone();
+  expectPublishDone();
   folly::coro::Baton fetchBaton;
   for (uint32_t group = 2; group < 6; group++) {
     EXPECT_CALL(
@@ -160,7 +160,7 @@ CO_TEST_P_X(MoQSessionTest, AbsoluteJoiningFetch) {
       FetchType::ABSOLUTE_JOINING);
   EXPECT_FALSE(res.subscribeResult.hasError());
   EXPECT_FALSE(res.fetchResult.hasError());
-  co_await subscribeDone_;
+  co_await publishDone_;
   co_await fetchBaton;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }

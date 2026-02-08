@@ -15,8 +15,8 @@ using testing::_;
 CO_TEST_P_X(MoQSessionTest, NoPublishHandler) {
   co_await setupMoQSession();
   serverSession_->setPublishHandler(nullptr);
-  auto subAnnResult =
-      co_await clientSession_->subscribeNamespace(getSubscribeNamespace());
+  auto subAnnResult = co_await clientSession_->subscribeNamespace(
+      getSubscribeNamespace(), nullptr);
   EXPECT_TRUE(subAnnResult.hasError());
   auto res = co_await clientSession_->trackStatus(getTrackStatus());
   EXPECT_TRUE(res.hasError());
@@ -231,7 +231,7 @@ CO_TEST_P_X(MoQSessionTest, PublishWithFilterParameters) {
                         testing::Return(
                             folly::Expected<folly::Unit, MoQPublishError>(
                                 folly::unit)));
-                EXPECT_CALL(*mockConsumer, subscribeDone(_))
+                EXPECT_CALL(*mockConsumer, publishDone(_))
                     .WillOnce(testing::Return(folly::unit));
 
                 // Create the PublishOk directly instead of using a coroutine
@@ -349,7 +349,7 @@ CO_TEST_P_X(MoQSessionTest, PublishHandleCancel) {
 
   // For this test, we'll use the simpler approach of immediate return
   // since the key behavior we're testing is that cancel() sends
-  // SUBSCRIBE_DONE and the sender side properly handles it
+  // PUBLISH_DONE and the sender side properly handles it
 
   // Mock to capture the PublishHandle and return a consumer
   EXPECT_CALL(*serverSubscriber, publish(_, _))
@@ -399,8 +399,8 @@ CO_TEST_P_X(MoQSessionTest, PublishHandleCancel) {
 
   // The cancel test is complete - we verified:
   // 1. cancel() doesn't crash
-  // 2. cancel() sends SUBSCRIBE_DONE (evidenced by GMOCK warning)
-  // 3. Sender side receives SUBSCRIBE_DONE and completes publish with error
+  // 2. cancel() sends PUBLISH_DONE (evidenced by GMOCK warning)
+  // 3. Sender side receives PUBLISH_DONE and completes publish with error
 
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
@@ -457,8 +457,8 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateWithDeliveryTimeout) {
         folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT), 7000));
 
     // Set expectations for stats callbacks for all versions
-    EXPECT_CALL(*serverSubscriberStatsCallback_, onSubscribeUpdate());
-    EXPECT_CALL(*clientPublisherStatsCallback_, onSubscribeUpdate());
+    EXPECT_CALL(*serverSubscriberStatsCallback_, onRequestUpdate());
+    EXPECT_CALL(*clientPublisherStatsCallback_, onRequestUpdate());
 
     co_await capturedHandle->subscribeUpdate(subscribeUpdate);
 
@@ -521,8 +521,8 @@ CO_TEST_P_X(MoQSessionTest, PublishThenSubscribeUpdate) {
         true};
 
     // Set expectations for stats callbacks for all versions
-    EXPECT_CALL(*serverSubscriberStatsCallback_, onSubscribeUpdate());
-    EXPECT_CALL(*clientPublisherStatsCallback_, onSubscribeUpdate());
+    EXPECT_CALL(*serverSubscriberStatsCallback_, onRequestUpdate());
+    EXPECT_CALL(*clientPublisherStatsCallback_, onRequestUpdate());
 
     co_await capturedHandle->subscribeUpdate(subscribeUpdate);
 
@@ -565,12 +565,12 @@ CO_TEST_P_X(MoQSessionTest, PublishDataArrivesBeforePublishOk) {
                         testing::Return(
                             folly::Expected<folly::Unit, MoQPublishError>(
                                 folly::unit)));
-                EXPECT_CALL(*trackConsumer, subscribeDone(_))
+                EXPECT_CALL(*trackConsumer, publishDone(_))
                     .WillOnce(testing::Return(folly::unit));
 
                 // Verify that data is not delivered until PUBLISH_OK is
                 // returned
-                EXPECT_CALL(*trackConsumer, datagram(_, _)).Times(0);
+                EXPECT_CALL(*trackConsumer, datagram(_, _, _)).Times(0);
 
                 // Delay PUBLISH_OK response
                 return Subscriber::PublishConsumerAndReplyTask{
@@ -583,7 +583,7 @@ CO_TEST_P_X(MoQSessionTest, PublishDataArrivesBeforePublishOk) {
                           co_await folly::coro::sleep(
                               std::chrono::milliseconds(100));
                           // Now data should be delivered
-                          EXPECT_CALL(*trackConsumer, datagram(_, _))
+                          EXPECT_CALL(*trackConsumer, datagram(_, _, _))
                               .WillOnce(testing::Return(folly::unit));
                           co_return PublishOk{
                               actualPub.requestID,
@@ -662,7 +662,7 @@ CO_TEST_P_X(MoQSessionTest, PublishOkRequestIDMappedToInbound) {
                         testing::Return(
                             folly::Expected<folly::Unit, MoQPublishError>(
                                 folly::unit)));
-                EXPECT_CALL(*mockConsumer, subscribeDone(_))
+                EXPECT_CALL(*mockConsumer, publishDone(_))
                     .WillOnce(testing::Return(folly::unit));
 
                 // Return a PublishOk with a mismatched requestID to simulate a
@@ -723,7 +723,7 @@ CO_TEST_P_X(MoQSessionTest, PublishOkWithDeliveryTimeout) {
                         testing::Return(
                             folly::Expected<folly::Unit, MoQPublishError>(
                                 folly::unit)));
-                EXPECT_CALL(*mockConsumer, subscribeDone(_))
+                EXPECT_CALL(*mockConsumer, publishDone(_))
                     .WillOnce(testing::Return(folly::unit));
 
                 // Create PublishOk with delivery timeout parameter
@@ -830,7 +830,7 @@ CO_TEST_P_X(MoQSessionTest, PublishOkWithZeroDeliveryTimeout) {
                         testing::Return(
                             folly::Expected<folly::Unit, MoQPublishError>(
                                 folly::unit)));
-                EXPECT_CALL(*mockConsumer, subscribeDone(_))
+                EXPECT_CALL(*mockConsumer, publishDone(_))
                     .WillOnce(testing::Return(folly::unit));
 
                 PublishOk publishOk{
@@ -923,7 +923,7 @@ CO_TEST_P_X(MoQSessionTest, PublishConsumerObjectStreamAfterSessionClose) {
 
   // After session is closed and destroyed, objectStream should return an error
   auto res = consumer->objectStream(
-      ObjectHeader(0, 0, 0, 0, 10), moxygen::test::makeBuf(10));
+      ObjectHeader(0, 0, 0, 0, 10), moxygen::test::makeBuf(10), false);
   EXPECT_TRUE(res.hasError());
   EXPECT_EQ(res.error().code, MoQPublishError::API_ERROR);
 }

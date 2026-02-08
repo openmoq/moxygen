@@ -282,7 +282,7 @@ void MLogger::logSubscribeUpdate(
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTSubscribeUpdate>();
   baseMsg->requestId = req.requestID.value;
-  baseMsg->subscriptionRequestId = req.subscriptionRequestID.value;
+  baseMsg->subscriptionRequestId = req.existingRequestID.value;
   if (req.start.has_value()) {
     baseMsg->startLocation.group = req.start->group;
     baseMsg->startLocation.object = req.start->object;
@@ -550,7 +550,7 @@ void MLogger::logFetchError(
 }
 
 void MLogger::logPublishDone(
-    const SubscribeDone& req,
+    const PublishDone& req,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTPublishDone>();
   baseMsg->requestId = req.requestID.value;
@@ -919,7 +919,7 @@ void MLogger::logObjectDatagramCreated(
     baseMsg.objectStatus = static_cast<uint64_t>(header.status);
   }
   if (payload) {
-    baseMsg.objectPayload = payload->getIOBuf()->clone();
+    baseMsg.objectPayload = payload->clone();
   }
   baseMsg.endOfGroup = false; // TODO: Extract from datagram type when available
   addObjectDatagramCreatedLog(std::move(baseMsg));
@@ -1012,7 +1012,7 @@ void MLogger::logSubgroupObjectCreated(
       objHeader.extensions.getMutableExtensions());
   baseMsg.objectPayloadLength = payload->length();
   baseMsg.objectStatus = static_cast<uint64_t>(objHeader.status);
-  baseMsg.objectPayload = payload->getIOBuf()->clone();
+  baseMsg.objectPayload = payload->clone();
   addSubgroupObjectCreatedLog(std::move(baseMsg));
 }
 
@@ -1031,7 +1031,7 @@ void MLogger::logSubgroupObjectParsed(
       objHeader.extensions.getMutableExtensions());
   baseMsg.objectPayloadLength = payload->length();
   baseMsg.objectStatus = static_cast<uint64_t>(objHeader.status);
-  baseMsg.objectPayload = payload->getIOBuf()->clone();
+  baseMsg.objectPayload = payload->clone();
   addSubgroupObjectParsedLog(std::move(baseMsg));
 }
 
@@ -1068,7 +1068,7 @@ void MLogger::logFetchObjectCreated(
       objHeader.extensions.getMutableExtensions());
   baseMsg.objectPayloadLength = payload->length();
   baseMsg.objectStatus = static_cast<uint64_t>(objHeader.status);
-  baseMsg.objectPayload = payload->getIOBuf()->clone();
+  baseMsg.objectPayload = payload->clone();
   addFetchObjectCreatedLog(std::move(baseMsg));
 }
 
@@ -1087,7 +1087,7 @@ void MLogger::logFetchObjectParsed(
       objHeader.extensions.getMutableExtensions());
   baseMsg.objectPayloadLength = payload->length();
   baseMsg.objectStatus = static_cast<uint64_t>(objHeader.status);
-  baseMsg.objectPayload = payload->getIOBuf()->clone();
+  baseMsg.objectPayload = payload->clone();
   addFetchObjectParsedLog(std::move(baseMsg));
 }
 

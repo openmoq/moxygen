@@ -522,8 +522,12 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
   }
 
   folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
-  beginSubgroup(uint64_t groupID, uint64_t subgroupID, Priority priority)
-      override {
+  beginSubgroup(
+      uint64_t groupID,
+      uint64_t subgroupID,
+      Priority priority,
+      bool /*containsLastInGroup*/ = false) override {
+    // TODO: Handle containsLastInGroup parameter when caching
     auto res = consumer_->beginSubgroup(groupID, subgroupID, priority);
     if (res.hasValue()) {
       return std::make_shared<SubgroupWriteback>(
@@ -544,7 +548,9 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
 
   compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
-      Payload payload) override {
+      Payload payload,
+      bool /*lastInGroup*/ = false) override {
+    // TODO: Handle lastInGroup parameter when caching
     auto res = track_.updateLargest(
         {header.group, header.id}, isEndOfTrack(header.status));
     if (!res) {
@@ -571,7 +577,9 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
 
   compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
-      Payload payload) override {
+      Payload payload,
+      bool /*lastInGroup*/ = false) override {
+    // TODO: Handle lastInGroup parameter when caching
     auto res = track_.updateLargest(
         {header.group, header.id}, isEndOfTrack(header.status));
     if (!res) {
@@ -596,9 +604,9 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
     return consumer_->datagram(header, std::move(payload));
   }
 
-  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
-      SubscribeDone subDone) override {
-    return consumer_->subscribeDone(std::move(subDone));
+  compat::Expected<compat::Unit, MoQPublishError> publishDone(
+      PublishDone pubDone) override {
+    return consumer_->publishDone(std::move(pubDone));
   }
 
  private:
@@ -965,7 +973,7 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetch(
       largestInFetch.group--;
     }
     auto fetchHandle = std::make_shared<FetchHandle>(FetchOk{
-        fetch.requestID, fetch.groupOrder, isEndOfTrack, largestInFetch});
+        fetch.requestID, fetch.groupOrder, isEndOfTrack, largestInFetch, {}});
     co_withExecutor(
         co_await folly::coro::co_current_executor,
         folly::coro::co_withCancellation(
@@ -1124,7 +1132,11 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchImpl(
         bool isEndOfTrack = track->endOfTrack &&
             standalone->end >= *track->largestGroupAndObject;
         fetchHandle = std::make_shared<FetchHandle>(FetchOk{
-            fetch.requestID, fetch.groupOrder, isEndOfTrack, standalone->end});
+            fetch.requestID,
+            fetch.groupOrder,
+            isEndOfTrack,
+            standalone->end,
+            {}});
         fetchHandle->setUpstreamFetchHandle(res.value());
         co_return fetchHandle;
       }
@@ -1146,11 +1158,11 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchImpl(
         standalone->end = *track->largestGroupAndObject;
       }
       co_return std::make_shared<FetchHandle>(FetchOk{
-          fetch.requestID, fetch.groupOrder, endOfTrack, standalone->end});
+          fetch.requestID, fetch.groupOrder, endOfTrack, standalone->end, {}});
     } else {
       consumer->endOfFetch();
-      co_return std::make_shared<FetchHandle>(
-          FetchOk{fetch.requestID, fetch.groupOrder, false, standalone->end});
+      co_return std::make_shared<FetchHandle>(FetchOk{
+          fetch.requestID, fetch.groupOrder, false, standalone->end, {}});
     }
   }
   co_return nullptr;
@@ -1220,11 +1232,12 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchUpstream(
     if (!fetchHandle) {
       XLOG(DBG1) << "no fetchHandle and last object";
       fetchHandle = std::make_shared<FetchHandle>(FetchOk(
-          {fetch.requestID,
-           fetch.groupOrder,
-           res.value()->fetchOk().endOfTrack,
-           res.value()->fetchOk().endLocation,
-           res.value()->fetchOk().params}));
+          fetch.requestID,
+          fetch.groupOrder,
+          res.value()->fetchOk().endOfTrack,
+          res.value()->fetchOk().endLocation,
+          res.value()->fetchOk().extensions,
+          res.value()->fetchOk().params));
     }
     fetchHandle->setUpstreamFetchHandle(res.value());
     co_return fetchHandle;

@@ -11,7 +11,7 @@
 #include <functional>
 
 #if MOXYGEN_USE_FOLLY
-#include <folly/Executor.h>
+#include <folly/DefaultKeepAliveExecutor.h>
 #if MOXYGEN_QUIC_MVFST
 #include <quic/common/events/QuicEventBase.h>
 #endif
@@ -21,10 +21,17 @@ namespace moxygen {
 
 #if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 
-// Folly + mvfst mode: inherit from folly::Executor, use QuicTimerCallback
-class MoQExecutor : public folly::Executor {
+// Folly + mvfst mode: inherit from DefaultKeepAliveExecutor, use QuicTimerCallback
+class MoQExecutor : public folly::DefaultKeepAliveExecutor {
  public:
-  virtual ~MoQExecutor() = default;
+  using KeepAlive = folly::Executor::KeepAlive<MoQExecutor>;
+
+  virtual ~MoQExecutor() override = default;
+
+  // Returns a KeepAlive token for this executor
+  KeepAlive keepAlive() {
+    return getKeepAliveToken(this);
+  }
 
   template <
       typename T,
@@ -49,6 +56,9 @@ class MoQExecutor : public folly::Executor {
 // Folly + picoquic mode: inherit from folly::Executor, use std::function
 class MoQExecutor : public folly::Executor {
  public:
+  // KeepAlive type for Folly+picoquic - use shared_ptr for ownership
+  using KeepAlive = std::shared_ptr<MoQExecutor>;
+
   virtual ~MoQExecutor() = default;
 
   template <
@@ -74,6 +84,9 @@ class MoQExecutor : public folly::Executor {
 // Std-mode executor interface
 class MoQExecutor {
  public:
+  // KeepAlive type for std-mode - just a shared_ptr
+  using KeepAlive = std::shared_ptr<MoQExecutor>;
+
   virtual ~MoQExecutor() = default;
 
   // Execute a function

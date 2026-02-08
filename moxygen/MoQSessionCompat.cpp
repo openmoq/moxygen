@@ -104,52 +104,52 @@ class MoQSessionBase::SubscribeTrackReceiveState {
   void cancel() {
     callback_.reset();
     cancelled_ = true;
-    pendingSubscribeDone_.reset();
+    pendingPublishDone_.reset();
   }
 
   void onSubgroup() {
     streamCount_++;
-    if (pendingSubscribeDone_ &&
-        streamCount_ >= pendingSubscribeDone_->streamCount) {
-      deliverSubscribeDoneAndRemove();
+    if (pendingPublishDone_ &&
+        streamCount_ >= pendingPublishDone_->streamCount) {
+      deliverPublishDoneAndRemove();
     }
   }
 
-  void processSubscribeDone(SubscribeDone subDone) {
+  void processPublishDone(PublishDone pubDone) {
     if (!callback_) {
-      // Unsubscribe raced with subscribeDone - just remove state
+      // Unsubscribe raced with publishDone - just remove state
       session_->removeSubscriptionState(alias_, requestID_);
       return;
     }
-    if (pendingSubscribeDone_) {
-      XLOG(ERR) << "Duplicate SUBSCRIBE_DONE";
+    if (pendingPublishDone_) {
+      XLOG(ERR) << "Duplicate PUBLISH_DONE";
       session_->close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
       return;
     }
 
-    pendingSubscribeDone_ = std::move(subDone);
-    if (pendingSubscribeDone_->streamCount > streamCount_) {
+    pendingPublishDone_ = std::move(pubDone);
+    if (pendingPublishDone_->streamCount > streamCount_) {
       // Still waiting for streams - schedule timeout
       if (session_ && session_->getExecutor()) {
         auto* self = this;
         session_->getExecutor()->scheduleTimeout(
             [self]() {
-              if (self->pendingSubscribeDone_) {
-                self->deliverSubscribeDoneAndRemove();
+              if (self->pendingPublishDone_) {
+                self->deliverPublishDoneAndRemove();
               }
             },
             session_->getMoqSettings().publishDoneStreamCountTimeout);
       }
     } else {
-      deliverSubscribeDoneAndRemove();
+      deliverPublishDoneAndRemove();
     }
   }
 
   void subscribeError(SubscribeError subErr) {
     if (callback_) {
-      processSubscribeDone(
+      processPublishDone(
           {requestID_,
-           SubscribeDoneStatusCode::SESSION_CLOSED,
+           PublishDoneStatusCode::SESSION_CLOSED,
            0,
            "closed locally"});
     }
@@ -172,12 +172,12 @@ class MoQSessionBase::SubscribeTrackReceiveState {
   }
 
  private:
-  void deliverSubscribeDoneAndRemove() {
-    if (pendingSubscribeDone_ && callback_) {
+  void deliverPublishDoneAndRemove() {
+    if (pendingPublishDone_ && callback_) {
       auto cb = std::exchange(callback_, nullptr);
-      cb->subscribeDone(std::move(*pendingSubscribeDone_));
+      cb->publishDone(std::move(*pendingPublishDone_));
     }
-    pendingSubscribeDone_.reset();
+    pendingPublishDone_.reset();
     session_->removeSubscriptionState(alias_, requestID_);
   }
 
@@ -189,7 +189,7 @@ class MoQSessionBase::SubscribeTrackReceiveState {
   bool cancelled_{false};
   uint64_t streamCount_{0};
   uint64_t currentStreamId_{0};
-  std::optional<SubscribeDone> pendingSubscribeDone_;
+  std::optional<PublishDone> pendingPublishDone_;
   uint8_t publisherPriority_{kDefaultPriority};
 };
 
@@ -597,7 +597,8 @@ class CompatTrackPublisher : public MoQSessionBase::PublisherImpl,
   beginSubgroup(
       uint64_t groupID,
       uint64_t subgroupID,
-      Priority priority) override {
+      Priority priority,
+      bool /*containsLastInGroup*/ = false) override {
     if (!wt_ || !trackAlias_) {
       return compat::makeUnexpected(
           MoQPublishError(MoQPublishError::CANCELLED, "session closed"));
@@ -637,7 +638,8 @@ class CompatTrackPublisher : public MoQSessionBase::PublisherImpl,
 
   compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
-      Payload payload) override {
+      Payload payload,
+      bool /*lastInGroup*/ = false) override {
     if (!wt_ || !trackAlias_) {
       return compat::makeUnexpected(
           MoQPublishError(MoQPublishError::CANCELLED, "session closed"));
@@ -665,7 +667,8 @@ class CompatTrackPublisher : public MoQSessionBase::PublisherImpl,
 
   compat::Expected<compat::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
-      Payload payload) override {
+      Payload payload,
+      bool /*lastInGroup*/ = false) override {
     if (!wt_ || !trackAlias_) {
       return compat::makeUnexpected(
           MoQPublishError(MoQPublishError::CANCELLED, "session closed"));
@@ -682,13 +685,13 @@ class CompatTrackPublisher : public MoQSessionBase::PublisherImpl,
     return compat::unit;
   }
 
-  compat::Expected<compat::Unit, MoQPublishError> subscribeDone(
-      SubscribeDone subDone) override {
-    subDone.requestID = requestID_;
-    subDone.streamCount = streamCount_;
+  compat::Expected<compat::Unit, MoQPublishError> publishDone(
+      PublishDone pubDone) override {
+    pubDone.requestID = requestID_;
+    pubDone.streamCount = streamCount_;
     if (session_) {
       subscriptionHandle_.reset();
-      session_->sendSubscribeDone(subDone);
+      session_->sendPublishDone(pubDone);
     }
     return compat::unit;
   }
@@ -709,12 +712,12 @@ class CompatTrackPublisher : public MoQSessionBase::PublisherImpl,
 
   // PublisherImpl virtual overrides
   void terminatePublish(
-      SubscribeDone subDone,
+      PublishDone pubDone,
       ResetStreamErrorCode /*error*/) override {
-    // Reset all active subgroups, then send SubscribeDone
+    // Reset all active subgroups, then send PublishDone
     subscriptionHandle_.reset();
     if (session_) {
-      session_->sendSubscribeDone(subDone);
+      session_->sendPublishDone(pubDone);
     }
   }
 
@@ -802,7 +805,7 @@ class CompatFetchPublisher : public MoQSessionBase::PublisherImpl {
 
   // PublisherImpl virtual overrides
   void terminatePublish(
-      SubscribeDone /*subDone*/,
+      PublishDone /*pubDone*/,
       ResetStreamErrorCode error) override {
     reset(error);
   }
@@ -1128,7 +1131,7 @@ class CompatReceiverSubscriptionHandle : public SubscriptionHandle {
           "Session closed"});
       return;
     }
-    subUpdate.subscriptionRequestID = subscribeOk_->requestID;
+    subUpdate.existingRequestID = subscribeOk_->requestID;
     session_->subscribeUpdate(subUpdate);
     // Fire-and-forget for now (no response tracking)
     callback->onSuccess(SubscribeUpdateOk{.requestID = subUpdate.requestID});
@@ -1359,7 +1362,7 @@ void MoQSessionBase::subscribeUpdateOk(const RequestOk& /*requestOk*/) {}
 void MoQSessionBase::subscribeUpdateError(
     const SubscribeUpdateError& /*requestError*/,
     RequestID /*subscriptionRequestID*/) {}
-void MoQSessionBase::sendSubscribeDone(const SubscribeDone& /*subDone*/) {}
+void MoQSessionBase::sendPublishDone(const PublishDone& /*pubDone*/) {}
 void MoQSessionBase::fetchOk(const FetchOk& /*fetchOkMsg*/) {}
 void MoQSessionBase::fetchError(const FetchError& /*fetchErr*/) {}
 void MoQSessionBase::fetchCancel(const FetchCancel& /*fetchCan*/) {}
@@ -1701,26 +1704,26 @@ void MoQSession::subscribeUpdateError(
   // Terminate subscription
   auto it = pubTracks_.find(subscriptionRequestID);
   if (it != pubTracks_.end()) {
-    SubscribeDone subDone{
+    PublishDone pubDone{
         subscriptionRequestID,
-        SubscribeDoneStatusCode::UPDATE_FAILED,
+        PublishDoneStatusCode::UPDATE_FAILED,
         static_cast<uint64_t>(requestError.errorCode),
         requestError.reasonPhrase};
-    it->second->terminatePublish(subDone, ResetStreamErrorCode::CANCELLED);
+    it->second->terminatePublish(pubDone, ResetStreamErrorCode::CANCELLED);
   }
 }
 
-void MoQSession::sendSubscribeDone(const SubscribeDone& subDone) {
-  auto it = pubTracks_.find(subDone.requestID);
+void MoQSession::sendPublishDone(const PublishDone& pubDone) {
+  auto it = pubTracks_.find(pubDone.requestID);
   if (it == pubTracks_.end()) {
-    XLOG(ERR) << "subscribeDone for invalid id=" << subDone.requestID
+    XLOG(ERR) << "publishDone for invalid id=" << pubDone.requestID
               << " sess=" << this;
     return;
   }
   pubTracks_.erase(it);
-  auto res = moqFrameWriter_.writeSubscribeDone(controlWriteBuf_, subDone);
+  auto res = moqFrameWriter_.writePublishDone(controlWriteBuf_, pubDone);
   if (!res) {
-    XLOG(ERR) << "writeSubscribeDone failed sess=" << this;
+    XLOG(ERR) << "writePublishDone failed sess=" << this;
     return;
   }
   flushControlBuf();
@@ -2243,7 +2246,7 @@ void MoQSession::onFetchCancel(FetchCancel fetchCan) {
   auto it = pubTracks_.find(fetchCan.requestID);
   if (it != pubTracks_.end()) {
     it->second->terminatePublish(
-        SubscribeDone{fetchCan.requestID, SubscribeDoneStatusCode::SUBSCRIPTION_ENDED,
+        PublishDone{fetchCan.requestID, PublishDoneStatusCode::SUBSCRIPTION_ENDED,
                       0, "fetch cancelled"},
         ResetStreamErrorCode::CANCELLED);
     pubTracks_.erase(it);
@@ -2254,22 +2257,22 @@ void MoQSession::onFetchCancel(FetchCancel fetchCan) {
 // Phase 7: Remaining handlers
 // =========================================================================
 
-void MoQSession::onSubscribeUpdate(SubscribeUpdate subscribeUpdate) {
-  auto subscriptionRequestID = subscribeUpdate.requestID;
+void MoQSession::onRequestUpdate(RequestUpdate requestUpdate) {
+  auto subscriptionRequestID = requestUpdate.requestID;
   auto it = pubTracks_.find(subscriptionRequestID);
   if (it == pubTracks_.end()) {
     XLOG(ERR) << "No matching subscribe ID=" << subscriptionRequestID
               << " sess=" << this;
     return;
   }
-  it->second->setSubPriority(subscribeUpdate.priority);
+  it->second->setSubPriority(requestUpdate.priority);
 }
 
 void MoQSession::onUnsubscribe(Unsubscribe unsub) {
   auto it = pubTracks_.find(unsub.requestID);
   if (it != pubTracks_.end()) {
     it->second->terminatePublish(
-        SubscribeDone{unsub.requestID, SubscribeDoneStatusCode::SUBSCRIPTION_ENDED,
+        PublishDone{unsub.requestID, PublishDoneStatusCode::SUBSCRIPTION_ENDED,
                       0, "unsubscribed"},
         ResetStreamErrorCode::CANCELLED);
     pubTracks_.erase(it);
@@ -2277,10 +2280,10 @@ void MoQSession::onUnsubscribe(Unsubscribe unsub) {
   retireRequestID(true);
 }
 
-void MoQSession::onSubscribeDone(SubscribeDone subscribeDone) {
-  auto aliasIt = reqIdToTrackAlias_.find(subscribeDone.requestID);
+void MoQSession::onPublishDone(PublishDone publishDone) {
+  auto aliasIt = reqIdToTrackAlias_.find(publishDone.requestID);
   if (aliasIt == reqIdToTrackAlias_.end()) {
-    XLOG(ERR) << "No matching request ID=" << subscribeDone.requestID
+    XLOG(ERR) << "No matching request ID=" << publishDone.requestID
               << " sess=" << this;
     return;
   }
@@ -2290,7 +2293,7 @@ void MoQSession::onSubscribeDone(SubscribeDone subscribeDone) {
               << " sess=" << this;
     return;
   }
-  trackIt->second->processSubscribeDone(std::move(subscribeDone));
+  trackIt->second->processPublishDone(std::move(publishDone));
 }
 
 void MoQSession::onPublish(PublishRequest publish) {

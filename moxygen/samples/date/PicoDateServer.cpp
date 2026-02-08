@@ -223,6 +223,7 @@ class DatePublisher : public Publisher,
         std::chrono::milliseconds(0),
         GroupOrder::OldestFirst,
         largest,
+        Extensions{},
         TrackRequestParameters{FrameType::SUBSCRIBE_OK}});
 
     // Store subscriber
@@ -308,6 +309,7 @@ class DatePublisher : public Publisher,
         resolveGroupOrder(GroupOrder::OldestFirst, fetch.groupOrder),
         0,
         largest,
+        Extensions{},
         TrackRequestParameters{FrameType::FETCH_OK}});
     callback->onSuccess(fetchHandle);
   }

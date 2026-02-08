@@ -136,7 +136,7 @@ class TextHandler : public ObjectReceiverCallback {
     std::cout << "Stream Error=" << folly::to_underlying(error) << std::endl;
   }
 
-  void onSubscribeDone(SubscribeDone) override {
+  void onPublishDone(PublishDone) override {
     CHECK(!fetch_);
     std::cout << __func__ << std::endl;
     baton.post();
@@ -156,12 +156,14 @@ class MoQTextClientMobile
       std::shared_ptr<MoQLibevExecutorImpl> evb,
       proxygen::URL url,
       FullTrackName ftn)
-      : moqClient_(std::make_unique<MoQClientMobile>(evb, std::move(url))),
+      : moqClient_(
+            std::make_unique<MoQClientMobile>(std::move(evb), std::move(url))),
         fullTrackName_(std::move(ftn)) {}
 
   folly::coro::Task<MoQSession::SubscribeNamespaceResult> subscribeNamespace(
       SubscribeNamespace subAnn) {
-    auto res = co_await moqClient_->moqSession_->subscribeNamespace(subAnn);
+    auto res =
+        co_await moqClient_->moqSession_->subscribeNamespace(subAnn, nullptr);
     if (res.hasValue()) {
       subscribeNamespaceHandle_ = res.value();
     }
@@ -405,9 +407,8 @@ int main(int argc, char* argv[]) {
       TrackNamespace(FLAGS_track_namespace, FLAGS_track_namespace_delimiter);
 
   struct ev_loop* evLoop = ev_loop_new(0);
-  std::shared_ptr<MoQLibevExecutorImpl> moqEvb =
-      std::make_shared<MoQLibevExecutorImpl>(
-          std::make_unique<EvLoopWeak>(evLoop));
+  auto moqEvb = std::make_shared<MoQLibevExecutorImpl>(
+      std::make_unique<EvLoopWeak>(evLoop));
 
   auto textClient = std::make_shared<MoQTextClientMobile>(
       moqEvb, std::move(url), moxygen::FullTrackName({ns, FLAGS_track_name}));

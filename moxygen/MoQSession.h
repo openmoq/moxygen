@@ -24,6 +24,8 @@ namespace moxygen {
 
 #if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 
+// BufferingThresholds and MoQSettings are defined in MoQSessionBase.h
+
 /**
  * MoQSession - Folly-based MoQ session implementation (requires mvfst/proxygen)
  *
@@ -51,12 +53,12 @@ class MoQSession : public MoQSessionBase,
 
   explicit MoQSession(
       folly::MaybeManagedPtr<proxygen::WebTransport> wt,
-      std::shared_ptr<MoQExecutor> exec);
+      MoQExecutor::KeepAlive exec);
 
   explicit MoQSession(
       folly::MaybeManagedPtr<proxygen::WebTransport> wt,
       ServerSetupCallback& serverSetupCallback,
-      std::shared_ptr<MoQExecutor> exec);
+      MoQExecutor::KeepAlive exec);
 
   ~MoQSession() override;
 
@@ -108,7 +110,7 @@ class MoQSession : public MoQSessionBase,
   void subscribeUpdateError(
       const SubscribeUpdateError& requestError,
       RequestID subscriptionRequestID) override;
-  void sendSubscribeDone(const SubscribeDone& subDone) override;
+  void sendPublishDone(const PublishDone& pubDone) override;
   void fetchOk(const FetchOk& fetchOk) override;
   void fetchError(const FetchError& fetchError) override;
   void fetchCancel(const FetchCancel& fetchCancel) override;
@@ -158,6 +160,15 @@ class MoQSession : public MoQSessionBase,
       proxygen::WebTransport::StreamReadHandle* rh) noexcept override;
   void onNewBidiStream(
       proxygen::WebTransport::BidiStreamHandle bh) noexcept override;
+
+  void handleClientSetup(
+      proxygen::WebTransport::BidiStreamHandle bh,
+      std::unique_ptr<folly::IOBuf> initialData = nullptr) noexcept;
+
+  // Used to tease apart the control stream from subscribe namespace streams.
+  // This is only called for draft >= 16.
+  folly::coro::Task<void> bidiStreamDemuxer(
+      proxygen::WebTransport::BidiStreamHandle bh) noexcept;
   void onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept override;
   void onSessionEnd(folly::Optional<uint32_t> err) noexcept override {
     XLOG(INFO) << __func__ << "err="
@@ -187,7 +198,8 @@ class MoQSession : public MoQSessionBase,
   compat::Task<void> controlWriteLoop(
       proxygen::WebTransport::StreamWriteHandle* writeHandle);
   compat::Task<void> controlReadLoop(
-      proxygen::WebTransport::StreamReadHandle* readHandle);
+      proxygen::WebTransport::StreamReadHandle* readHandle,
+      std::unique_ptr<folly::IOBuf> initialData = nullptr);
 
   compat::Task<void> unidirectionalReadLoop(
       std::shared_ptr<MoQSession> session,
@@ -197,6 +209,14 @@ class MoQSession : public MoQSessionBase,
   compat::Task<void> handleSubscribe(
       SubscribeRequest sub,
       std::shared_ptr<TrackPublisherImpl> trackPublisher);
+
+  // Request update helpers - these are the renamed SubscribeUpdate operations
+  void requestUpdate(const RequestUpdate& reqUpdate);
+  void requestUpdateOk(const RequestOk& requestOk);
+  void requestUpdateError(
+      const SubscribeUpdateError& requestError,
+      RequestID existingRequestID);
+
   compat::Task<void> handleFetch(
       Fetch fetch,
       std::shared_ptr<FetchPublisherImpl> fetchPublisher);
@@ -208,14 +228,14 @@ class MoQSession : public MoQSessionBase,
   void onClientSetup(ClientSetup clientSetup) override;
   void onServerSetup(ServerSetup setup) override;
   void onSubscribe(SubscribeRequest subscribeRequest) override;
-  void onSubscribeUpdate(SubscribeUpdate subscribeUpdate) override;
+  void onRequestUpdate(RequestUpdate requestUpdate) override;
   void onSubscribeOk(SubscribeOk subscribeOk) override;
   void onRequestOk(RequestOk requestOk, FrameType frameType) override;
   void onRequestError(RequestError requestError, FrameType frameType) override;
   void onUnsubscribe(Unsubscribe unsubscribe) override;
   void onPublish(PublishRequest publish) override;
   void onPublishOk(PublishOk publishOk) override;
-  void onSubscribeDone(SubscribeDone subscribeDone) override;
+  void onPublishDone(PublishDone publishDone) override;
   void onMaxRequestID(MaxRequestID maxSubId) override;
   void onRequestsBlocked(RequestsBlocked requestsBlocked) override;
   void onFetch(Fetch fetch) override;
@@ -261,6 +281,7 @@ class MoQSession : public MoQSessionBase,
 
   // Folly-specific state
   folly::MaybeManagedPtr<proxygen::WebTransport> wt_;
+  // Control channel state
   folly::IOBufQueue controlWriteBuf_{folly::IOBufQueue::cacheChainLength()};
   moxygen::TimedBaton controlWriteEvent_;
 
@@ -273,6 +294,19 @@ class MoQSession : public MoQSessionBase,
   // Cached transport info
   mutable quic::TransportInfo cachedTransportInfo_;
   mutable std::chrono::steady_clock::time_point lastTransportInfoUpdate_{};
+
+  // Type-specific REQUEST_UPDATE handlers - take handles directly to avoid
+  // double lookup
+  virtual void handleSubscribeRequestUpdate(
+      RequestUpdate requestUpdate,
+      std::shared_ptr<TrackPublisherImpl> trackPublisher);
+  virtual void handleFetchRequestUpdate(
+      const RequestUpdate& requestUpdate,
+      const std::shared_ptr<FetchPublisherImpl>& fetchPublisher);
+  virtual void handlePublishRequestUpdate(
+      const RequestUpdate& requestUpdate,
+      RequestID existingRequestID,
+      TrackAlias trackAlias);
 
   // Pending request state management
   class PendingRequestState {
@@ -579,7 +613,7 @@ class MoQSession : public MoQSessionBase,
   void subscribeUpdateError(
       const SubscribeUpdateError& requestError,
       RequestID subscriptionRequestID) override;
-  void sendSubscribeDone(const SubscribeDone& subDone) override;
+  void sendPublishDone(const PublishDone& pubDone) override;
   void fetchOk(const FetchOk& fetchOkMsg) override;
   void fetchError(const FetchError& fetchErr) override;
   void fetchCancel(const FetchCancel& fetchCan) override;
@@ -602,13 +636,13 @@ class MoQSession : public MoQSessionBase,
   void onClientSetup(ClientSetup clientSetup) override;
   void onServerSetup(ServerSetup setup) override;
   void onSubscribe(SubscribeRequest subscribeRequest) override;
-  void onSubscribeUpdate(SubscribeUpdate subscribeUpdate) override;
+  void onRequestUpdate(RequestUpdate requestUpdate) override;
   void onSubscribeOk(SubscribeOk subscribeOk) override;
   void onRequestError(RequestError requestError, FrameType frameType) override;
   void onUnsubscribe(Unsubscribe unsubscribe) override;
   void onPublish(PublishRequest publish) override;
   void onPublishOk(PublishOk publishOk) override;
-  void onSubscribeDone(SubscribeDone subscribeDone) override;
+  void onPublishDone(PublishDone publishDone) override;
   void onMaxRequestID(MaxRequestID maxSubId) override;
   void onRequestsBlocked(RequestsBlocked requestsBlocked) override;
   void onFetch(Fetch fetch) override;

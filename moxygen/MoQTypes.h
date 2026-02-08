@@ -12,6 +12,9 @@
 #include <moxygen/compat/Hash.h>
 #include <moxygen/compat/Payload.h>
 #include <moxygen/compat/Unit.h>
+#if MOXYGEN_USE_FOLLY
+#include <folly/io/IOBuf.h>
+#endif
 #include <algorithm>
 #include <optional>
 #include <vector>
@@ -30,9 +33,22 @@ const uint64_t kImmutableExtensionType = 0xB;
 const uint64_t kPriorGroupIdGapExtensionType = 0x3C;
 const uint64_t kPriorObjectIdGapExtensionType = 0x3E;
 
+// Track Property Extension Types (Draft-16+)
+constexpr uint64_t kDeliveryTimeoutExtensionType = 0x02;
+constexpr uint64_t kMaxCacheDurationExtensionType = 0x04;
+constexpr uint64_t kPublisherPriorityExtensionType = 0x0E;
+constexpr uint64_t kPublisherGroupOrderExtensionType = 0x22;
+constexpr uint64_t kDynamicGroupsExtensionType = 0x30;
+
 //////// Types ////////
 
+#if MOXYGEN_USE_FOLLY
+// Folly mode: use IOBuf directly for backward compatibility
+using Payload = std::unique_ptr<folly::IOBuf>;
+#else
+// Std mode: use compat::Payload wrapper
 using Payload = std::unique_ptr<compat::Payload>;
+#endif
 using Priority = uint8_t;
 
 // Undefine Windows macros that conflict with our enum values
@@ -73,7 +89,7 @@ using ErrorCode = SessionCloseErrorCode;
 
 // SubscribeErrorCode is now an alias for RequestErrorCode - see below
 
-enum class SubscribeDoneStatusCode : uint32_t {
+enum class PublishDoneStatusCode : uint32_t {
   INTERNAL_ERROR = 0x0,
   UNAUTHORIZED = 0x1,
   TRACK_ENDED = 0x2,
@@ -135,6 +151,7 @@ enum class ResetStreamErrorCode : uint32_t {
 
 enum class FrameType : uint64_t {
   SUBSCRIBE_UPDATE = 2,
+  REQUEST_UPDATE = 2,
   SUBSCRIBE = 3,
   SUBSCRIBE_OK = 4,
   SUBSCRIBE_ERROR = 5,
@@ -146,7 +163,7 @@ enum class FrameType : uint64_t {
   NAMESPACE = 0x8,               // Draft 16 and above
   PUBLISH_NAMESPACE_DONE = 9,
   UNSUBSCRIBE = 0xA,
-  SUBSCRIBE_DONE = 0xB,
+  PUBLISH_DONE = 0xB,
   PUBLISH_NAMESPACE_CANCEL = 0xC,
   TRACK_STATUS = 0xD,
   TRACK_STATUS_OK = 0xE, // Draft 15 and below
@@ -924,9 +941,9 @@ struct SubscribeRequest {
   TrackRequestParameters params{FrameType::SUBSCRIBE};
 };
 
-struct SubscribeUpdate {
+struct RequestUpdate {
   RequestID requestID;
-  RequestID subscriptionRequestID;
+  RequestID existingRequestID;
   std::optional<AbsoluteLocation> start;
   std::optional<uint64_t> endGroup;
   uint8_t priority{kDefaultPriority};
@@ -936,6 +953,9 @@ struct SubscribeUpdate {
   TrackRequestParameters params{FrameType::SUBSCRIBE_UPDATE};
 };
 
+// Backward compatibility alias
+using SubscribeUpdate = RequestUpdate;
+
 struct SubscribeOk {
   RequestID requestID;
   TrackAlias trackAlias;
@@ -943,6 +963,7 @@ struct SubscribeOk {
   GroupOrder groupOrder;
   // context exists is inferred from presence of largest
   std::optional<AbsoluteLocation> largest;
+  Extensions extensions; // Draft 16+
   TrackRequestParameters params{FrameType::SUBSCRIBE_OK};
 };
 
@@ -952,9 +973,9 @@ struct Unsubscribe {
   RequestID requestID;
 };
 
-struct SubscribeDone {
+struct PublishDone {
   RequestID requestID;
-  SubscribeDoneStatusCode statusCode;
+  PublishDoneStatusCode statusCode;
   uint64_t streamCount{0};
   std::string reasonPhrase;
 };
@@ -966,6 +987,7 @@ struct PublishRequest {
   GroupOrder groupOrder{GroupOrder::Default};
   std::optional<AbsoluteLocation> largest;
   bool forward{true};
+  Extensions extensions; // Draft 16+
   TrackRequestParameters params{FrameType::PUBLISH};
 };
 
@@ -1106,6 +1128,7 @@ struct FetchOk {
   GroupOrder groupOrder;
   uint8_t endOfTrack;
   AbsoluteLocation endLocation;
+  Extensions extensions; // Draft 16+
   TrackRequestParameters params{FrameType::FETCH_OK};
 };
 
@@ -1160,6 +1183,11 @@ struct RequestError {
   RequestID requestID;
   RequestErrorCode errorCode;
   std::string reasonPhrase;
+  // Retry Interval: The time (in milliseconds) before the request SHOULD be
+  // sent again, plus one.
+  // If the value is 0, the request SHOULD NOT be retried.
+  // A value of 1 indicates the request can be retried immediately.
+  std::optional<std::chrono::milliseconds> retryInterval = std::nullopt;
 };
 
 // Type aliases for backward compatibility

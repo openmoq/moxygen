@@ -76,8 +76,8 @@ SubscribeRequest getSubscribe(const FullTrackName& ftn) {
       0};
 }
 
-SubscribeDone getTrackEndedSubscribeDone(RequestID id) {
-  return {id, SubscribeDoneStatusCode::TRACK_ENDED, 0, "end of track"};
+PublishDone getTrackEndedPublishDone(RequestID id) {
+  return {id, PublishDoneStatusCode::TRACK_ENDED, 0, "end of track"};
 }
 
 TrackStatus getTrackStatus() {
@@ -170,18 +170,18 @@ void TestTimeoutCallback::timeoutExpired() noexcept {
 void MoQSessionTest::SetUp() {
   // Schedule timeout to crash test if it hangs
   eventBase_.timer().scheduleTimeout(&testTimeout_, std::chrono::seconds(10));
-  MoQExecutor_ = std::make_shared<MoQFollyExecutorImpl>(&eventBase_);
+  MoQExecutor_ = std::make_unique<MoQFollyExecutorImpl>(&eventBase_);
   std::tie(clientWt_, serverWt_) =
       proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
   clientSession_ = std::make_shared<MoQRelaySession>(
       folly::MaybeManagedPtr<proxygen::WebTransport>(clientWt_.get()),
-      MoQExecutor_);
+      MoQExecutor_->keepAlive());
   serverWt_->setPeerHandler(clientSession_.get());
 
   serverSession_ = std::make_shared<MoQRelaySession>(
       folly::MaybeManagedPtr<proxygen::WebTransport>(serverWt_.get()),
       *this,
-      MoQExecutor_);
+      MoQExecutor_->keepAlive());
   clientWt_->setPeerHandler(serverSession_.get());
 
   fetchCallback_ = std::make_shared<testing::StrictMock<MockFetchConsumer>>();
@@ -220,6 +220,17 @@ void MoQSessionTest::SetUp() {
 void MoQSessionTest::TearDown() {
   // Cancel the timeout to prevent false alarms after test completes
   testTimeout_.cancelTimeout();
+
+  // Close sessions to release their KeepAlive tokens
+  if (clientSession_) {
+    clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+  }
+  if (serverSession_) {
+    serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+  }
+
+  // Drain the EventBase to let pending work complete and release tokens
+  eventBase_.loopOnce(EVLOOP_NONBLOCK);
 }
 
 compat::Expected<compat::Unit, SessionCloseErrorCode>
@@ -444,13 +455,13 @@ void MoQSessionTest::expectSubscribe(
       .RetiresOnSaturation();
 }
 
-void MoQSessionTest::expectSubscribeDone(MoQControlCodec::Direction recipient) {
+void MoQSessionTest::expectPublishDone(MoQControlCodec::Direction recipient) {
   EXPECT_CALL(
       *getPublisherStatsCallback(oppositeDirection(recipient)),
-      onSubscribeDone(_));
-  EXPECT_CALL(*getSubscriberStatsCallback(recipient), onSubscribeDone(_));
-  EXPECT_CALL(*subscribeCallback_, subscribeDone(_)).WillOnce([&] {
-    subscribeDone_.post();
+      onPublishDone(_));
+  EXPECT_CALL(*getSubscriberStatsCallback(recipient), onPublishDone(_));
+  EXPECT_CALL(*subscribeCallback_, publishDone(_)).WillOnce([&] {
+    publishDone_.post();
     return folly::unit;
   });
 }

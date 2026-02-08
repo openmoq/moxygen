@@ -4,34 +4,30 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# flvparser
-add_library(flvparser
-    FlvCommon.cpp
-    FlvReader.cpp
-    FlvCoder.cpp
-    FlvWriter.cpp
-    FlvStreamParser.cpp
+# MoQMiToFlv
+add_library(moqmitoflv
+    MoQMiToFlv.cpp
 )
 
 target_include_directories(
-    flvparser PUBLIC
+    moqmitoflv PUBLIC
     $<BUILD_INTERFACE:${MOXYGEN_FBCODE_ROOT}>
 )
 target_compile_options(
-    flvparser PRIVATE
+    moqmitoflv PRIVATE
     ${_MOXYGEN_COMMON_COMPILE_OPTIONS}
 )
-
 target_link_libraries(
-    flvparser PUBLIC
+    moqmitoflv PUBLIC
     Folly::folly
+    mvfst::mvfst_codec_types
+    mvfst::mvfst_folly_utils
+    flvparser
 )
 
 install(
-    TARGETS flvparser
+    TARGETS moqmitoflv
     EXPORT moxygen-exports
     ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
     LIBRARY DESTINATION ${LIB_INSTALL_DIR}
 )
-
-add_subdirectory(test)
