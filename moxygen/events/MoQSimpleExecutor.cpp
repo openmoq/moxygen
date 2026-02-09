@@ -6,6 +6,8 @@
 
 #include "moxygen/events/MoQSimpleExecutor.h"
 
+#include <thread>
+
 namespace moxygen {
 
 MoQSimpleExecutor::~MoQSimpleExecutor() {
@@ -115,6 +117,64 @@ void MoQSimpleExecutor::stop() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     stopping_ = true;
+  }
+  cv_.notify_one();
+}
+
+bool MoQSimpleExecutor::runOnce() {
+  std::function<void()> task;
+  bool didWork = false;
+
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    // Fire any timers that are due
+    auto now = std::chrono::steady_clock::now();
+    while (!timers_.empty() && timers_.top().deadline <= now) {
+      auto timerCb = std::move(const_cast<TimerEntry&>(timers_.top()).callback);
+      timers_.pop();
+      lock.unlock();
+      timerCb();
+      didWork = true;
+      lock.lock();
+      now = std::chrono::steady_clock::now();
+    }
+
+    // Get next task if available
+    if (!tasks_.empty()) {
+      task = std::move(tasks_.front());
+      tasks_.pop();
+    }
+  }
+
+  // Execute task outside the lock
+  if (task) {
+    task();
+    didWork = true;
+  }
+
+  return didWork;
+}
+
+void MoQSimpleExecutor::runFor(std::chrono::milliseconds duration) {
+  auto deadline = std::chrono::steady_clock::now() + duration;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!runOnce()) {
+      // No work, sleep briefly to avoid busy-wait
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+}
+
+void MoQSimpleExecutor::scheduleAt(
+    std::function<void()> callback,
+    std::chrono::steady_clock::time_point deadline) {
+  if (!callback) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    timers_.push({deadline, std::move(callback)});
   }
   cv_.notify_one();
 }

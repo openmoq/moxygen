@@ -7,8 +7,29 @@
 option(BUILD_TESTS  "Enable tests" OFF)
 include(CTest)
 if(BUILD_TESTS)
-  find_package(GMock 1.10.0 MODULE REQUIRED)
-  find_package(GTest 1.10.0 MODULE REQUIRED)
+  if(MOXYGEN_USE_FOLLY)
+    # Folly mode: use custom GMock/GTest modules from getdeps
+    find_package(GMock 1.10.0 MODULE REQUIRED)
+    find_package(GTest 1.10.0 MODULE REQUIRED)
+  else()
+    # Std-mode: use standard CMake GTest package or fetch it
+    include(FetchContent)
+    FetchContent_Declare(
+      googletest
+      GIT_REPOSITORY https://github.com/google/googletest.git
+      GIT_TAG v1.14.0
+    )
+    # For Windows: Prevent overriding the parent project's compiler/linker settings
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    # Set compatibility variables for moxygen_add_test
+    set(LIBGMOCK_INCLUDE_DIR "")  # Not needed, GTest::gmock handles it
+    set(LIBGTEST_INCLUDE_DIRS "")
+    set(LIBGMOCK_DEFINES "")
+    set(LIBGMOCK_LIBRARIES GTest::gtest GTest::gmock)
+    set(GLOG_LIBRARY "")  # No glog in std-mode
+  endif()
 endif()
 
 function(moxygen_add_test)

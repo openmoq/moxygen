@@ -43,6 +43,18 @@ class MoQSimpleExecutor : public MoQExecutor {
   // Run the event loop (blocks until stop() is called)
   void run();
 
+  // Run one iteration of the event loop (non-blocking)
+  // Returns true if work was done
+  bool runOnce();
+
+  // Run the event loop for a specified duration
+  void runFor(std::chrono::milliseconds duration);
+
+  // Schedule a callback at a specific time point
+  void scheduleAt(
+      std::function<void()> callback,
+      std::chrono::steady_clock::time_point deadline);
+
   // Signal the event loop to stop
   void stop();
 

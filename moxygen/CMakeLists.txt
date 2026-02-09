@@ -281,4 +281,9 @@ endif() # NOT MOXYGEN_USE_FOLLY
 add_subdirectory(samples/date)
 add_subdirectory(samples/text-client)
 
+# Std-mode tests
+if(NOT MOXYGEN_USE_FOLLY)
+  add_subdirectory(test)
+endif()
+
 endif() # MOXYGEN_QUIC_BACKEND == picoquic
