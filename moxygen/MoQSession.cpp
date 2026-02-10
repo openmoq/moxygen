@@ -1065,8 +1065,9 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     co_withExecutor(
         session_->getExecutor(),
         folly::coro::co_invoke(
-            [trackPubImpl, update = std::move(requestUpdate)]() mutable
-                -> folly::coro::Task<void> {
+            [trackPubImpl = std::move(trackPubImpl),
+             update = std::move(
+                 requestUpdate)]() mutable -> folly::coro::Task<void> {
               co_await trackPubImpl->handleRequestUpdate(std::move(update));
             }))
         .start();
@@ -1101,10 +1102,10 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       setForward(*requestUpdate.forward);
     }
 
-    // Call application's async subscribeUpdate handler with cancellation
+    // Call application's async requestUpdate handler with cancellation
     auto updateResult = co_await co_awaitTry(co_withCancellation(
         session_->getCancellationSource().getToken(),
-        subscriptionHandle_->subscribeUpdate(std::move(requestUpdate))));
+        subscriptionHandle_->requestUpdate(std::move(requestUpdate))));
 
     // Only send responses for v15+
     if (getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 15) {
@@ -1338,6 +1339,50 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
 
   void setLogger(std::shared_ptr<MLogger> logger) {
     logger_ = logger;
+  }
+  folly::coro::Task<void> onRequestUpdate(RequestUpdate requestUpdate) {
+    if (!handle_) {
+      XLOG(ERR) << "Received RequestUpdate before sending FETCH_OK id="
+                << requestID_ << " fetchPub=" << this;
+      if (getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 15) {
+        session_->requestUpdateError(
+            RequestError{
+                requestUpdate.requestID,
+                RequestErrorCode::INTERNAL_ERROR,
+                "FETCH not yet initialized"},
+            requestID_);
+      }
+      co_return;
+    }
+
+    auto existingRequestID = requestID_;
+    auto updateRequestID = requestUpdate.requestID;
+
+    // Call the handle's requestUpdate
+    auto updateResult = co_await co_awaitTry(co_withCancellation(
+        session_->cancellationSource_.getToken(),
+        handle_->requestUpdate(std::move(requestUpdate))));
+
+    // Only send responses for v15+
+    if (getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 15) {
+      if (updateResult.hasException()) {
+        XLOG(ERR) << "Exception in requestUpdate ex="
+                  << updateResult.exception().what() << " fetchPub=" << this;
+        session_->requestUpdateError(
+            RequestError{
+                updateRequestID,
+                RequestErrorCode::INTERNAL_ERROR,
+                "Exception in requestUpdate"},
+            existingRequestID);
+      } else if (updateResult->hasError()) {
+        auto updateErr = updateResult->error();
+        updateErr.requestID = updateRequestID; // In case app got it wrong
+        session_->requestUpdateError(updateErr, existingRequestID);
+      } else {
+        RequestOk requestOk{.requestID = updateRequestID};
+        session_->requestUpdateOk(requestOk);
+      }
+    }
   }
 
  private:
@@ -1962,7 +2007,16 @@ MoQSession::PendingRequestState::setError(
     RequestError error,
     FrameType frameType) {
   switch (frameType) {
-    case FrameType::SUBSCRIBE_ERROR: {
+    case FrameType::REQUEST_ERROR: {
+      // REQUEST_ERROR == SUBSCRIBE_ERROR (both are 5), so check type
+      if (type_ == Type::REQUEST_UPDATE) {
+        // This is a REQUEST_ERROR for a REQUEST_UPDATE
+        storage_.requestUpdate_.setValue(
+            folly::makeUnexpected(
+                RequestError{
+                    error.requestID, error.errorCode, error.reasonPhrase}));
+        return type_;
+      }
       auto ptr = tryGetSubscribeTrack();
       if (!ptr || !*ptr || (*ptr)->isPublish()) {
         return compat::makeUnexpected(compat::unit);
@@ -1991,16 +2045,6 @@ MoQSession::PendingRequestState::setError(
       }
       (*fetchPtr)->fetchError(std::move(error));
       return type_;
-    }
-    case FrameType::SUBSCRIBE_UPDATE: {
-      if (type_ == Type::SUBSCRIBE_UPDATE) {
-        storage_.subscribeUpdate_.setValue(
-            compat::makeUnexpected(
-                SubscribeUpdateError{
-                    error.requestID, error.errorCode, error.reasonPhrase}));
-        return type_;
-      }
-      return compat::makeUnexpected(compat::unit);
     }
     case FrameType::PUBLISH_NAMESPACE_ERROR:
     case FrameType::SUBSCRIBE_NAMESPACE_ERROR: {
@@ -3255,28 +3299,22 @@ void MoQSession::onRequestUpdate(RequestUpdate requestUpdate) {
       handleSubscribeRequestUpdate(std::move(requestUpdate), trackPub);
       return;
     }
-    if (auto fetchPub =
-            std::dynamic_pointer_cast<FetchPublisherImpl>(pubIt->second)) {
-      handleFetchRequestUpdate(requestUpdate, fetchPub);
-      return;
+    // v16+: FETCH supports REQUEST_UPDATE
+    if (getDraftMajorVersion(*getNegotiatedVersion()) >= 16) {
+      if (auto fetchPub =
+              std::dynamic_pointer_cast<FetchPublisherImpl>(pubIt->second)) {
+        handleFetchRequestUpdate(requestUpdate, fetchPub);
+        return;
+      }
     }
   }
 
-  // Check reqIdToTrackAlias_ for PUBLISH
-  auto publishIt = reqIdToTrackAlias_.find(existingRequestID);
-  if (publishIt != reqIdToTrackAlias_.end()) {
-    handlePublishRequestUpdate(
-        std::move(requestUpdate), existingRequestID, publishIt->second);
-    return;
-  }
-
-  // Unknown request ID
-  XLOG(ERR) << "RequestUpdate for unknown request ID=" << existingRequestID
-            << " sess=" << this;
   if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
     requestUpdateError(
         SubscribeUpdateError{
-            requestID, RequestErrorCode::INTERNAL_ERROR, "Unknown request ID"},
+            requestID,
+            RequestErrorCode::NOT_SUPPORTED,
+            "REQUEST_UPDATE not supported for this message type"},
         existingRequestID);
   }
 }
@@ -3299,33 +3337,20 @@ void MoQSession::handleFetchRequestUpdate(
   XLOG(DBG1) << __func__ << " requestID=" << fetchPublisher->requestID()
              << " sess=" << this;
 
-  // TODO: Implement full FETCH update handling (priority, auth_token)
-  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
-    requestUpdateError(
-        SubscribeUpdateError{
-            requestUpdate.requestID,
-            RequestErrorCode::NOT_SUPPORTED,
-            "FETCH REQUEST_UPDATE not yet implemented"},
-        fetchPublisher->requestID());
+  if (!publishHandler_) {
+    XLOG(DBG1) << __func__ << " No publisher callback set";
+    return;
   }
-}
 
-void MoQSession::handlePublishRequestUpdate(
-    const RequestUpdate& requestUpdate,
-    RequestID existingRequestID,
-    TrackAlias trackAlias) {
-  XLOG(DBG1) << __func__ << " existingRequestID=" << existingRequestID
-             << " trackAlias=" << trackAlias << " sess=" << this;
-
-  // TODO: Implement full PUBLISH update handling (forward, auth_token)
-  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
-    requestUpdateError(
-        SubscribeUpdateError{
-            requestUpdate.requestID,
-            RequestErrorCode::NOT_SUPPORTED,
-            "PUBLISH REQUEST_UPDATE not yet implemented"},
-        existingRequestID);
-  }
+  // Simple passthrough - just deliver to application and relay response
+  co_withExecutor(
+      getExecutor(),
+      folly::coro::co_invoke(
+          [fetchPublisher, update = std::move(requestUpdate)]() mutable
+              -> folly::coro::Task<void> {
+            co_await fetchPublisher->onRequestUpdate(std::move(update));
+          }))
+      .start();
 }
 
 void MoQSession::onUnsubscribe(Unsubscribe unsubscribe) {
@@ -3563,21 +3588,21 @@ class MoQSession::ReceiverSubscriptionHandle
         trackAlias_(alias),
         session_(std::move(session)) {}
 
-  folly::coro::Task<SubscriptionHandle::SubscribeUpdateResult> subscribeUpdate(
-      SubscribeUpdate subscribeUpdate) override {
+  folly::coro::Task<SubscriptionHandle::RequestUpdateResult> requestUpdate(
+      RequestUpdate requestUpdate) override {
     if (!session_) {
       co_return compat::makeUnexpected(
-          SubscribeUpdateError{
-              subscribeUpdate.requestID,
+          RequestError{
+              requestUpdate.requestID,
               RequestErrorCode::INTERNAL_ERROR,
               "Session closed"});
     }
 
-    subscribeUpdate.existingRequestID = subscribeOk_->requestID;
+    requestUpdate.existingRequestID = subscribeOk_->requestID;
     if (getDraftMajorVersion(*(session_->getNegotiatedVersion())) >= 14) {
-      subscribeUpdate.requestID = session_->getNextRequestID();
+      requestUpdate.requestID = session_->getNextRequestID();
     } else {
-      subscribeUpdate.requestID = subscribeOk_->requestID;
+      requestUpdate.requestID = subscribeOk_->requestID;
     }
 
     // For v15+, create promise and wait for REQUEST_OK response
@@ -3585,24 +3610,24 @@ class MoQSession::ReceiverSubscriptionHandle
     if (getDraftMajorVersion(*(session_->getNegotiatedVersion())) >= 15) {
       // Create promise/contract for tracking the response
       auto contract = folly::coro::makePromiseContract<
-          folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>();
+          folly::Expected<RequestOk, RequestError>>();
 
       // Register pending request
       session_->pendingRequests_.emplace(
-          subscribeUpdate.requestID,
-          PendingRequestState::makeSubscribeUpdate(std::move(contract.first)));
+          requestUpdate.requestID,
+          PendingRequestState::makeRequestUpdate(std::move(contract.first)));
 
-      // Send the SUBSCRIBE_UPDATE message
-      session_->subscribeUpdate(subscribeUpdate);
+      // Send the REQUEST_UPDATE message
+      session_->requestUpdate(requestUpdate);
 
       // Wait for REQUEST_OK or REQUEST_ERROR response
       co_return co_await std::move(contract.second);
     } else {
-      session_->subscribeUpdate(subscribeUpdate);
+      session_->requestUpdate(requestUpdate);
 
-      // Version < 15: Return a constructed response. SubscribeUpdate is fire
+      // Version < 15: Return a constructed response. RequestUpdate is fire
       // and forget
-      co_return SubscribeUpdateOk{.requestID = subscribeUpdate.requestID};
+      co_return RequestOk{.requestID = requestUpdate.requestID};
     }
   }
 
@@ -4090,7 +4115,7 @@ void MoQSession::handleSubscribeUpdateOkFromRequestOk(
   auto pendingRequest = std::move(reqIt->second);
   pendingRequests_.erase(reqIt);
 
-  auto* promise = pendingRequest->tryGetSubscribeUpdate();
+  auto* promise = pendingRequest->tryGetRequestUpdate();
   if (!promise) {
     XLOG(ERR) << "handleSubscribeUpdateOkFromRequestOk: invalid promise type"
               << " requestID=" << requestOk.requestID << " sess=" << this;
@@ -4665,8 +4690,6 @@ void MoQSession::requestUpdateError(
       controlWriteBuf_, requestError, FrameType::REQUEST_UPDATE);
   if (!res) {
     XLOG(ERR) << "writeRequestError for REQUEST_UPDATE failed sess=" << this;
-    // Proceed to cleanup state even if write failed
-    // The write has errored out but this is still an update error
   } else {
     controlWriteEvent_.signal();
   }
@@ -4738,32 +4761,55 @@ void MoQSession::requestUpdate(const RequestUpdate& reqUpdate) {
   }
   XLOG(DBG1) << __func__ << " sess=" << this;
   MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onRequestUpdate);
+
+  // First check if this is for a subscription
   auto trackAliasIt = reqIdToTrackAlias_.find(reqUpdate.existingRequestID);
-  if (trackAliasIt == reqIdToTrackAlias_.end()) {
-    // unknown
-    XLOG(ERR) << "No matching request ID=" << reqUpdate.existingRequestID
-              << " sess=" << this;
+  if (trackAliasIt != reqIdToTrackAlias_.end()) {
+    auto trackIt = subTracks_.find(trackAliasIt->second);
+    if (trackIt == subTracks_.end()) {
+      XLOG(ERR) << "No matching track Alias=" << trackAliasIt->second
+                << " sess=" << this;
+      return;
+    }
+    auto res = moqFrameWriter_.writeRequestUpdate(controlWriteBuf_, reqUpdate);
+    if (!res) {
+      XLOG(ERR) << "writeRequestUpdate failed sess=" << this;
+      return;
+    }
+    controlWriteEvent_.signal();
     return;
   }
-  auto trackIt = subTracks_.find(trackAliasIt->second);
-  if (trackIt == subTracks_.end()) {
-    // unknown
-    XLOG(ERR) << "No matching track Alias=" << trackAliasIt->second
-              << " sess=" << this;
+
+  // Check if this is for a fetch
+  auto fetchIt = fetches_.find(reqUpdate.existingRequestID);
+  if (fetchIt != fetches_.end()) {
+    auto res = moqFrameWriter_.writeRequestUpdate(controlWriteBuf_, reqUpdate);
+    if (!res) {
+      XLOG(ERR) << "writeRequestUpdate failed sess=" << this;
+      return;
+    }
+    controlWriteEvent_.signal();
     return;
   }
-  auto res = moqFrameWriter_.writeRequestUpdate(controlWriteBuf_, reqUpdate);
-  if (!res) {
-    XLOG(ERR) << "writeRequestUpdate failed sess=" << this;
-    return;
-  }
-  controlWriteEvent_.signal();
+
+  // Unknown request ID
+  XLOG(ERR) << "No matching request ID=" << reqUpdate.existingRequestID
+            << " sess=" << this;
 }
 
 class MoQSession::ReceiverFetchHandle : public Publisher::FetchHandle {
  public:
   ReceiverFetchHandle(FetchOk ok, std::shared_ptr<MoQSession> session)
       : FetchHandle(std::move(ok)), session_(std::move(session)) {}
+
+  folly::coro::Task<FetchHandle::RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) override {
+    co_return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::NOT_SUPPORTED,
+            "REQUEST_UPDATE not supported for FETCH"});
+  }
 
   void fetchCancel() override {
     if (session_) {
@@ -5388,7 +5434,7 @@ void MoQSession::onRequestOk(RequestOk requestOk, FrameType frameType) {
     }
     case FrameType::REQUEST_OK: {
       switch (reqIt->second->getType()) {
-        case PendingRequestState::Type::SUBSCRIBE_UPDATE:
+        case PendingRequestState::Type::REQUEST_UPDATE:
           handleSubscribeUpdateOkFromRequestOk(requestOk, reqIt);
           break;
         default:

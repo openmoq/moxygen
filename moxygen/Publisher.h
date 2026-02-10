@@ -50,23 +50,13 @@ class SubscriptionHandle {
   virtual ~SubscriptionHandle() = default;
 
   virtual void unsubscribe() = 0;
-  using SubscribeUpdateResult =
-      compat::Expected<SubscribeUpdateOk, SubscribeUpdateError>;
-  // Updates subscription parameters (start/end locations, priority, forward).
+
+  using RequestUpdateResult = compat::Expected<RequestOk, RequestError>;
+  // Updates request parameters (start/end locations, priority, forward).
   // This is a coroutine because it may do async work, such as forwarding the
   // update to the upstream publisher in a relay scenario.
-#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
-  // Coroutine-based API for Folly + mvfst mode
-  virtual compat::Task<SubscribeUpdateResult> subscribeUpdate(
-      SubscribeUpdate subUpdate) = 0;
-#else
-  // Callback-based API for std-mode and Folly + picoquic
-  virtual void subscribeUpdateWithCallback(
-      SubscribeUpdate subUpdate,
-      std::shared_ptr<
-          compat::ResultCallback<SubscribeUpdateOk, SubscribeUpdateError>>
-          callback) = 0;
-#endif
+  virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) = 0;
 
   const SubscribeOk& subscribeOk() const {
     return *subscribeOk_;
@@ -148,6 +138,10 @@ class Publisher {
 
     virtual void fetchCancel() = 0;
 
+    using RequestUpdateResult = folly::Expected<RequestOk, RequestError>;
+    virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+        RequestUpdate reqUpdate) = 0;
+
     const FetchOk& fetchOk() const {
       return *fetchOk_;
     }
@@ -193,6 +187,10 @@ class Publisher {
     virtual ~SubscribeNamespaceHandle() = default;
 
     virtual void unsubscribeNamespace() = 0;
+
+    using RequestUpdateResult = folly::Expected<RequestOk, RequestError>;
+    virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+        RequestUpdate reqUpdate) = 0;
 
     const SubscribeNamespaceOk& subscribeNamespaceOk() const {
       return *subscribeNamespaceOk_;

@@ -209,6 +209,9 @@ class MoQSession : public MoQSessionBase,
   compat::Task<void> handleSubscribe(
       SubscribeRequest sub,
       std::shared_ptr<TrackPublisherImpl> trackPublisher);
+  void sendSubscribeOk(const SubscribeOk& subOk);
+  void subscribeError(const SubscribeError& subErr);
+  void unsubscribe(const Unsubscribe& unsubscribe);
 
   // Request update helpers - these are the renamed SubscribeUpdate operations
   void requestUpdate(const RequestUpdate& reqUpdate);
@@ -216,6 +219,20 @@ class MoQSession : public MoQSessionBase,
   void requestUpdateError(
       const SubscribeUpdateError& requestError,
       RequestID existingRequestID);
+
+  // Backward compatibility forwarders
+  void subscribeUpdate(const SubscribeUpdate& subUpdate) {
+    requestUpdate(subUpdate);
+  }
+  void subscribeUpdateOk(const RequestOk& reqOk) {
+    requestUpdateOk(reqOk);
+  }
+  void subscribeUpdateError(
+      const SubscribeUpdateError& reqError,
+      RequestID existingReqID) {
+    requestUpdateError(reqError, existingReqID);
+  }
+  void sendPublishDone(const PublishDone& pubDone);
 
   compat::Task<void> handleFetch(
       Fetch fetch,
@@ -279,7 +296,8 @@ class MoQSession : public MoQSessionBase,
           std::unique_ptr<PendingRequestState>,
           RequestID::hash>::iterator reqIt);
 
-  // Folly-specific state
+  // Core session state
+  MoQControlCodec::Direction dir_;
   folly::MaybeManagedPtr<proxygen::WebTransport> wt_;
   // Control channel state
   folly::IOBufQueue controlWriteBuf_{folly::IOBufQueue::cacheChainLength()};
@@ -295,18 +313,20 @@ class MoQSession : public MoQSessionBase,
   mutable quic::TransportInfo cachedTransportInfo_;
   mutable std::chrono::steady_clock::time_point lastTransportInfoUpdate_{};
 
-  // Type-specific REQUEST_UPDATE handlers - take handles directly to avoid
-  // double lookup
+  // PublishNamespace response methods - available for responding to
+  // incoming publishNamespaces
+  void publishNamespaceError(
+      const PublishNamespaceError& publishNamespaceError);
+  void subscribeNamespaceError(
+      const SubscribeNamespaceError& subscribeNamespaceError);
+
+  // Type-specific REQUEST_UPDATE handlers
   virtual void handleSubscribeRequestUpdate(
       RequestUpdate requestUpdate,
       std::shared_ptr<TrackPublisherImpl> trackPublisher);
   virtual void handleFetchRequestUpdate(
       const RequestUpdate& requestUpdate,
       const std::shared_ptr<FetchPublisherImpl>& fetchPublisher);
-  virtual void handlePublishRequestUpdate(
-      const RequestUpdate& requestUpdate,
-      RequestID existingRequestID,
-      TrackAlias trackAlias);
 
   // Pending request state management
   class PendingRequestState {
@@ -316,7 +336,7 @@ class MoQSession : public MoQSessionBase,
       PUBLISH,
       TRACK_STATUS,
       FETCH,
-      SUBSCRIBE_UPDATE,
+      REQUEST_UPDATE,
       // PublishNamespace types - only handled by MoQRelaySession subclass
       PUBLISH_NAMESPACE,
       SUBSCRIBE_NAMESPACE
@@ -335,9 +355,8 @@ class MoQSession : public MoQSessionBase,
       folly::coro::Promise<folly::Expected<TrackStatusOk, TrackStatusError>>
           trackStatus_;
       std::shared_ptr<FetchTrackReceiveState> fetchTrack_;
-      folly::coro::Promise<
-          folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
-          subscribeUpdate_;
+      folly::coro::Promise<folly::Expected<RequestOk, RequestError>>
+          requestUpdate_;
     } storage_;
 
    public:
@@ -376,12 +395,12 @@ class MoQSession : public MoQSessionBase,
       return result;
     }
 
-    static std::unique_ptr<PendingRequestState> makeSubscribeUpdate(
-        folly::coro::Promise<
-            folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>> promise) {
+    static std::unique_ptr<PendingRequestState> makeRequestUpdate(
+        folly::coro::Promise<folly::Expected<RequestOk, RequestError>>
+            promise) {
       auto result = std::make_unique<PendingRequestState>();
-      result->type_ = Type::SUBSCRIBE_UPDATE;
-      new (&result->storage_.subscribeUpdate_) auto(std::move(promise));
+      result->type_ = Type::REQUEST_UPDATE;
+      new (&result->storage_.requestUpdate_) auto(std::move(promise));
       return result;
     }
 
@@ -406,8 +425,8 @@ class MoQSession : public MoQSessionBase,
         case Type::FETCH:
           storage_.fetchTrack_.~shared_ptr<FetchTrackReceiveState>();
           break;
-        case Type::SUBSCRIBE_UPDATE:
-          storage_.subscribeUpdate_.~Promise();
+        case Type::REQUEST_UPDATE:
+          storage_.requestUpdate_.~Promise();
           break;
         case Type::PUBLISH_NAMESPACE:
         case Type::SUBSCRIBE_NAMESPACE:
@@ -432,7 +451,7 @@ class MoQSession : public MoQSessionBase,
           return ok ? FrameType::TRACK_STATUS_OK : FrameType::TRACK_STATUS;
         case Type::FETCH:
           return ok ? FrameType::FETCH_OK : FrameType::FETCH_ERROR;
-        case Type::SUBSCRIBE_UPDATE:
+        case Type::REQUEST_UPDATE:
           return ok ? FrameType::REQUEST_OK : FrameType::REQUEST_ERROR;
         case Type::PUBLISH_NAMESPACE:
           return ok ? FrameType::PUBLISH_NAMESPACE_OK
@@ -475,11 +494,9 @@ class MoQSession : public MoQSessionBase,
       return type_ == Type::FETCH ? &storage_.fetchTrack_ : nullptr;
     }
 
-    folly::coro::Promise<
-        folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>*
-    tryGetSubscribeUpdate() {
-      return type_ == Type::SUBSCRIBE_UPDATE ? &storage_.subscribeUpdate_
-                                             : nullptr;
+    folly::coro::Promise<folly::Expected<RequestOk, RequestError>>*
+    tryGetRequestUpdate() {
+      return type_ == Type::REQUEST_UPDATE ? &storage_.requestUpdate_ : nullptr;
     }
 
     Type getType() const {

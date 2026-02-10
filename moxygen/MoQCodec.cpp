@@ -501,7 +501,7 @@ compat::Expected<compat::Unit, ErrorCode> MoQControlCodec::parseFrame(
       }
       break;
     }
-    case FrameType::SUBSCRIBE_UPDATE: {
+    case FrameType::REQUEST_UPDATE: {
       auto res = moqFrameParser_.parseRequestUpdate(cursor, curFrameLength_);
       if (res) {
         if (callback_) {
