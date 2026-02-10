@@ -12,6 +12,7 @@
 #include <moxygen/MoQTypes.h>
 #include <moxygen/MoQVersions.h>
 #include <moxygen/compat/Try.h>
+#include <moxygen/transports/PicoquicH3Transport.h>
 
 #include <picoquic_packet_loop.h>
 #include <picosocks.h>
@@ -85,13 +86,23 @@ PicoquicMoQServer::~PicoquicMoQServer() {
 }
 
 bool PicoquicMoQServer::initQuicContext() {
+  // Determine ALPN based on transport mode if not explicitly set
+  std::string alpn = config_.alpn;
+  if (alpn.empty()) {
+    if (config_.transportMode == TransportMode::WEBTRANSPORT) {
+      alpn = "h3";  // HTTP/3 for WebTransport
+    } else {
+      alpn = std::string(kAlpnMoqtLegacy);  // "moq-00" for raw QUIC
+    }
+  }
+
   // Create QUIC context
   quic_ = picoquic_create(
       static_cast<uint32_t>(config_.maxConnections),
       config_.certFile.c_str(),
       config_.keyFile.c_str(),
       nullptr,  // cert_root_file (not needed for server)
-      config_.alpn.c_str(),
+      alpn.c_str(),
       nullptr,  // default_callback_fn (set separately)
       nullptr,  // default_callback_ctx
       nullptr,  // cnx_id_callback

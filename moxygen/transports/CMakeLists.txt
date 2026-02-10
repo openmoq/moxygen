@@ -73,6 +73,7 @@ endif()
 if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
   add_library(moqtransport_picoquic
     PicoquicWebTransport.cpp
+    PicoquicH3Transport.cpp
     PicoquicMoQClient.cpp
     PicoquicMoQServer.cpp
   )

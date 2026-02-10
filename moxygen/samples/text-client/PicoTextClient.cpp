@@ -23,6 +23,7 @@
 #include <moxygen/compat/SocketAddress.h>
 #include <moxygen/events/MoQSimpleExecutor.h>
 #include <moxygen/transports/PicoquicMoQClient.h>
+#include <moxygen/transports/TransportMode.h>
 
 #include <atomic>
 #include <chrono>
@@ -46,6 +47,7 @@ struct Args {
   std::string ns{"moq-date"};
   std::string nsDelimiter{"/"};
   std::string track{"date"};
+  std::string transport{"quic"}; // quic, webtransport
   bool insecure{false};
   int connectTimeout{5000};
 };
@@ -62,8 +64,10 @@ Args parseArgs(int argc, char* argv[]) {
       args.ns = argv[++i];
     } else if (arg == "--ns-delimiter" && i + 1 < argc) {
       args.nsDelimiter = argv[++i];
-    } else if ((arg == "--track" || arg == "-t") && i + 1 < argc) {
+    } else if ((arg == "--track") && i + 1 < argc) {
       args.track = argv[++i];
+    } else if ((arg == "--transport" || arg == "-T") && i + 1 < argc) {
+      args.transport = argv[++i];
     } else if (arg == "--insecure" || arg == "-k") {
       args.insecure = true;
     } else if (arg == "--timeout" && i + 1 < argc) {
@@ -71,14 +75,15 @@ Args parseArgs(int argc, char* argv[]) {
     } else if (arg == "--help" || arg == "-h") {
       std::cout
           << "Usage: picotextclient [options]\n"
-          << "  --host, -H <host>        Server hostname (required)\n"
-          << "  --port, -p <port>        Server port (default: 4433)\n"
-          << "  --ns,   -n <namespace>   Track namespace (default: moq-date)\n"
-          << "  --ns-delimiter <delim>   Namespace delimiter (default: /)\n"
-          << "  --track, -t <name>       Track name (default: date)\n"
-          << "  --insecure, -k           Skip TLS certificate validation\n"
-          << "  --timeout <ms>           Connect timeout in ms (default: 5000)\n"
-          << "  --help, -h               Show this help\n";
+          << "  --host, -H <host>          Server hostname (required)\n"
+          << "  --port, -p <port>          Server port (default: 4433)\n"
+          << "  --ns,   -n <namespace>     Track namespace (default: moq-date)\n"
+          << "  --ns-delimiter <delim>     Namespace delimiter (default: /)\n"
+          << "  --track <name>             Track name (default: date)\n"
+          << "  --transport, -T <type>     quic|webtransport (default: quic)\n"
+          << "  --insecure, -k             Skip TLS certificate validation\n"
+          << "  --timeout <ms>             Connect timeout in ms (default: 5000)\n"
+          << "  --help, -h                 Show this help\n";
       std::exit(0);
     } else {
       std::cerr << "Unknown argument: " << arg << "\n";
@@ -304,8 +309,10 @@ void signalHandler(int /*sig*/) {
 int main(int argc, char* argv[]) {
   auto args = parseArgs(argc, argv);
 
+  auto transportMode = moxygen::transports::transportModeFromString(args.transport);
   std::cout << "Connecting to " << args.host << ":" << args.port
             << " ns='" << args.ns << "' track='" << args.track << "'"
+            << " transport=" << moxygen::transports::transportModeToString(transportMode)
             << (args.insecure ? " (insecure)" : "") << "\n";
 
   // Create executor
@@ -316,7 +323,8 @@ int main(int argc, char* argv[]) {
   moxygen::transports::PicoquicMoQClient::Config clientConfig;
   clientConfig.serverHost = args.host;
   clientConfig.serverPort = args.port;
-  clientConfig.alpn = std::string(moxygen::kAlpnMoqtLegacy);
+  clientConfig.transportMode = transportMode;
+  // ALPN is auto-selected based on transport mode
   clientConfig.insecure = args.insecure;
   clientConfig.idleTimeout = std::chrono::milliseconds(30000);
 

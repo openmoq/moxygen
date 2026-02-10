@@ -23,6 +23,7 @@
 #include <moxygen/compat/SocketAddress.h>
 #include <moxygen/events/MoQSimpleExecutor.h>
 #include <moxygen/transports/PicoquicMoQServer.h>
+#include <moxygen/transports/TransportMode.h>
 
 #include <atomic>
 #include <chrono>
@@ -49,7 +50,8 @@ struct Args {
   std::string certFile;
   std::string keyFile;
   std::string ns{"moq-date"};
-  std::string mode{"spg"}; // spg, spo, datagram
+  std::string mode{"spg"};       // spg, spo, datagram
+  std::string transport{"quic"}; // quic, webtransport
 };
 
 Args parseArgs(int argc, char* argv[]) {
@@ -66,14 +68,17 @@ Args parseArgs(int argc, char* argv[]) {
       args.ns = argv[++i];
     } else if ((arg == "--mode" || arg == "-m") && i + 1 < argc) {
       args.mode = argv[++i];
+    } else if ((arg == "--transport" || arg == "-t") && i + 1 < argc) {
+      args.transport = argv[++i];
     } else if (arg == "--help" || arg == "-h") {
       std::cout << "Usage: picodateserver [options]\n"
-                << "  --port, -p <port>    Server port (default: 4433)\n"
-                << "  --cert, -c <file>    TLS certificate file (required)\n"
-                << "  --key,  -k <file>    TLS private key file (required)\n"
-                << "  --ns,   -n <ns>      Track namespace (default: moq-date)\n"
-                << "  --mode, -m <mode>    spg|spo|datagram (default: spg)\n"
-                << "  --help, -h           Show this help\n";
+                << "  --port, -p <port>         Server port (default: 4433)\n"
+                << "  --cert, -c <file>         TLS certificate file (required)\n"
+                << "  --key,  -k <file>         TLS private key file (required)\n"
+                << "  --ns,   -n <ns>           Track namespace (default: moq-date)\n"
+                << "  --mode, -m <mode>         spg|spo|datagram (default: spg)\n"
+                << "  --transport, -t <type>    quic|webtransport (default: quic)\n"
+                << "  --help, -h                Show this help\n";
       std::exit(0);
     } else {
       std::cerr << "Unknown argument: " << arg << "\n";
@@ -602,8 +607,10 @@ int main(int argc, char* argv[]) {
   auto args = parseArgs(argc, argv);
   auto mode = parseMode(args.mode);
 
+  auto transportMode = moxygen::transports::transportModeFromString(args.transport);
   std::cout << "Starting picodateserver on port " << args.port
             << " with namespace '" << args.ns << "' mode=" << args.mode
+            << " transport=" << moxygen::transports::transportModeToString(transportMode)
             << "\n";
 
   // Create executor
@@ -616,7 +623,8 @@ int main(int argc, char* argv[]) {
   moxygen::transports::PicoquicMoQServer::Config serverConfig;
   serverConfig.certFile = args.certFile;
   serverConfig.keyFile = args.keyFile;
-  serverConfig.alpn = std::string(moxygen::kAlpnMoqtLegacy);
+  serverConfig.transportMode = transportMode;
+  // ALPN is auto-selected based on transport mode
 
   // Create server
   auto server = std::make_unique<moxygen::transports::PicoquicMoQServer>(

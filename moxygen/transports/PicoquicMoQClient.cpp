@@ -11,6 +11,7 @@
 #include <moxygen/MoQSession.h>
 #include <moxygen/MoQTypes.h>
 #include <moxygen/MoQVersions.h>
+#include <moxygen/transports/PicoquicH3Transport.h>
 
 #include <picoquic_packet_loop.h>
 #include <picosocks.h>
@@ -36,13 +37,23 @@ PicoquicMoQClient::~PicoquicMoQClient() {
 }
 
 bool PicoquicMoQClient::initQuicContext() {
+  // Determine ALPN based on transport mode if not explicitly set
+  std::string alpn = config_.alpn;
+  if (alpn.empty()) {
+    if (config_.transportMode == TransportMode::WEBTRANSPORT) {
+      alpn = "h3";  // HTTP/3 for WebTransport
+    } else {
+      alpn = std::string(kAlpnMoqtLegacy);  // "moq-00" for raw QUIC
+    }
+  }
+
   // Create QUIC context
   quic_ = picoquic_create(
       1,  // max_connections
       config_.certFile.empty() ? nullptr : config_.certFile.c_str(),
       config_.keyFile.empty() ? nullptr : config_.keyFile.c_str(),
       config_.caFile.empty() ? nullptr : config_.caFile.c_str(),
-      config_.alpn.c_str(),
+      alpn.c_str(),
       nullptr,  // default_callback_fn (set per connection)
       nullptr,  // default_callback_ctx
       nullptr,  // cnx_id_callback
@@ -219,6 +230,9 @@ int PicoquicMoQClient::picoquicCallback(
       if (client->transport_) {
         return PicoquicWebTransport::picoCallback(
             cnx, stream_id, bytes, length, event, client->transport_.get(), stream_ctx);
+      } else if (client->h3Transport_) {
+        return PicoquicH3Transport::quicCallback(
+            cnx, stream_id, bytes, length, event, client->h3Transport_.get(), stream_ctx);
       }
       break;
   }
@@ -231,37 +245,59 @@ void PicoquicMoQClient::onConnected() {
     return;  // Already connected
   }
 
-  // Create transport wrapper with thread dispatcher
-  transport_ = std::make_shared<PicoquicWebTransport>(cnx_, false, &dispatcher_);
+  // Get the underlying WebTransportInterface for the session
+  compat::WebTransportInterface* wtInterface = nullptr;
 
-  // Update connection callback context to use transport directly
-  picoquic_set_callback(cnx_, PicoquicWebTransport::picoCallback, transport_.get());
+  if (config_.transportMode == TransportMode::WEBTRANSPORT) {
+    // Create HTTP/3 transport for WebTransport mode
+    h3Transport_ = std::make_shared<PicoquicH3Transport>(
+        cnx_, config_.wtPath, &dispatcher_);
+    h3Transport_->initH3Context();
+    h3Transport_->initiateWebTransportUpgrade();
+    wtInterface = h3Transport_.get();
+
+    // Update connection callback context to use h3 transport
+    picoquic_set_callback(cnx_, PicoquicH3Transport::quicCallback, h3Transport_.get());
+  } else {
+    // Create raw QUIC transport (original behavior)
+    transport_ = std::make_shared<PicoquicWebTransport>(cnx_, false, &dispatcher_);
+    wtInterface = transport_.get();
+
+    // Update connection callback context to use transport directly
+    picoquic_set_callback(cnx_, PicoquicWebTransport::picoCallback, transport_.get());
+  }
 
 #if !MOXYGEN_QUIC_MVFST
-  // Create MoQ session (std-mode)
-  session_ = std::make_shared<MoQSession>(transport_, executor_);
+  // Create MoQ session (std-mode) with the appropriate transport
+  std::shared_ptr<compat::WebTransportInterface> wtShared;
+  if (config_.transportMode == TransportMode::WEBTRANSPORT) {
+    wtShared = h3Transport_;
+  } else {
+    wtShared = transport_;
+  }
+  session_ = std::make_shared<MoQSession>(wtShared, executor_);
 
   // Set up transport callbacks
-  transport_->setNewUniStreamCallback([this](compat::StreamReadHandle* stream) {
+  wtInterface->setNewUniStreamCallback([this](compat::StreamReadHandle* stream) {
     if (session_) {
       session_->onNewUniStream(stream);
     }
   });
 
-  transport_->setNewBidiStreamCallback([this](compat::BidiStreamHandle* stream) {
+  wtInterface->setNewBidiStreamCallback([this](compat::BidiStreamHandle* stream) {
     if (session_) {
       session_->onNewBidiStream(stream);
     }
   });
 
-  transport_->setDatagramCallback(
+  wtInterface->setDatagramCallback(
       [this](std::unique_ptr<compat::Payload> datagram) {
         if (session_) {
           session_->onDatagram(std::move(datagram));
         }
       });
 
-  transport_->setSessionCloseCallback([this](std::optional<uint32_t> error) {
+  wtInterface->setSessionCloseCallback([this](std::optional<uint32_t> error) {
     if (session_) {
       session_->onSessionEnd(error);
     }
@@ -342,6 +378,11 @@ void PicoquicMoQClient::close(SessionCloseErrorCode errorCode) {
     transport_.reset();
   }
 
+  if (h3Transport_) {
+    h3Transport_->closeSession(static_cast<uint32_t>(errorCode));
+    h3Transport_.reset();
+  }
+
   // Delete the network thread (signals close and waits for thread exit)
   if (threadCtx_) {
     picoquic_delete_network_thread(threadCtx_);
@@ -354,20 +395,37 @@ void PicoquicMoQClient::close(SessionCloseErrorCode errorCode) {
 std::unique_ptr<compat::MoQClientInterface> PicoquicMoQClientFactory::createClient(
     std::shared_ptr<MoQExecutor> executor,
     const std::string& url) {
-  // Parse URL to extract host and port
-  // Expected format: moq://host:port or moq-wt://host:port/path
+  // Parse URL to extract host, port, and transport mode
+  // Expected formats:
+  //   moq://host:port         - raw QUIC
+  //   moq-wt://host:port/path - WebTransport
+  //   https://host:port/path  - WebTransport (standard WebTransport URL)
   PicoquicMoQClient::Config config = defaultConfig_;
 
-  std::regex urlRegex(R"(moq(?:-wt)?://([^:/]+)(?::(\d+))?(?:/.*)?)", std::regex::icase);
+  // Check for WebTransport URLs
+  std::regex wtUrlRegex(R"((moq-wt|https)://([^:/]+)(?::(\d+))?(/[^\s]*)?)", std::regex::icase);
+  std::regex quicUrlRegex(R"(moq://([^:/]+)(?::(\d+))?(?:/.*)?)", std::regex::icase);
   std::smatch match;
 
-  if (std::regex_match(url, match, urlRegex)) {
+  if (std::regex_match(url, match, wtUrlRegex)) {
+    // WebTransport URL
+    config.transportMode = TransportMode::WEBTRANSPORT;
+    config.serverHost = match[2].str();
+    if (match[3].matched) {
+      config.serverPort = static_cast<uint16_t>(std::stoi(match[3].str()));
+    }
+    if (match[4].matched) {
+      config.wtPath = match[4].str();
+    }
+  } else if (std::regex_match(url, match, quicUrlRegex)) {
+    // Raw QUIC URL
+    config.transportMode = TransportMode::QUIC;
     config.serverHost = match[1].str();
     if (match[2].matched) {
       config.serverPort = static_cast<uint16_t>(std::stoi(match[2].str()));
     }
   } else {
-    // Assume it's just a host:port
+    // Assume it's just a host:port (raw QUIC)
     size_t colonPos = url.find(':');
     if (colonPos != std::string::npos) {
       config.serverHost = url.substr(0, colonPos);

@@ -12,6 +12,7 @@
 
 #include <moxygen/compat/MoQServerInterface.h>
 #include <moxygen/transports/PicoquicWebTransport.h>
+#include <moxygen/transports/TransportMode.h>
 
 // Forward declaration
 namespace moxygen {
@@ -27,16 +28,28 @@ class MoQSession;
 
 namespace moxygen::transports {
 
+// Forward declaration
+class PicoquicH3Transport;
+
 /**
  * PicoquicMoQServer implements MoQServerInterface using picoquic.
  * This provides a pure C++ implementation without Folly/Proxygen dependencies.
+ *
+ * Supports two transport modes:
+ * - QUIC: Direct MoQ over QUIC (raw QUIC with "moq-00" ALPN)
+ * - WEBTRANSPORT: MoQ over WebTransport over HTTP/3 ("h3" ALPN)
+ *
+ * WebTransport mode enables interoperability with mvfst/proxygen clients.
  */
 class PicoquicMoQServer : public compat::MoQServerInterface {
  public:
   struct Config {
     std::string certFile;  // Server certificate (required)
     std::string keyFile;   // Server private key (required)
-    std::string alpn{"moq-00"};
+    std::string alpn;      // If empty, auto-selected based on transport mode
+
+    // Transport mode selection
+    TransportMode transportMode{TransportMode::QUIC};
 
     // Connection settings
     std::chrono::milliseconds idleTimeout{30000};

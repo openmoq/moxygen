@@ -12,6 +12,7 @@
 
 #include <moxygen/compat/MoQClientInterface.h>
 #include <moxygen/transports/PicoquicWebTransport.h>
+#include <moxygen/transports/TransportMode.h>
 
 // Forward declaration
 namespace moxygen {
@@ -26,17 +27,30 @@ class MoQSession;
 
 namespace moxygen::transports {
 
+// Forward declaration
+class PicoquicH3Transport;
+
 /**
  * PicoquicMoQClient implements MoQClientInterface using picoquic.
  * This provides a pure C++ implementation without Folly/Proxygen dependencies.
+ *
+ * Supports two transport modes:
+ * - QUIC: Direct MoQ over QUIC (raw QUIC with "moq-00" ALPN)
+ * - WEBTRANSPORT: MoQ over WebTransport over HTTP/3 ("h3" ALPN)
+ *
+ * WebTransport mode enables interoperability with mvfst/proxygen servers.
  */
 class PicoquicMoQClient : public compat::MoQClientInterface {
  public:
   struct Config {
     std::string serverHost;
     uint16_t serverPort{443};
-    std::string alpn{"moq-00"};
-    std::string sni;  // If empty, uses serverHost
+    std::string alpn;  // If empty, auto-selected based on transport mode
+    std::string sni;   // If empty, uses serverHost
+
+    // Transport mode selection
+    TransportMode transportMode{TransportMode::QUIC};
+    std::string wtPath{"/moq"};  // WebTransport endpoint path
 
     // TLS settings
     std::string certFile;    // Client certificate (optional)
@@ -112,8 +126,9 @@ class PicoquicMoQClient : public compat::MoQClientInterface {
   picoquic_quic_t* quic_{nullptr};
   picoquic_cnx_t* cnx_{nullptr};
 
-  // Transport wrapper
-  std::shared_ptr<PicoquicWebTransport> transport_;
+  // Transport wrapper (one of these will be used based on mode)
+  std::shared_ptr<PicoquicWebTransport> transport_;      // For QUIC mode
+  std::shared_ptr<PicoquicH3Transport> h3Transport_;     // For WebTransport mode
 
   // MoQ session
   std::shared_ptr<MoQSession> session_;
