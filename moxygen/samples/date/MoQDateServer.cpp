@@ -422,7 +422,8 @@ class DatePublisher : public Publisher {
       } else {
         switch (mode_) {
           case Mode::STREAM_PER_GROUP:
-            subgroupPublisher = publishDate(subgroupPublisher, minute, second);
+            subgroupPublisher =
+                publishDate(subgroupPublisher, minute, second, currentMinute);
             break;
           case Mode::STREAM_PER_OBJECT:
             publishDate(minute, second);
@@ -439,12 +440,19 @@ class DatePublisher : public Publisher {
   std::shared_ptr<SubgroupConsumer> publishDate(
       std::shared_ptr<SubgroupConsumer> subgroupPublisher,
       uint64_t group,
-      uint64_t second) {
+      uint64_t second,
+      uint64_t& currentGroup) {
     uint64_t subgroup = 0;
     uint64_t object = second;
-    if (!subgroupPublisher) {
+    // Create new subgroup if none exists OR if group changed
+    if (!subgroupPublisher || group != currentGroup) {
+      if (subgroupPublisher) {
+        // End the previous group before starting new one
+        subgroupPublisher->endOfGroup(61);
+      }
       subgroupPublisher =
           forwarder_.beginSubgroup(group, subgroup, /*priority=*/0).value();
+      currentGroup = group;
     }
     if (object == 0) {
       subgroupPublisher->object(0, minutePayload(group), kExtensions, false);
