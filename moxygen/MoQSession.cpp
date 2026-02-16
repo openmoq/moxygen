@@ -1345,7 +1345,7 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
       XLOG(ERR) << "Received RequestUpdate before sending FETCH_OK id="
                 << requestID_ << " fetchPub=" << this;
       if (getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 15) {
-        session_->requestUpdateError(
+        session_->subscribeUpdateError(
             RequestError{
                 requestUpdate.requestID,
                 RequestErrorCode::INTERNAL_ERROR,
@@ -1360,7 +1360,7 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
 
     // Call the handle's requestUpdate
     auto updateResult = co_await co_awaitTry(co_withCancellation(
-        session_->cancellationSource_.getToken(),
+        session_->getCancellationSource().getToken(),
         handle_->requestUpdate(std::move(requestUpdate))));
 
     // Only send responses for v15+
@@ -1368,7 +1368,7 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
       if (updateResult.hasException()) {
         XLOG(ERR) << "Exception in requestUpdate ex="
                   << updateResult.exception().what() << " fetchPub=" << this;
-        session_->requestUpdateError(
+        session_->subscribeUpdateError(
             RequestError{
                 updateRequestID,
                 RequestErrorCode::INTERNAL_ERROR,
@@ -1377,10 +1377,10 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
       } else if (updateResult->hasError()) {
         auto updateErr = updateResult->error();
         updateErr.requestID = updateRequestID; // In case app got it wrong
-        session_->requestUpdateError(updateErr, existingRequestID);
+        session_->subscribeUpdateError(updateErr, existingRequestID);
       } else {
         RequestOk requestOk{.requestID = updateRequestID};
-        session_->requestUpdateOk(requestOk);
+        session_->subscribeUpdateOk(requestOk);
       }
     }
   }

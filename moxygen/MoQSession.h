@@ -209,9 +209,6 @@ class MoQSession : public MoQSessionBase,
   compat::Task<void> handleSubscribe(
       SubscribeRequest sub,
       std::shared_ptr<TrackPublisherImpl> trackPublisher);
-  void sendSubscribeOk(const SubscribeOk& subOk);
-  void subscribeError(const SubscribeError& subErr);
-  void unsubscribe(const Unsubscribe& unsubscribe);
 
   // Request update helpers - these are the renamed SubscribeUpdate operations
   void requestUpdate(const RequestUpdate& reqUpdate);
@@ -219,20 +216,6 @@ class MoQSession : public MoQSessionBase,
   void requestUpdateError(
       const SubscribeUpdateError& requestError,
       RequestID existingRequestID);
-
-  // Backward compatibility forwarders
-  void subscribeUpdate(const SubscribeUpdate& subUpdate) {
-    requestUpdate(subUpdate);
-  }
-  void subscribeUpdateOk(const RequestOk& reqOk) {
-    requestUpdateOk(reqOk);
-  }
-  void subscribeUpdateError(
-      const SubscribeUpdateError& reqError,
-      RequestID existingReqID) {
-    requestUpdateError(reqError, existingReqID);
-  }
-  void sendPublishDone(const PublishDone& pubDone);
 
   compat::Task<void> handleFetch(
       Fetch fetch,
@@ -297,7 +280,7 @@ class MoQSession : public MoQSessionBase,
           RequestID::hash>::iterator reqIt);
 
   // Core session state
-  MoQControlCodec::Direction dir_;
+  // Note: dir_ is inherited from MoQSessionBase - do not redeclare here
   folly::MaybeManagedPtr<proxygen::WebTransport> wt_;
   // Control channel state
   folly::IOBufQueue controlWriteBuf_{folly::IOBufQueue::cacheChainLength()};
@@ -312,13 +295,6 @@ class MoQSession : public MoQSessionBase,
   // Cached transport info
   mutable quic::TransportInfo cachedTransportInfo_;
   mutable std::chrono::steady_clock::time_point lastTransportInfoUpdate_{};
-
-  // PublishNamespace response methods - available for responding to
-  // incoming publishNamespaces
-  void publishNamespaceError(
-      const PublishNamespaceError& publishNamespaceError);
-  void subscribeNamespaceError(
-      const SubscribeNamespaceError& subscribeNamespaceError);
 
   // Type-specific REQUEST_UPDATE handlers
   virtual void handleSubscribeRequestUpdate(
@@ -551,6 +527,25 @@ class MoQSession : public MoQSessionBase,
     }
     return compat::SocketAddress();
   }
+
+  // Get the session handling the current request (thread-local)
+  static std::shared_ptr<MoQSession> getRequestSession();
+
+  // Set the request session for the current thread (used by session handlers)
+  static void setRequestSession(std::shared_ptr<MoQSession> session);
+
+  // RAII guard for setting request session
+  class RequestSessionGuard {
+   public:
+    explicit RequestSessionGuard(std::shared_ptr<MoQSession> session) {
+      setRequestSession(std::move(session));
+    }
+    ~RequestSessionGuard() {
+      setRequestSession(nullptr);
+    }
+    RequestSessionGuard(const RequestSessionGuard&) = delete;
+    RequestSessionGuard& operator=(const RequestSessionGuard&) = delete;
+  };
 
   // MoQSessionBase overrides
   void start() override;
