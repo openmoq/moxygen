@@ -1231,6 +1231,35 @@ Uses picoquic transport with the callback-based MoQSessionCompat for a full rela
 - The relay and date server must use different ports (relay: 4443, server: 4567)
 - The client connects to the relay, not the date server
 
+### Workflow 7: Picoquic Relay + Date Server + Text Client with WebTransport (std-mode)
+
+Same as Workflow 6 but using WebTransport (HTTP/3) instead of raw QUIC.
+
+```bash
+# Terminal 1: Start picoquic relay server with WebTransport
+./_build_std/moxygen/samples/relay/picorelayserver -p 4443 \
+  --cert ./certs/server-cert.pem --key ./certs/server-key.pem \
+  --transport webtransport
+
+# Terminal 2: Start picoquic date server (publishes to relay via WebTransport)
+./_build_std/moxygen/samples/date/picodateserver -p 4567 \
+  --cert ./certs/server-cert.pem --key ./certs/server-key.pem \
+  --relay_url "https://127.0.0.1:4443/moq"
+
+# Terminal 3: Subscribe via relay with WebTransport
+./_build_std/moxygen/samples/text-client/picotextclient -H 127.0.0.1 -p 4443 \
+  --ns moq-date --track date --transport webtransport
+```
+
+**Differences from raw QUIC (Workflow 6):**
+
+| Component | Raw QUIC | WebTransport |
+|-----------|----------|--------------|
+| Relay | (default) | `--transport webtransport` |
+| Date Server URL | `moq://...` | `https://...` |
+| Client | (default) | `--transport webtransport` |
+| ALPN | `moq-00` | `h3` |
+
 ### Debug Logging
 
 All binaries use glog. Set verbosity with `--v` and per-module with `--vmodule`:
