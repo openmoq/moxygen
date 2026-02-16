@@ -22,6 +22,8 @@
 #include <moxygen/compat/MoQServerInterface.h>
 #include <moxygen/compat/SocketAddress.h>
 #include <moxygen/events/MoQSimpleExecutor.h>
+#include <moxygen/transports/PicoquicMoQClient.h>
+#include <moxygen/transports/PicoquicMoQRelayClient.h>
 #include <moxygen/transports/PicoquicMoQServer.h>
 #include <moxygen/transports/TransportMode.h>
 
@@ -34,6 +36,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <map>
@@ -52,7 +55,49 @@ struct Args {
   std::string ns{"moq-date"};
   std::string mode{"spg"};       // spg, spo, datagram
   std::string transport{"quic"}; // quic, webtransport
+  std::string relayUrl;          // relay server URL (e.g., https://host:port/path)
+  bool insecure{false};          // skip TLS certificate validation
+  uint32_t relayConnectTimeout{5000}; // relay connect timeout in ms
 };
+
+// Simple URL parser for relay URL
+struct ParsedUrl {
+  std::string scheme;
+  std::string host;
+  uint16_t port{443};
+  std::string path;
+  bool valid{false};
+};
+
+ParsedUrl parseUrl(const std::string& url) {
+  ParsedUrl result;
+
+  // Match: scheme://host[:port][/path]
+  std::regex urlRegex(
+      R"(^(https?|wss?|moq)://([^/:]+)(?::(\d+))?(/.*)?$)",
+      std::regex::icase);
+
+  std::smatch match;
+  if (std::regex_match(url, match, urlRegex)) {
+    result.scheme = match[1].str();
+    result.host = match[2].str();
+    if (match[3].matched) {
+      result.port = static_cast<uint16_t>(std::stoi(match[3].str()));
+    } else {
+      // Default ports
+      if (result.scheme == "https" || result.scheme == "wss" ||
+          result.scheme == "moq") {
+        result.port = 443;
+      } else {
+        result.port = 80;
+      }
+    }
+    result.path = match[4].matched ? match[4].str() : "/moq";
+    result.valid = true;
+  }
+
+  return result;
+}
 
 Args parseArgs(int argc, char* argv[]) {
   Args args;
@@ -70,6 +115,12 @@ Args parseArgs(int argc, char* argv[]) {
       args.mode = argv[++i];
     } else if ((arg == "--transport" || arg == "-t") && i + 1 < argc) {
       args.transport = argv[++i];
+    } else if ((arg == "--relay_url" || arg == "-r") && i + 1 < argc) {
+      args.relayUrl = argv[++i];
+    } else if (arg == "--insecure") {
+      args.insecure = true;
+    } else if (arg == "--relay_connect_timeout" && i + 1 < argc) {
+      args.relayConnectTimeout = static_cast<uint32_t>(std::stoi(argv[++i]));
     } else if (arg == "--help" || arg == "-h") {
       std::cout << "Usage: picodateserver [options]\n"
                 << "  --port, -p <port>         Server port (default: 4433)\n"
@@ -78,6 +129,9 @@ Args parseArgs(int argc, char* argv[]) {
                 << "  --ns,   -n <ns>           Track namespace (default: moq-date)\n"
                 << "  --mode, -m <mode>         spg|spo|datagram (default: spg)\n"
                 << "  --transport, -t <type>    quic|webtransport (default: quic)\n"
+                << "  --relay_url, -r <url>     Relay server URL (e.g., https://host:port/moq)\n"
+                << "  --insecure                Skip TLS certificate validation\n"
+                << "  --relay_connect_timeout   Relay connect timeout in ms (default: 5000)\n"
                 << "  --help, -h                Show this help\n";
       std::exit(0);
     } else {
@@ -115,15 +169,14 @@ class DateSubscriptionHandle : public Publisher::SubscriptionHandle {
     unsubscribed_ = true;
   }
 
-  void subscribeUpdateWithCallback(
-      SubscribeUpdate update,
-      std::shared_ptr<
-          compat::ResultCallback<SubscribeUpdateOk, SubscribeUpdateError>>
+  void requestUpdateWithCallback(
+      RequestUpdate update,
+      std::shared_ptr<compat::ResultCallback<RequestOk, RequestError>>
           callback) override {
-    callback->onError(SubscribeUpdateError{
+    callback->onError(RequestError{
         update.requestID,
-        SubscribeUpdateErrorCode::NOT_SUPPORTED,
-        "Subscribe update not supported"});
+        RequestErrorCode::NOT_SUPPORTED,
+        "Request update not supported"});
   }
 
   bool isUnsubscribed() const {
@@ -643,25 +696,83 @@ int main(int argc, char* argv[]) {
 
   std::cout << "Server listening on port " << args.port << "\n";
 
+  // Relay client (optional)
+  std::unique_ptr<moxygen::transports::PicoquicMoQRelayClient> relayClient;
+  if (!args.relayUrl.empty()) {
+    auto url = parseUrl(args.relayUrl);
+    if (!url.valid) {
+      std::cerr << "Invalid relay URL: " << args.relayUrl << "\n";
+      return 1;
+    }
+
+    std::cout << "Connecting to relay at " << url.host << ":" << url.port
+              << url.path << "\n";
+
+    // Configure relay client
+    moxygen::transports::PicoquicMoQClient::Config clientConfig;
+    clientConfig.serverHost = url.host;
+    clientConfig.serverPort = url.port;
+    clientConfig.wtPath = url.path;
+    clientConfig.insecure = args.insecure;
+    // Use transport mode based on URL scheme:
+    // - moq:// -> raw QUIC mode
+    // - https:// or wss:// -> WebTransport mode
+    if (url.scheme == "moq") {
+      clientConfig.transportMode = moxygen::transports::TransportMode::QUIC;
+    } else {
+      clientConfig.transportMode = moxygen::transports::TransportMode::WEBTRANSPORT;
+    }
+
+    relayClient = std::make_unique<moxygen::transports::PicoquicMoQRelayClient>(
+        executor, std::move(clientConfig));
+
+    // Connect to relay
+    auto ns = args.ns;
+    auto setupCallback = moxygen::compat::makeResultCallback<
+        moxygen::SessionCloseErrorCode>(
+        [&relayClient, publisher, ns]() {
+          std::cout << "Connected to relay, publishing namespace '" << ns
+                    << "'\n";
+          // Announce namespace to relay
+          relayClient->run(
+              publisher,
+              {moxygen::TrackNamespace({ns}, "/")},
+              moxygen::compat::makeResultCallback<moxygen::PublishNamespaceError>(
+                  []() {
+                    std::cout << "Namespace announced to relay\n";
+                  },
+                  [](moxygen::PublishNamespaceError error) {
+                    std::cerr << "Failed to announce namespace: "
+                              << error.reasonPhrase << "\n";
+                  }));
+        },
+        [](moxygen::SessionCloseErrorCode error) {
+          std::cerr << "Failed to connect to relay: "
+                    << static_cast<uint32_t>(error) << "\n";
+        });
+
+    relayClient->setupWithCallback(
+        publisher,
+        nullptr,
+        std::chrono::milliseconds(args.relayConnectTimeout),
+        std::move(setupCallback));
+  }
+
   // Run executor event loop (processes scheduled tasks like the publish loop)
   // The server runs its own thread for the QUIC event loop, so we use the
   // executor loop here for application-level scheduling.
   while (g_running.load()) {
-    // Process pending executor tasks with a short timeout
-    executor->scheduleTimeout(
-        [&]() {
-          if (!g_running.load()) {
-            executor->stop();
-          }
-        },
-        std::chrono::milliseconds(500));
-
-    // Run a batch of tasks (this will block until tasks are available or
-    // the stop signal)
-    executor->run();
+    // Run with short timeout to allow checking g_running periodically
+    executor->runFor(std::chrono::milliseconds(100));
   }
 
   std::cout << "Shutting down...\n";
+
+  // Shutdown relay client first
+  if (relayClient) {
+    relayClient->shutdown();
+  }
+
   server->stop();
 
   return 0;

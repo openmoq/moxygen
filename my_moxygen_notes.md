@@ -1186,6 +1186,51 @@ picotextclient --host localhost --port 4433 --ns moq-date --track date --insecur
 | `--insecure, -k` | false | Skip TLS cert validation |
 | `--timeout` | 5000 | Connect timeout in ms |
 
+### Workflow 6: Picoquic Relay + Date Server + Text Client (std-mode)
+
+Uses picoquic transport with the callback-based MoQSessionCompat for a full relay setup.
+
+```
+  picodateserver            picorelayserver           picotextclient
+  (publisher)                   (relay)                (subscriber)
+      |                            |                        |
+      |--- QUIC connect :4443 ---->|                        |
+      |--- CLIENT_SETUP ---------->|                        |
+      |<-- SERVER_SETUP -----------|                        |
+      |--- PUBLISH_NAMESPACE ----->|                        |
+      |<-- PUBLISH_NAMESPACE_OK ---|                        |
+      |                            |<-- QUIC connect :4443 -|
+      |                            |<-- CLIENT_SETUP -------|
+      |                            |--- SERVER_SETUP ------>|
+      |                            |<-- SUBSCRIBE ----------|
+      |<-- SUBSCRIBE --------------|                        |
+      |--- SUBSCRIBE_OK ---------->|--- SUBSCRIBE_OK ------>|
+      |                            |                        |
+      |--- OBJECT (date/time) ---->|--- OBJECT ------------>| "2026-02-16 12:00:00"
+      :                            :                        :
+```
+
+```bash
+# Terminal 1: Start picoquic relay server
+./_build_std/moxygen/samples/relay/picorelayserver -p 4443 \
+  --cert ./certs/server-cert.pem --key ./certs/server-key.pem
+
+# Terminal 2: Start picoquic date server (publishes to relay)
+./_build_std/moxygen/samples/date/picodateserver -p 4567 \
+  --cert ./certs/server-cert.pem --key ./certs/server-key.pem \
+  --relay_url "moq://127.0.0.1:4443"
+
+# Terminal 3: Subscribe via relay
+./_build_std/moxygen/samples/text-client/picotextclient -H 127.0.0.1 -p 4443 \
+  --ns moq-date --track date
+```
+
+**Key points:**
+- Use `moq://` scheme for raw QUIC transport (uses `moq-00` ALPN)
+- Use `https://` scheme for WebTransport (uses `h3` ALPN)
+- The relay and date server must use different ports (relay: 4443, server: 4567)
+- The client connects to the relay, not the date server
+
 ### Debug Logging
 
 All binaries use glog. Set verbosity with `--v` and per-module with `--vmodule`:
@@ -1828,6 +1873,14 @@ for std-mode builds. Not done yet.
 ---
 
 ## Version History
+
+- **Std-mode relay client fixes** (2026-02-16): Multiple fixes for picoquic relay client flow:
+  - Fixed ALPN bug in `PicoquicMoQClient.cpp`: `picoquic_create_cnx()` was using empty `config_.alpn` instead of the computed ALPN value. Added `computedAlpn_` member variable.
+  - Added `moq://` URL scheme support in `PicoDateServer.cpp` URL parser.
+  - Fixed transport mode selection based on URL scheme: `moq://` → raw QUIC, `https://` → WebTransport.
+  - Added session factory support to `PicoquicMoQClient` for creating `MoQRelaySession` instead of `MoQSession`.
+  - Fixed `PicoquicMoQRelayClient` to use `MoQRelaySession::createRelaySessionFactory()`.
+  - **Critical fix**: Added `flushControlBuf()` call after `writePublishNamespace()` and `writeSubscribeNamespace()` in `MoQRelaySessionCompat.cpp` - control messages were being written but never sent.
 
 - **MoQDateServer minute boundary fix** (2026-02-14): Fixed "Object ID not advancing"
   error when crossing minute boundaries. The `publishDate()` function now properly

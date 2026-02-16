@@ -38,12 +38,12 @@ PicoquicMoQClient::~PicoquicMoQClient() {
 
 bool PicoquicMoQClient::initQuicContext() {
   // Determine ALPN based on transport mode if not explicitly set
-  std::string alpn = config_.alpn;
-  if (alpn.empty()) {
+  computedAlpn_ = config_.alpn;
+  if (computedAlpn_.empty()) {
     if (config_.transportMode == TransportMode::WEBTRANSPORT) {
-      alpn = "h3";  // HTTP/3 for WebTransport
+      computedAlpn_ = "h3";  // HTTP/3 for WebTransport
     } else {
-      alpn = std::string(kAlpnMoqtLegacy);  // "moq-00" for raw QUIC
+      computedAlpn_ = std::string(kAlpnMoqtLegacy);  // "moq-00" for raw QUIC
     }
   }
 
@@ -53,7 +53,7 @@ bool PicoquicMoQClient::initQuicContext() {
       config_.certFile.empty() ? nullptr : config_.certFile.c_str(),
       config_.keyFile.empty() ? nullptr : config_.keyFile.c_str(),
       config_.caFile.empty() ? nullptr : config_.caFile.c_str(),
-      alpn.c_str(),
+      computedAlpn_.c_str(),
       nullptr,  // default_callback_fn (set per connection)
       nullptr,  // default_callback_ctx
       nullptr,  // cnx_id_callback
@@ -136,7 +136,7 @@ void PicoquicMoQClient::connectWithCallback(
       picoquic_current_time(),
       0,  // preferred_version (0 = default)
       sni.c_str(),
-      config_.alpn.c_str(),
+      computedAlpn_.c_str(),
       1);  // client_mode
 
   if (!cnx_) {
@@ -275,7 +275,13 @@ void PicoquicMoQClient::onConnected() {
   } else {
     wtShared = transport_;
   }
-  session_ = std::make_shared<MoQSession>(wtShared, executor_);
+
+  // Use session factory if provided, otherwise create regular MoQSession
+  if (config_.sessionFactory) {
+    session_ = config_.sessionFactory(wtShared, executor_);
+  } else {
+    session_ = std::make_shared<MoQSession>(wtShared, executor_);
+  }
 
   // Set up transport callbacks
   wtInterface->setNewUniStreamCallback([this](compat::StreamReadHandle* stream) {

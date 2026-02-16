@@ -176,6 +176,8 @@ void MoQRelaySession::publishNamespaceWithCallback(
       ann.requestID,
       PendingPublishNamespace{
           trackNamespace, std::move(callback), std::move(cancelCallback)});
+
+  flushControlBuf();
 }
 
 // Subscriber methods (outgoing subscribeNamespace)
@@ -203,6 +205,8 @@ void MoQRelaySession::subscribeNamespaceWithCallback(
   pendingSubscribeNamespaces_.emplace(
       subAnn.requestID,
       PendingSubscribeNamespace{trackNamespace, std::move(callback)});
+
+  flushControlBuf();
 }
 
 // Incoming message handlers

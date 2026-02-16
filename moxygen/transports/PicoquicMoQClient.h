@@ -42,6 +42,11 @@ class PicoquicH3Transport;
  */
 class PicoquicMoQClient : public compat::MoQClientInterface {
  public:
+  // Session factory function type
+  using SessionFactory = std::function<std::shared_ptr<MoQSession>(
+      std::shared_ptr<compat::WebTransportInterface>,
+      std::shared_ptr<MoQExecutor>)>;
+
   struct Config {
     std::string serverHost;
     uint16_t serverPort{443};
@@ -62,6 +67,10 @@ class PicoquicMoQClient : public compat::MoQClientInterface {
     std::chrono::milliseconds idleTimeout{30000};
     size_t maxStreamData{1000000};
     size_t maxData{10000000};
+
+    // Session factory (optional) - if not set, creates regular MoQSession
+    // Use MoQRelaySession::createRelaySessionFactory() for relay clients
+    SessionFactory sessionFactory;
   };
 
   PicoquicMoQClient(
@@ -121,6 +130,7 @@ class PicoquicMoQClient : public compat::MoQClientInterface {
 
   std::shared_ptr<MoQExecutor> executor_;
   Config config_;
+  std::string computedAlpn_;  // ALPN value computed in initQuicContext()
 
   // picoquic state
   picoquic_quic_t* quic_{nullptr};
