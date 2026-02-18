@@ -13,12 +13,12 @@ This design allows the same MoQ protocol implementation to be used across differ
 
 ## Build Configuration Matrix
 
-| Configuration | `MOXYGEN_USE_FOLLY` | `MOXYGEN_QUIC_BACKEND` |
-|---------------|---------------------|------------------------|
-| Full Folly    | 1 | mvfst |
-| Folly+Picoquic| 1 | picoquic |
-| Std+Picoquic  | 0 | picoquic |
-| Std+mvfst     | 0 | mvfst |
+| Configuration | `MOXYGEN_USE_FOLLY` | `MOXYGEN_QUIC_BACKEND` | Use Case |
+|---------------|---------------------|------------------------|----------|
+| Full Folly    | 1 | mvfst | Production (Meta infrastructure) |
+| Folly+Picoquic| 1 | picoquic | Testing Folly code with picoquic |
+| Std+Picoquic  | 0 | picoquic | Embedded/minimal deployments |
+| Std+mvfst     | 0 | mvfst | Std-mode with pre-built mvfst |
 
 Configuration is controlled via CMake options and compile-time macros in `moxygen/compat/Config.h`.
 
@@ -31,7 +31,7 @@ Configuration is controlled via CMake options and compile-time macros in `moxyge
 | Compat Header | Folly Mode | Std Mode | Purpose |
 |---------------|------------|----------|---------|
 | `Config.h` | Defines `MOXYGEN_USE_FOLLY=1` | Defines `MOXYGEN_USE_FOLLY=0` | Build configuration |
-| `Payload.h` | Wraps `folly::IOBuf` | `ByteBuffer` with refcount | Zero-copy buffer |
+| `Payload.h` | Wraps `folly::IOBuf` | `std::vector<uint8_t>` | Zero-copy buffer |
 | `ByteBuffer.h` | N/A (uses IOBuf) | Custom buffer with SBO | Buffer with headroom/tailroom |
 | `ByteBufferQueue.h` | N/A (uses IOBufQueue) | Deque of ByteBuffers | Buffer queue for streaming |
 | `ByteCursor.h` | N/A (uses folly::Cursor) | Custom cursor | Read cursor for parsing |
@@ -134,7 +134,7 @@ Configuration is controlled via CMake options and compile-time macros in `moxyge
 │                         MoQSession                               │
 │  ┌─────────────────┐  ┌──────────────┐  ┌───────────────────┐   │
 │  │ Framer/Codec    │  │ Publisher/   │  │ compat::Payload   │   │
-│  │ (ByteCursor)    │  │ Subscriber   │  │ (ByteBuffer+COW)  │   │
+│  │ (ByteCursor)    │  │ Subscriber   │  │ (vector<uint8_t>) │   │
 │  └─────────────────┘  └──────────────┘  └───────────────────┘   │
 │                                                                   │
 │  Uses: compat::SemiFuture, compat::ByteBufferQueue              │
@@ -477,54 +477,6 @@ class ByteBufferQueue {
 };
 ```
 
-### Payload (`moxygen/compat/Payload.h`)
-
-The `Payload` class provides a unified buffer abstraction across both modes:
-
-**Folly Mode:**
-- Thin wrapper around `std::unique_ptr<folly::IOBuf>`
-- Delegates all operations to IOBuf
-
-**Std Mode:**
-- Uses `std::shared_ptr<ByteBuffer>` for reference counting
-- Copy-on-write semantics for efficient cloning
-- Buffer chain support via linked `next_` pointer
-
-```cpp
-class Payload {
-  std::shared_ptr<ByteBuffer> buf_;
-  std::unique_ptr<Payload> next_;  // Buffer chain
-
-  // O(1) clone - shares buffer via refcount
-  std::unique_ptr<Payload> clone() const {
-    auto p = std::make_unique<Payload>(buf_);  // Share, don't copy
-    if (next_) p->next_ = next_->clone();
-    return p;
-  }
-
-  // Copy-on-write: only copy when modifying shared buffer
-  uint8_t* writableData() {
-    ensureUnique();  // Copy if refcount > 1
-    return buf_ ? buf_->writableData() : nullptr;
-  }
-
-  // Zero-copy wrap
-  static std::unique_ptr<Payload> wrap(std::unique_ptr<ByteBuffer> buf) {
-    return std::make_unique<Payload>(std::move(buf));
-  }
-};
-```
-
-**Performance characteristics:**
-
-| Operation | Folly Mode | Std Mode |
-|-----------|------------|----------|
-| `clone()` | O(1) refcount | O(1) refcount |
-| `writableData()` | O(1) or COW | O(1) or COW |
-| `coalesce()` | O(n) if chained | O(n) if chained |
-| `wrap()` | O(1) | O(1) |
-| `copyBuffer()` | O(n) | O(n) |
-
 ---
 
 ## Hash Functions
@@ -551,7 +503,7 @@ The `Hash.h` (`moxygen/compat/Hash.h`) provides multiple hash implementations:
 | File | Lines | Description |
 |------|-------|-------------|
 | `Config.h` | 44 | Build configuration macros |
-| `Payload.h` | 432 | Buffer abstraction (IOBuf/ByteBuffer) |
+| `Payload.h` | 242 | Buffer abstraction (IOBuf/vector) |
 | `ByteBuffer.h` | 352 | Std-mode buffer with SBO |
 | `ByteBufferQueue.h` | 382 | Std-mode buffer queue |
 | `ByteCursor.h` | ~350 | Std-mode read cursor |
