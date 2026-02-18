@@ -25,6 +25,8 @@
 #include <moxygen/transports/PicoquicMoQClient.h>
 #include <moxygen/transports/TransportMode.h>
 
+#include <moxygen/compat/Config.h>
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -38,6 +40,15 @@
 namespace {
 
 using namespace moxygen;
+
+// Helper to convert payload to string (works with both Folly and std-mode)
+inline std::string payloadToString(Payload& payload) {
+#if MOXYGEN_USE_FOLLY
+  return payload->moveToFbString().toStdString();
+#else
+  return payload->moveToString();
+#endif
+}
 
 // --- Command line arguments ---
 
@@ -112,7 +123,7 @@ class SimpleSubgroupReceiver : public SubgroupConsumer {
       Extensions extensions,
       bool finSubgroup) override {
     if (payload) {
-      std::string data = payload->moveToString();
+      std::string data = payloadToString(payload);
       std::cout << data;
       if (objectID > 0) {
         // After the minute prefix (object 0), seconds are separate objects
@@ -232,7 +243,7 @@ class SimpleTrackReceiver : public TrackConsumer {
     }
 
     if (payload) {
-      std::cout << payload->moveToString() << std::flush;
+      std::cout << payloadToString(payload) << std::flush;
     }
     return compat::unit;
   }
@@ -242,7 +253,7 @@ class SimpleTrackReceiver : public TrackConsumer {
       Payload payload,
       bool /*lastInGroup*/ = false) override {
     if (payload) {
-      std::cout << payload->moveToString() << std::flush;
+      std::cout << payloadToString(payload) << std::flush;
     }
     return compat::unit;
   }
