@@ -28,6 +28,7 @@
   - [Workflow 3: FLV streaming](#workflow-3-flv-streaming-through-relay)
   - [Workflow 4: Test suite](#workflow-4-test-suite)
   - [Workflow 5: Picoquic Date Server + Text Client](#workflow-5-picoquic-date-server--text-client-std-mode)
+  - [Workflow 8: Advanced Std-mode Tests](#workflow-8-advanced-std-mode-tests-webtransport--interop)
   - [Debug Logging](#debug-logging)
 - [Running Tests](#running-tests)
 - [Key Flags Reference](#key-flags-reference)
@@ -1155,15 +1156,56 @@ Binaries are in the build tree at `_build_std/moxygen/samples/`.
 
 ```bash
 # Generate TLS certs (required for QUIC)
+cd _build_std
 openssl genrsa -out key.pem 2048
 openssl req -new -x509 -key key.pem -out cert.pem -days 365 -subj "/CN=localhost"
-
-# Terminal 1: Start picoquic date server
-picodateserver --cert cert.pem --key key.pem --port 4433 --ns moq-date --mode spg
-
-# Terminal 2: Connect picoquic text client
-picotextclient --host localhost --port 4433 --ns moq-date --track date --insecure
 ```
+
+#### Run: Raw QUIC (default)
+
+```bash
+# Terminal 1: Start date server (raw QUIC - default)
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4433 \
+  --cert _build_std/cert.pem \
+  --key _build_std/key.pem \
+  -n moq-date \
+  -m spg \
+  -t quic
+
+# Terminal 2: Connect client (raw QUIC)
+./_build_std/moxygen/samples/text-client/picotextclient \
+  -H localhost \
+  -p 4433 \
+  -n moq-date \
+  --track date \
+  -T quic \
+  -k
+```
+
+#### Run: WebTransport (HTTP/3)
+
+```bash
+# Terminal 1: Start date server (WebTransport)
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4433 \
+  --cert _build_std/cert.pem \
+  --key _build_std/key.pem \
+  -n moq-date \
+  -m spg \
+  -t webtransport
+
+# Terminal 2: Connect client (WebTransport)
+./_build_std/moxygen/samples/text-client/picotextclient \
+  -H localhost \
+  -p 4433 \
+  -n moq-date \
+  --track date \
+  -T webtransport \
+  -k
+```
+
+**Expected Output:** Client prints seconds counter: `00`, `01`, `02`, ... (updates each second)
 
 **picodateserver flags:**
 | Flag | Default | Description |
@@ -1211,18 +1253,31 @@ Uses picoquic transport with the callback-based MoQSessionCompat for a full rela
 ```
 
 ```bash
-# Terminal 1: Start picoquic relay server
-./_build_std/moxygen/samples/relay/picorelayserver -p 4443 \
-  --cert ./certs/server-cert.pem --key ./certs/server-key.pem
+# Terminal 1: Start relay server (raw QUIC)
+./_build_std/moxygen/samples/relay/picorelayserver \
+  -p 4443 \
+  -c _build_std/cert.pem \
+  -k _build_std/key.pem \
+  -t quic
 
-# Terminal 2: Start picoquic date server (publishes to relay)
-./_build_std/moxygen/samples/date/picodateserver -p 4567 \
-  --cert ./certs/server-cert.pem --key ./certs/server-key.pem \
-  --relay_url "moq://127.0.0.1:4443"
+# Terminal 2: Start date server (publishes to relay via raw QUIC)
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4433 \
+  --cert _build_std/cert.pem \
+  --key _build_std/key.pem \
+  -n moq-date \
+  -m spg \
+  -r moq://localhost:4443 \
+  --insecure
 
-# Terminal 3: Subscribe via relay
-./_build_std/moxygen/samples/text-client/picotextclient -H 127.0.0.1 -p 4443 \
-  --ns moq-date --track date
+# Terminal 3: Subscribe via relay (raw QUIC)
+./_build_std/moxygen/samples/text-client/picotextclient \
+  -H localhost \
+  -p 4443 \
+  -n moq-date \
+  --track date \
+  -T quic \
+  --insecure
 ```
 
 **Key points:**
@@ -1236,20 +1291,34 @@ Uses picoquic transport with the callback-based MoQSessionCompat for a full rela
 Same as Workflow 6 but using WebTransport (HTTP/3) instead of raw QUIC.
 
 ```bash
-# Terminal 1: Start picoquic relay server with WebTransport
-./_build_std/moxygen/samples/relay/picorelayserver -p 4443 \
-  --cert ./certs/server-cert.pem --key ./certs/server-key.pem \
-  --transport webtransport
+# Terminal 1: Start relay server (WebTransport)
+./_build_std/moxygen/samples/relay/picorelayserver \
+  -p 4443 \
+  -c _build_std/cert.pem \
+  -k _build_std/key.pem \
+  -t webtransport
 
-# Terminal 2: Start picoquic date server (publishes to relay via WebTransport)
-./_build_std/moxygen/samples/date/picodateserver -p 4567 \
-  --cert ./certs/server-cert.pem --key ./certs/server-key.pem \
-  --relay_url "https://127.0.0.1:4443/moq"
+# Terminal 2: Start date server (publishes to relay via WebTransport)
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4433 \
+  --cert _build_std/cert.pem \
+  --key _build_std/key.pem \
+  -n moq-date \
+  -m spg \
+  -r https://localhost:4443/moq \
+  --insecure
 
-# Terminal 3: Subscribe via relay with WebTransport
-./_build_std/moxygen/samples/text-client/picotextclient -H 127.0.0.1 -p 4443 \
-  --ns moq-date --track date --transport webtransport
+# Terminal 3: Subscribe via relay (WebTransport)
+./_build_std/moxygen/samples/text-client/picotextclient \
+  -H localhost \
+  -p 4443 \
+  -n moq-date \
+  --track date \
+  -T webtransport \
+  -k
 ```
+
+**Expected Output:** Client prints seconds counter through relay.
 
 **Differences from raw QUIC (Workflow 6):**
 
@@ -1259,6 +1328,323 @@ Same as Workflow 6 but using WebTransport (HTTP/3) instead of raw QUIC.
 | Date Server URL | `moq://...` | `https://...` |
 | Client | (default) | `--transport webtransport` |
 | ALPN | `moq-00` | `h3` |
+
+### Workflow 8: Advanced Std-mode Tests (WebTransport & Interop)
+
+This section provides comprehensive test commands for the picoquic std-mode implementation,
+covering relay mode, datagram delivery, cross-transport mode, and cross-flavor interoperability.
+
+**Prerequisites:**
+```bash
+# Build std-mode (if not already done)
+cd /Users/suhas/work/code/moq/moxygen
+mkdir -p _build_std && cd _build_std
+cmake .. -DMOXYGEN_USE_FOLLY=OFF -DMOXYGEN_QUIC_BACKEND=picoquic -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build . --parallel
+
+# Generate TLS certs (if not already done)
+cd /Users/suhas/work/code/moq/moxygen
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
+```
+
+---
+
+#### Test 1: Relay Mode (Date Server → Relay → Client) - WebTransport
+
+Full relay setup where the date server publishes through the relay.
+
+```bash
+# Terminal 1: Start relay server (WebTransport)
+./_build_std/moxygen/samples/relay/picorelayserver \
+  -p 4443 \
+  -c cert.pem \
+  -k key.pem \
+  -t webtransport
+
+# Terminal 2: Start date server publishing TO the relay
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4433 \
+  -c cert.pem \
+  -k key.pem \
+  -n moq-date \
+  -m spg \
+  -r https://localhost:4443/moq \
+  --insecure
+
+# Terminal 3: Subscribe via relay
+./_build_std/moxygen/samples/text-client/picotextclient \
+  -H localhost \
+  -p 4443 \
+  -n moq-date \
+  --track date \
+  -T webtransport \
+  --insecure
+```
+
+**Expected:** Client receives date/time objects flowing through the relay.
+
+---
+
+#### Test 2: Relay Mode (Date Server → Relay → Client) - Raw QUIC
+
+Same as Test 1 but using raw QUIC transport (`moq-00` ALPN).
+
+```bash
+# Terminal 1: Start relay server (raw QUIC - default)
+./_build_std/moxygen/samples/relay/picorelayserver \
+  -p 4443 \
+  -c cert.pem \
+  -k key.pem \
+  -t quic
+
+# Terminal 2: Start date server publishing TO the relay (raw QUIC)
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4433 \
+  -c cert.pem \
+  -k key.pem \
+  -n moq-date \
+  -m spg \
+  -r moq://localhost:4443 \
+  --insecure
+
+# Terminal 3: Subscribe via relay (raw QUIC)
+./_build_std/moxygen/samples/text-client/picotextclient \
+  -H localhost \
+  -p 4443 \
+  -n moq-date \
+  --track date \
+  -T quic \
+  --insecure
+```
+
+**Expected:** Client receives date/time objects via raw QUIC.
+
+---
+
+#### Test 3: Datagram Delivery Mode
+
+Test datagram-based object delivery instead of streams.
+
+```bash
+# Terminal 1: Start date server with datagram mode (direct, no relay)
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4433 \
+  -c cert.pem \
+  -k key.pem \
+  -n moq-date \
+  -m datagram \
+  -t webtransport
+
+# Terminal 2: Connect client
+./_build_std/moxygen/samples/text-client/picotextclient \
+  -H localhost \
+  -p 4433 \
+  -n moq-date \
+  --track date \
+  -T webtransport \
+  --insecure
+```
+
+**Expected:** Date objects delivered via datagrams (lower latency, unreliable).
+
+---
+
+#### Test 4: Datagram Delivery via Relay
+
+Datagram delivery through a relay.
+
+```bash
+# Terminal 1: Start relay (WebTransport)
+./_build_std/moxygen/samples/relay/picorelayserver \
+  -p 4443 \
+  -c cert.pem \
+  -k key.pem \
+  -t webtransport
+
+# Terminal 2: Date server with datagram mode, publishing to relay
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4433 \
+  -c cert.pem \
+  -k key.pem \
+  -n moq-date \
+  -m datagram \
+  -r https://localhost:4443/moq \
+  --insecure
+
+# Terminal 3: Client subscribes via relay
+./_build_std/moxygen/samples/text-client/picotextclient \
+  -H localhost \
+  -p 4443 \
+  -n moq-date \
+  --track date \
+  -T webtransport \
+  --insecure
+```
+
+---
+
+#### Test 5: Cross-Transport Mode (Mixed QUIC and WebTransport)
+
+Test scenarios where different components use different transport modes.
+**Note:** This requires the relay to accept both transport modes on the same port.
+
+**Scenario A: WebTransport server ← Raw QUIC client**
+```bash
+# Terminal 1: Start date server with WebTransport
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4433 \
+  -c cert.pem \
+  -k key.pem \
+  -n moq-date \
+  -m spg \
+  -t webtransport
+
+# Terminal 2: Try connecting with raw QUIC client
+# NOTE: This will FAIL - ALPN mismatch (moq-00 vs h3)
+./_build_std/moxygen/samples/text-client/picotextclient \
+  -H localhost \
+  -p 4433 \
+  -n moq-date \
+  --track date \
+  -T quic \
+  --insecure
+```
+
+**Expected:** Connection fails due to ALPN mismatch. This demonstrates that
+raw QUIC (`moq-00`) and WebTransport (`h3`) are NOT directly interoperable.
+
+**Scenario B: Relay bridges different transport modes**
+
+Currently the picoquic relay accepts ONE transport mode per instance.
+For cross-transport bridging, use the mvfst relay (see Test 6).
+
+---
+
+#### Test 6: Cross-Flavor Interop (Picoquic ↔ mvfst)
+
+Test interoperability between picoquic (std-mode) and mvfst (Folly) implementations.
+Both must use WebTransport (`h3` ALPN) for interop.
+
+**Scenario A: Picoquic client → mvfst relay → mvfst publisher**
+
+```bash
+# Terminal 1: Start mvfst relay (from Folly build)
+# Assumes _build/installed/moxygen/bin is in PATH
+moqrelayserver --insecure --port 4433
+
+# Terminal 2: Start mvfst date publisher (connects to relay)
+moqdateserver --insecure --port 4434 \
+  --relay_url "https://localhost:4433/moq-relay" \
+  --ns "moq-date"
+
+# Terminal 3: Connect with PICOQUIC client via WebTransport
+./_build_std/moxygen/samples/text-client/picotextclient \
+  -H localhost \
+  -p 4433 \
+  -n moq-date \
+  --track date \
+  -T webtransport \
+  --insecure
+```
+
+**Expected:** Picoquic client receives date objects from mvfst publisher via mvfst relay.
+
+---
+
+**Scenario B: mvfst client → picoquic server**
+
+```bash
+# Terminal 1: Start picoquic date server with WebTransport
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4433 \
+  -c cert.pem \
+  -k key.pem \
+  -n moq-date \
+  -m spg \
+  -t webtransport
+
+# Terminal 2: Connect with mvfst client
+moqtextclient --insecure \
+  --connect_url "https://localhost:4433/moq-date" \
+  --track_namespace "moq-date" \
+  --track_name "date"
+```
+
+**Expected:** mvfst client receives date objects from picoquic server.
+
+---
+
+**Scenario C: Picoquic publisher → mvfst relay ← Picoquic subscriber**
+
+Full cross-flavor: both publisher and subscriber are picoquic, relay is mvfst.
+
+```bash
+# Terminal 1: Start mvfst relay
+moqrelayserver --insecure --port 4433
+
+# Terminal 2: Start PICOQUIC date server publishing TO mvfst relay
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4434 \
+  -c cert.pem \
+  -k key.pem \
+  -n moq-date \
+  -m spg \
+  -r https://localhost:4433/moq-relay \
+  --insecure
+
+# Terminal 3: PICOQUIC client subscribes via mvfst relay
+./_build_std/moxygen/samples/text-client/picotextclient \
+  -H localhost \
+  -p 4433 \
+  -n moq-date \
+  --track date \
+  -T webtransport \
+  --insecure
+```
+
+**Expected:** Picoquic client receives objects from picoquic publisher, routed through mvfst relay.
+
+---
+
+#### Test 7: All Delivery Modes Comparison
+
+Compare the three delivery modes: stream-per-group, stream-per-object, and datagram.
+
+```bash
+# Stream Per Group (spg) - default, one stream per minute
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4433 -c cert.pem -k key.pem -n moq-date -m spg -t webtransport
+
+# Stream Per Object (spo) - one stream per second
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4433 -c cert.pem -k key.pem -n moq-date -m spo -t webtransport
+
+# Datagram - unreliable, lowest latency
+./_build_std/moxygen/samples/date/picodateserver \
+  -p 4433 -c cert.pem -k key.pem -n moq-date -m datagram -t webtransport
+```
+
+---
+
+#### Quick Reference: URL Schemes and Transport Modes
+
+| URL Scheme | Transport Mode | ALPN | Flag (server) | Flag (client) |
+|------------|----------------|------|---------------|---------------|
+| `moq://host:port` | Raw QUIC | `moq-00` | `-t quic` | `-T quic` |
+| `https://host:port/path` | WebTransport | `h3` | `-t webtransport` | `-T webtransport` |
+
+**Interoperability Matrix:**
+
+| Server Transport | Client Transport | Result |
+|------------------|------------------|--------|
+| WebTransport | WebTransport | ✅ Works |
+| Raw QUIC | Raw QUIC | ✅ Works |
+| WebTransport | Raw QUIC | ❌ ALPN mismatch |
+| Raw QUIC | WebTransport | ❌ ALPN mismatch |
+| mvfst (WebTransport) | picoquic (WebTransport) | ✅ Works |
+| picoquic (WebTransport) | mvfst (WebTransport) | ✅ Works |
+
+---
 
 ### Debug Logging
 
