@@ -27,10 +27,10 @@ DEFINE_string(audio_track_name, "audio0", "Audio track Name");
 DEFINE_int32(connect_timeout, 1000, "Connect timeout (ms)");
 DEFINE_int32(transaction_timeout, 120, "Transaction timeout (s)");
 DEFINE_bool(quic_transport, false, "Use raw QUIC transport");
-DEFINE_bool(
-    use_legacy_setup,
-    false,
-    "If true, use only moq-00 ALPN (legacy). If false, use latest draft ALPN with fallback to legacy");
+DEFINE_string(
+    versions,
+    "",
+    "Comma-separated MoQ draft versions (e.g. \"14,16\"). Empty = all supported.");
 DEFINE_uint64(
     delivery_timeout,
     0,
@@ -73,9 +73,7 @@ class MoQFlvStreamerClient
     auto g =
         folly::makeGuard([func = __func__] { XLOG(INFO) << "exit " << func; });
     try {
-      // Default to experimental protocols, override to legacy if flag set
-      std::vector<std::string> alpns =
-          getDefaultMoqtProtocols(!FLAGS_use_legacy_setup);
+      auto alpns = getMoqtProtocols(FLAGS_versions, true);
       // Create session
       co_await moqClient_.setup(
           /*publisher=*/shared_from_this(),
@@ -218,6 +216,7 @@ class MoQFlvStreamerClient
             MoQSession::resolveGroupOrder(
                 GroupOrder::OldestFirst, subscribeReq.groupOrder),
             largest,
+            {},
             std::move(params)},
         consumerPtr,
         *this);
@@ -330,13 +329,13 @@ class MoQFlvStreamerClient
 
     const TrackConsumer* consumer{nullptr};
 
-    folly::coro::Task<folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
-    subscribeUpdate(SubscribeUpdate update) override {
+    folly::coro::Task<RequestUpdateResult> requestUpdate(
+        RequestUpdate reqUpdate) override {
       co_return folly::makeUnexpected(
-          SubscribeUpdateError{
-              update.requestID,
-              SubscribeUpdateErrorCode::NOT_SUPPORTED,
-              "Subscribe update not implemented"});
+          RequestError{
+              reqUpdate.requestID,
+              RequestErrorCode::NOT_SUPPORTED,
+              "Request update not implemented"});
     }
     void unsubscribe() override {
       auto requestID = subscribeOk_->requestID;
@@ -411,24 +410,32 @@ int main(int argc, char* argv[]) {
     }
 
     void unreg() {
-      unregisterSignalHandler(SIGTERM);
-      unregisterSignalHandler(SIGINT);
+      if (!unreg_) {
+        unregisterSignalHandler(SIGTERM);
+        unregisterSignalHandler(SIGINT);
+        unreg_ = true;
+      }
     }
 
    private:
     std::function<void(int)> fn_;
+    bool unreg_{false};
   };
 
-  // TODO this does NOT work, we do not get the signal
-  SigHandler handler(
-      &eventBase, [&streamerClient](int) mutable { streamerClient->stop(); });
+  SigHandler handler(&eventBase, [&streamerClient](int) mutable {
+    XLOG(INFO, "Caught keyboard signal, stopping");
+    streamerClient->stop();
+  });
 
   co_withExecutor(
       &eventBase, streamerClient->run({RequestID(0), {std::move(ns)}}))
       .start()
-      .via(&eventBase)
-      .thenTry([&handler](auto) { handler.unreg(); });
-  if (!eventBase.loop()) {
+      .via(&eventBase);
+
+  auto ret = eventBase.loop();
+  handler.unreg();
+
+  if (!ret) {
     return 1;
   }
   return 0;

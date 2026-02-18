@@ -16,15 +16,23 @@ DEFINE_string(cert, "", "Cert path");
 DEFINE_string(key, "", "Key path");
 DEFINE_string(endpoint, "/moq-relay", "End point");
 DEFINE_int32(port, 9668, "Relay Server Port");
-DEFINE_bool(enable_cache, false, "Enable relay cache");
+DEFINE_bool(enable_cache, true, "Enable relay cache");
 DEFINE_bool(
     insecure,
     false,
     "Use insecure verifier (skip certificate validation)");
-DEFINE_bool(
-    use_legacy_setup,
-    false,
-    "If true, use only moq-00 ALPN (legacy). If false, use latest draft ALPN with fallback to legacy");
+DEFINE_string(
+    versions,
+    "",
+    "Comma-separated MoQ draft versions (e.g. \"14,16\"). Empty = all supported.");
+DEFINE_int32(
+    max_cached_tracks,
+    100,
+    "Maximum number of cached tracks (0 to disable caching)");
+DEFINE_int32(
+    max_cached_groups_per_track,
+    3,
+    "Maximum groups per track in cache");
 
 namespace {
 using namespace moxygen;
@@ -33,7 +41,18 @@ class MoQRelayServer : public MoQServer {
  public:
   // Used when the insecure flag is false
   MoQRelayServer(const std::string& cert, const std::string& key)
-      : MoQServer(cert, key, FLAGS_endpoint) {}
+      : MoQServer(
+            quic::samples::createFizzServerContext(
+                []() {
+                  std::vector<std::string> alpns = {"h3"};
+                  auto moqt = getMoqtProtocols(FLAGS_versions, true);
+                  alpns.insert(alpns.end(), moqt.begin(), moqt.end());
+                  return alpns;
+                }(),
+                fizz::server::ClientAuthMode::Optional,
+                cert,
+                key),
+            FLAGS_endpoint) {}
 
   // Used when the insecure flag is true
   MoQRelayServer()
@@ -41,7 +60,7 @@ class MoQRelayServer : public MoQServer {
             quic::samples::createFizzServerContextWithInsecureDefault(
                 []() {
                   std::vector<std::string> alpns = {"h3"};
-                  auto moqt = getDefaultMoqtProtocols(!FLAGS_use_legacy_setup);
+                  auto moqt = getMoqtProtocols(FLAGS_versions, true);
                   alpns.insert(alpns.end(), moqt.begin(), moqt.end());
                   return alpns;
                 }(),
@@ -66,8 +85,9 @@ class MoQRelayServer : public MoQServer {
   }
 
  private:
-  std::shared_ptr<MoQRelay> relay_{
-      std::make_shared<MoQRelay>(FLAGS_enable_cache)};
+  std::shared_ptr<MoQRelay> relay_{std::make_shared<MoQRelay>(
+      FLAGS_max_cached_tracks,
+      FLAGS_max_cached_groups_per_track)};
 };
 } // namespace
 

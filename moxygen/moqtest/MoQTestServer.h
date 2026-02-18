@@ -28,9 +28,9 @@ class MoQTestSubscriptionHandle : public Publisher::SubscriptionHandle {
         cancelSource_(std::move(cancellationSource)) {}
 
   virtual void unsubscribe() override;
-  virtual folly::coro::Task<
-      folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
-  subscribeUpdate(SubscribeUpdate update) override;
+  using RequestUpdateResult = folly::Expected<RequestOk, RequestError>;
+  virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) override;
 
  private:
   SubscribeOk subscribeOk_;
@@ -47,6 +47,9 @@ class MoQTestFetchHandle : public Publisher::FetchHandle {
         cancelSource_(std::move(cancellationSource)) {}
 
   virtual void fetchCancel() override;
+  using RequestUpdateResult = folly::Expected<RequestOk, RequestError>;
+  virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) override;
 
  private:
   FetchOk fetchOk_;
@@ -57,7 +60,10 @@ class MoQTestServer : public moxygen::Publisher,
                       public moxygen::MoQServer,
                       public std::enable_shared_from_this<MoQTestServer> {
  public:
-  MoQTestServer(const std::string& cert = "", const std::string& key = "");
+  MoQTestServer(
+      const std::string& cert = "",
+      const std::string& key = "",
+      const std::string& versions = "");
 
   //  Override onNewSession to set publisher handler to be this object
   virtual void onNewSession(
@@ -136,6 +142,7 @@ class MoQTestServer : public moxygen::Publisher,
       int32_t transactionTimeout);
 
   // Relay client connection (if using relay mode)
+  std::string versions_;
   std::unique_ptr<MoQClient> relayClient_;
   std::shared_ptr<MoQRelaySession> relaySession_;
   std::shared_ptr<Subscriber::PublishNamespaceHandle> publishNamespaceHandle_;

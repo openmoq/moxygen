@@ -27,7 +27,7 @@ CO_TEST_P_X(MoQSessionTest, ServerInitiatedSubscribe) {
       MoQControlCodec::Direction::CLIENT);
 
   auto sg1 = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Return(sg1));
   EXPECT_CALL(*sg1, object(0, _, _, false))
       .WillOnce(testing::Return(folly::unit));
@@ -157,10 +157,10 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdate) {
       true};
 
   // Set expectations for stats callbacks for all versions
-  EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeUpdate());
-  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeUpdate());
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate());
+  EXPECT_CALL(*serverPublisherStatsCallback_, onRequestUpdate());
 
-  co_await subscribeHandler->subscribeUpdate(subscribeUpdate);
+  co_await subscribeHandler->requestUpdate(subscribeUpdate);
 
   // Wait for subscribe update to be processed
   co_await subscribeUpdateProcessed;
@@ -239,11 +239,11 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateForwardingFalse) {
   auto mockSubgroupConsumer =
       std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
   folly::coro::Baton subgroupCreated;
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
-      .WillOnce(testing::Invoke([&](auto, auto, auto) {
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
+      .WillOnce([&](auto, auto, auto, auto) {
         subgroupCreated.post();
         return mockSubgroupConsumer;
-      }));
+      });
   EXPECT_CALL(*mockSubgroupConsumer, object(0, _, _, _))
       .WillOnce(testing::Return(folly::unit));
   EXPECT_CALL(*mockSubgroupConsumer, reset(_));
@@ -263,11 +263,10 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateForwardingFalse) {
       false};
 
   // Set expectations for stats callbacks for all versions
-  EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeUpdate());
-  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeUpdate());
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate());
+  EXPECT_CALL(*serverPublisherStatsCallback_, onRequestUpdate());
 
-  auto updateResult =
-      co_await subscribeHandler->subscribeUpdate(subscribeUpdate);
+  auto updateResult = co_await subscribeHandler->requestUpdate(subscribeUpdate);
   EXPECT_TRUE(updateResult.hasValue());
 
   // For v15+, verify that the response contains the LARGEST_OBJECT parameter
@@ -325,9 +324,9 @@ CO_TEST_P_X(MoQSessionTest, PublishDoneStreamCount) {
   });
   auto sg1 = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
   auto sg2 = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Return(sg1));
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 1, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 1, 0, _))
       .WillOnce(testing::Return(sg2));
   EXPECT_CALL(*sg1, object(0, _, _, true))
       .WillOnce(testing::Return(folly::unit));
@@ -357,7 +356,7 @@ CO_TEST_P_X(MoQSessionTest, PublishDoneAPIErrors) {
   co_await setupMoQSession();
   expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
     pub->publishDone(getTrackEndedPublishDone(sub.requestID));
-    // All these APIs fail after SUBSCRIBE_DONE
+    // All these APIs fail after PUBLISH_DONE
     EXPECT_EQ(
         pub->beginSubgroup(1, 1, 1).error().code, MoQPublishError::API_ERROR);
     EXPECT_EQ(
@@ -433,7 +432,7 @@ CO_TEST_P_X(MoQSessionTest, Unsubscribe) {
   EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeSuccess());
   folly::coro::Baton subgroupCreated;
   auto sg = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Invoke([&]() {
         subgroupCreated.post();
         return sg;
@@ -497,7 +496,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeDuringDrain) {
   });
 
   EXPECT_CALL(
-      *fetchCallback_, object(0, 0, 0, HasChainDataLengthOf(100), _, true));
+      *fetchCallback_, object(0, 0, 0, HasChainDataLengthOf(100), _, true, _));
   auto res =
       co_await clientSession_->fetch(getFetch({0, 0}, {0, 1}), fetchCallback_);
   EXPECT_FALSE(res.hasError());
@@ -544,7 +543,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeOKAfterSubgroup) {
   folly::coro::Baton objectDelivered;
 
   // Expect object to be delivered after SUBSCRIBE_OK arrives
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Return(sg));
   EXPECT_CALL(*sg, object(0, _, _, true))
       .WillOnce(testing::Invoke([&objectDelivered]() {
@@ -576,7 +575,7 @@ CO_TEST_P_X(
 
   // The app should NOT get onSubgroup or object
   auto sg = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(_, _, _)).Times(0);
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(_, _, _, _)).Times(0);
   EXPECT_CALL(*sg, object(_, _, _, _)).Times(0);
 
   // Simulate server subscribe handler that delays returning SubscribeOk
@@ -658,7 +657,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeOKArrivesOneByteAtATime) {
 
   auto subscribeRequest = getSubscribe(kTestTrackName);
   auto sg = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0))
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
       .WillOnce(testing::Return(sg));
   EXPECT_CALL(*sg, object(_, _, _, _))
       .WillRepeatedly(testing::Return(folly::unit));
@@ -746,7 +745,7 @@ CO_TEST_P_X(MoQSessionTest, SubscriberCancelsBeforeSubscribeOK) {
 
   auto subscribeRequest = getSubscribe(kTestTrackName);
   auto sg = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
-  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0)).Times(0);
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _)).Times(0);
   folly::CancellationSource cancelSource;
   auto subscribeFut =
       folly::coro::co_withExecutor(
@@ -824,12 +823,12 @@ CO_TEST_P_X(MoQSessionTest, PublishDoneIgnoredAfterClose) {
   });
 
   auto subscribeRequest = getSubscribe(kTestTrackName);
-  EXPECT_CALL(*subscribeCallback_, datagram(_, _))
-      .WillOnce(testing::Invoke([&](auto, auto) {
+  EXPECT_CALL(*subscribeCallback_, datagram(_, _, _))
+      .WillOnce([&](const auto&, auto, auto) {
         clientSession_->close(SessionCloseErrorCode::NO_ERROR);
         handle->publishDone(getTrackEndedPublishDone(reqID));
         return folly::unit;
-      }));
+      });
   EXPECT_CALL(*subscribeCallback_, publishDone(_))
       .WillOnce(testing::Return(folly::unit));
   auto res =
@@ -861,7 +860,7 @@ CO_TEST_P_X(V14PlusTests, SubscribeUpdateWithRequestID) {
         // Set up mock expectations for subscribeUpdate for both versions
         // For v15+, also verify requestID assignments
         if (getDraftMajorVersion(getServerSelectedVersion()) >= 15) {
-          EXPECT_CALL(*mockSubscriptionHandle, subscribeUpdateCalled)
+          EXPECT_CALL(*mockSubscriptionHandle, requestUpdateCalled)
               .WillOnce(
                   testing::Invoke([&sub, &subscribeUpdateProcessed](
                                       const auto& actualUpdate) {
@@ -876,11 +875,10 @@ CO_TEST_P_X(V14PlusTests, SubscribeUpdateWithRequestID) {
 
                     subscribeUpdateProcessed.post();
                   }));
-          EXPECT_CALL(*mockSubscriptionHandle, subscribeUpdateResult)
+          EXPECT_CALL(*mockSubscriptionHandle, requestUpdateResult)
               .WillOnce(
                   testing::Return(
-                      folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>(
-                          SubscribeUpdateOk{})));
+                      folly::Expected<RequestOk, RequestError>(RequestOk{})));
         } else {
           expectSubscribeUpdate(
               mockSubscriptionHandle, subscribeUpdateProcessed);
@@ -903,10 +901,10 @@ CO_TEST_P_X(V14PlusTests, SubscribeUpdateWithRequestID) {
       true};
 
   // Set expectations for stats callbacks for all versions
-  EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeUpdate());
-  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeUpdate());
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate());
+  EXPECT_CALL(*serverPublisherStatsCallback_, onRequestUpdate());
 
-  co_await subscribeHandler->subscribeUpdate(subscribeUpdate);
+  co_await subscribeHandler->requestUpdate(subscribeUpdate);
 
   // Wait for subscribe update to be processed
   co_await subscribeUpdateProcessed;

@@ -23,34 +23,47 @@ void MoQTestSubscriptionHandle::unsubscribe() {
   cancelSource_.requestCancellation();
 }
 
-folly::coro::Task<folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
-MoQTestSubscriptionHandle::subscribeUpdate(SubscribeUpdate update) {
-  LOG(INFO) << "Received Subscribe Update";
+folly::coro::Task<MoQTestSubscriptionHandle::RequestUpdateResult>
+MoQTestSubscriptionHandle::requestUpdate(RequestUpdate update) {
+  LOG(INFO) << "Received Request Update";
   co_return folly::makeUnexpected(
-      SubscribeUpdateError{
+      RequestError{
           update.requestID,
-          SubscribeUpdateErrorCode::NOT_SUPPORTED,
-          "Subscribe update not implemented"});
+          RequestErrorCode::NOT_SUPPORTED,
+          "Request update not implemented"});
+}
+
+folly::coro::Task<MoQTestFetchHandle::RequestUpdateResult>
+MoQTestFetchHandle::requestUpdate(RequestUpdate update) {
+  LOG(INFO) << "Received Request Update for Fetch";
+  co_return folly::makeUnexpected(
+      RequestError{
+          update.requestID,
+          RequestErrorCode::NOT_SUPPORTED,
+          "Request update not implemented"});
 }
 
 void MoQTestFetchHandle::fetchCancel() {
   cancelSource_.requestCancellation();
 }
 
-MoQTestServer::MoQTestServer(const std::string& cert, const std::string& key)
+MoQTestServer::MoQTestServer(
+    const std::string& cert,
+    const std::string& key,
+    const std::string& versions)
     : MoQServer(
           quic::samples::createFizzServerContextWithInsecureDefault(
-              []() {
+              [&versions]() {
                 std::vector<std::string> alpns = {"h3"};
-                auto moqt = getDefaultMoqtProtocols(
-                    true); // Always experimental for tests
+                auto moqt = getMoqtProtocols(versions, true);
                 alpns.insert(alpns.end(), moqt.begin(), moqt.end());
                 return alpns;
               }(),
               fizz::server::ClientAuthMode::None,
               cert,
               key),
-          kEndpointName) {}
+          kEndpointName),
+      versions_(versions) {}
 
 folly::coro::Task<MoQSession::SubscribeResult> MoQTestServer::subscribe(
     SubscribeRequest sub,
@@ -377,7 +390,7 @@ folly::coro::Task<void> MoQTestServer::sendDatagram(
       header.id = objectId;
       header.extensions = Extensions(extensions, {});
 
-      auto res = callback->datagram(header, std::move(objectPayload));
+      auto res = callback->datagram(header, std::move(objectPayload), false);
       if (res.hasError()) {
         // If sending datagram fails, callback->publishDone with error
         PublishDone done;
@@ -642,7 +655,7 @@ folly::coro::Task<void> MoQTestServer::doRelaySetup(
       /*publishHandler=*/shared_from_this(),
       /*subscribeHandler=*/nullptr,
       quic::TransportSettings(),
-      {});
+      getMoqtProtocols(versions_, true));
 
   // Get the session
   relaySession_ =

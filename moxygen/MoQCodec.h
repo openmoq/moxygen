@@ -66,7 +66,7 @@ class MoQControlCodec : public MoQCodec {
     virtual void onClientSetup(ClientSetup clientSetup) = 0;
     virtual void onServerSetup(ServerSetup serverSetup) = 0;
     virtual void onSubscribe(SubscribeRequest subscribeRequest) = 0;
-    virtual void onSubscribeUpdate(SubscribeUpdate subscribeUpdate) = 0;
+    virtual void onRequestUpdate(RequestUpdate requestUpdate) = 0;
     virtual void onSubscribeOk(SubscribeOk subscribeOk) = 0;
     virtual void onRequestOk(RequestOk ok, FrameType frameType) = 0;
     virtual void onRequestError(RequestError error, FrameType frameType) = 0;
@@ -119,7 +119,7 @@ class MoQControlCodec : public MoQCodec {
       case FrameType::PUBLISH_NAMESPACE_ERROR:
       case FrameType::PUBLISH_NAMESPACE_DONE:
       case FrameType::UNSUBSCRIBE:
-      case FrameType::SUBSCRIBE_DONE:
+      case FrameType::PUBLISH_DONE:
       case FrameType::PUBLISH:
       case FrameType::PUBLISH_OK:
       case FrameType::PUBLISH_ERROR:
@@ -183,7 +183,8 @@ class MoQObjectStreamCodec : public MoQCodec {
         uint64_t length,
         Payload initialPayload,
         bool objectComplete,
-        bool subgroupComplete) = 0;
+        bool subgroupComplete,
+        bool forwardingPreferenceIsDatagram = false) = 0;
     virtual ParseResult onObjectStatus(
         uint64_t group,
         uint64_t subgroup,
@@ -193,6 +194,13 @@ class MoQObjectStreamCodec : public MoQCodec {
     virtual ParseResult onObjectPayload(
         Payload payload,
         bool objectComplete) = 0;
+    // Called when an End of Range marker is parsed from a FETCH response
+    // isUnknownOrNonexistent: true for 0x10C (unknown), false for 0x8C
+    // (non-existent)
+    virtual ParseResult onEndOfRange(
+        uint64_t groupId,
+        uint64_t objectId,
+        bool isUnknownOrNonexistent) = 0;
     virtual void onEndOfStream() = 0;
   };
 

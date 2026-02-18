@@ -28,7 +28,7 @@ class ObjectReceiverCallback {
   virtual void onError(ResetStreamErrorCode) = 0;
   virtual void onPublishDone(PublishDone done) = 0;
   // For SUBSCRIBEs:
-  // Called when SUBSCRIBE_DONE has arrived AND all outstanding subgroup
+  // Called when PUBLISH_DONE has arrived AND all outstanding subgroup
   // streams have closed.
   //
   // For FETCHes:
@@ -191,8 +191,11 @@ class ObjectReceiver : public TrackConsumer,
   }
 
   folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
-  beginSubgroup(uint64_t groupID, uint64_t subgroupID, Priority priority)
-      override {
+  beginSubgroup(
+      uint64_t groupID,
+      uint64_t subgroupID,
+      Priority priority,
+      bool /*containsLastInGroup*/ = false) override {
     ++openSubgroups_;
     auto receiver = std::make_shared<ObjectSubgroupReceiver>(
         callback_, trackAlias_, groupID, subgroupID, priority);
@@ -209,7 +212,7 @@ class ObjectReceiver : public TrackConsumer,
   }
 
   // Fire onAllDataReceived callback once when both conditions are met:
-  // 1. SUBSCRIBE_DONE has been received
+  // 1. PUBLISH_DONE has been received
   // 2. All subgroup streams have closed
   void maybeFireAllDataReceived() {
     if (!allDataCallbackSent_ && publishDoneDelivered_ && openSubgroups_ == 0) {
@@ -225,7 +228,8 @@ class ObjectReceiver : public TrackConsumer,
 
   folly::Expected<folly::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
-      Payload payload) override {
+      Payload payload,
+      bool /*lastInGroup*/ = false) override {
     auto fcState = callback_->onObject(trackAlias_, header, std::move(payload));
     if (fcState == ObjectReceiverCallback::FlowControlState::BLOCKED) {
       if (fetchPublisher_) {
@@ -240,7 +244,8 @@ class ObjectReceiver : public TrackConsumer,
 
   folly::Expected<folly::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
-      Payload payload) override {
+      Payload payload,
+      bool /*lastInGroup*/ = false) override {
     (void)callback_->onObject(trackAlias_, header, std::move(payload));
     return folly::unit;
   }
@@ -259,7 +264,8 @@ class ObjectReceiver : public TrackConsumer,
       uint64_t objectID,
       Payload payload,
       Extensions extensions,
-      bool finFetch) override {
+      bool finFetch,
+      bool /*forwardingPreferenceIsDatagram*/ = false) override {
     fetchPublisher_->setFetchGroupAndSubgroup(groupID, subgroupID);
     return fetchPublisher_->object(
         objectID, std::move(payload), std::move(extensions), finFetch);

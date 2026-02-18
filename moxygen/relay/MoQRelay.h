@@ -20,9 +20,12 @@ class MoQRelay : public Publisher,
                  public std::enable_shared_from_this<MoQRelay>,
                  public MoQForwarder::Callback {
  public:
-  explicit MoQRelay(bool enableCache) {
-    if (enableCache) {
-      cache_ = std::make_unique<MoQCache>();
+  explicit MoQRelay(
+      size_t maxCachedTracks = kDefaultMaxCachedTracks,
+      size_t maxCachedGroupsPerTrack = kDefaultMaxCachedGroupsPerTrack) {
+    if (maxCachedTracks > 0) {
+      cache_ =
+          std::make_unique<MoQCache>(maxCachedTracks, maxCachedGroupsPerTrack);
     }
   }
 
@@ -90,6 +93,15 @@ class MoQRelay : public Publisher,
 
     void publishNamespaceDone() override {
       relay_.publishNamespaceDone(trackNamespace_, this);
+    }
+
+    folly::coro::Task<RequestUpdateResult> requestUpdate(
+        RequestUpdate reqUpdate) override {
+      co_return folly::makeUnexpected(
+          RequestError{
+              reqUpdate.requestID,
+              RequestErrorCode::NOT_SUPPORTED,
+              "REQUEST_UPDATE not supported for relay PUBLISH_NAMESPACE"});
     }
 
     // Helper to check if THIS node (excluding children) has content

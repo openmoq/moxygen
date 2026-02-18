@@ -46,7 +46,7 @@ struct MoQSettings {
   std::chrono::milliseconds versionNegotiationTimeout{std::chrono::seconds(2)};
   // Timeout for waiting for unknown alias resolution
   std::chrono::milliseconds unknownAliasTimeout{std::chrono::seconds(2)};
-  // Timeout for waiting for in-flight streams when SUBSCRIBE_DONE is received
+  // Timeout for waiting for in-flight streams when PUBLISH_DONE is received
   std::chrono::milliseconds publishDoneStreamCountTimeout{
       std::chrono::seconds(2)};
 };
@@ -422,11 +422,18 @@ class MoQSession : public Subscriber,
   void sendSubscribeOk(const SubscribeOk& subOk);
   void subscribeError(const SubscribeError& subErr);
   void unsubscribe(const Unsubscribe& unsubscribe);
-  void subscribeUpdate(const SubscribeUpdate& subUpdate);
-  void subscribeUpdateOk(const RequestOk& requestOk);
+  // Backward compatibility forwarders
+  void subscribeUpdate(const SubscribeUpdate& subUpdate) {
+    requestUpdate(subUpdate);
+  }
+  void subscribeUpdateOk(const RequestOk& reqOk) {
+    requestUpdateOk(reqOk);
+  }
   void subscribeUpdateError(
-      const SubscribeUpdateError& requestError,
-      RequestID existingRequestID);
+      const SubscribeUpdateError& reqError,
+      RequestID existingReqID) {
+    requestUpdateError(reqError, existingReqID);
+  }
   void sendPublishDone(const PublishDone& pubDone);
 
   folly::coro::Task<void> handleFetch(
@@ -448,7 +455,6 @@ class MoQSession : public Subscriber,
   void onClientSetup(ClientSetup clientSetup) override;
   void onServerSetup(ServerSetup setup) override;
   void onSubscribe(SubscribeRequest subscribeRequest) override;
-  void onSubscribeUpdate(SubscribeUpdate subscribeUpdate) override;
   void onSubscribeOk(SubscribeOk subscribeOk) override;
   void onRequestOk(RequestOk requestOk, FrameType frameType) override;
   void onRequestError(RequestError requestError, FrameType frameType) override;
@@ -502,6 +508,8 @@ class MoQSession : public Subscriber,
 
  protected:
   // Protected members and methods for MoQRelaySession subclass access
+
+  void requestUpdate(const RequestUpdate& reqUpdate);
 
   // Core session state
   MoQControlCodec::Direction dir_;
@@ -557,6 +565,25 @@ class MoQSession : public Subscriber,
   void subscribeNamespaceError(
       const SubscribeNamespaceError& subscribeNamespaceError);
 
+  // REQUEST_UPDATE error response - available for subclass handlers
+  void requestUpdateError(
+      const SubscribeUpdateError& requestError,
+      RequestID existingRequestID);
+
+  // REQUEST_UPDATE ok response - available for subclass handlers
+  void requestUpdateOk(const RequestOk& requestOk);
+
+  // REQUEST_UPDATE handler (protected for subclass access)
+  void onRequestUpdate(RequestUpdate requestUpdate) override;
+
+  // Type-specific REQUEST_UPDATE handlers
+  virtual void handleSubscribeRequestUpdate(
+      RequestUpdate requestUpdate,
+      std::shared_ptr<TrackPublisherImpl> trackPublisher);
+  virtual void handleFetchRequestUpdate(
+      const RequestUpdate& requestUpdate,
+      const std::shared_ptr<FetchPublisherImpl>& fetchPublisher);
+
   // Core frame writer and stats callbacks needed by MoQRelaySession
   MoQFrameWriter moqFrameWriter_;
   std::shared_ptr<MoQPublisherStatsCallback> publisherStatsCallback_{nullptr};
@@ -575,7 +602,7 @@ class MoQSession : public Subscriber,
       PUBLISH,
       TRACK_STATUS,
       FETCH,
-      SUBSCRIBE_UPDATE,
+      REQUEST_UPDATE,
       // PublishNamespace types - only handled by MoQRelaySession subclass
       PUBLISH_NAMESPACE,
       SUBSCRIBE_NAMESPACE
@@ -594,9 +621,8 @@ class MoQSession : public Subscriber,
       folly::coro::Promise<folly::Expected<TrackStatusOk, TrackStatusError>>
           trackStatus_;
       std::shared_ptr<FetchTrackReceiveState> fetchTrack_;
-      folly::coro::Promise<
-          folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
-          subscribeUpdate_;
+      folly::coro::Promise<folly::Expected<RequestOk, RequestError>>
+          requestUpdate_;
     } storage_;
 
    public:
@@ -635,12 +661,12 @@ class MoQSession : public Subscriber,
       return result;
     }
 
-    static std::unique_ptr<PendingRequestState> makeSubscribeUpdate(
-        folly::coro::Promise<
-            folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>> promise) {
+    static std::unique_ptr<PendingRequestState> makeRequestUpdate(
+        folly::coro::Promise<folly::Expected<RequestOk, RequestError>>
+            promise) {
       auto result = std::make_unique<PendingRequestState>();
-      result->type_ = Type::SUBSCRIBE_UPDATE;
-      new (&result->storage_.subscribeUpdate_) auto(std::move(promise));
+      result->type_ = Type::REQUEST_UPDATE;
+      new (&result->storage_.requestUpdate_) auto(std::move(promise));
       return result;
     }
 
@@ -666,8 +692,8 @@ class MoQSession : public Subscriber,
           // If FETCH storage is added, destroy it here, e.g.:
           storage_.fetchTrack_.~shared_ptr<FetchTrackReceiveState>();
           break;
-        case Type::SUBSCRIBE_UPDATE:
-          storage_.subscribeUpdate_.~Promise();
+        case Type::REQUEST_UPDATE:
+          storage_.requestUpdate_.~Promise();
           break;
         case Type::PUBLISH_NAMESPACE:
         case Type::SUBSCRIBE_NAMESPACE:
@@ -692,7 +718,7 @@ class MoQSession : public Subscriber,
           return ok ? FrameType::TRACK_STATUS_OK : FrameType::TRACK_STATUS;
         case Type::FETCH:
           return ok ? FrameType::FETCH_OK : FrameType::FETCH_ERROR;
-        case Type::SUBSCRIBE_UPDATE:
+        case Type::REQUEST_UPDATE:
           return ok ? FrameType::REQUEST_OK : FrameType::REQUEST_ERROR;
         case Type::PUBLISH_NAMESPACE:
           return ok ? FrameType::PUBLISH_NAMESPACE_OK
@@ -735,11 +761,9 @@ class MoQSession : public Subscriber,
       return type_ == Type::FETCH ? &storage_.fetchTrack_ : nullptr;
     }
 
-    folly::coro::Promise<
-        folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>*
-    tryGetSubscribeUpdate() {
-      return type_ == Type::SUBSCRIBE_UPDATE ? &storage_.subscribeUpdate_
-                                             : nullptr;
+    folly::coro::Promise<folly::Expected<RequestOk, RequestError>>*
+    tryGetRequestUpdate() {
+      return type_ == Type::REQUEST_UPDATE ? &storage_.requestUpdate_ : nullptr;
     }
 
     Type getType() const {

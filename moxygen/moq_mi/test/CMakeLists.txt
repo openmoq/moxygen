@@ -13,7 +13,8 @@ moxygen_add_test(TARGET MoQMiTests
   SOURCES
     MoQMiTest.cpp
   DEPENDS
-    moqmi
-    flvparser
-    proxygen::proxygen
+    moxygen_moq_mi
+    moxygen_flv_parser_flv_reader
+    proxygen::proxygen_utils_logging
+    testmain
 )

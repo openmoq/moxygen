@@ -27,6 +27,18 @@ const uint64_t kImmutableExtensionType = 0xB;
 const uint64_t kPriorGroupIdGapExtensionType = 0x3C;
 const uint64_t kPriorObjectIdGapExtensionType = 0x3E;
 
+// Track Property Extension Types (Draft-16+)
+constexpr uint64_t kDeliveryTimeoutExtensionType = 0x02;
+constexpr uint64_t kMaxCacheDurationExtensionType = 0x04;
+constexpr uint64_t kPublisherPriorityExtensionType = 0x0E;
+constexpr uint64_t kPublisherGroupOrderExtensionType = 0x22;
+constexpr uint64_t kDynamicGroupsExtensionType = 0x30;
+
+// End of Range serialization flags (MOQT spec)
+// Used in FETCH responses to indicate ranges of missing/unknown objects
+constexpr uint64_t kSerializationFlagEndOfNonExistentRange = 0x8C;
+constexpr uint64_t kSerializationFlagEndOfUnknownRange = 0x10C;
+
 //////// Types ////////
 
 using Payload = std::unique_ptr<folly::IOBuf>;
@@ -132,6 +144,7 @@ enum class ResetStreamErrorCode : uint32_t {
 
 enum class FrameType : uint64_t {
   SUBSCRIBE_UPDATE = 2,
+  REQUEST_UPDATE = 2,
   SUBSCRIBE = 3,
   SUBSCRIBE_OK = 4,
   SUBSCRIBE_ERROR = 5,
@@ -143,7 +156,7 @@ enum class FrameType : uint64_t {
   NAMESPACE = 0x8,               // Draft 16 and above
   PUBLISH_NAMESPACE_DONE = 9,
   UNSUBSCRIBE = 0xA,
-  SUBSCRIBE_DONE = 0xB,
+  PUBLISH_DONE = 0xB,
   PUBLISH_NAMESPACE_CANCEL = 0xC,
   TRACK_STATUS = 0xD,
   TRACK_STATUS_OK = 0xE, // Draft 15 and below
@@ -444,6 +457,9 @@ class Parameters {
 
   // Validates if a parameter is allowed for frameType_
   bool isParamAllowed(TrackRequestParamKey key) const;
+
+  // Returns true if key is a known parameter key in kParamAllowlist
+  static bool isKnownParamKey(uint64_t key);
 
   const Parameter& getParam(size_t position) const {
     return params_.at(position);
@@ -802,13 +818,17 @@ struct ObjectHeader {
   ObjectStatus status{ObjectStatus::NORMAL};
   Extensions extensions;
   std::optional<uint64_t> length{std::nullopt};
+  // Forwarding preference: true = Datagram, false = Subgroup (stream)
+  // Used in FETCH serialization to indicate how this object should be forwarded
+  bool forwardingPreferenceIsDatagram{false};
 
   // == Operator For Datagram Testing
   bool operator==(const ObjectHeader& other) const {
     return group == other.group && subgroup == other.subgroup &&
         id == other.id && priority == other.priority &&
         status == other.status && extensions == other.extensions &&
-        length == other.length;
+        length == other.length &&
+        forwardingPreferenceIsDatagram == other.forwardingPreferenceIsDatagram;
   }
 };
 
@@ -974,6 +994,7 @@ struct SubscribeOk {
   GroupOrder groupOrder;
   // context exists is inferred from presence of largest
   std::optional<AbsoluteLocation> largest;
+  Extensions extensions; // Draft 16+
   TrackRequestParameters params{FrameType::SUBSCRIBE_OK};
 };
 
@@ -997,6 +1018,7 @@ struct PublishRequest {
   GroupOrder groupOrder{GroupOrder::Default};
   std::optional<AbsoluteLocation> largest;
   bool forward{true};
+  Extensions extensions; // Draft 16+
   TrackRequestParameters params{FrameType::PUBLISH};
 };
 
@@ -1137,6 +1159,7 @@ struct FetchOk {
   GroupOrder groupOrder;
   uint8_t endOfTrack;
   AbsoluteLocation endLocation;
+  Extensions extensions; // Draft 16+
   TrackRequestParameters params{FrameType::FETCH_OK};
 };
 
