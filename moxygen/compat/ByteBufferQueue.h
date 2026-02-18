@@ -110,15 +110,18 @@ class ChainView {
 // - Single-buffer move() returns without copying (O(1))
 // - trimStart() uses O(1) ByteBuffer::trimStart via offset adjustment
 // - ChainView allows scatter-gather I/O without coalescing
+// - chainLength() is always O(1) via cached length
 //
 class ByteBufferQueue {
  public:
   struct Options {
-    bool cacheChainLength{false};
+    bool cacheChainLength{true};  // Always cache by default for O(1) length
   };
 
   ByteBufferQueue() = default;
-  explicit ByteBufferQueue(Options opts) : cacheLength_(opts.cacheChainLength) {}
+  explicit ByteBufferQueue(Options /*opts*/) {
+    // Length is always cached now - options kept for API compatibility
+  }
 
   // Convenience factory matching IOBufQueue::cacheChainLength()
   static Options cacheChainLength() {
@@ -134,9 +137,7 @@ class ByteBufferQueue {
   // Append data to the queue
   void append(std::unique_ptr<ByteBuffer> buf) {
     if (buf && buf->length() > 0) {
-      if (cacheLength_) {
-        cachedLength_ += buf->length();
-      }
+      cachedLength_ += buf->length();
       chain_.push_back(std::move(buf));
     }
   }
@@ -152,23 +153,14 @@ class ByteBufferQueue {
   // Prepend data to the queue
   void prepend(std::unique_ptr<ByteBuffer> buf) {
     if (buf && buf->length() > 0) {
-      if (cacheLength_) {
-        cachedLength_ += buf->length();
-      }
+      cachedLength_ += buf->length();
       chain_.push_front(std::move(buf));
     }
   }
 
-  // Get total length of all buffers
+  // Get total length of all buffers - O(1) via cached length
   size_t chainLength() const {
-    if (cacheLength_) {
-      return cachedLength_;
-    }
-    size_t total = 0;
-    for (const auto& buf : chain_) {
-      total += buf->length();
-    }
-    return total;
+    return cachedLength_;
   }
 
   bool empty() const {
@@ -202,9 +194,7 @@ class ByteBufferQueue {
     if (chain_.size() == 1) {
       auto result = std::move(chain_.front());
       chain_.pop_front();
-      if (cacheLength_) {
-        cachedLength_ = 0;
-      }
+      cachedLength_ = 0;
       return result;
     }
 
@@ -215,32 +205,26 @@ class ByteBufferQueue {
   // Move as ChainView - allows iteration without coalescing
   // Use this when transport supports scatter-gather I/O
   ChainView moveAsChainView() {
-    size_t len = cacheLength_ ? cachedLength_ : chainLength();
-    ChainView view(std::move(chain_), len);
+    ChainView view(std::move(chain_), cachedLength_);
     chain_.clear();
-    if (cacheLength_) {
-      cachedLength_ = 0;
-    }
+    cachedLength_ = 0;
     return view;
   }
 
-  // Split off first n bytes
+  // Split off first n bytes as a single coalesced buffer
   // OPTIMIZED: Uses O(1) trimStart on remaining buffer
   std::unique_ptr<ByteBuffer> split(size_t n) {
     if (n == 0 || chain_.empty()) {
       return nullptr;
     }
 
-    size_t totalLen = chainLength();
-    n = std::min(n, totalLen);
+    n = std::min(n, cachedLength_);
 
     // Fast path: split exactly at first buffer boundary
     auto& front = chain_.front();
     if (n == front->length()) {
       auto result = std::move(chain_.front());
-      if (cacheLength_) {
-        cachedLength_ -= result->length();
-      }
+      cachedLength_ -= result->length();
       chain_.pop_front();
       return result;
     }
@@ -253,10 +237,7 @@ class ByteBufferQueue {
 
       // O(1) trimStart with new ByteBuffer implementation
       front->trimStart(n);
-
-      if (cacheLength_) {
-        cachedLength_ -= n;
-      }
+      cachedLength_ -= n;
       return result;
     }
 
@@ -274,21 +255,58 @@ class ByteBufferQueue {
       remaining -= toCopy;
 
       if (toCopy == buf->length()) {
-        if (cacheLength_) {
-          cachedLength_ -= buf->length();
-        }
+        cachedLength_ -= buf->length();
         chain_.pop_front();
       } else {
         // O(1) trimStart with new ByteBuffer implementation
         buf->trimStart(toCopy);
-        if (cacheLength_) {
-          cachedLength_ -= toCopy;
-        }
+        cachedLength_ -= toCopy;
       }
     }
 
     result->append(n);
     return result;
+  }
+
+  // Split off first n bytes as a chain of buffers (zero-copy when possible)
+  // Returns a ChainView containing complete buffers, plus a partial copy if needed
+  // This avoids coalescing when the split aligns with buffer boundaries
+  ChainView splitChain(size_t n) {
+    if (n == 0 || chain_.empty()) {
+      return ChainView();
+    }
+
+    n = std::min(n, cachedLength_);
+    std::deque<std::unique_ptr<ByteBuffer>> result;
+    size_t resultLen = 0;
+
+    // Move complete buffers that fit within n
+    while (!chain_.empty() && resultLen + chain_.front()->length() <= n) {
+      auto& front = chain_.front();
+      resultLen += front->length();
+      cachedLength_ -= front->length();
+      result.push_back(std::move(chain_.front()));
+      chain_.pop_front();
+    }
+
+    // Handle partial buffer if needed
+    if (resultLen < n && !chain_.empty()) {
+      size_t partialLen = n - resultLen;
+      auto& front = chain_.front();
+
+      // Create a copy for the partial portion
+      auto partial = ByteBuffer::create(partialLen);
+      std::memcpy(partial->writableData(), front->data(), partialLen);
+      partial->append(partialLen);
+      result.push_back(std::move(partial));
+
+      // O(1) trimStart on remaining
+      front->trimStart(partialLen);
+      cachedLength_ -= partialLen;
+      resultLen = n;
+    }
+
+    return ChainView(std::move(result), resultLen);
   }
 
   // Trim bytes from the start
@@ -298,16 +316,12 @@ class ByteBufferQueue {
       auto& front = chain_.front();
       if (n >= front->length()) {
         n -= front->length();
-        if (cacheLength_) {
-          cachedLength_ -= front->length();
-        }
+        cachedLength_ -= front->length();
         chain_.pop_front();
       } else {
         // O(1) trimStart with new ByteBuffer implementation
         front->trimStart(n);
-        if (cacheLength_) {
-          cachedLength_ -= n;
-        }
+        cachedLength_ -= n;
         n = 0;
       }
     }
@@ -316,9 +330,7 @@ class ByteBufferQueue {
   // Clear all data
   void clear() {
     chain_.clear();
-    if (cacheLength_) {
-      cachedLength_ = 0;
-    }
+    cachedLength_ = 0;
   }
 
   // Access to chain for iteration (used by Cursor)
@@ -341,9 +353,7 @@ class ByteBufferQueue {
     if (preallocatedBuf_) {
       preallocatedBuf_->append(n);
       preallocatedSize_ = n;
-      if (cacheLength_) {
-        cachedLength_ += n;
-      }
+      cachedLength_ += n;
       chain_.push_back(std::move(preallocatedBuf_));
     }
   }
@@ -351,20 +361,17 @@ class ByteBufferQueue {
  private:
   // Coalesce all buffers into one (called when chain_.size() > 1)
   std::unique_ptr<ByteBuffer> moveCoalesced() {
-    size_t totalLen = chainLength();
-    auto result = ByteBuffer::create(totalLen);
+    auto result = ByteBuffer::create(cachedLength_);
 
     size_t offset = 0;
     for (auto& buf : chain_) {
       std::memcpy(result->writableData() + offset, buf->data(), buf->length());
       offset += buf->length();
     }
-    result->append(totalLen);
+    result->append(cachedLength_);
 
     chain_.clear();
-    if (cacheLength_) {
-      cachedLength_ = 0;
-    }
+    cachedLength_ = 0;
 
     return result;
   }
@@ -372,8 +379,7 @@ class ByteBufferQueue {
   std::unique_ptr<ByteBuffer> preallocatedBuf_;
   size_t preallocatedSize_{0};
   std::deque<std::unique_ptr<ByteBuffer>> chain_;
-  bool cacheLength_{false};
-  size_t cachedLength_{0};
+  size_t cachedLength_{0};  // Always cached for O(1) chainLength()
 };
 
 } // namespace moxygen::compat

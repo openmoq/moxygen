@@ -14,8 +14,10 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace moxygen::compat {
 
@@ -25,6 +27,92 @@ namespace moxygen::compat {
 // This header provides the std-mode implementation only
 
 #else // !MOXYGEN_USE_FOLLY
+
+// Thread-local buffer pool for reducing allocation overhead
+// Pools heap buffers by size class (powers of 2 from 256 to 64KB)
+class ByteBufferPool {
+ public:
+  // Size classes: 256, 512, 1K, 2K, 4K, 8K, 16K, 32K, 64K
+  static constexpr size_t kMinPoolSize = 256;
+  static constexpr size_t kMaxPoolSize = 65536;
+  static constexpr size_t kNumSizeClasses = 9;  // log2(64K/256) + 1
+  static constexpr size_t kMaxPooledPerClass = 8;  // Max buffers to keep per size
+
+  // Get thread-local pool instance
+  static ByteBufferPool& instance() {
+    thread_local ByteBufferPool pool;
+    return pool;
+  }
+
+  // Allocate a buffer of at least the requested size
+  // Returns nullptr if no pooled buffer available (caller should use new[])
+  uint8_t* allocate(size_t requestedSize, size_t& actualSize) {
+    if (requestedSize < kMinPoolSize || requestedSize > kMaxPoolSize) {
+      return nullptr;
+    }
+
+    size_t sizeClass = getSizeClass(requestedSize);
+    actualSize = classSizes_[sizeClass];
+
+    auto& pool = pools_[sizeClass];
+    if (!pool.empty()) {
+      uint8_t* buf = pool.back();
+      pool.pop_back();
+      return buf;
+    }
+    return nullptr;
+  }
+
+  // Return a buffer to the pool
+  // Returns true if pooled, false if caller should delete[]
+  bool deallocate(uint8_t* buf, size_t size) {
+    if (size < kMinPoolSize || size > kMaxPoolSize || !buf) {
+      return false;
+    }
+
+    size_t sizeClass = getSizeClass(size);
+
+    auto& pool = pools_[sizeClass];
+    if (pool.size() < kMaxPooledPerClass) {
+      pool.push_back(buf);
+      return true;
+    }
+    return false;  // Pool full, caller should delete
+  }
+
+  ~ByteBufferPool() {
+    // Free all pooled buffers
+    for (auto& pool : pools_) {
+      for (auto* buf : pool) {
+        delete[] buf;
+      }
+    }
+  }
+
+ private:
+  ByteBufferPool() {
+    // Initialize size class lookup
+    size_t size = kMinPoolSize;
+    for (size_t i = 0; i < kNumSizeClasses; ++i) {
+      classSizes_[i] = size;
+      size *= 2;
+    }
+  }
+
+  // Get size class index for a given size (rounds up to next power of 2)
+  size_t getSizeClass(size_t size) const {
+    // Find the smallest size class that fits
+    for (size_t i = 0; i < kNumSizeClasses; ++i) {
+      if (classSizes_[i] >= size) {
+        return i;
+      }
+    }
+    return kNumSizeClasses - 1;  // Largest class
+  }
+
+  std::array<size_t, kNumSizeClasses> classSizes_;
+  std::array<std::vector<uint8_t*>, kNumSizeClasses> pools_;
+};
 
 // Std-mode ByteBuffer - IOBuf-like buffer with headroom/tailroom and SBO
 //
@@ -61,23 +149,46 @@ class ByteBuffer {
       std::memset(storage_.inline_.data(), 0, kInlineSize);
     } else {
       // Allocate with headroom for future prepends
-      size_t allocSize = capacity + kDefaultHeadroom;
-      storage_.heap_.data = new uint8_t[allocSize];
-      storage_.heap_.capacity = allocSize;
+      size_t requestedSize = capacity + kDefaultHeadroom + kDefaultTailroom;
+
+      // Try to get from pool first
+      size_t actualSize = 0;
+      uint8_t* pooled = ByteBufferPool::instance().allocate(requestedSize, actualSize);
+      if (pooled) {
+        storage_.heap_.data = pooled;
+        storage_.heap_.capacity = actualSize;
+        fromPool_ = true;
+      } else {
+        storage_.heap_.data = new uint8_t[requestedSize];
+        storage_.heap_.capacity = requestedSize;
+        fromPool_ = false;
+      }
       offset_ = kDefaultHeadroom;  // Start with headroom
     }
   }
 
-  // Destructor - clean up heap allocation
+  // Destructor - return to pool or delete
   ~ByteBuffer() {
     if (!isInline_ && storage_.heap_.data) {
-      delete[] storage_.heap_.data;
+      if (fromPool_) {
+        // Try to return to pool
+        if (!ByteBufferPool::instance().deallocate(
+                storage_.heap_.data, storage_.heap_.capacity)) {
+          // Pool full, delete
+          delete[] storage_.heap_.data;
+        }
+      } else {
+        delete[] storage_.heap_.data;
+      }
     }
   }
 
   // Move constructor
   ByteBuffer(ByteBuffer&& other) noexcept
-      : isInline_(other.isInline_), offset_(other.offset_), length_(other.length_) {
+      : isInline_(other.isInline_),
+        fromPool_(other.fromPool_),
+        offset_(other.offset_),
+        length_(other.length_) {
     if (isInline_) {
       storage_.inline_ = other.storage_.inline_;
     } else {
@@ -88,6 +199,7 @@ class ByteBuffer {
     other.offset_ = 0;
     other.length_ = 0;
     other.isInline_ = true;
+    other.fromPool_ = false;
   }
 
   // Move assignment
@@ -95,10 +207,18 @@ class ByteBuffer {
     if (this != &other) {
       // Clean up current heap allocation
       if (!isInline_ && storage_.heap_.data) {
-        delete[] storage_.heap_.data;
+        if (fromPool_) {
+          if (!ByteBufferPool::instance().deallocate(
+                  storage_.heap_.data, storage_.heap_.capacity)) {
+            delete[] storage_.heap_.data;
+          }
+        } else {
+          delete[] storage_.heap_.data;
+        }
       }
 
       isInline_ = other.isInline_;
+      fromPool_ = other.fromPool_;
       offset_ = other.offset_;
       length_ = other.length_;
 
@@ -113,6 +233,7 @@ class ByteBuffer {
       other.offset_ = 0;
       other.length_ = 0;
       other.isInline_ = true;
+      other.fromPool_ = false;
     }
     return *this;
   }
@@ -299,50 +420,111 @@ class ByteBuffer {
   } storage_;
 
   bool isInline_{true};
-  size_t offset_{0};   // Headroom: valid data starts at offset_
-  size_t length_{0};   // Valid data length
+  bool fromPool_{false};  // Whether heap buffer came from pool
+  size_t offset_{0};      // Headroom: valid data starts at offset_
+  size_t length_{0};      // Valid data length
+
+  // Free current heap buffer (return to pool or delete)
+  void freeHeapBuffer() {
+    if (!isInline_ && storage_.heap_.data) {
+      if (fromPool_) {
+        if (!ByteBufferPool::instance().deallocate(
+                storage_.heap_.data, storage_.heap_.capacity)) {
+          delete[] storage_.heap_.data;
+        }
+      } else {
+        delete[] storage_.heap_.data;
+      }
+    }
+  }
+
+  // Allocate a new heap buffer (from pool or new)
+  void allocateHeapBuffer(size_t size, size_t& actualCapacity) {
+    size_t actualSize = 0;
+    uint8_t* pooled = ByteBufferPool::instance().allocate(size, actualSize);
+    if (pooled) {
+      storage_.heap_.data = pooled;
+      storage_.heap_.capacity = actualSize;
+      actualCapacity = actualSize;
+      fromPool_ = true;
+    } else {
+      storage_.heap_.data = new uint8_t[size];
+      storage_.heap_.capacity = size;
+      actualCapacity = size;
+      fromPool_ = false;
+    }
+    isInline_ = false;
+  }
 
   // Reallocate with additional headroom for prepend
   void reallocateWithHeadroom(size_t additionalHeadroom) {
     size_t neededHeadroom = additionalHeadroom + kDefaultHeadroom;
     size_t newCapacity = neededHeadroom + length_ + kDefaultTailroom;
 
-    uint8_t* newData = new uint8_t[newCapacity];
+    // Allocate new buffer (try pool first)
+    size_t actualCapacity = 0;
+    uint8_t* oldData = isInline_ ? storage_.inline_.data() : storage_.heap_.data;
+    size_t oldLength = length_;
+    size_t oldOffset = offset_;
+    bool wasInline = isInline_;
+    bool wasFromPool = fromPool_;
+
+    // Save old heap info before allocating new
+    uint8_t* oldHeapData = wasInline ? nullptr : storage_.heap_.data;
+    size_t oldHeapCapacity = wasInline ? 0 : storage_.heap_.capacity;
+
+    allocateHeapBuffer(newCapacity, actualCapacity);
     size_t newOffset = neededHeadroom;
 
     // Copy existing data to new location
-    std::memcpy(newData + newOffset, data(), length_);
+    std::memcpy(storage_.heap_.data + newOffset, oldData + oldOffset, oldLength);
 
     // Clean up old heap if needed
-    if (!isInline_ && storage_.heap_.data) {
-      delete[] storage_.heap_.data;
+    if (!wasInline && oldHeapData) {
+      if (wasFromPool) {
+        if (!ByteBufferPool::instance().deallocate(oldHeapData, oldHeapCapacity)) {
+          delete[] oldHeapData;
+        }
+      } else {
+        delete[] oldHeapData;
+      }
     }
 
-    storage_.heap_.data = newData;
-    storage_.heap_.capacity = newCapacity;
     offset_ = newOffset;
-    isInline_ = false;
   }
 
   // Reallocate for more capacity (tailroom)
   void reallocateForCapacity(size_t newCapacity) {
     size_t allocSize = offset_ + newCapacity + kDefaultTailroom;
 
-    uint8_t* newData = new uint8_t[allocSize];
+    // Save old state
+    uint8_t* oldData = isInline_ ? storage_.inline_.data() : storage_.heap_.data;
+    size_t oldLength = length_;
+    size_t oldOffset = offset_;
+    bool wasInline = isInline_;
+    bool wasFromPool = fromPool_;
+    uint8_t* oldHeapData = wasInline ? nullptr : storage_.heap_.data;
+    size_t oldHeapCapacity = wasInline ? 0 : storage_.heap_.capacity;
+
+    size_t actualCapacity = 0;
+    allocateHeapBuffer(allocSize, actualCapacity);
 
     // Copy existing data preserving offset
-    if (length_ > 0) {
-      std::memcpy(newData + offset_, data(), length_);
+    if (oldLength > 0) {
+      std::memcpy(storage_.heap_.data + oldOffset, oldData + oldOffset, oldLength);
     }
+    offset_ = oldOffset;
 
     // Clean up old heap if needed
-    if (!isInline_ && storage_.heap_.data) {
-      delete[] storage_.heap_.data;
+    if (!wasInline && oldHeapData) {
+      if (wasFromPool) {
+        if (!ByteBufferPool::instance().deallocate(oldHeapData, oldHeapCapacity)) {
+          delete[] oldHeapData;
+        }
+      } else {
+        delete[] oldHeapData;
+      }
     }
-
-    storage_.heap_.data = newData;
-    storage_.heap_.capacity = allocSize;
-    isInline_ = false;
   }
 };
 
