@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +19,17 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// Debug assertions - active in debug builds only
+#ifdef NDEBUG
+#define BYTEBUFFER_DCHECK(cond) ((void)0)
+#define BYTEBUFFER_DCHECK_LE(a, b) ((void)0)
+#define BYTEBUFFER_DCHECK_GE(a, b) ((void)0)
+#else
+#define BYTEBUFFER_DCHECK(cond) assert(cond)
+#define BYTEBUFFER_DCHECK_LE(a, b) assert((a) <= (b))
+#define BYTEBUFFER_DCHECK_GE(a, b) assert((a) >= (b))
+#endif
 
 namespace moxygen::compat {
 
@@ -120,7 +132,9 @@ class ByteBufferPool {
 // - O(1) trimStart() via offset adjustment (like IOBuf headroom)
 // - O(1) prepend() when headroom available
 // - Small Buffer Optimization: buffers <= 64 bytes use inline storage
+// - External data wrapping for zero-copy operations
 // - Overflow-safe arithmetic in append/prepend
+// - Thread-local buffer pooling for reduced allocations
 //
 // Memory layout (heap mode):
 // |<-- headroom -->|<------- length -------->|<--- tailroom --->|
@@ -129,12 +143,22 @@ class ByteBufferPool {
 // ^                ^                         ^                  ^
 // heap_.data    data()              data()+length()    heap_.data+capacity
 //
+// Ownership modes:
+// - OWNED: Buffer owns the memory (inline, heap, or pooled)
+// - EXTERNAL: Buffer references external memory (caller owns lifetime)
+//
 class ByteBuffer {
  public:
   // Configuration constants
   static constexpr size_t kInlineSize = 64;        // SBO threshold
   static constexpr size_t kDefaultHeadroom = 128;  // Pre-allocated headroom
   static constexpr size_t kDefaultTailroom = 256;  // Pre-allocated tailroom
+
+  // Ownership mode
+  enum class OwnershipMode : uint8_t {
+    OWNED,     // Buffer owns the memory
+    EXTERNAL   // External memory, caller manages lifetime
+  };
 
   // Default constructor - inline mode, empty
   ByteBuffer() : isInline_(true), offset_(0), length_(0) {
@@ -167,26 +191,29 @@ class ByteBuffer {
     }
   }
 
-  // Destructor - return to pool or delete
+  // Private constructor for external data wrapping
+ private:
+  ByteBuffer(const uint8_t* externalData, size_t len, OwnershipMode mode)
+      : isInline_(false),
+        isExternal_(mode == OwnershipMode::EXTERNAL),
+        offset_(0),
+        length_(len) {
+    // Store external pointer in heap storage (won't be freed)
+    storage_.heap_.data = const_cast<uint8_t*>(externalData);
+    storage_.heap_.capacity = len;  // No headroom/tailroom for external
+  }
+
+ public:
+  // Destructor - return to pool, delete, or nothing (external)
   ~ByteBuffer() {
-    if (!isInline_ && storage_.heap_.data) {
-      if (fromPool_) {
-        // Try to return to pool
-        if (!ByteBufferPool::instance().deallocate(
-                storage_.heap_.data, storage_.heap_.capacity)) {
-          // Pool full, delete
-          delete[] storage_.heap_.data;
-        }
-      } else {
-        delete[] storage_.heap_.data;
-      }
-    }
+    freeOwnedMemory();
   }
 
   // Move constructor
   ByteBuffer(ByteBuffer&& other) noexcept
       : isInline_(other.isInline_),
         fromPool_(other.fromPool_),
+        isExternal_(other.isExternal_),
         offset_(other.offset_),
         length_(other.length_) {
     if (isInline_) {
@@ -200,25 +227,18 @@ class ByteBuffer {
     other.length_ = 0;
     other.isInline_ = true;
     other.fromPool_ = false;
+    other.isExternal_ = false;
   }
 
   // Move assignment
   ByteBuffer& operator=(ByteBuffer&& other) noexcept {
     if (this != &other) {
-      // Clean up current heap allocation
-      if (!isInline_ && storage_.heap_.data) {
-        if (fromPool_) {
-          if (!ByteBufferPool::instance().deallocate(
-                  storage_.heap_.data, storage_.heap_.capacity)) {
-            delete[] storage_.heap_.data;
-          }
-        } else {
-          delete[] storage_.heap_.data;
-        }
-      }
+      // Clean up current memory
+      freeOwnedMemory();
 
       isInline_ = other.isInline_;
       fromPool_ = other.fromPool_;
+      isExternal_ = other.isExternal_;
       offset_ = other.offset_;
       length_ = other.length_;
 
@@ -234,6 +254,7 @@ class ByteBuffer {
       other.length_ = 0;
       other.isInline_ = true;
       other.fromPool_ = false;
+      other.isExternal_ = false;
     }
     return *this;
   }
@@ -258,8 +279,62 @@ class ByteBuffer {
     return copyBuffer(str.data(), str.size());
   }
 
+  // Wrap external data without copying (ZERO-COPY)
+  //
+  // WARNING: The caller MUST ensure that:
+  // 1. The external data remains valid for the lifetime of this ByteBuffer
+  // 2. The external data is not modified while this ByteBuffer exists
+  // 3. This ByteBuffer is not used after the external data is freed
+  //
+  // Use cases:
+  // - Wrapping data from memory-mapped files
+  // - Wrapping data from static/const buffers
+  // - Avoiding copies when data lifetime is guaranteed
+  //
+  // The wrapped buffer is READ-ONLY. Calls to writableData() will throw.
+  // Operations that modify the buffer (prepend, append to data) will throw.
+  // trimStart/trimEnd are allowed as they only adjust offsets.
+  //
+  static std::unique_ptr<ByteBuffer> wrapExternal(
+      const void* data,
+      size_t size) {
+    if (!data && size > 0) {
+      throw std::invalid_argument("ByteBuffer::wrapExternal: null data with non-zero size");
+    }
+    // Use placement new with private constructor
+    auto buf = std::unique_ptr<ByteBuffer>(new ByteBuffer(
+        static_cast<const uint8_t*>(data), size, OwnershipMode::EXTERNAL));
+    return buf;
+  }
+
+  // Check if buffer wraps external data
+  bool isExternal() const {
+    return isExternal_;
+  }
+
+  // Check if buffer is writable (not external)
+  bool isWritable() const {
+    return !isExternal_;
+  }
+
   // Data access - accounts for offset
+  // THROWS if buffer is external (read-only)
   uint8_t* writableData() {
+    if (isExternal_) {
+      throw std::logic_error(
+          "ByteBuffer::writableData: cannot write to external buffer");
+    }
+    if (isInline_) {
+      return storage_.inline_.data() + offset_;
+    }
+    return storage_.heap_.data + offset_;
+  }
+
+  // Safe version that returns nullptr for external buffers
+  uint8_t* writableDataOrNull() {
+    if (isExternal_) {
+      return nullptr;
+    }
     if (isInline_) {
       return storage_.inline_.data() + offset_;
     }
@@ -268,8 +343,11 @@ class ByteBuffer {
 
   const uint8_t* data() const {
     if (isInline_) {
+      BYTEBUFFER_DCHECK_LE(offset_, kInlineSize);
       return storage_.inline_.data() + offset_;
     }
+    BYTEBUFFER_DCHECK(storage_.heap_.data != nullptr || length_ == 0);
+    BYTEBUFFER_DCHECK_LE(offset_, storage_.heap_.capacity);
     return storage_.heap_.data + offset_;
   }
 
@@ -306,7 +384,20 @@ class ByteBuffer {
   }
 
   // Append - extend valid data length (with overflow check)
+  // For external buffers: only extends length, doesn't allow writing past original
   void append(size_t len) {
+    if (isExternal_) {
+      // For external buffers, we can only "reveal" more of the original data
+      // This is used after wrapExternal to set the initial length
+      size_t maxLen = storage_.heap_.capacity;  // Original external size
+      if (length_ + len > maxLen) {
+        throw std::out_of_range(
+            "ByteBuffer::append: would exceed external buffer bounds");
+      }
+      length_ += len;
+      return;
+    }
+
     size_t newLength;
     if (__builtin_add_overflow(length_, len, &newLength)) {
       throw std::overflow_error("ByteBuffer::append overflow");
@@ -316,8 +407,15 @@ class ByteBuffer {
   }
 
   // Prepend - O(1) when headroom available, else reallocate
+  // THROWS for external buffers (cannot reallocate)
   void prepend(size_t len) {
     if (len == 0) return;
+
+    if (isExternal_) {
+      // External buffers have no headroom
+      throw std::logic_error(
+          "ByteBuffer::prepend: cannot prepend to external buffer");
+    }
 
     // Overflow check
     size_t newLength;
@@ -345,6 +443,8 @@ class ByteBuffer {
       offset_ += len;  // O(1)!
       length_ -= len;
     }
+    // Invariant: offset_ + length_ never exceeds capacity
+    BYTEBUFFER_DCHECK_LE(offset_ + length_, isInline_ ? kInlineSize : storage_.heap_.capacity);
   }
 
   // TrimEnd - O(1), just reduce length
@@ -354,9 +454,12 @@ class ByteBuffer {
     } else {
       length_ -= len;
     }
+    // Invariant: offset_ + length_ never exceeds capacity
+    BYTEBUFFER_DCHECK_LE(offset_ + length_, isInline_ ? kInlineSize : storage_.heap_.capacity);
   }
 
-  // Clone - deep copy
+  // Clone - deep copy (always creates owned buffer)
+  // For external buffers, this is the way to get a writable copy
   std::unique_ptr<ByteBuffer> clone() const {
     auto copy = std::make_unique<ByteBuffer>(length_);
     std::memcpy(copy->writableData(), data(), length_);
@@ -364,18 +467,37 @@ class ByteBuffer {
     return copy;
   }
 
+  // Clone into owned buffer only if external, otherwise return nullptr
+  // Useful when you need a writable buffer but want to avoid copy if already owned
+  std::unique_ptr<ByteBuffer> cloneIfExternal() const {
+    if (isExternal_) {
+      return clone();
+    }
+    return nullptr;
+  }
+
   // Coalesce - no-op for contiguous buffer
   void coalesce() {}
 
   // Reserve more capacity (may reallocate)
+  // THROWS for external buffers
   void reserve(size_t newCapacity) {
+    if (isExternal_) {
+      throw std::logic_error(
+          "ByteBuffer::reserve: cannot reserve on external buffer");
+    }
     if (newCapacity > capacity()) {
       reallocateForCapacity(newCapacity);
     }
   }
 
   // Ensure writable space at end
+  // THROWS for external buffers
   void ensureWritableSpace(size_t len) {
+    if (isExternal_) {
+      throw std::logic_error(
+          "ByteBuffer::ensureWritableSpace: cannot ensure space on external buffer");
+    }
     if (len > tailroom()) {
       reallocateForCapacity(length_ + len);
     }
@@ -420,12 +542,17 @@ class ByteBuffer {
   } storage_;
 
   bool isInline_{true};
-  bool fromPool_{false};  // Whether heap buffer came from pool
-  size_t offset_{0};      // Headroom: valid data starts at offset_
-  size_t length_{0};      // Valid data length
+  bool fromPool_{false};    // Whether heap buffer came from pool
+  bool isExternal_{false};  // Whether buffer wraps external data (not owned)
+  size_t offset_{0};        // Headroom: valid data starts at offset_
+  size_t length_{0};        // Valid data length
 
-  // Free current heap buffer (return to pool or delete)
-  void freeHeapBuffer() {
+  // Free owned memory (skip for external buffers)
+  void freeOwnedMemory() {
+    if (isExternal_) {
+      // External data - we don't own it, don't free
+      return;
+    }
     if (!isInline_ && storage_.heap_.data) {
       if (fromPool_) {
         if (!ByteBufferPool::instance().deallocate(
@@ -436,6 +563,11 @@ class ByteBuffer {
         delete[] storage_.heap_.data;
       }
     }
+  }
+
+  // Legacy alias for compatibility
+  void freeHeapBuffer() {
+    freeOwnedMemory();
   }
 
   // Allocate a new heap buffer (from pool or new)
