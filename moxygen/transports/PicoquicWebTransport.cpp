@@ -503,58 +503,77 @@ PicoquicStreamWriteHandle::writeStreamDataSync(
 int PicoquicStreamWriteHandle::onPrepareToSend(
     void* context,
     size_t maxLength) {
-  std::lock_guard<std::mutex> lock(outbuf_.mutex);
+  // Collect waiters to signal outside the lock
+  std::vector<compat::Promise<compat::Unit>> waitersToSignal;
 
-  // Calculate available data
-  size_t available = 0;
-  for (auto& chunk : outbuf_.chunks) {
-    available += chunk->size();
-  }
-  available -= outbuf_.firstChunkOffset;
+  {
+    std::lock_guard<std::mutex> lock(outbuf_.mutex);
 
-  if (available == 0 && !outbuf_.finQueued) {
-    // Nothing to send — renege
-    picoquic_provide_stream_data_buffer(context, 0, 0, 0);
-    return 0;
-  }
+    // Signal any waiters that picoquic is ready for data
+    // This is the key JIT backpressure signal
+    waitersToSignal = std::move(outbuf_.readyWaiters);
+    outbuf_.readyWaiters.clear();
 
-  if (available == 0 && outbuf_.finQueued && !outbuf_.finSent) {
-    // Only FIN to send, no data
-    picoquic_provide_stream_data_buffer(context, 0, 1, 0);
-    outbuf_.finSent = true;
-    return 0;
-  }
+    // Calculate available data
+    size_t available = 0;
+    for (auto& chunk : outbuf_.chunks) {
+      available += chunk->size();
+    }
+    available -= outbuf_.firstChunkOffset;
 
-  size_t toSend = std::min(available, maxLength);
-  bool isFin = outbuf_.finQueued && (toSend == available);
-  bool stillActive = (toSend < available);
+    if (available == 0 && !outbuf_.finQueued) {
+      // Nothing to send — renege
+      picoquic_provide_stream_data_buffer(context, 0, 0, 0);
+      // Still signal waiters so publishers can queue more data
+      goto signal_waiters;
+    }
 
-  uint8_t* buf = picoquic_provide_stream_data_buffer(
-      context, toSend, isFin ? 1 : 0, stillActive ? 1 : 0);
+    if (available == 0 && outbuf_.finQueued && !outbuf_.finSent) {
+      // Only FIN to send, no data
+      picoquic_provide_stream_data_buffer(context, 0, 1, 0);
+      outbuf_.finSent = true;
+      goto signal_waiters;
+    }
 
-  if (!buf || toSend == 0) {
-    return 0;
-  }
+    size_t toSend = std::min(available, maxLength);
+    bool isFin = outbuf_.finQueued && (toSend == available);
+    bool stillActive = (toSend < available);
 
-  // Copy data from chunks to picoquic buffer
-  size_t written = 0;
-  while (written < toSend && !outbuf_.chunks.empty()) {
-    auto& front = outbuf_.chunks.front();
-    size_t chunkRemaining = front->size() - outbuf_.firstChunkOffset;
-    size_t copyLen = std::min(chunkRemaining, toSend - written);
+    uint8_t* buf = picoquic_provide_stream_data_buffer(
+        context, toSend, isFin ? 1 : 0, stillActive ? 1 : 0);
 
-    memcpy(buf + written, front->data() + outbuf_.firstChunkOffset, copyLen);
-    written += copyLen;
-    outbuf_.firstChunkOffset += copyLen;
+    if (!buf || toSend == 0) {
+      goto signal_waiters;
+    }
 
-    if (outbuf_.firstChunkOffset >= front->size()) {
-      outbuf_.chunks.pop_front();
-      outbuf_.firstChunkOffset = 0;
+    // Copy data from chunks to picoquic buffer
+    size_t written = 0;
+    while (written < toSend && !outbuf_.chunks.empty()) {
+      auto& front = outbuf_.chunks.front();
+      size_t chunkRemaining = front->size() - outbuf_.firstChunkOffset;
+      size_t copyLen = std::min(chunkRemaining, toSend - written);
+
+      memcpy(buf + written, front->data() + outbuf_.firstChunkOffset, copyLen);
+      written += copyLen;
+      outbuf_.firstChunkOffset += copyLen;
+
+      if (outbuf_.firstChunkOffset >= front->size()) {
+        outbuf_.chunks.pop_front();
+        outbuf_.firstChunkOffset = 0;
+      }
+    }
+
+    if (isFin) {
+      outbuf_.finSent = true;
     }
   }
 
-  if (isFin) {
-    outbuf_.finSent = true;
+signal_waiters:
+  // Signal waiters outside the lock to prevent deadlock
+  for (auto& promise : waitersToSignal) {
+    if (!promise.isFulfilled()) {
+      promise.setValue(compat::unit);
+    }
   }
 
   return 0;
@@ -586,6 +605,15 @@ void PicoquicStreamWriteHandle::awaitWritable(
   if (writableCb_) {
     writableCb_();
   }
+}
+
+compat::Expected<compat::SemiFuture<compat::Unit>, compat::WebTransportError>
+PicoquicStreamWriteHandle::awaitWritable() {
+  std::lock_guard<std::mutex> lock(outbuf_.mutex);
+
+  // Create a promise and store it - will be fulfilled when prepare_to_send fires
+  outbuf_.readyWaiters.emplace_back();
+  return outbuf_.readyWaiters.back().getSemiFuture();
 }
 
 void PicoquicStreamWriteHandle::setPeerCancelCallback(

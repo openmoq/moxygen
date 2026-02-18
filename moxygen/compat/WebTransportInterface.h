@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <moxygen/compat/Async.h>
 #include <moxygen/compat/Config.h>
 #include <moxygen/compat/Expected.h>
 #include <moxygen/compat/Payload.h>
@@ -89,6 +90,16 @@ class StreamWriteHandle {
   // Callback is invoked when the stream becomes writable after being blocked
   virtual void awaitWritable(std::function<void()> callback) = 0;
 
+  // Flow control: Get a future that completes when the stream is writable
+  // For JIT transports, this completes when prepare_to_send is called
+  // Default implementation uses awaitWritable callback
+  virtual Expected<SemiFuture<Unit>, WebTransportError> awaitWritable() {
+    auto promise = std::make_shared<Promise<Unit>>();
+    auto future = promise->getSemiFuture();
+    awaitWritable([promise]() mutable { promise->setValue(unit); });
+    return std::move(future);
+  }
+
   // Set callback for when stream is cancelled/reset by peer
   // errorCode is the STOP_SENDING or RESET_STREAM error code
   virtual void setPeerCancelCallback(std::function<void(uint32_t)> cb) = 0;
@@ -156,6 +167,22 @@ class WebTransportInterface {
 
   // Create a bidirectional stream
   virtual Expected<BidiStreamHandle*, WebTransportError> createBidiStream() = 0;
+
+  // --- Stream Credit (Flow Control) ---
+
+  // Wait for unidirectional stream creation credit (MAX_STREAMS)
+  // Returns a future that completes when a new uni stream can be created
+  // For JIT transports, this may complete immediately if credit is available
+  virtual Expected<SemiFuture<Unit>, WebTransportError> awaitUniStreamCredit() {
+    // Default: assume stream credit is always available
+    return SemiFuture<Unit>(unit);
+  }
+
+  // Wait for bidirectional stream creation credit (MAX_STREAMS)
+  virtual Expected<SemiFuture<Unit>, WebTransportError> awaitBidiStreamCredit() {
+    // Default: assume stream credit is always available
+    return SemiFuture<Unit>(unit);
+  }
 
   // --- Datagrams ---
 

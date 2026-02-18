@@ -234,6 +234,11 @@ class PicoquicStreamWriteHandle : public compat::StreamWriteHandle {
   void resetStream(uint32_t errorCode) override;
   void setPriority(const compat::StreamPriority& priority) override;
   void awaitWritable(std::function<void()> callback) override;
+
+  // JIT-aware version: returns future that completes when prepare_to_send fires
+  compat::Expected<compat::SemiFuture<compat::Unit>, compat::WebTransportError>
+  awaitWritable() override;
+
   void setPeerCancelCallback(std::function<void(uint32_t)> cb) override;
 
   compat::Expected<compat::Unit, compat::WebTransportError>
@@ -267,6 +272,9 @@ class PicoquicStreamWriteHandle : public compat::StreamWriteHandle {
     size_t firstChunkOffset{0}; // bytes already consumed from front chunk
     bool finQueued{false};      // FIN has been buffered
     bool finSent{false};        // FIN has been provided to picoquic
+
+    // Waiters for prepare_to_send signal (JIT backpressure)
+    std::vector<compat::Promise<compat::Unit>> readyWaiters;
   };
   OutBuffer outbuf_;
 };
