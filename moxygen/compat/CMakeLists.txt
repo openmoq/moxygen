@@ -28,6 +28,9 @@ else()
 
     target_compile_definitions(moqcompat PUBLIC MOXYGEN_USE_FOLLY=0)
 
+    # spdlog for logging (fetched in root CMakeLists.txt)
+    target_link_libraries(moqcompat PUBLIC spdlog::spdlog)
+
     # Optional abseil support for high-performance containers
     # When enabled, FastMap/FastSet use absl::flat_hash_map/set (Swiss table)
     if(MOXYGEN_USE_ABSEIL)

@@ -167,6 +167,28 @@ elseif(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
   message(STATUS "Picoquic fetched and configured")
 endif()
 
+# spdlog for std-mode logging (fast, header-only option available)
+if(NOT MOXYGEN_USE_FOLLY)
+  include(FetchContent)
+
+  # Use header-only mode for simplicity
+  set(SPDLOG_FMT_EXTERNAL OFF CACHE BOOL "" FORCE)
+
+  FetchContent_Declare(
+    spdlog
+    GIT_REPOSITORY https://github.com/gabime/spdlog.git
+    GIT_TAG        v1.13.0
+    GIT_SHALLOW    TRUE
+  )
+
+  FetchContent_MakeAvailable(spdlog)
+
+  # Install spdlog targets for export compatibility
+  install(TARGETS spdlog EXPORT moxygen-exports)
+
+  message(STATUS "spdlog fetched and configured for std-mode logging")
+endif()
+
 list(APPEND
   _MOXYGEN_COMMON_COMPILE_OPTIONS
   -Wall
