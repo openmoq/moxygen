@@ -4,7 +4,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <moxygen/transports/MvfstStdModeAdapter.h>
+#include <moxygen/transports/openmoq/adapters/MvfstStdModeAdapter.h>
 
 #if MOXYGEN_QUIC_MVFST
 

@@ -20,8 +20,8 @@
 #include <moxygen/compat/SocketAddress.h>
 #include <moxygen/events/MoQSimpleExecutor.h>
 #include <moxygen/relay/MoQRelayCompat.h>
-#include <moxygen/transports/PicoquicMoQServer.h>
-#include <moxygen/transports/TransportMode.h>
+#include <moxygen/transports/openmoq/picoquic/PicoquicMoQServer.h>
+#include <moxygen/transports/openmoq/picoquic/TransportMode.h>
 
 #include <unistd.h>
 

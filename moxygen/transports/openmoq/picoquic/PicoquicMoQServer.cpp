@@ -4,7 +4,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "moxygen/transports/PicoquicMoQServer.h"
+#include "moxygen/transports/openmoq/picoquic/PicoquicMoQServer.h"
 
 #if MOXYGEN_QUIC_PICOQUIC
 
@@ -12,7 +12,7 @@
 #include <moxygen/MoQTypes.h>
 #include <moxygen/MoQVersions.h>
 #include <moxygen/compat/Try.h>
-#include <moxygen/transports/PicoquicH3Transport.h>
+#include <moxygen/transports/openmoq/picoquic/PicoquicH3Transport.h>
 
 #if MOXYGEN_USE_FOLLY
 #include <folly/ExceptionWrapper.h>

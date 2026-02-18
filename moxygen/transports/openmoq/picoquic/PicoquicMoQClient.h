@@ -11,8 +11,8 @@
 #if MOXYGEN_QUIC_PICOQUIC
 
 #include <moxygen/compat/MoQClientInterface.h>
-#include <moxygen/transports/PicoquicRawTransport.h>
-#include <moxygen/transports/TransportMode.h>
+#include <moxygen/transports/openmoq/picoquic/PicoquicRawTransport.h>
+#include <moxygen/transports/openmoq/picoquic/TransportMode.h>
 
 // Forward declaration
 namespace moxygen {

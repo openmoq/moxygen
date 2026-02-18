@@ -22,10 +22,10 @@
 #include <moxygen/compat/MoQServerInterface.h>
 #include <moxygen/compat/SocketAddress.h>
 #include <moxygen/events/MoQSimpleExecutor.h>
-#include <moxygen/transports/PicoquicMoQClient.h>
-#include <moxygen/transports/PicoquicMoQRelayClient.h>
-#include <moxygen/transports/PicoquicMoQServer.h>
-#include <moxygen/transports/TransportMode.h>
+#include <moxygen/transports/openmoq/picoquic/PicoquicMoQClient.h>
+#include <moxygen/transports/openmoq/picoquic/PicoquicMoQRelayClient.h>
+#include <moxygen/transports/openmoq/picoquic/PicoquicMoQServer.h>
+#include <moxygen/transports/openmoq/picoquic/TransportMode.h>
 
 #include <atomic>
 #include <chrono>

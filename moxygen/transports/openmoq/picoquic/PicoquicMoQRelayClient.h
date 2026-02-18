@@ -14,7 +14,7 @@
 #include <moxygen/Publisher.h>
 #include <moxygen/Subscriber.h>
 #include <moxygen/compat/Callbacks.h>
-#include <moxygen/transports/PicoquicMoQClient.h>
+#include <moxygen/transports/openmoq/picoquic/PicoquicMoQClient.h>
 
 #include <chrono>
 #include <memory>

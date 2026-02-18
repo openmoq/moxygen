@@ -22,8 +22,8 @@
 #include <moxygen/compat/MoQClientInterface.h>
 #include <moxygen/compat/SocketAddress.h>
 #include <moxygen/events/MoQSimpleExecutor.h>
-#include <moxygen/transports/PicoquicMoQClient.h>
-#include <moxygen/transports/TransportMode.h>
+#include <moxygen/transports/openmoq/picoquic/PicoquicMoQClient.h>
+#include <moxygen/transports/openmoq/picoquic/TransportMode.h>
 
 #include <moxygen/compat/Config.h>
 

@@ -4,7 +4,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <moxygen/transports/PicoquicH3Transport.h>
+#include <moxygen/transports/openmoq/picoquic/PicoquicH3Transport.h>
 
 #if MOXYGEN_QUIC_PICOQUIC
 

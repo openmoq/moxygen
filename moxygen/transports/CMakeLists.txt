@@ -5,11 +5,18 @@
 # LICENSE file in the root directory of this source tree.
 
 # Transport implementations for different QUIC backends
+#
+# Directory structure:
+#   transports/
+#   ├── openmoq/
+#   │   ├── picoquic/    - Picoquic-based transport (std-mode)
+#   │   └── adapters/    - Cross-backend adapters (hybrid modes)
+#   └── CMakeLists.txt   - This file
 
 # --- mvfst/proxygen WebTransport adapter ---
 if(MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
   add_library(moqtransport_proxygen
-    ProxygenWebTransportAdapter.cpp
+    openmoq/adapters/ProxygenWebTransportAdapter.cpp
   )
 
   target_include_directories(
@@ -39,7 +46,7 @@ if(MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
   # MvfstStdModeAdapter - allows std-mode code to use mvfst transport
   # This adapter wraps mvfst/proxygen and provides a callback-based interface
   add_library(moqtransport_mvfst_stdmode
-    MvfstStdModeAdapter.cpp
+    openmoq/adapters/MvfstStdModeAdapter.cpp
   )
 
   target_include_directories(
@@ -72,11 +79,11 @@ endif()
 # --- picoquic transport implementation ---
 if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
   add_library(moqtransport_picoquic
-    PicoquicRawTransport.cpp
-    PicoquicH3Transport.cpp
-    PicoquicMoQClient.cpp
-    PicoquicMoQServer.cpp
-    PicoquicMoQRelayClient.cpp
+    openmoq/picoquic/PicoquicRawTransport.cpp
+    openmoq/picoquic/PicoquicH3Transport.cpp
+    openmoq/picoquic/PicoquicMoQClient.cpp
+    openmoq/picoquic/PicoquicMoQServer.cpp
+    openmoq/picoquic/PicoquicMoQRelayClient.cpp
   )
 
   target_include_directories(

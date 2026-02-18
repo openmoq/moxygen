@@ -11,7 +11,7 @@
 #if MOXYGEN_QUIC_PICOQUIC
 
 #include <moxygen/compat/WebTransportInterface.h>
-#include <moxygen/transports/PicoquicRawTransport.h>
+#include <moxygen/transports/openmoq/picoquic/PicoquicRawTransport.h>
 
 // picoquic HTTP/3 headers
 #include <h3zero.h>

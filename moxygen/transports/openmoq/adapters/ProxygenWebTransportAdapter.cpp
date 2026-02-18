@@ -4,7 +4,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "moxygen/transports/ProxygenWebTransportAdapter.h"
+#include "moxygen/transports/openmoq/adapters/ProxygenWebTransportAdapter.h"
 
 #if MOXYGEN_QUIC_MVFST
 

@@ -4,7 +4,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <moxygen/transports/PicoquicMoQRelayClient.h>
+#include <moxygen/transports/openmoq/picoquic/PicoquicMoQRelayClient.h>
 
 #if MOXYGEN_QUIC_PICOQUIC
 
