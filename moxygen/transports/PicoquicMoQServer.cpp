@@ -14,6 +14,10 @@
 #include <moxygen/compat/Try.h>
 #include <moxygen/transports/PicoquicH3Transport.h>
 
+#if MOXYGEN_USE_FOLLY
+#include <folly/ExceptionWrapper.h>
+#endif
+
 #include <picoquic_packet_loop.h>
 #include <picosocks.h>
 
@@ -30,8 +34,8 @@ extern "C" {
 
 namespace moxygen::transports {
 
-#if !MOXYGEN_USE_FOLLY
-// Server-side setup callback implementation
+#if !MOXYGEN_QUIC_MVFST
+// Server-side setup callback implementation (for picoquic backend)
 class PicoquicMoQServer::ServerSetupCallbackImpl
     : public MoQSession::ServerSetupCallback {
  public:
@@ -51,8 +55,13 @@ class PicoquicMoQServer::ServerSetupCallbackImpl
         if (result.hasValue()) {
           return compat::Try<ServerSetup>(std::move(result.value()));
         }
+#if MOXYGEN_USE_FOLLY
+        return compat::Try<ServerSetup>(
+            folly::exception_wrapper(std::runtime_error("Session rejected")));
+#else
         return compat::Try<ServerSetup>(
             std::make_exception_ptr(std::runtime_error("Session rejected")));
+#endif
       }
     }
     // Default setup
@@ -462,12 +471,14 @@ void PicoquicMoQServer::onNewConnection(picoquic_cnx_t* cnx) {
   // Create transport wrapper with thread dispatcher
   auto transport = std::make_shared<PicoquicRawTransport>(cnx, true, &dispatcher_);
 
-#if !MOXYGEN_USE_FOLLY
-  // Create the setup callback wrapper
+#if !MOXYGEN_QUIC_MVFST
+  // Create the setup callback wrapper (for picoquic backend)
   auto setupCallback = std::make_shared<ServerSetupCallbackImpl>(sessionHandler_);
 
   // Create session with setup callback
-  auto session = std::make_shared<MoQSession>(transport, *setupCallback, executor_);
+  // Cast to base interface type for MoQSession constructor
+  std::shared_ptr<compat::WebTransportInterface> wtInterface = transport;
+  auto session = std::make_shared<MoQSession>(wtInterface, *setupCallback, executor_);
 
   // Store connection state (safe: pico thread only)
   ConnectionState state;

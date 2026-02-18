@@ -477,6 +477,14 @@ class MoQUrl {
   TransportType transportType_{TransportType::QUIC};
 };
 
+/**
+ * Check if a string looks like a URL (has scheme://)
+ * Standalone function for compatibility with Folly mode
+ */
+inline bool isUrl(std::string_view str) {
+  return Url::isUrl(str);
+}
+
 } // namespace moxygen::compat
 
 #endif // !MOXYGEN_USE_FOLLY

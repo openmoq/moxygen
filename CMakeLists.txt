@@ -74,6 +74,13 @@ else()
   add_compile_definitions(MOXYGEN_QUIC_MVFST=1)
 endif()
 
+# Define compile-time flag for Folly mode
+if(MOXYGEN_USE_FOLLY)
+  add_compile_definitions(MOXYGEN_USE_FOLLY=1)
+else()
+  add_compile_definitions(MOXYGEN_USE_FOLLY=0)
+endif()
+
 # Print build configuration
 message(STATUS "Moxygen build configuration:")
 message(STATUS "  MOXYGEN_USE_FOLLY: ${MOXYGEN_USE_FOLLY}")
