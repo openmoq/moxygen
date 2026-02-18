@@ -20,7 +20,9 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
+#include <utility>
 
 namespace moxygen::compat {
 
@@ -290,6 +292,304 @@ struct PointerHash {
   }
 };
 
+// =============================================================================
+// Enum hash (generic, no specialization required)
+// =============================================================================
+
+struct EnumHash {
+  template <typename E>
+  std::enable_if_t<std::is_enum_v<E>, size_t>
+  operator()(E e) const noexcept {
+    return mixHash(static_cast<uint64_t>(to_underlying(e)));
+  }
+};
+
+// =============================================================================
+// Pair hash
+// =============================================================================
+
+struct PairHash {
+  template <typename T1, typename T2>
+  size_t operator()(const std::pair<T1, T2>& p) const noexcept {
+    size_t h1 = std::hash<T1>{}(p.first);
+    size_t h2 = std::hash<T2>{}(p.second);
+    return hash_combine(h1, h2);
+  }
+};
+
+// Pair hash with custom hashers
+template <typename Hash1 = void, typename Hash2 = void>
+struct PairHasher {
+  template <typename T1, typename T2>
+  size_t operator()(const std::pair<T1, T2>& p) const noexcept {
+    size_t h1, h2;
+    if constexpr (std::is_void_v<Hash1>) {
+      h1 = std::hash<T1>{}(p.first);
+    } else {
+      h1 = Hash1{}(p.first);
+    }
+    if constexpr (std::is_void_v<Hash2>) {
+      h2 = std::hash<T2>{}(p.second);
+    } else {
+      h2 = Hash2{}(p.second);
+    }
+    return hash_combine(h1, h2);
+  }
+};
+
+// =============================================================================
+// Tuple hash
+// =============================================================================
+
+namespace detail {
+
+template <typename Tuple, size_t... Is>
+size_t hashTupleImpl(const Tuple& t, std::index_sequence<Is...>) noexcept {
+  size_t seed = 0;
+  ((seed = hash_combine(
+        seed,
+        std::hash<std::tuple_element_t<Is, Tuple>>{}(std::get<Is>(t)))),
+   ...);
+  return seed;
+}
+
+} // namespace detail
+
+struct TupleHash {
+  template <typename... Args>
+  size_t operator()(const std::tuple<Args...>& t) const noexcept {
+    return detail::hashTupleImpl(t, std::index_sequence_for<Args...>{});
+  }
+};
+
+// =============================================================================
+// Transparent string hash (for heterogeneous lookup)
+// =============================================================================
+// Allows lookup in unordered_map<string, V> using string_view without
+// constructing a temporary string.
+
+struct TransparentStringHash {
+  using is_transparent = void;  // Enable heterogeneous lookup
+
+  size_t operator()(std::string_view sv) const noexcept {
+    const auto& key = detail::getSipHashKey();
+    return static_cast<size_t>(detail::siphash24(
+        reinterpret_cast<const uint8_t*>(sv.data()),
+        sv.size(),
+        key.k0,
+        key.k1));
+  }
+
+  size_t operator()(const std::string& s) const noexcept {
+    return (*this)(std::string_view(s));
+  }
+
+  size_t operator()(const char* s) const noexcept {
+    return (*this)(std::string_view(s));
+  }
+};
+
+struct TransparentStringEqual {
+  using is_transparent = void;
+
+  bool operator()(std::string_view a, std::string_view b) const noexcept {
+    return a == b;
+  }
+};
+
+// =============================================================================
+// FNV-1a hash (fast, non-cryptographic)
+// =============================================================================
+// Good for general-purpose hashing when security isn't a concern.
+// Faster than SipHash for small inputs.
+
+namespace detail {
+
+inline constexpr uint64_t kFnvOffset64 = 0xcbf29ce484222325ULL;
+inline constexpr uint64_t kFnvPrime64 = 0x100000001b3ULL;
+
+inline constexpr size_t fnv1a(const uint8_t* data, size_t len) noexcept {
+  uint64_t hash = kFnvOffset64;
+  for (size_t i = 0; i < len; ++i) {
+    hash ^= static_cast<uint64_t>(data[i]);
+    hash *= kFnvPrime64;
+  }
+  return static_cast<size_t>(hash);
+}
+
+} // namespace detail
+
+struct FnvHash {
+  size_t operator()(std::string_view sv) const noexcept {
+    return detail::fnv1a(
+        reinterpret_cast<const uint8_t*>(sv.data()), sv.size());
+  }
+
+  size_t operator()(const std::string& s) const noexcept {
+    return (*this)(std::string_view(s));
+  }
+
+  // Hash raw bytes
+  size_t operator()(const void* data, size_t len) const noexcept {
+    return detail::fnv1a(static_cast<const uint8_t*>(data), len);
+  }
+};
+
+// =============================================================================
+// Constexpr string hash (compile-time)
+// =============================================================================
+// Use for switch statements on strings, compile-time string comparison, etc.
+//
+// Example:
+//   switch (constexprHash(str)) {
+//     case "hello"_hash: ...
+//     case "world"_hash: ...
+//   }
+
+constexpr size_t constexprHash(std::string_view sv) noexcept {
+  uint64_t hash = detail::kFnvOffset64;
+  for (char c : sv) {
+    hash ^= static_cast<uint64_t>(static_cast<uint8_t>(c));
+    hash *= detail::kFnvPrime64;
+  }
+  return static_cast<size_t>(hash);
+}
+
+// User-defined literal for compile-time string hashing
+constexpr size_t operator""_hash(const char* str, size_t len) noexcept {
+  return constexprHash(std::string_view(str, len));
+}
+
+// =============================================================================
+// WyHash - extremely fast hash function
+// =============================================================================
+// Modern hash function with excellent speed and distribution.
+// Based on wyhash by Wang Yi: https://github.com/wangyi-fudan/wyhash
+// This is a simplified version for common use cases.
+
+namespace detail {
+
+inline uint64_t wyMix(uint64_t a, uint64_t b) noexcept {
+  // Multiply and xor high/low parts
+  __uint128_t r = static_cast<__uint128_t>(a) * b;
+  return static_cast<uint64_t>(r) ^ static_cast<uint64_t>(r >> 64);
+}
+
+inline uint64_t wyRead8(const uint8_t* p) noexcept {
+  uint64_t v;
+  std::memcpy(&v, p, 8);
+  return v;
+}
+
+inline uint64_t wyRead4(const uint8_t* p) noexcept {
+  uint32_t v;
+  std::memcpy(&v, p, 4);
+  return v;
+}
+
+inline constexpr uint64_t kWyP0 = 0xa0761d6478bd642fULL;
+inline constexpr uint64_t kWyP1 = 0xe7037ed1a0b428dbULL;
+inline constexpr uint64_t kWyP2 = 0x8ebc6af09c88c6e3ULL;
+inline constexpr uint64_t kWyP3 = 0x589965cc75374cc3ULL;
+
+inline uint64_t wyhash(const uint8_t* data, size_t len, uint64_t seed) noexcept {
+  const uint8_t* p = data;
+  uint64_t a, b;
+
+  if (len <= 16) {
+    if (len >= 4) {
+      a = (wyRead4(p) << 32) | wyRead4(p + ((len >> 3) << 2));
+      b = (wyRead4(p + len - 4) << 32) | wyRead4(p + len - 4 - ((len >> 3) << 2));
+    } else if (len > 0) {
+      a = (static_cast<uint64_t>(p[0]) << 16) |
+          (static_cast<uint64_t>(p[len >> 1]) << 8) | p[len - 1];
+      b = 0;
+    } else {
+      a = b = 0;
+    }
+  } else {
+    size_t i = len;
+    if (i > 48) {
+      uint64_t s1 = seed, s2 = seed;
+      do {
+        seed = wyMix(wyRead8(p) ^ kWyP1, wyRead8(p + 8) ^ seed);
+        s1 = wyMix(wyRead8(p + 16) ^ kWyP2, wyRead8(p + 24) ^ s1);
+        s2 = wyMix(wyRead8(p + 32) ^ kWyP3, wyRead8(p + 40) ^ s2);
+        p += 48;
+        i -= 48;
+      } while (i > 48);
+      seed ^= s1 ^ s2;
+    }
+    while (i > 16) {
+      seed = wyMix(wyRead8(p) ^ kWyP1, wyRead8(p + 8) ^ seed);
+      p += 16;
+      i -= 16;
+    }
+    a = wyRead8(p + i - 16);
+    b = wyRead8(p + i - 8);
+  }
+
+  return wyMix(kWyP1 ^ len, wyMix(a ^ kWyP1, b ^ seed));
+}
+
+// Global wyhash seed
+struct WyHashSeed {
+  uint64_t seed;
+  WyHashSeed() noexcept {
+    std::random_device rd;
+    seed = (static_cast<uint64_t>(rd()) << 32) | rd();
+  }
+};
+
+inline uint64_t getWyHashSeed() noexcept {
+  static const WyHashSeed s;
+  return s.seed;
+}
+
+} // namespace detail
+
+struct WyHash {
+  size_t operator()(std::string_view sv) const noexcept {
+    return static_cast<size_t>(detail::wyhash(
+        reinterpret_cast<const uint8_t*>(sv.data()),
+        sv.size(),
+        detail::getWyHashSeed()));
+  }
+
+  size_t operator()(const std::string& s) const noexcept {
+    return (*this)(std::string_view(s));
+  }
+
+  size_t operator()(const void* data, size_t len) const noexcept {
+    return static_cast<size_t>(detail::wyhash(
+        static_cast<const uint8_t*>(data), len, detail::getWyHashSeed()));
+  }
+
+  // Hash integers directly
+  template <typename T>
+  std::enable_if_t<std::is_integral_v<T>, size_t>
+  operator()(T val) const noexcept {
+    return static_cast<size_t>(
+        detail::wyMix(static_cast<uint64_t>(val) ^ detail::kWyP0,
+                      detail::getWyHashSeed() ^ detail::kWyP1));
+  }
+};
+
 #endif // !MOXYGEN_USE_FOLLY
+
+// =============================================================================
+// Cross-mode utilities (available in both Folly and std modes)
+// =============================================================================
+
+// Hash bytes directly (useful for custom types)
+inline size_t hashBytes(const void* data, size_t len) noexcept {
+#if MOXYGEN_USE_FOLLY
+  return folly::hash::SpookyHashV2::Hash64(data, len, 0);
+#else
+  const auto& key = detail::getSipHashKey();
+  return static_cast<size_t>(detail::siphash24(
+      static_cast<const uint8_t*>(data), len, key.k0, key.k1));
+#endif
+}
 
 } // namespace moxygen::compat
