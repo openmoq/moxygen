@@ -13,30 +13,38 @@
 #else
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <vector>
+#include <unordered_map>
 
 namespace folly {
 
-// Minimal std-mode replacement for folly::CancellationToken
-// This provides basic cancellation signaling without the full folly
-// implementation
+// =============================================================================
+// CancellationToken/Source - Thread-safe cancellation signaling
+// =============================================================================
+// Fixed implementation that properly unregisters callbacks to prevent:
+// - Memory leaks (callbacks stored forever)
+// - Use-after-free (calling into destroyed callback objects)
+//
+// Uses unique IDs instead of storing raw pointers/lambdas capturing 'this'.
+// =============================================================================
 
 class CancellationSource;
+class CancellationCallback;
 
 class CancellationToken {
  public:
   CancellationToken() = default;
 
   // Check if cancellation has been requested
-  bool isCancellationRequested() const {
+  bool isCancellationRequested() const noexcept {
     return state_ && state_->cancelled.load(std::memory_order_acquire);
   }
 
   // Check if the token can be cancelled
-  bool canBeCancelled() const {
+  bool canBeCancelled() const noexcept {
     return state_ != nullptr;
   }
 
@@ -44,10 +52,17 @@ class CancellationToken {
   friend class CancellationSource;
   friend class CancellationCallback;
 
+  struct CallbackEntry {
+    std::function<void()> callback;
+    bool active{true};  // Set to false when unregistered
+  };
+
   struct State {
     std::atomic<bool> cancelled{false};
+    std::atomic<uint64_t> nextCallbackId{1};
     std::mutex mutex;
-    std::vector<std::function<void()>> callbacks;
+    std::unordered_map<uint64_t, CallbackEntry> callbacks;
+    bool invoking{false};  // True while invoking callbacks
   };
 
   explicit CancellationToken(std::shared_ptr<State> state)
@@ -60,12 +75,18 @@ class CancellationSource {
  public:
   CancellationSource() : state_(std::make_shared<CancellationToken::State>()) {}
 
+  // Default copy/move
+  CancellationSource(const CancellationSource&) = default;
+  CancellationSource(CancellationSource&&) = default;
+  CancellationSource& operator=(const CancellationSource&) = default;
+  CancellationSource& operator=(CancellationSource&&) = default;
+
   // Get a token that can be used to check for cancellation
   CancellationToken getToken() const {
     return CancellationToken(state_);
   }
 
-  // Request cancellation
+  // Request cancellation - returns true if this call triggered cancellation
   bool requestCancellation() {
     if (!state_) {
       return false;
@@ -73,20 +94,43 @@ class CancellationSource {
 
     bool expected = false;
     if (!state_->cancelled.compare_exchange_strong(
-            expected, true, std::memory_order_release)) {
+            expected, true, std::memory_order_acq_rel)) {
       return false; // Already cancelled
     }
 
-    // Invoke callbacks
-    std::vector<std::function<void()>> callbacks;
+    // Collect and invoke callbacks
+    std::vector<std::function<void()>> toInvoke;
     {
       std::lock_guard<std::mutex> lock(state_->mutex);
-      callbacks = std::move(state_->callbacks);
+      state_->invoking = true;
+      for (auto& [id, entry] : state_->callbacks) {
+        if (entry.active && entry.callback) {
+          toInvoke.push_back(std::move(entry.callback));
+        }
+      }
+      state_->callbacks.clear();
     }
-    for (auto& cb : callbacks) {
-      cb();
+
+    // Invoke outside lock to prevent deadlocks
+    for (auto& cb : toInvoke) {
+      try {
+        cb();
+      } catch (...) {
+        // Swallow exceptions from callbacks
+      }
     }
+
+    {
+      std::lock_guard<std::mutex> lock(state_->mutex);
+      state_->invoking = false;
+    }
+
     return true;
+  }
+
+  // Check if cancellation was requested
+  bool isCancellationRequested() const noexcept {
+    return state_ && state_->cancelled.load(std::memory_order_acquire);
   }
 
  private:
@@ -94,9 +138,14 @@ class CancellationSource {
   std::shared_ptr<CancellationToken::State> state_;
 };
 
-// RAII callback that fires when cancellation is requested
+// =============================================================================
+// CancellationCallback - RAII callback that fires on cancellation
+// =============================================================================
+// Properly unregisters on destruction to prevent use-after-free.
+
 class CancellationCallback {
  public:
+  // Register callback - invokes immediately if already cancelled
   template <typename F>
   CancellationCallback(const CancellationToken& token, F&& callback)
       : state_(token.state_) {
@@ -104,46 +153,84 @@ class CancellationCallback {
       return;
     }
 
-    // If already cancelled, invoke immediately
+    // If already cancelled, invoke immediately and don't register
     if (state_->cancelled.load(std::memory_order_acquire)) {
-      callback();
+      try {
+        callback();
+      } catch (...) {
+        // Swallow exceptions
+      }
+      state_ = nullptr;  // Don't need to unregister
       return;
     }
 
-    // Register callback
+    // Register callback with unique ID
     {
       std::lock_guard<std::mutex> lock(state_->mutex);
+
       // Double-check after acquiring lock
       if (state_->cancelled.load(std::memory_order_acquire)) {
-        // Invoke outside lock
+        // Will invoke below, outside lock
       } else {
-        callback_ = std::forward<F>(callback);
-        state_->callbacks.push_back([this]() {
-          if (callback_) {
-            callback_();
-          }
-        });
-        registered_ = true;
-        return;
+        callbackId_ = state_->nextCallbackId.fetch_add(1, std::memory_order_relaxed);
+        state_->callbacks[callbackId_] = {std::forward<F>(callback), true};
+        return;  // Successfully registered
       }
     }
-    // Cancelled while we were registering
-    callback();
+
+    // Cancelled while we were registering - invoke now
+    try {
+      callback();
+    } catch (...) {
+      // Swallow exceptions
+    }
+    state_ = nullptr;  // Don't need to unregister
   }
 
   ~CancellationCallback() {
-    // Note: For simplicity, we don't unregister.
-    // In a full implementation, we would remove from callbacks list.
-    callback_ = nullptr;
+    unregister();
+  }
+
+  // Move-only
+  CancellationCallback(CancellationCallback&& other) noexcept
+      : state_(std::move(other.state_)), callbackId_(other.callbackId_) {
+    other.callbackId_ = 0;
+  }
+
+  CancellationCallback& operator=(CancellationCallback&& other) noexcept {
+    if (this != &other) {
+      unregister();
+      state_ = std::move(other.state_);
+      callbackId_ = other.callbackId_;
+      other.callbackId_ = 0;
+    }
+    return *this;
   }
 
   CancellationCallback(const CancellationCallback&) = delete;
   CancellationCallback& operator=(const CancellationCallback&) = delete;
 
+  // Manually unregister (also called by destructor)
+  void unregister() noexcept {
+    if (!state_ || callbackId_ == 0) {
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    auto it = state_->callbacks.find(callbackId_);
+    if (it != state_->callbacks.end()) {
+      it->second.active = false;  // Mark inactive
+      // Only erase if not currently invoking (to avoid iterator invalidation)
+      if (!state_->invoking) {
+        state_->callbacks.erase(it);
+      }
+    }
+    callbackId_ = 0;
+  }
+
  private:
   std::shared_ptr<CancellationToken::State> state_;
-  std::function<void()> callback_;
-  bool registered_{false};
+  uint64_t callbackId_{0};
 };
 
 } // namespace folly
