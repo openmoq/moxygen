@@ -72,6 +72,7 @@ struct Args {
   std::string nsDelimiter{"/"};
   std::string track{"date"};
   std::string transport{"quic"}; // quic, webtransport
+  std::string wtPath{"/moq"};    // WebTransport endpoint path
   bool insecure{false};
   int connectTimeout{5000};
 };
@@ -92,6 +93,8 @@ Args parseArgs(int argc, char* argv[]) {
       args.track = argv[++i];
     } else if ((arg == "--transport" || arg == "-T") && i + 1 < argc) {
       args.transport = argv[++i];
+    } else if ((arg == "--path" || arg == "--endpoint") && i + 1 < argc) {
+      args.wtPath = argv[++i];
     } else if (arg == "--insecure" || arg == "-k") {
       args.insecure = true;
     } else if (arg == "--timeout" && i + 1 < argc) {
@@ -105,6 +108,8 @@ Args parseArgs(int argc, char* argv[]) {
           << "  --ns-delimiter <delim>     Namespace delimiter (default: /)\n"
           << "  --track <name>             Track name (default: date)\n"
           << "  --transport, -T <type>     quic|webtransport (default: quic)\n"
+          << "  --path, --endpoint <path>  WebTransport endpoint path (default: /moq)\n"
+          << "                             Use /moq-relay for Mode 1 (Folly) relay\n"
           << "  --insecure, -k             Skip TLS certificate validation\n"
           << "  --timeout <ms>             Connect timeout in ms (default: 5000)\n"
           << "  --help, -h                 Show this help\n";
@@ -344,6 +349,7 @@ int main(int argc, char* argv[]) {
   clientConfig.serverHost = args.host;
   clientConfig.serverPort = args.port;
   clientConfig.transportMode = transportMode;
+  clientConfig.wtPath = args.wtPath;  // WebTransport endpoint path
   // ALPN is auto-selected based on transport mode
   clientConfig.insecure = args.insecure;
   clientConfig.idleTimeout = std::chrono::milliseconds(30000);
