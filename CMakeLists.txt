@@ -98,6 +98,33 @@ option(BUILD_SAMPLES
   ON
 )
 
+# std-mode dependencies (Abseil + spdlog)
+if(NOT MOXYGEN_USE_FOLLY)
+  include(FetchContent)
+
+  # Abseil for high-performance containers
+  set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
+  set(ABSL_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    abseil-cpp
+    GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
+    GIT_TAG        20240116.2
+    GIT_SHALLOW    TRUE
+  )
+  FetchContent_MakeAvailable(abseil-cpp)
+
+  # spdlog for logging
+  set(SPDLOG_FMT_EXTERNAL OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    spdlog
+    GIT_REPOSITORY https://github.com/gabime/spdlog.git
+    GIT_TAG        v1.13.0
+    GIT_SHALLOW    TRUE
+  )
+  FetchContent_MakeAvailable(spdlog)
+  install(TARGETS spdlog EXPORT moxygen-exports)
+endif()
+
 list(APPEND
   _MOXYGEN_COMMON_COMPILE_OPTIONS
   -Wall
@@ -135,6 +162,9 @@ endif()
 
 include(MoxygenTest)
 include(MoxygenFunctions)
+
+# Compat layer (must come before moxygen for dependency resolution)
+add_subdirectory(moxygen/compat)
 
 add_subdirectory(moxygen)
 

@@ -19,12 +19,8 @@ using Unit = folly::Unit;
 constexpr auto unit = folly::unit;
 #else
 struct Unit {
-  constexpr bool operator==(const Unit&) const {
-    return true;
-  }
-  constexpr bool operator!=(const Unit&) const {
-    return false;
-  }
+  constexpr bool operator==(const Unit&) const { return true; }
+  constexpr bool operator!=(const Unit&) const { return false; }
 };
 constexpr Unit unit{};
 #endif
