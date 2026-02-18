@@ -8,11 +8,109 @@
 
 #include <moxygen/compat/Config.h>
 
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <string>
+#include <string_view>
+
 #if MOXYGEN_USE_FOLLY
 #include <folly/Uri.h>
 
 namespace moxygen::compat {
 using Url = folly::Uri;
+
+/**
+ * Check if a string looks like a URL (has scheme://)
+ * Standalone function for use with folly::Uri
+ */
+inline bool isUrl(std::string_view str) {
+  auto colonPos = str.find("://");
+  if (colonPos == std::string_view::npos || colonPos == 0) {
+    return false;
+  }
+  // Check that scheme contains only valid characters
+  for (size_t i = 0; i < colonPos; ++i) {
+    char c = str[i];
+    if (!std::isalnum(static_cast<unsigned char>(c)) &&
+        c != '+' && c != '-' && c != '.') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * MoQUrl - MoQ-specific URL utilities (folly::Uri version)
+ *
+ * Handles MoQ URL schemes:
+ * - moq://host:port        - Raw QUIC MoQ
+ * - moq-wt://host:port/path - WebTransport MoQ
+ * - https://host:port/path  - WebTransport (standard URL)
+ */
+class MoQUrl {
+ public:
+  enum class TransportType {
+    QUIC,           // Raw QUIC (moq:// or no path)
+    WEBTRANSPORT    // WebTransport (moq-wt:// or https://)
+  };
+
+  explicit MoQUrl(const std::string& urlStr) : url_(urlStr), valid_(true) {
+    determineTransportType();
+  }
+
+  explicit MoQUrl(const Url& url) : url_(url), valid_(true) {
+    determineTransportType();
+  }
+
+  // Get parsed URL
+  const Url& url() const { return url_; }
+
+  // Get transport type
+  TransportType transportType() const { return transportType_; }
+
+  // Convenience accessors
+  std::string host() const { return url_.host(); }
+  uint16_t port() const { return url_.port(); }
+  std::string path() const { return url_.path(); }
+
+  // Is this a WebTransport URL?
+  bool isWebTransport() const {
+    return transportType_ == TransportType::WEBTRANSPORT;
+  }
+
+  // Is this a raw QUIC URL?
+  bool isQuic() const {
+    return transportType_ == TransportType::QUIC;
+  }
+
+  bool valid() const { return valid_; }
+
+ private:
+  void determineTransportType() {
+    std::string scheme = url_.scheme();
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(), ::tolower);
+
+    if (scheme == "moq-wt" || scheme == "https" || scheme == "wss") {
+      transportType_ = TransportType::WEBTRANSPORT;
+    } else if (scheme == "moq" || scheme == "quic") {
+      transportType_ = TransportType::QUIC;
+    } else {
+      // Default to WebTransport for unknown schemes with paths
+      std::string urlPath = url_.path();
+      if (urlPath != "/" && !urlPath.empty()) {
+        transportType_ = TransportType::WEBTRANSPORT;
+      } else {
+        transportType_ = TransportType::QUIC;
+      }
+    }
+  }
+
+  Url url_;
+  TransportType transportType_{TransportType::QUIC};
+  bool valid_{false};
+};
+
 } // namespace moxygen::compat
 
 #else

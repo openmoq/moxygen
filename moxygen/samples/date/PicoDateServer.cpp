@@ -220,12 +220,20 @@ class DatePublisher : public Publisher,
     auto* lt = ::localtime_r(&inTimeT, &localTm);
     std::ostringstream ss;
     ss << std::put_time(lt, "%Y-%m-%d %H:%M:");
+#if MOXYGEN_USE_FOLLY
+    return folly::IOBuf::copyBuffer(ss.str());
+#else
     return compat::Payload::copyBuffer(ss.str());
+#endif
   }
 
   Payload secondPayload(uint64_t object) const {
     auto secStr = std::to_string(object - 1);
+#if MOXYGEN_USE_FOLLY
+    return folly::IOBuf::copyBuffer(secStr);
+#else
     return compat::Payload::copyBuffer(secStr);
+#endif
   }
 
   // --- Publisher interface (callback-based, std-mode) ---

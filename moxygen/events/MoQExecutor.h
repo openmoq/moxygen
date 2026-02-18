@@ -61,6 +61,19 @@ class MoQExecutor : public folly::Executor {
 
   virtual ~MoQExecutor() = default;
 
+  // Execute a function - use std::function for compatibility with std-mode
+  // implementations. This hides folly::Executor::add(Func) which uses
+  // folly::Function, but allows consistent interface across modes.
+  virtual void add(std::function<void()> func) = 0;
+
+  // Implement folly::Executor::add by forwarding to our add
+  // Use shared_ptr wrapper since std::function requires copyable callables
+  // but folly::Function is move-only
+  void add(folly::Function<void()> func) override {
+    auto wrapper = std::make_shared<folly::Function<void()>>(std::move(func));
+    add(std::function<void()>([wrapper]() { (*wrapper)(); }));
+  }
+
   template <
       typename T,
       typename = std::enable_if_t<std::is_base_of_v<MoQExecutor, T>>>

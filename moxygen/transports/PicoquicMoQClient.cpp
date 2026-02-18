@@ -434,7 +434,7 @@ std::unique_ptr<compat::MoQClientInterface> PicoquicMoQClientFactory::createClie
   PicoquicMoQClient::Config config = defaultConfig_;
 
   // Use the compat URL parser if it looks like a URL
-  if (compat::Url::isUrl(url)) {
+  if (compat::isUrl(url)) {
     compat::MoQUrl moqUrl(url);
     if (moqUrl.valid()) {
       config.serverHost = moqUrl.host();

@@ -557,13 +557,13 @@ void PicoquicH3Transport::drainSession() {
 compat::SocketAddress PicoquicH3Transport::getPeerAddress() const {
   sockaddr_storage addr;
   picoquic_get_peer_addr(cnx_, reinterpret_cast<sockaddr**>(&addr));
-  return compat::SocketAddress(reinterpret_cast<sockaddr*>(&addr));
+  return compat::makeSocketAddress(reinterpret_cast<sockaddr*>(&addr));
 }
 
 compat::SocketAddress PicoquicH3Transport::getLocalAddress() const {
   sockaddr_storage addr;
   picoquic_get_local_addr(cnx_, reinterpret_cast<sockaddr**>(&addr));
-  return compat::SocketAddress(reinterpret_cast<sockaddr*>(&addr));
+  return compat::makeSocketAddress(reinterpret_cast<sockaddr*>(&addr));
 }
 
 std::string PicoquicH3Transport::getALPN() const {

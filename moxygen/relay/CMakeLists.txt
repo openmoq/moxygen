@@ -7,8 +7,9 @@
 # Relay components (shared between Folly and std-mode)
 # MoQForwarder can now be built in std-mode with callback-based APIs
 
-# MoQCache - requires Folly for F14Set
-if(MOXYGEN_USE_FOLLY)
+# MoQCache - requires Folly + mvfst (coroutine-based APIs)
+# Not compatible with picoquic backend which uses callback-based APIs
+if(MOXYGEN_USE_FOLLY AND MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
 add_library(moqcache MoQCache.cpp)
 target_include_directories(
   moqcache PUBLIC
@@ -30,7 +31,7 @@ install(
     ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
     LIBRARY DESTINATION ${LIB_INSTALL_DIR}
 )
-endif() # MOXYGEN_USE_FOLLY
+endif() # MOXYGEN_USE_FOLLY AND mvfst
 
 # Folly + mvfst: Full relay implementation with coroutines
 if(MOXYGEN_USE_FOLLY AND MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
