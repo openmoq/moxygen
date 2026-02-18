@@ -145,77 +145,267 @@ class Payload {
 
 #else // !MOXYGEN_USE_FOLLY
 
-// Std-mode Payload backed by vector
+// =============================================================================
+// Std-mode Payload backed by ByteBuffer with reference counting
+// =============================================================================
+//
+// Performance features:
+// - Small Buffer Optimization (SBO): buffers <= 64 bytes use inline storage
+// - Reference counting: clone() shares data, copy-on-write semantics
+// - Headroom/tailroom: O(1) trimStart/prepend when space available
+// - Buffer chains: multiple buffers can be linked for scatter-gather
+//
+// This provides near-parity with folly::IOBuf for common operations.
+// =============================================================================
+
 class Payload {
  public:
   Payload() = default;
-  explicit Payload(std::vector<uint8_t> data) : data_(std::move(data)) {}
+
+  // Construct from vector (legacy compatibility)
+  explicit Payload(std::vector<uint8_t> data) {
+    if (!data.empty()) {
+      buf_ = std::make_shared<ByteBuffer>(data.size());
+      std::memcpy(buf_->writableData(), data.data(), data.size());
+      buf_->append(data.size());
+    }
+  }
+
+  // Construct from ByteBuffer (takes ownership)
+  explicit Payload(std::unique_ptr<ByteBuffer> buf)
+      : buf_(std::move(buf)) {}
+
+  // Construct from shared ByteBuffer (reference counting)
+  explicit Payload(std::shared_ptr<ByteBuffer> buf)
+      : buf_(std::move(buf)) {}
 
   // Iterator constructor for convenience
   template <typename InputIt>
-  Payload(InputIt first, InputIt last) : data_(first, last) {}
+  Payload(InputIt first, InputIt last) {
+    size_t size = std::distance(first, last);
+    if (size > 0) {
+      buf_ = std::make_shared<ByteBuffer>(size);
+      std::copy(first, last, buf_->writableData());
+      buf_->append(size);
+    }
+  }
 
-  // Move-only
+  // Move operations
   Payload(Payload&&) = default;
   Payload& operator=(Payload&&) = default;
-  Payload(const Payload&) = delete;
-  Payload& operator=(const Payload&) = delete;
 
-  explicit operator bool() const { return !data_.empty(); }
+  // Copy is allowed (shares underlying buffer via refcount)
+  Payload(const Payload& other) : buf_(other.buf_), next_(nullptr) {
+    // Note: doesn't copy chain, only this buffer
+  }
+  Payload& operator=(const Payload& other) {
+    if (this != &other) {
+      buf_ = other.buf_;
+      next_ = nullptr;
+    }
+    return *this;
+  }
 
-  size_t computeChainDataLength() const { return data_.size(); }
-  size_t length() const { return data_.size(); }
-  size_t size() const { return data_.size(); }  // Alias for length()
-  const uint8_t* data() const { return data_.data(); }
-  uint8_t* writableData() { return data_.data(); }
-  bool empty() const { return data_.empty(); }
-  void coalesce() {} // No-op for vector
+  explicit operator bool() const { return buf_ != nullptr && buf_->length() > 0; }
 
+  // Total length of this buffer and all chained buffers
+  size_t computeChainDataLength() const {
+    size_t total = length();
+    for (Payload* p = next_.get(); p != nullptr; p = p->next_.get()) {
+      total += p->length();
+    }
+    return total;
+  }
+
+  size_t length() const { return buf_ ? buf_->length() : 0; }
+  size_t size() const { return length(); }
+
+  const uint8_t* data() const { return buf_ ? buf_->data() : nullptr; }
+
+  // Get writable data - triggers copy-on-write if shared
+  uint8_t* writableData() {
+    ensureUnique();
+    return buf_ ? buf_->writableData() : nullptr;
+  }
+
+  bool empty() const { return !buf_ || buf_->empty(); }
+
+  // Coalesce chain into single contiguous buffer
+  void coalesce() {
+    if (!next_) {
+      return;  // Already single buffer
+    }
+
+    size_t totalLen = computeChainDataLength();
+    auto newBuf = std::make_shared<ByteBuffer>(totalLen);
+
+    // Copy all data
+    size_t offset = 0;
+    for (Payload* p = this; p != nullptr; p = p->next_.get()) {
+      if (p->buf_ && p->buf_->length() > 0) {
+        std::memcpy(newBuf->writableData() + offset, p->buf_->data(), p->buf_->length());
+        offset += p->buf_->length();
+      }
+    }
+    newBuf->append(totalLen);
+
+    buf_ = std::move(newBuf);
+    next_.reset();
+  }
+
+  // Clone - shares buffer via reference counting (O(1))
+  // Actual copy only happens on write (copy-on-write)
   std::unique_ptr<Payload> clone() const {
-    return std::make_unique<Payload>(data_);
+    if (!buf_) {
+      return nullptr;
+    }
+    auto p = std::make_unique<Payload>(buf_);  // Share the buffer
+    // Clone chain if present
+    if (next_) {
+      p->next_ = next_->clone();
+    }
+    return p;
   }
 
   std::string moveToString() {
-    return std::string(
-        reinterpret_cast<const char*>(data_.data()), data_.size());
+    coalesce();
+    if (!buf_) {
+      return {};
+    }
+    return std::string(reinterpret_cast<const char*>(buf_->data()), buf_->length());
   }
 
   std::string toString() const {
-    return std::string(
-        reinterpret_cast<const char*>(data_.data()), data_.size());
+    if (!buf_) {
+      return {};
+    }
+    if (!next_) {
+      return std::string(reinterpret_cast<const char*>(buf_->data()), buf_->length());
+    }
+    // Need to coalesce for chain
+    std::string result;
+    result.reserve(computeChainDataLength());
+    for (const Payload* p = this; p != nullptr; p = p->next_.get()) {
+      if (p->buf_) {
+        result.append(reinterpret_cast<const char*>(p->buf_->data()), p->buf_->length());
+      }
+    }
+    return result;
   }
 
   // No IOBuf in std mode
   void* getIOBuf() { return nullptr; }
   const void* getIOBuf() const { return nullptr; }
 
+  // Append another payload to the chain
+  void appendChain(std::unique_ptr<Payload> other) {
+    if (!other) return;
+    Payload* tail = this;
+    while (tail->next_) {
+      tail = tail->next_.get();
+    }
+    tail->next_ = std::move(other);
+  }
+
+  // Prepend another payload to the chain
+  void prependChain(std::unique_ptr<Payload> other) {
+    if (!other) return;
+    // Find tail of other chain
+    Payload* otherTail = other.get();
+    while (otherTail->next_) {
+      otherTail = otherTail->next_.get();
+    }
+    // Move our data to become next of other's tail
+    otherTail->next_ = std::make_unique<Payload>(std::move(buf_));
+    otherTail->next_->next_ = std::move(next_);
+    // Take other's buffer as ours
+    buf_ = std::move(other->buf_);
+    next_ = std::move(other->next_);
+  }
+
+  // Extend valid data region
+  void append(size_t n) {
+    ensureUnique();
+    if (buf_) {
+      buf_->append(n);
+    }
+  }
+
+  // Trim bytes from start (O(1) with ByteBuffer's offset)
+  void trimStart(size_t n) {
+    ensureUnique();
+    if (buf_) {
+      buf_->trimStart(n);
+    }
+  }
+
+  // Trim bytes from end
+  void trimEnd(size_t n) {
+    ensureUnique();
+    if (buf_) {
+      buf_->trimEnd(n);
+    }
+  }
+
+  // Prepend data (O(1) if headroom available)
+  void prepend(size_t n) {
+    ensureUnique();
+    if (buf_) {
+      buf_->prepend(n);
+    }
+  }
+
+  // Get headroom (bytes available before data)
+  size_t headroom() const {
+    return buf_ ? buf_->headroom() : 0;
+  }
+
+  // Get tailroom (bytes available after data)
+  size_t tailroom() const {
+    return buf_ ? buf_->tailroom() : 0;
+  }
+
+  // Check if buffer is shared (refcount > 1)
+  bool isShared() const {
+    return buf_ && buf_.use_count() > 1;
+  }
+
+  // --- Factory methods ---
+
   static std::unique_ptr<Payload> create(size_t capacity) {
-    auto p = std::make_unique<Payload>();
-    p->data_.reserve(capacity);
-    return p;
+    return std::make_unique<Payload>(std::make_shared<ByteBuffer>(capacity));
   }
 
   static std::unique_ptr<Payload> copyBuffer(const void* data, size_t size) {
-    return std::make_unique<Payload>(std::vector<uint8_t>(
-        static_cast<const uint8_t*>(data),
-        static_cast<const uint8_t*>(data) + size));
+    auto buf = std::make_shared<ByteBuffer>(size);
+    std::memcpy(buf->writableData(), data, size);
+    buf->append(size);
+    return std::make_unique<Payload>(std::move(buf));
   }
 
   static std::unique_ptr<Payload> copyBuffer(const std::string& str) {
     return copyBuffer(str.data(), str.size());
   }
 
-  // Wrap a ByteBuffer (for compatibility with Buffer type alias)
+  // Wrap a ByteBuffer (takes ownership, no copy!)
   static std::unique_ptr<Payload> wrap(std::unique_ptr<ByteBuffer> buf) {
     if (!buf) {
       return nullptr;
     }
-    return std::make_unique<Payload>(std::vector<uint8_t>(
-        buf->data(), buf->data() + buf->length()));
+    return std::make_unique<Payload>(std::move(buf));
   }
 
  private:
-  std::vector<uint8_t> data_;
+  // Ensure we have exclusive ownership before modifying
+  void ensureUnique() {
+    if (buf_ && buf_.use_count() > 1) {
+      // Copy-on-write: make our own copy via clone()
+      buf_ = std::shared_ptr<ByteBuffer>(buf_->clone());
+    }
+  }
+
+  std::shared_ptr<ByteBuffer> buf_;
+  std::unique_ptr<Payload> next_;  // For buffer chains
 };
 
 #endif // MOXYGEN_USE_FOLLY
