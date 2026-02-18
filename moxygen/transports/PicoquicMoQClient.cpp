@@ -246,7 +246,7 @@ int PicoquicMoQClient::picoquicCallback(
     default:
       // Forward to transport if it exists
       if (client->transport_) {
-        return PicoquicWebTransport::picoCallback(
+        return PicoquicRawTransport::picoCallback(
             cnx, stream_id, bytes, length, event, client->transport_.get(), stream_ctx);
       } else if (client->h3Transport_) {
         return PicoquicH3Transport::quicCallback(
@@ -288,10 +288,10 @@ void PicoquicMoQClient::onConnected() {
     }
   } else {
     // Create raw QUIC transport (original behavior)
-    transport_ = std::make_shared<PicoquicWebTransport>(cnx_, false, &dispatcher_);
+    transport_ = std::make_shared<PicoquicRawTransport>(cnx_, false, &dispatcher_);
 
     // Update connection callback context to use transport directly
-    picoquic_set_callback(cnx_, PicoquicWebTransport::picoCallback, transport_.get());
+    picoquic_set_callback(cnx_, PicoquicRawTransport::picoCallback, transport_.get());
 
     // For raw QUIC, complete setup immediately
     completeSessionSetup(transport_.get(), transport_);

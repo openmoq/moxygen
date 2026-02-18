@@ -4,7 +4,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "moxygen/transports/PicoquicWebTransport.h"
+#include "moxygen/transports/PicoquicRawTransport.h"
 
 #if MOXYGEN_QUIC_PICOQUIC
 
@@ -56,9 +56,9 @@ void PicoquicThreadDispatcher::drainWorkQueue() {
   }
 }
 
-// --- PicoquicWebTransport Implementation ---
+// --- PicoquicRawTransport Implementation ---
 
-PicoquicWebTransport::PicoquicWebTransport(
+PicoquicRawTransport::PicoquicRawTransport(
     picoquic_cnx_t* cnx,
     bool isServer,
     PicoquicThreadDispatcher* dispatcher)
@@ -68,13 +68,13 @@ PicoquicWebTransport::PicoquicWebTransport(
   // so it can pass the transport as callback_ctx.
 }
 
-PicoquicWebTransport::~PicoquicWebTransport() {
+PicoquicRawTransport::~PicoquicRawTransport() {
   if (!closed_) {
     closeSession(0);
   }
 }
 
-int PicoquicWebTransport::picoCallback(
+int PicoquicRawTransport::picoCallback(
     picoquic_cnx_t* cnx,
     uint64_t stream_id,
     uint8_t* bytes,
@@ -82,7 +82,7 @@ int PicoquicWebTransport::picoCallback(
     picoquic_call_back_event_t fin_or_event,
     void* callback_ctx,
     void* stream_ctx) {
-  auto* self = static_cast<PicoquicWebTransport*>(callback_ctx);
+  auto* self = static_cast<PicoquicRawTransport*>(callback_ctx);
   if (!self) {
     return 0;
   }
@@ -91,7 +91,7 @@ int PicoquicWebTransport::picoCallback(
       stream_id, bytes, length, fin_or_event, stream_ctx);
 }
 
-int PicoquicWebTransport::onStreamEvent(
+int PicoquicRawTransport::onStreamEvent(
     uint64_t streamId,
     uint8_t* bytes,
     size_t length,
@@ -221,14 +221,14 @@ int PicoquicWebTransport::onStreamEvent(
   return 0;
 }
 
-void PicoquicWebTransport::onDatagram(uint8_t* bytes, size_t length) {
+void PicoquicRawTransport::onDatagram(uint8_t* bytes, size_t length) {
   if (datagramCb_ && bytes && length > 0) {
     auto payload = compat::Payload::copyBuffer(bytes, length);
     datagramCb_(std::move(payload));
   }
 }
 
-int PicoquicWebTransport::onPrepareDatagram(
+int PicoquicRawTransport::onPrepareDatagram(
     uint8_t* context,
     size_t maxLength) {
   std::lock_guard<std::mutex> lock(datagramMutex_);
@@ -264,7 +264,7 @@ int PicoquicWebTransport::onPrepareDatagram(
 }
 
 compat::Expected<compat::StreamWriteHandle*, compat::WebTransportError>
-PicoquicWebTransport::createUniStream() {
+PicoquicRawTransport::createUniStream() {
   using ResultType =
       compat::Expected<compat::StreamWriteHandle*, compat::WebTransportError>;
 
@@ -292,7 +292,7 @@ PicoquicWebTransport::createUniStream() {
 }
 
 compat::Expected<compat::BidiStreamHandle*, compat::WebTransportError>
-PicoquicWebTransport::createBidiStream() {
+PicoquicRawTransport::createBidiStream() {
   using ResultType =
       compat::Expected<compat::BidiStreamHandle*, compat::WebTransportError>;
 
@@ -328,7 +328,7 @@ PicoquicWebTransport::createBidiStream() {
 }
 
 compat::Expected<compat::Unit, compat::WebTransportError>
-PicoquicWebTransport::sendDatagram(std::unique_ptr<compat::Payload> data) {
+PicoquicRawTransport::sendDatagram(std::unique_ptr<compat::Payload> data) {
   if (!data || data->empty()) {
     return compat::makeUnexpected(compat::WebTransportError::SEND_ERROR);
   }
@@ -354,15 +354,15 @@ PicoquicWebTransport::sendDatagram(std::unique_ptr<compat::Payload> data) {
   return compat::Unit{};
 }
 
-void PicoquicWebTransport::setMaxDatagramSize(size_t maxSize) {
+void PicoquicRawTransport::setMaxDatagramSize(size_t maxSize) {
   maxDatagramSize_ = maxSize;
 }
 
-size_t PicoquicWebTransport::getMaxDatagramSize() const {
+size_t PicoquicRawTransport::getMaxDatagramSize() const {
   return maxDatagramSize_;
 }
 
-void PicoquicWebTransport::closeSession(uint32_t errorCode) {
+void PicoquicRawTransport::closeSession(uint32_t errorCode) {
   if (!closed_) {
     closed_ = true;
     if (dispatcher_ && !dispatcher_->isOnPicoThread()) {
@@ -376,24 +376,24 @@ void PicoquicWebTransport::closeSession(uint32_t errorCode) {
   }
 }
 
-void PicoquicWebTransport::drainSession() {
+void PicoquicRawTransport::drainSession() {
   // picoquic doesn't have a direct drain - just close gracefully
   closeSession(0);
 }
 
-compat::SocketAddress PicoquicWebTransport::getPeerAddress() const {
+compat::SocketAddress PicoquicRawTransport::getPeerAddress() const {
   struct sockaddr* addr = nullptr;
   picoquic_get_peer_addr(cnx_, &addr);
   return compat::makeSocketAddress(addr);
 }
 
-compat::SocketAddress PicoquicWebTransport::getLocalAddress() const {
+compat::SocketAddress PicoquicRawTransport::getLocalAddress() const {
   struct sockaddr* addr = nullptr;
   picoquic_get_local_addr(cnx_, &addr);
   return compat::makeSocketAddress(addr);
 }
 
-std::string PicoquicWebTransport::getALPN() const {
+std::string PicoquicRawTransport::getALPN() const {
   const char* alpn = picoquic_tls_get_negotiated_alpn(cnx_);
   if (alpn) {
     return std::string(alpn);
@@ -401,32 +401,32 @@ std::string PicoquicWebTransport::getALPN() const {
   return "";
 }
 
-bool PicoquicWebTransport::isConnected() const {
+bool PicoquicRawTransport::isConnected() const {
   return !closed_ &&
          picoquic_get_cnx_state(cnx_) == picoquic_state_ready;
 }
 
-void PicoquicWebTransport::setNewUniStreamCallback(
+void PicoquicRawTransport::setNewUniStreamCallback(
     std::function<void(compat::StreamReadHandle*)> cb) {
   newUniStreamCb_ = std::move(cb);
 }
 
-void PicoquicWebTransport::setNewBidiStreamCallback(
+void PicoquicRawTransport::setNewBidiStreamCallback(
     std::function<void(compat::BidiStreamHandle*)> cb) {
   newBidiStreamCb_ = std::move(cb);
 }
 
-void PicoquicWebTransport::setDatagramCallback(
+void PicoquicRawTransport::setDatagramCallback(
     std::function<void(std::unique_ptr<compat::Payload>)> cb) {
   datagramCb_ = std::move(cb);
 }
 
-void PicoquicWebTransport::setSessionCloseCallback(
+void PicoquicRawTransport::setSessionCloseCallback(
     std::function<void(std::optional<uint32_t> error)> cb) {
   sessionCloseCb_ = std::move(cb);
 }
 
-void PicoquicWebTransport::setSessionDrainCallback(
+void PicoquicRawTransport::setSessionDrainCallback(
     std::function<void()> cb) {
   sessionDrainCb_ = std::move(cb);
 }

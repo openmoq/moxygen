@@ -11,7 +11,7 @@
 #if MOXYGEN_QUIC_PICOQUIC
 
 #include <moxygen/compat/MoQClientInterface.h>
-#include <moxygen/transports/PicoquicWebTransport.h>
+#include <moxygen/transports/PicoquicRawTransport.h>
 #include <moxygen/transports/TransportMode.h>
 
 // Forward declaration
@@ -97,7 +97,7 @@ class PicoquicMoQClient : public compat::MoQClientInterface {
   }
 
   // Access the underlying transport
-  PicoquicWebTransport* getTransport() const {
+  PicoquicRawTransport* getTransport() const {
     return transport_.get();
   }
 
@@ -128,6 +128,11 @@ class PicoquicMoQClient : public compat::MoQClientInterface {
   // Handle connection error
   void onConnectionError(uint32_t errorCode);
 
+  // Complete session setup (called after transport is ready)
+  void completeSessionSetup(
+      compat::WebTransportInterface* wtInterface,
+      std::shared_ptr<compat::WebTransportInterface> wtShared);
+
   std::shared_ptr<MoQExecutor> executor_;
   Config config_;
   std::string computedAlpn_;  // ALPN value computed in initQuicContext()
@@ -137,7 +142,7 @@ class PicoquicMoQClient : public compat::MoQClientInterface {
   picoquic_cnx_t* cnx_{nullptr};
 
   // Transport wrapper (one of these will be used based on mode)
-  std::shared_ptr<PicoquicWebTransport> transport_;      // For QUIC mode
+  std::shared_ptr<PicoquicRawTransport> transport_;      // For QUIC mode
   std::shared_ptr<PicoquicH3Transport> h3Transport_;     // For WebTransport mode
 
   // MoQ session

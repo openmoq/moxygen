@@ -91,22 +91,23 @@ class PicoquicStreamReadHandle;
 class PicoquicBidiStreamHandle;
 
 /**
- * PicoquicWebTransport implements WebTransportInterface using picoquic.
+ * PicoquicRawTransport implements WebTransportInterface using raw QUIC streams.
  * This provides a pure C++ implementation without Folly dependencies.
+ * Uses ALPN "moq-00" for direct MoQ-over-QUIC without HTTP/3 framing.
  *
  * Thread safety: All picoquic API calls are dispatched to the picoquic thread
  * via PicoquicThreadDispatcher. The JIT send API (mark_active_stream +
  * prepare_to_send + provide_stream_data_buffer) is used for stream writes.
  */
-class PicoquicWebTransport : public compat::WebTransportInterface {
+class PicoquicRawTransport : public compat::WebTransportInterface {
  public:
   // Create from an existing picoquic connection
-  explicit PicoquicWebTransport(
+  explicit PicoquicRawTransport(
       picoquic_cnx_t* cnx,
       bool isServer = false,
       PicoquicThreadDispatcher* dispatcher = nullptr);
 
-  ~PicoquicWebTransport() override;
+  ~PicoquicRawTransport() override;
 
   // picoquic callback - called by picoquic event loop
   static int picoCallback(
@@ -248,7 +249,7 @@ class PicoquicStreamWriteHandle : public compat::StreamWriteHandle {
   [[nodiscard]] bool isCancelled() const override;
   [[nodiscard]] std::optional<uint32_t> getCancelError() const override;
 
-  // Called by PicoquicWebTransport from picoquic_callback_prepare_to_send
+  // Called by PicoquicRawTransport from picoquic_callback_prepare_to_send
   // context = opaque context for picoquic_provide_stream_data_buffer
   // maxLength = max bytes that can be sent
   int onPrepareToSend(void* context, size_t maxLength);
@@ -304,7 +305,7 @@ class PicoquicStreamReadHandle : public compat::StreamReadHandle {
 
   [[nodiscard]] bool isFinished() const override;
 
-  // Called by PicoquicWebTransport when data arrives
+  // Called by PicoquicRawTransport when data arrives
   void onData(const uint8_t* data, size_t length, bool fin);
   void onError(uint32_t errorCode);
 

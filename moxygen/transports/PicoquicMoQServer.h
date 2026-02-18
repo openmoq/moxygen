@@ -11,7 +11,7 @@
 #if MOXYGEN_QUIC_PICOQUIC
 
 #include <moxygen/compat/MoQServerInterface.h>
-#include <moxygen/transports/PicoquicWebTransport.h>
+#include <moxygen/transports/PicoquicRawTransport.h>
 #include <moxygen/transports/TransportMode.h>
 
 // Forward declaration
@@ -20,6 +20,12 @@ class MoQSession;
 }
 
 #include <picoquic.h>
+
+// h3zero headers for WebTransport support
+extern "C" {
+#include <h3zero.h>
+#include <h3zero_common.h>
+}
 
 #include <atomic>
 #include <memory>
@@ -91,12 +97,13 @@ class PicoquicMoQServer : public compat::MoQServerInterface {
 
   // Per-connection state
   struct ConnectionState {
-    std::shared_ptr<PicoquicWebTransport> transport;
+    std::shared_ptr<PicoquicRawTransport> transport;  // Raw QUIC mode
+    std::shared_ptr<PicoquicH3Transport> h3Transport; // WebTransport mode
     std::shared_ptr<MoQSession> session;
     std::shared_ptr<ServerSetupCallbackImpl> setupCallback;
   };
 
-  // picoquic callback for all connections
+  // picoquic callback for all connections (raw QUIC mode)
   static int picoquicCallback(
       picoquic_cnx_t* cnx,
       uint64_t stream_id,
@@ -105,6 +112,15 @@ class PicoquicMoQServer : public compat::MoQServerInterface {
       picoquic_call_back_event_t event,
       void* callback_ctx,
       void* stream_ctx);
+
+  // WebTransport path callback (WebTransport mode)
+  static int wtPathCallback(
+      picoquic_cnx_t* cnx,
+      uint8_t* bytes,
+      size_t length,
+      picohttp_call_back_event_t event,
+      struct st_h3zero_stream_ctx_t* stream_ctx,
+      void* callback_ctx);
 
   // Loop callback for network thread events
   static int picoLoopCallback(
@@ -128,6 +144,11 @@ class PicoquicMoQServer : public compat::MoQServerInterface {
 
   // picoquic state
   picoquic_quic_t* quic_{nullptr};
+
+  // h3zero state for WebTransport mode
+  h3zero_callback_ctx_t* h3Ctx_{nullptr};
+  picohttp_server_path_item_t pathTable_[1];
+  picohttp_server_parameters_t serverParams_{};
 
   // Session handler
   std::shared_ptr<SessionHandler> sessionHandler_;

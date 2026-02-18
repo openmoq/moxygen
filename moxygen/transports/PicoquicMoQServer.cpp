@@ -17,8 +17,16 @@
 #include <picoquic_packet_loop.h>
 #include <picosocks.h>
 
+// h3zero headers for WebTransport
+extern "C" {
+#include <h3zero.h>
+#include <h3zero_common.h>
+#include <pico_webtransport.h>
+}
+
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 
 namespace moxygen::transports {
 
@@ -79,6 +87,11 @@ PicoquicMoQServer::~PicoquicMoQServer() {
   // Safe to access after pico thread is stopped
   connections_.clear();
 
+  if (h3Ctx_) {
+    h3zero_callback_delete_context(nullptr, h3Ctx_);
+    h3Ctx_ = nullptr;
+  }
+
   if (quic_) {
     picoquic_free(quic_);
     quic_ = nullptr;
@@ -118,8 +131,28 @@ bool PicoquicMoQServer::initQuicContext() {
     return false;
   }
 
-  // Set server-side callback
-  picoquic_set_default_callback(quic_, picoquicCallback, this);
+  if (config_.transportMode == TransportMode::WEBTRANSPORT) {
+    // Set WebTransport transport parameters as default
+    picowt_set_default_transport_parameters(quic_);
+
+    // Set up path table for WebTransport endpoint
+    pathTable_[0].path = endpoint_.c_str();
+    pathTable_[0].path_length = endpoint_.length();
+    pathTable_[0].path_callback = &PicoquicMoQServer::wtPathCallback;
+    pathTable_[0].path_app_ctx = this;
+
+    // Set up server parameters - h3zero will create per-connection contexts
+    serverParams_.web_folder = nullptr;
+    serverParams_.path_table = pathTable_;
+    serverParams_.path_table_nb = 1;
+
+    // Use h3zero callback with server parameters
+    // h3zero_callback will create h3zero contexts per-connection using these params
+    picoquic_set_default_callback(quic_, h3zero_callback, &serverParams_);
+  } else {
+    // Raw QUIC mode - use direct callback
+    picoquic_set_default_callback(quic_, picoquicCallback, this);
+  }
 
   // Configure QUIC settings
   picoquic_set_default_idle_timeout(
@@ -131,35 +164,66 @@ bool PicoquicMoQServer::initQuicContext() {
 void PicoquicMoQServer::start(
     const compat::SocketAddress& addr,
     std::shared_ptr<SessionHandler> handler) {
+  std::cerr << "[SERVER] start() called, port=" << addr.getPort() << std::endl;
   if (running_.exchange(true)) {
+    std::cerr << "[SERVER] Already running" << std::endl;
     return;  // Already running
   }
 
   sessionHandler_ = std::move(handler);
 
+  std::cerr << "[SERVER] Calling initQuicContext()" << std::endl;
   if (!initQuicContext()) {
+    std::cerr << "[SERVER] initQuicContext() FAILED" << std::endl;
     running_ = false;
     return;
   }
+  std::cerr << "[SERVER] initQuicContext() succeeded" << std::endl;
 
   // Configure loop parameters
   memset(&loopParam_, 0, sizeof(loopParam_));
   loopParam_.local_port = addr.getPort();
 
   // Start network thread with loop callback
+  std::cerr << "[SERVER] Starting network thread..." << std::endl;
   int ret = 0;
   threadCtx_ = picoquic_start_network_thread(
       quic_, &loopParam_, picoLoopCallback, this, &ret);
 
   if (!threadCtx_ || ret != 0) {
+    std::cerr << "[SERVER] Failed to start network thread, ret=" << ret << std::endl;
     running_ = false;
     return;
   }
+  std::cerr << "[SERVER] Waiting for thread to be ready..." << std::endl;
 
-  // Wait for thread to be ready
-  while (!threadCtx_->thread_is_ready) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  // Wait for thread to be ready with timeout
+  // The thread may fail early (e.g., socket binding failure) and exit
+  // without ever setting thread_is_ready
+  constexpr int kMaxWaitMs = 5000;  // 5 second timeout
+  int waitedMs = 0;
+  while (!threadCtx_->thread_is_ready && waitedMs < kMaxWaitMs) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    waitedMs += 10;
+
+    // Check if thread exited with error (return_code is set on thread exit)
+    if (threadCtx_->return_code != 0) {
+      std::cerr << "[SERVER] Thread exited with error: " << threadCtx_->return_code << std::endl;
+      running_ = false;
+      picoquic_delete_network_thread(threadCtx_);
+      threadCtx_ = nullptr;
+      return;
+    }
   }
+
+  if (!threadCtx_->thread_is_ready) {
+    std::cerr << "[SERVER] Timeout waiting for thread to be ready" << std::endl;
+    running_ = false;
+    picoquic_delete_network_thread(threadCtx_);
+    threadCtx_ = nullptr;
+    return;
+  }
+  std::cerr << "[SERVER] Thread is ready" << std::endl;
 
   dispatcher_.setThreadContext(threadCtx_);
 }
@@ -181,13 +245,16 @@ int PicoquicMoQServer::picoLoopCallback(
     picoquic_packet_loop_cb_enum cb_mode,
     void* callback_ctx,
     void* /*callback_argv*/) {
+  std::cerr << "[SERVER] picoLoopCallback cb_mode=" << cb_mode << std::endl;
   auto* server = static_cast<PicoquicMoQServer*>(callback_ctx);
   if (!server) {
+    std::cerr << "[SERVER] picoLoopCallback: server is null!" << std::endl;
     return 0;
   }
 
   switch (cb_mode) {
     case picoquic_packet_loop_ready:
+      std::cerr << "[SERVER] picoquic_packet_loop_ready received" << std::endl;
       server->dispatcher_.setPicoThreadId(std::this_thread::get_id());
       break;
     case picoquic_packet_loop_wake_up:
@@ -228,7 +295,7 @@ int PicoquicMoQServer::picoquicCallback(
       // Forward to the connection's transport (safe: pico thread only)
       auto it = server->connections_.find(cnx);
       if (it != server->connections_.end() && it->second.transport) {
-        return PicoquicWebTransport::picoCallback(
+        return PicoquicRawTransport::picoCallback(
             cnx, stream_id, bytes, length, event,
             it->second.transport.get(), stream_ctx);
       }
@@ -239,9 +306,161 @@ int PicoquicMoQServer::picoquicCallback(
   return 0;
 }
 
+int PicoquicMoQServer::wtPathCallback(
+    picoquic_cnx_t* cnx,
+    uint8_t* bytes,
+    size_t length,
+    picohttp_call_back_event_t event,
+    struct st_h3zero_stream_ctx_t* stream_ctx,
+    void* callback_ctx) {
+  auto* server = static_cast<PicoquicMoQServer*>(callback_ctx);
+  if (!server) {
+    return -1;
+  }
+
+  std::cerr << "[WT_PATH_CB] event=" << event
+            << " stream_id=" << (stream_ctx ? stream_ctx->stream_id : UINT64_MAX)
+            << " length=" << length << "\n";
+
+  switch (event) {
+    case picohttp_callback_connect: {
+      // WebTransport CONNECT received - create session
+      auto h3_ctx = static_cast<h3zero_callback_ctx_t*>(
+          picoquic_get_callback_context(cnx));
+
+      std::cerr << "[WT_PATH_CB] CONNECT: h3_ctx=" << h3_ctx
+                << " stream_id=" << (stream_ctx ? stream_ctx->stream_id : UINT64_MAX)
+                << "\n";
+
+      // Create PicoquicH3Transport for this connection
+      auto h3Transport = std::make_shared<PicoquicH3Transport>(
+          cnx, h3_ctx, stream_ctx, &server->dispatcher_);
+
+      // Register stream prefix for this WebTransport session
+      int prefixRet = h3zero_declare_stream_prefix(
+          h3_ctx,
+          stream_ctx->stream_id,
+          &PicoquicMoQServer::wtPathCallback,
+          server);
+      std::cerr << "[WT_PATH_CB] Registered stream prefix for stream_id="
+                << stream_ctx->stream_id << " ret=" << prefixRet << "\n";
+
+      // Verify the registration worked
+      auto* verifyPrefix = h3zero_find_stream_prefix(h3_ctx, stream_ctx->stream_id);
+      std::cerr << "[WT_PATH_CB] Verify stream prefix lookup: "
+                << (verifyPrefix ? "FOUND" : "NOT FOUND") << "\n";
+
+#if !MOXYGEN_USE_FOLLY
+      // Create setup callback and session
+      auto setupCallback =
+          std::make_shared<ServerSetupCallbackImpl>(server->sessionHandler_);
+
+      auto session = std::make_shared<MoQSession>(
+          h3Transport, *setupCallback, server->executor_);
+
+      // Store connection state
+      ConnectionState state;
+      state.h3Transport = h3Transport;
+      state.session = session;
+      state.setupCallback = setupCallback;
+      server->connections_[cnx] = std::move(state);
+
+      // Set up transport callbacks
+      h3Transport->setNewUniStreamCallback(
+          [session](compat::StreamReadHandle* stream) {
+            session->onNewUniStream(stream);
+          });
+
+      h3Transport->setNewBidiStreamCallback(
+          [session](compat::BidiStreamHandle* stream) {
+            session->onNewBidiStream(stream);
+          });
+
+      h3Transport->setDatagramCallback(
+          [session](std::unique_ptr<compat::Payload> datagram) {
+            session->onDatagram(std::move(datagram));
+          });
+
+      h3Transport->setSessionCloseCallback(
+          [session, server, cnx](std::optional<uint32_t> error) {
+            session->onSessionEnd(error);
+            server->onConnectionClose(cnx);
+          });
+
+      // Set stream callback context for this session
+      stream_ctx->path_callback = &PicoquicMoQServer::wtPathCallback;
+      stream_ctx->path_callback_ctx = server;
+
+      // Start the session
+      session->start();
+#endif
+      break;
+    }
+
+    case picohttp_callback_post_data:
+    case picohttp_callback_post_fin: {
+      std::cerr << "[WT_PATH_CB] POST_DATA/FIN: stream_id="
+                << (stream_ctx ? stream_ctx->stream_id : UINT64_MAX)
+                << " length=" << length
+                << " event=" << event << "\n";
+      // Data on a stream - find the H3 transport and deliver
+      auto it = server->connections_.find(cnx);
+      if (it != server->connections_.end() && it->second.h3Transport) {
+        std::cerr << "[WT_PATH_CB] Forwarding to h3Transport\n";
+        it->second.h3Transport->onH3Event(
+            stream_ctx ? stream_ctx->stream_id : UINT64_MAX,
+            bytes, length, event, stream_ctx);
+      } else {
+        std::cerr << "[WT_PATH_CB] ERROR: h3Transport not found!\n";
+      }
+      break;
+    }
+
+    case picohttp_callback_post_datagram: {
+      auto it = server->connections_.find(cnx);
+      if (it != server->connections_.end() && it->second.h3Transport) {
+        it->second.h3Transport->onH3Event(
+            UINT64_MAX, bytes, length, event, stream_ctx);
+      }
+      break;
+    }
+
+    case picohttp_callback_provide_data: {
+      auto it = server->connections_.find(cnx);
+      if (it != server->connections_.end() && it->second.h3Transport) {
+        it->second.h3Transport->onH3Event(
+            stream_ctx ? stream_ctx->stream_id : UINT64_MAX,
+            bytes, length, event, stream_ctx);
+      }
+      break;
+    }
+
+    case picohttp_callback_reset:
+    case picohttp_callback_stop_sending: {
+      auto it = server->connections_.find(cnx);
+      if (it != server->connections_.end() && it->second.h3Transport) {
+        it->second.h3Transport->onH3Event(
+            stream_ctx ? stream_ctx->stream_id : UINT64_MAX,
+            bytes, length, event, stream_ctx);
+      }
+      break;
+    }
+
+    case picohttp_callback_free:
+    case picohttp_callback_deregister:
+      // Cleanup handled elsewhere
+      break;
+
+    default:
+      break;
+  }
+
+  return 0;
+}
+
 void PicoquicMoQServer::onNewConnection(picoquic_cnx_t* cnx) {
   // Create transport wrapper with thread dispatcher
-  auto transport = std::make_shared<PicoquicWebTransport>(cnx, true, &dispatcher_);
+  auto transport = std::make_shared<PicoquicRawTransport>(cnx, true, &dispatcher_);
 
 #if !MOXYGEN_USE_FOLLY
   // Create the setup callback wrapper
@@ -277,7 +496,7 @@ void PicoquicMoQServer::onNewConnection(picoquic_cnx_t* cnx) {
   });
 
   // Update connection callback to use transport
-  picoquic_set_callback(cnx, PicoquicWebTransport::picoCallback, transport.get());
+  picoquic_set_callback(cnx, PicoquicRawTransport::picoCallback, transport.get());
 
   // Start the session
   session->start();

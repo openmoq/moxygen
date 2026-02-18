@@ -72,10 +72,11 @@ endif()
 # --- picoquic transport implementation ---
 if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
   add_library(moqtransport_picoquic
-    PicoquicWebTransport.cpp
+    PicoquicRawTransport.cpp
     PicoquicH3Transport.cpp
     PicoquicMoQClient.cpp
     PicoquicMoQServer.cpp
+    PicoquicMoQRelayClient.cpp
   )
 
   target_include_directories(
