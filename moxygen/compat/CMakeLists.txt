@@ -17,6 +17,23 @@ if(MOXYGEN_USE_FOLLY)
     target_link_libraries(moqcompat INTERFACE Folly::folly)
 else()
     target_compile_definitions(moqcompat INTERFACE MOXYGEN_USE_FOLLY=0)
+
+    # Optional abseil support for high-performance containers
+    # When enabled, FastMap/FastSet use absl::flat_hash_map/set (Swiss table)
+    if(MOXYGEN_USE_ABSEIL)
+        find_package(absl REQUIRED)
+        target_compile_definitions(moqcompat INTERFACE MOXYGEN_USE_ABSEIL=1)
+        target_link_libraries(moqcompat INTERFACE
+            absl::flat_hash_map
+            absl::flat_hash_set
+            absl::node_hash_map
+            absl::node_hash_set
+        )
+        message(STATUS "Using abseil containers (Swiss table)")
+    else()
+        target_compile_definitions(moqcompat INTERFACE MOXYGEN_USE_ABSEIL=0)
+        message(STATUS "Using built-in RobinHood containers")
+    endif()
 endif()
 
 install(

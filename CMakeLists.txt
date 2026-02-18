@@ -40,6 +40,11 @@ option(MOXYGEN_USE_FOLLY
   ON
 )
 
+option(MOXYGEN_USE_ABSEIL
+  "When not using Folly, use abseil containers (Swiss table). When OFF, uses built-in RobinHood."
+  OFF
+)
+
 # QUIC backend selection
 set(MOXYGEN_QUIC_BACKEND "mvfst" CACHE STRING "QUIC stack to use (mvfst or picoquic)")
 set_property(CACHE MOXYGEN_QUIC_BACKEND PROPERTY STRINGS "mvfst" "picoquic")
@@ -72,6 +77,9 @@ endif()
 # Print build configuration
 message(STATUS "Moxygen build configuration:")
 message(STATUS "  MOXYGEN_USE_FOLLY: ${MOXYGEN_USE_FOLLY}")
+if(NOT MOXYGEN_USE_FOLLY)
+  message(STATUS "  MOXYGEN_USE_ABSEIL: ${MOXYGEN_USE_ABSEIL}")
+endif()
 message(STATUS "  MOXYGEN_QUIC_BACKEND: ${MOXYGEN_QUIC_BACKEND}")
 if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
   message(STATUS "  MOXYGEN_TLS_BACKEND: ${MOXYGEN_TLS_BACKEND}")

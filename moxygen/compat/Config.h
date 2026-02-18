@@ -12,6 +12,15 @@
 #define MOXYGEN_USE_FOLLY 1
 #endif
 
+// MOXYGEN_USE_ABSEIL controls whether to use abseil containers in std mode.
+// When enabled, FastMap/FastSet use absl::flat_hash_map/set (Swiss table).
+// When disabled, they use built-in RobinHoodMap/Set.
+// Default to 0 (use built-in) if not explicitly set by CMake.
+// Only applies when MOXYGEN_USE_FOLLY is 0.
+#ifndef MOXYGEN_USE_ABSEIL
+#define MOXYGEN_USE_ABSEIL 0
+#endif
+
 // QUIC backend selection
 // MOXYGEN_QUIC_MVFST - Use mvfst/proxygen QUIC stack
 // MOXYGEN_QUIC_PICOQUIC - Use picoquic QUIC stack
