@@ -428,5 +428,4 @@ template <typename T>
 using Try = folly::Try<T>;
 
 using folly::makeTryWith;
-using folly::makeTryWithNoThrow;
 } // namespace moxygen::compat

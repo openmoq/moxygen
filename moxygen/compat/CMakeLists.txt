@@ -16,7 +16,7 @@ if(MOXYGEN_USE_FOLLY)
     target_compile_definitions(moqcompat INTERFACE MOXYGEN_USE_FOLLY=1)
     target_link_libraries(moqcompat INTERFACE Folly::folly)
 else()
-    # Std mode: compiled library with priority queue implementation
+    # Std mode: compiled library
     add_library(moqcompat STATIC
         MoQPriorityQueue.cpp
     )

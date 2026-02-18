@@ -148,15 +148,6 @@ class Payload {
 // =============================================================================
 // Std-mode Payload backed by ByteBuffer with reference counting
 // =============================================================================
-//
-// Performance features:
-// - Small Buffer Optimization (SBO): buffers <= 64 bytes use inline storage
-// - Reference counting: clone() shares data, copy-on-write semantics
-// - Headroom/tailroom: O(1) trimStart/prepend when space available
-// - Buffer chains: multiple buffers can be linked for scatter-gather
-//
-// This provides near-parity with folly::IOBuf for common operations.
-// =============================================================================
 
 class Payload {
  public:
