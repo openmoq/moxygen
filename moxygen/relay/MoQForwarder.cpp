@@ -6,6 +6,8 @@
 
 #include "moxygen/relay/MoQForwarder.h"
 
+#include <iostream>
+
 namespace moxygen {
 
 namespace {
@@ -163,7 +165,7 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
       subReq.forward);
   if (upstreamDeliveryTimeout_.count() > 0) {
     subscriber->setParam(
-        {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
+        {compat::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
          static_cast<uint64_t>(upstreamDeliveryTimeout_.count())});
   }
   subscribers_.emplace(sessionPtr, subscriber);
@@ -201,7 +203,7 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
   return subscriber;
 }
 
-folly::Expected<SubscribeRange, FetchError> MoQForwarder::resolveJoiningFetch(
+compat::Expected<SubscribeRange, FetchError> MoQForwarder::resolveJoiningFetch(
     const std::shared_ptr<MoQSession>& session,
     const JoiningFetch& joining) const {
   auto subIt = subscribers_.find(session.get());
@@ -307,7 +309,7 @@ void MoQForwarder::checkAndFireOnEmpty() {
 }
 
 void MoQForwarder::removeSubscriberIt(
-    folly::F14FastMap<MoQSession*, std::shared_ptr<Subscriber>>::iterator subIt,
+    typename compat::FastMap<MoQSession*, std::shared_ptr<Subscriber>>::iterator subIt,
     std::optional<PublishDone> pubDone,
     const std::string& callsite) {
   auto& subscriber = *subIt->second;
@@ -411,12 +413,14 @@ compat::Expected<compat::Unit, MoQPublishError> MoQForwarder::setTrackAlias(
   return compat::unit;
 }
 
-folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+compat::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
 MoQForwarder::beginSubgroup(
     uint64_t groupID,
     uint64_t subgroupID,
     Priority priority,
     bool containsLastInGroup) {
+  std::cerr << "[FORWARDER] beginSubgroup g=" << groupID << " sg=" << subgroupID
+            << " numSubs=" << subscribers_.size() << "\n";
   updateLargest(groupID, 0);
   auto subgroupForwarder =
       std::make_shared<SubgroupForwarder>(*this, groupID, subgroupID, priority);
@@ -440,10 +444,17 @@ MoQForwarder::beginSubgroup(
   return subgroupForwarder;
 }
 
+#if MOXYGEN_USE_FOLLY
 folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
 MoQForwarder::awaitStreamCredit() {
   return folly::makeSemiFuture();
 }
+#else
+compat::Expected<compat::SemiFuture<compat::Unit>, MoQPublishError>
+MoQForwarder::awaitStreamCredit() {
+  return compat::makeSemiFuture();
+}
+#endif
 
 compat::Expected<compat::Unit, MoQPublishError> MoQForwarder::objectStream(
     const ObjectHeader& header,
@@ -555,6 +566,7 @@ void MoQForwarder::Subscriber::setParam(const TrackRequestParameter& param) {
   }
 }
 
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
 folly::coro::Task<folly::Expected<RequestOk, RequestError>>
 MoQForwarder::Subscriber::requestUpdate(RequestUpdate requestUpdate) {
   // Validation:
@@ -599,6 +611,54 @@ MoQForwarder::Subscriber::requestUpdate(RequestUpdate requestUpdate) {
 
   co_return RequestOk{.requestID = requestUpdate.requestID};
 }
+#else
+void MoQForwarder::Subscriber::requestUpdateWithCallback(
+    RequestUpdate reqUpdate,
+    std::shared_ptr<compat::ResultCallback<RequestOk, RequestError>> callback) {
+  // Validation:
+  // - Start location can be updated
+  // - End location can increase or decrease
+  // - For bounded subscriptions (endGroup > 0), end must be >= start
+  // - Forward state is optional and only updated if explicitly provided
+
+  // Only update start if provided
+  if (reqUpdate.start.has_value()) {
+    range.start = *reqUpdate.start;
+  }
+
+  // Only update end if provided
+  if (reqUpdate.endGroup.has_value()) {
+    AbsoluteLocation newEnd{*reqUpdate.endGroup, 0};
+
+    // Validate: for bounded end, the end must not be less than the start
+    if (*reqUpdate.endGroup > 0 && range.start >= newEnd) {
+      XLOG(ERR) << "Invalid requestUpdate: end Location " << newEnd
+                << " is less than start " << range.start;
+      session->close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+      callback->onError(RequestError(
+          reqUpdate.requestID,
+          RequestErrorCode::INVALID_RANGE,
+          "End Location is less than start"));
+      return;
+    }
+    range.end = newEnd;
+  }
+
+  auto wasForwarding = shouldForward;
+  // Only update forward state if explicitly provided (per draft 15+)
+  if (reqUpdate.forward.has_value()) {
+    shouldForward = *reqUpdate.forward;
+  }
+
+  if (shouldForward && !wasForwarding) {
+    forwarder.addForwardingSubscriber();
+  } else if (wasForwarding && !shouldForward) {
+    forwarder.removeForwardingSubscriber();
+  }
+
+  callback->onSuccess(RequestOk{.requestID = reqUpdate.requestID});
+}
+#endif
 
 void MoQForwarder::Subscriber::unsubscribe() {
   XLOG(DBG4) << "unsubscribe sess=" << this;
@@ -641,9 +701,9 @@ MoQForwarder::SubgroupForwarder::removeSubgroupAndCheckEmpty() {
 }
 
 template <typename T>
-folly::Expected<T, MoQPublishError>
+compat::Expected<T, MoQPublishError>
 MoQForwarder::SubgroupForwarder::cleanupOnError(
-    const folly::Expected<T, MoQPublishError>& result) {
+    const compat::Expected<T, MoQPublishError>& result) {
   if (result.hasError()) {
     XLOG(DBG1) << "Removing subgroup after error: " << result.error().what();
     removeSubgroupAndCheckEmpty();
@@ -657,6 +717,8 @@ MoQForwarder::SubgroupForwarder::object(
     Payload payload,
     Extensions extensions,
     bool finSubgroup) {
+  std::cerr << "[FORWARDER] object g=" << identifier_.group
+            << " sg=" << identifier_.subgroup << " obj=" << objectID << "\n";
   if (currentObjectLength_) {
     return compat::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
@@ -786,7 +848,7 @@ void MoQForwarder::SubgroupForwarder::reset(ResetStreamErrorCode error) {
   removeSubgroupAndCheckEmpty();
 }
 
-folly::Expected<ObjectPublishStatus, MoQPublishError>
+compat::Expected<ObjectPublishStatus, MoQPublishError>
 MoQForwarder::SubgroupForwarder::objectPayload(
     Payload payload,
     bool finSubgroup) {

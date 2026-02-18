@@ -16,6 +16,18 @@
 
 namespace moxygen {
 
+// Thread-local storage for the current request session
+static thread_local std::shared_ptr<MoQSession> tlsRequestSession;
+
+std::shared_ptr<MoQSession> MoQSession::getRequestSession() {
+  XCHECK(tlsRequestSession) << "No request session set for current thread";
+  return tlsRequestSession;
+}
+
+void MoQSession::setRequestSession(std::shared_ptr<MoQSession> session) {
+  tlsRequestSession = std::move(session);
+}
+
 namespace {
 
 // Helper: convert compat::Payload to Buffer for MoQFrameWriter methods
@@ -1157,22 +1169,22 @@ class CompatReceiverSubscriptionHandle : public SubscriptionHandle {
     }
   }
 
-  void subscribeUpdateWithCallback(
-      SubscribeUpdate subUpdate,
-      std::shared_ptr<
-          compat::ResultCallback<SubscribeUpdateOk, SubscribeUpdateError>>
+  void requestUpdateWithCallback(
+      RequestUpdate reqUpdate,
+      std::shared_ptr<compat::ResultCallback<RequestOk, RequestError>>
           callback) override {
     if (!session_) {
-      callback->onError(SubscribeUpdateError{
-          subUpdate.requestID,
+      callback->onError(RequestError{
+          reqUpdate.requestID,
           RequestErrorCode::INTERNAL_ERROR,
           "Session closed"});
       return;
     }
-    subUpdate.existingRequestID = subscribeOk_->requestID;
-    session_->subscribeUpdate(subUpdate);
+    reqUpdate.existingRequestID = subscribeOk_->requestID;
+    // Use subscribeUpdate which is available in both build modes
+    session_->subscribeUpdate(reqUpdate);
     // Fire-and-forget for now (no response tracking)
-    callback->onSuccess(SubscribeUpdateOk{.requestID = subUpdate.requestID});
+    callback->onSuccess(RequestOk{.requestID = reqUpdate.requestID});
   }
 
  private:
@@ -1487,6 +1499,7 @@ void MoQSession::setupControlReadCallback(compat::StreamReadHandle* readHandle) 
 }
 
 void MoQSession::start() {
+  std::cerr << "[SESSION] start() called, dir=" << (dir_ == MoQControlCodec::Direction::CLIENT ? "CLIENT" : "SERVER") << "\n";
   if (!wt_) {
     XLOG(ERR) << "Cannot start session without transport";
     return;
@@ -1494,8 +1507,10 @@ void MoQSession::start() {
 
   if (dir_ == MoQControlCodec::Direction::CLIENT) {
     // Client: create the bidi control stream
+    std::cerr << "[SESSION] Creating bidi control stream\n";
     auto cs = wt_->createBidiStream();
     if (!cs) {
+      std::cerr << "[SESSION] Failed to create control stream!\n";
       XLOG(ERR) << "Failed to create control stream sess=" << this;
       close(SessionCloseErrorCode::INTERNAL_ERROR);
       return;
@@ -1504,12 +1519,14 @@ void MoQSession::start() {
     controlWriteHandle_ = bidiHandle->writeHandle();
     controlReadHandle_ = bidiHandle->readHandle();
     controlStreamReady_ = true;
+    std::cerr << "[SESSION] Control stream created successfully\n";
 
     // Set up read callback for incoming control messages
     setupControlReadCallback(controlReadHandle_);
 
     // Flush any buffered data (CLIENT_SETUP from setupWithCallback)
     flushControlBuf();
+    std::cerr << "[SESSION] Control buffer flushed\n";
   }
   // Server side: control stream is established via onNewBidiStream
 }
@@ -1917,6 +1934,7 @@ void MoQSession::onClientSetup(ClientSetup clientSetup) {
 }
 
 void MoQSession::onServerSetup(ServerSetup setup) {
+  std::cerr << "[SESSION] onServerSetup received, version=" << setup.selectedVersion << "\n";
   if (dir_ != MoQControlCodec::Direction::CLIENT) {
     XLOG(ERR) << "Received SERVER_SETUP on server";
     close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
@@ -1931,6 +1949,7 @@ void MoQSession::onServerSetup(ServerSetup setup) {
   setupComplete_ = true;
 
   if (setupCallback_) {
+    std::cerr << "[SESSION] Calling setupCallback onSuccess\n";
     setupCallback_->onSuccess(std::move(setup));
     setupCallback_.reset();
   }
@@ -1941,6 +1960,9 @@ void MoQSession::onServerSetup(ServerSetup setup) {
 // =========================================================================
 
 void MoQSession::onSubscribe(SubscribeRequest subscribeRequest) {
+  // Set current session for handler callbacks
+  RequestSessionGuard sessionGuard(shared_from_this());
+
   const auto requestID = subscribeRequest.requestID;
 
   if (closeSessionIfRequestIDInvalid(requestID, false, true)) {
@@ -2136,6 +2158,9 @@ void MoQSession::onRequestError(
 // =========================================================================
 
 void MoQSession::onFetch(Fetch fetch) {
+  // Set current session for handler callbacks
+  RequestSessionGuard sessionGuard(shared_from_this());
+
   auto [standalone, joining] = fetchType(fetch);
   const auto requestID = fetch.requestID;
 
@@ -2335,6 +2360,9 @@ void MoQSession::onPublishDone(PublishDone publishDone) {
 }
 
 void MoQSession::onPublish(PublishRequest publish) {
+  // Set current session for handler callbacks
+  RequestSessionGuard sessionGuard(shared_from_this());
+
   if (!subscribeHandler_) {
     publishError(PublishError{
         publish.requestID, PublishErrorCode::NOT_SUPPORTED, "Not a subscriber"});
@@ -2411,6 +2439,9 @@ void MoQSession::onTrackStatusError(TrackStatusError /*trackStatusError*/) {
 }
 
 void MoQSession::onGoaway(Goaway goway) {
+  // Set current session for handler callbacks
+  RequestSessionGuard sessionGuard(shared_from_this());
+
   receivedGoaway_ = true;
   if (subscribeHandler_) {
     subscribeHandler_->goaway(std::move(goway));
@@ -2423,6 +2454,9 @@ void MoQSession::onConnectionError(ErrorCode error) {
 }
 
 void MoQSession::onPublishNamespace(PublishNamespace publishNamespace) {
+  // Set current session for handler callbacks
+  RequestSessionGuard sessionGuard(shared_from_this());
+
   if (!subscribeHandler_) {
     publishNamespaceError(PublishNamespaceError{
         publishNamespace.requestID,
@@ -2461,6 +2495,9 @@ void MoQSession::onPublishNamespaceCancel(PublishNamespaceCancel /*publishNamesp
 }
 
 void MoQSession::onSubscribeNamespace(SubscribeNamespace subscribeNamespace) {
+  // Set current session for handler callbacks
+  RequestSessionGuard sessionGuard(shared_from_this());
+
   if (!publishHandler_) {
     subscribeNamespaceError(SubscribeNamespaceError{
         subscribeNamespace.requestID,

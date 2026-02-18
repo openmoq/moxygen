@@ -3561,6 +3561,13 @@ WriteResult MoQFrameWriter::writeSubgroupHeader(
       /*endOfGroup=*/false,
       priorityPresent);
   auto streamTypeInt = to_underlying(streamType);
+  std::cerr << "[DEBUG] writeSubgroupHeader: version=" << std::hex << *version_
+            << " subgroup=" << std::dec << objectHeader.subgroup
+            << " streamType=0x" << std::hex << streamTypeInt
+            << " trackAlias=" << std::dec << trackAlias.value
+            << " group=" << objectHeader.group
+            << " priority=" << (priorityPresent ? (int)objectHeader.priority.value() : -1)
+            << "\n";
   writeVarint(writeBuf, streamTypeInt, size, error);
   writeVarint(writeBuf, trackAlias.value, size, error);
   writeVarint(writeBuf, objectHeader.group, size, error);

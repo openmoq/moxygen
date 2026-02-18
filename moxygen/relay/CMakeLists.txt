@@ -4,7 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Relay
+# Relay components (shared between Folly and std-mode)
+# MoQForwarder can now be built in std-mode with callback-based APIs
+
+# MoQCache - requires Folly for F14Set
+if(MOXYGEN_USE_FOLLY)
 add_library(moqcache MoQCache.cpp)
 target_include_directories(
   moqcache PUBLIC
@@ -17,6 +21,7 @@ target_compile_options(
 target_link_libraries(
   moqcache PUBLIC
   moxygen
+  Folly::folly
 )
 
 install(
@@ -25,6 +30,10 @@ install(
     ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
     LIBRARY DESTINATION ${LIB_INSTALL_DIR}
 )
+endif() # MOXYGEN_USE_FOLLY
+
+# Folly + mvfst: Full relay implementation with coroutines
+if(MOXYGEN_USE_FOLLY AND MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
 
 add_library(moqrelay MoQRelay.cpp MoQCache.cpp MoQForwarder.cpp)
 target_include_directories(
@@ -84,3 +93,60 @@ install(
 )
 
 add_subdirectory(test)
+
+endif() # MOXYGEN_USE_FOLLY AND mvfst
+
+# Picoquic: Relay libraries (callback-based, no coroutines)
+if(MOXYGEN_QUIC_BACKEND STREQUAL "picoquic")
+
+add_library(moqforwarder_compat MoQForwarder.cpp)
+target_include_directories(
+  moqforwarder_compat PUBLIC
+  $<BUILD_INTERFACE:${MOXYGEN_FBCODE_ROOT}>
+)
+target_compile_options(
+  moqforwarder_compat PRIVATE
+  ${_MOXYGEN_COMMON_COMPILE_OPTIONS}
+)
+target_link_libraries(
+  moqforwarder_compat PUBLIC
+  moxygen
+  moqcompat
+)
+if(MOXYGEN_USE_FOLLY)
+  target_link_libraries(moqforwarder_compat PUBLIC Folly::folly)
+endif()
+
+install(
+    TARGETS moqforwarder_compat
+    ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
+    LIBRARY DESTINATION ${LIB_INSTALL_DIR}
+)
+
+# MoQRelayCompat - simplified relay for picoquic/std-mode
+add_library(moqrelay_compat MoQRelayCompat.cpp)
+target_include_directories(
+  moqrelay_compat PUBLIC
+  $<BUILD_INTERFACE:${MOXYGEN_FBCODE_ROOT}>
+)
+target_compile_options(
+  moqrelay_compat PRIVATE
+  ${_MOXYGEN_COMMON_COMPILE_OPTIONS}
+)
+target_link_libraries(
+  moqrelay_compat PUBLIC
+  moxygen
+  moqcompat
+  moqforwarder_compat
+)
+if(MOXYGEN_USE_FOLLY)
+  target_link_libraries(moqrelay_compat PUBLIC Folly::folly)
+endif()
+
+install(
+    TARGETS moqrelay_compat
+    ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
+    LIBRARY DESTINATION ${LIB_INSTALL_DIR}
+)
+
+endif() # picoquic

@@ -6,8 +6,12 @@
 
 #pragma once
 
-#include <folly/logging/xlog.h>
+#include "moxygen/compat/Debug.h"
 #include "moxygen/MoQFramer.h"
+
+#if MOXYGEN_USE_FOLLY
+#include <folly/Conv.h>
+#endif
 
 namespace moxygen {
 
@@ -21,10 +25,17 @@ inline SubscribeRange toSubscribeRange(
     std::optional<AbsoluteLocation> end,
     LocationType locType,
     std::optional<AbsoluteLocation> largest) {
+#if MOXYGEN_USE_FOLLY
   XLOG(DBG1) << "m=" << toString(locType)
              << (start ? folly::to<std::string>(
                              " g=", start->group, " o=", start->object)
                        : std::string());
+#else
+  XLOG(DBG1) << "m=" << toString(locType)
+             << (start ? " g=" + std::to_string(start->group) +
+                             " o=" + std::to_string(start->object)
+                       : std::string());
+#endif
   SubscribeRange result;
   result.end = kLocationMax;
   switch (locType) {

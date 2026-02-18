@@ -169,14 +169,14 @@ class MoQRelaySession : public MoQSession {
       std::shared_ptr<Subscriber::PublishNamespaceCallback> cancelCallback,
       std::shared_ptr<compat::ResultCallback<
           std::shared_ptr<Subscriber::PublishNamespaceHandle>,
-          PublishNamespaceError>> callback);
+          PublishNamespaceError>> callback) override;
 
   // Callback-based subscribeNamespace
   void subscribeNamespaceWithCallback(
       SubscribeNamespace subAnn,
       std::shared_ptr<compat::ResultCallback<
           std::shared_ptr<Publisher::SubscribeNamespaceHandle>,
-          SubscribeNamespaceError>> callback);
+          SubscribeNamespaceError>> callback) override;
 
  private:
   // Forward declarations for inner classes

@@ -664,7 +664,7 @@ int main(int argc, char* argv[]) {
   std::cout << "Starting picodateserver on port " << args.port
             << " with namespace '" << args.ns << "' mode=" << args.mode
             << " transport=" << moxygen::transports::transportModeToString(transportMode)
-            << "\n";
+            << std::endl;
 
   // Create executor
   auto executor = std::make_shared<moxygen::MoQSimpleExecutor>();
@@ -694,7 +694,7 @@ int main(int argc, char* argv[]) {
   moxygen::compat::SocketAddress addr("::", args.port);
   server->start(addr, handler);
 
-  std::cout << "Server listening on port " << args.port << "\n";
+  std::cout << "Server listening on port " << args.port << std::endl;
 
   // Relay client (optional)
   std::unique_ptr<moxygen::transports::PicoquicMoQRelayClient> relayClient;

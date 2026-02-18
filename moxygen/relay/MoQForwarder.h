@@ -8,10 +8,12 @@
 
 #include "moxygen/MoQLocation.h"
 #include "moxygen/MoQSession.h"
+#include "moxygen/compat/Containers.h"
+#include "moxygen/compat/Hash.h"
 
-#include <folly/container/F14Set.h>
-#include <folly/hash/Hash.h>
+#if MOXYGEN_USE_FOLLY
 #include <folly/io/async/EventBase.h>
+#endif
 
 namespace moxygen {
 
@@ -59,7 +61,7 @@ class MoQForwarder : public TrackConsumer {
     uint64_t subgroup;
     struct hash {
       size_t operator()(const SubgroupIdentifier& id) const {
-        return folly::hash::hash_combine(id.group, id.subgroup);
+        return compat::hash_combine(id.group, id.subgroup);
       }
     };
     bool operator==(const SubgroupIdentifier& other) const {
@@ -68,7 +70,7 @@ class MoQForwarder : public TrackConsumer {
   };
   class SubgroupForwarder;
   struct Subscriber : public Publisher::SubscriptionHandle {
-    using SubgroupConsumerMap = folly::F14FastMap<
+    using SubgroupConsumerMap = compat::FastMap<
         SubgroupIdentifier,
         std::shared_ptr<SubgroupConsumer>,
         SubgroupIdentifier::hash>;
@@ -92,8 +94,15 @@ class MoQForwarder : public TrackConsumer {
     // updates existing param if key matches, otherwise adds new param
     void setParam(const TrackRequestParameter& param);
 
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
     folly::coro::Task<folly::Expected<RequestOk, RequestError>> requestUpdate(
         RequestUpdate requestUpdate) override;
+#else
+    void requestUpdateWithCallback(
+        RequestUpdate reqUpdate,
+        std::shared_ptr<compat::ResultCallback<RequestOk, RequestError>>
+            callback) override;
+#endif
 
     void unsubscribe() override;
 
@@ -130,7 +139,7 @@ class MoQForwarder : public TrackConsumer {
       std::shared_ptr<MoQSession> session,
       const PublishRequest& pub);
 
-  folly::Expected<SubscribeRange, FetchError> resolveJoiningFetch(
+  compat::Expected<SubscribeRange, FetchError> resolveJoiningFetch(
       const std::shared_ptr<MoQSession>& session,
       const JoiningFetch& joining) const;
 
@@ -163,15 +172,20 @@ class MoQForwarder : public TrackConsumer {
   compat::Expected<compat::Unit, MoQPublishError> setTrackAlias(
       TrackAlias alias) override;
 
-  folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+  compat::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
   beginSubgroup(
       uint64_t groupID,
       uint64_t subgroupID,
       Priority priority,
       bool containsLastInGroup = false) override;
 
+#if MOXYGEN_USE_FOLLY
   folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
   awaitStreamCredit() override;
+#else
+  compat::Expected<compat::SemiFuture<compat::Unit>, MoQPublishError>
+  awaitStreamCredit() override;
+#endif
 
   compat::Expected<compat::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
@@ -210,8 +224,8 @@ class MoQForwarder : public TrackConsumer {
     // Removes subgroup if result contains error, otherwise returns result
     // unchanged
     template <typename T>
-    folly::Expected<T, MoQPublishError> cleanupOnError(
-        const folly::Expected<T, MoQPublishError>& result);
+    compat::Expected<T, MoQPublishError> cleanupOnError(
+        const compat::Expected<T, MoQPublishError>& result);
 
    public:
     SubgroupForwarder(
@@ -242,7 +256,7 @@ class MoQForwarder : public TrackConsumer {
 
     void reset(ResetStreamErrorCode error) override;
 
-    folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
+    compat::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
         Payload payload,
         bool finSubgroup = false) override;
   };
@@ -264,7 +278,7 @@ class MoQForwarder : public TrackConsumer {
 
   // Helper that removes a subscriber given an iterator (avoids lookup)
   void removeSubscriberIt(
-      folly::F14FastMap<MoQSession*, std::shared_ptr<Subscriber>>::iterator
+      typename compat::FastMap<MoQSession*, std::shared_ptr<Subscriber>>::iterator
           subIt,
       std::optional<PublishDone> pubDone,
       const std::string& callsite);
@@ -281,8 +295,8 @@ class MoQForwarder : public TrackConsumer {
 
   FullTrackName fullTrackName_;
   std::optional<TrackAlias> trackAlias_;
-  folly::F14FastMap<MoQSession*, std::shared_ptr<Subscriber>> subscribers_;
-  folly::F14FastMap<
+  compat::FastMap<MoQSession*, std::shared_ptr<Subscriber>> subscribers_;
+  compat::FastMap<
       SubgroupIdentifier,
       std::shared_ptr<SubgroupForwarder>,
       SubgroupIdentifier::hash>

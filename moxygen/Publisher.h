@@ -55,8 +55,20 @@ class SubscriptionHandle {
   // Updates request parameters (start/end locations, priority, forward).
   // This is a coroutine because it may do async work, such as forwarding the
   // update to the upstream publisher in a relay scenario.
-  virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
+  virtual compat::Task<RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) = 0;
+#else
+  virtual void requestUpdateWithCallback(
+      RequestUpdate reqUpdate,
+      std::shared_ptr<compat::ResultCallback<RequestOk, RequestError>>
+          callback) {
+    callback->onError(RequestError{
+        reqUpdate.requestID,
+        RequestErrorCode::NOT_SUPPORTED,
+        "Request update not implemented"});
+  }
+#endif
 
   const SubscribeOk& subscribeOk() const {
     return *subscribeOk_;
@@ -138,9 +150,21 @@ class Publisher {
 
     virtual void fetchCancel() = 0;
 
-    using RequestUpdateResult = folly::Expected<RequestOk, RequestError>;
-    virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+    using RequestUpdateResult = compat::Expected<RequestOk, RequestError>;
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
+    virtual compat::Task<RequestUpdateResult> requestUpdate(
         RequestUpdate reqUpdate) = 0;
+#else
+    virtual void requestUpdateWithCallback(
+        RequestUpdate reqUpdate,
+        std::shared_ptr<compat::ResultCallback<RequestOk, RequestError>>
+            callback) {
+      callback->onError(RequestError{
+          reqUpdate.requestID,
+          RequestErrorCode::NOT_SUPPORTED,
+          "Request update not implemented"});
+    }
+#endif
 
     const FetchOk& fetchOk() const {
       return *fetchOk_;
@@ -188,9 +212,21 @@ class Publisher {
 
     virtual void unsubscribeNamespace() = 0;
 
-    using RequestUpdateResult = folly::Expected<RequestOk, RequestError>;
-    virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+    using RequestUpdateResult = compat::Expected<RequestOk, RequestError>;
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
+    virtual compat::Task<RequestUpdateResult> requestUpdate(
         RequestUpdate reqUpdate) = 0;
+#else
+    virtual void requestUpdateWithCallback(
+        RequestUpdate reqUpdate,
+        std::shared_ptr<compat::ResultCallback<RequestOk, RequestError>>
+            callback) {
+      callback->onError(RequestError{
+          reqUpdate.requestID,
+          RequestErrorCode::NOT_SUPPORTED,
+          "Request update not implemented"});
+    }
+#endif
 
     const SubscribeNamespaceOk& subscribeNamespaceOk() const {
       return *subscribeNamespaceOk_;

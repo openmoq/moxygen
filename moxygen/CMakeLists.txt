@@ -227,9 +227,11 @@ target_link_libraries(
 
 endif() # MOXYGEN_QUIC_BACKEND == mvfst
 
-# relay and related components require mvfst/proxygen
+# relay - mvfst gets full relay, picoquic gets forwarder only
+add_subdirectory(relay)
+
+# mvfst-specific samples and tests
 if(MOXYGEN_QUIC_BACKEND STREQUAL "mvfst")
-  add_subdirectory(relay)
   # TODO: Fails with compiler error in ubuntu P1361252588
   # add_subdirectory(samples/chat)
   add_subdirectory(samples/text-client)
@@ -281,6 +283,12 @@ endif() # NOT MOXYGEN_USE_FOLLY
 # Picoquic sample programs
 add_subdirectory(samples/date)
 add_subdirectory(samples/text-client)
+
+# Relay components for picoquic (MoQForwarder, MoQCache)
+add_subdirectory(relay)
+
+# Picoquic relay server sample
+add_subdirectory(samples/relay)
 
 # Std-mode tests
 if(NOT MOXYGEN_USE_FOLLY)

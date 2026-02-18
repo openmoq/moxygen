@@ -62,15 +62,27 @@ class Subscriber {
     // can be an uninteresting message
     virtual void publishNamespaceDone() {}
 
-    using RequestUpdateResult = folly::Expected<RequestOk, RequestError>;
-    virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
+    using RequestUpdateResult = compat::Expected<RequestOk, RequestError>;
+#if MOXYGEN_USE_FOLLY && MOXYGEN_QUIC_MVFST
+    virtual compat::Task<RequestUpdateResult> requestUpdate(
         RequestUpdate reqUpdate) {
-      co_return folly::makeUnexpected(
+      co_return compat::makeUnexpected(
           RequestError{
               reqUpdate.requestID,
               RequestErrorCode::NOT_SUPPORTED,
               "unimplemented"});
     }
+#else
+    virtual void requestUpdateWithCallback(
+        RequestUpdate reqUpdate,
+        std::shared_ptr<compat::ResultCallback<RequestOk, RequestError>>
+            callback) {
+      callback->onError(RequestError{
+          reqUpdate.requestID,
+          RequestErrorCode::NOT_SUPPORTED,
+          "unimplemented"});
+    }
+#endif
 
     const PublishNamespaceOk& publishNamespaceOk() const {
       return *publishNamespaceOk_;
