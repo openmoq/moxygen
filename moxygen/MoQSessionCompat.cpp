@@ -65,6 +65,14 @@ inline std::unique_ptr<Buffer> payloadToBuffer(const Payload& p) {
 // for writeStreamDataSync
 inline std::unique_ptr<compat::Payload> bufferToPayload(
     std::unique_ptr<Buffer> buf) {
+#if MOXYGEN_USE_FOLLY
+  // In Folly mode, coalesce the IOBuf chain to ensure Payload::data()/size()
+  // return the full data. The transport's onPrepareToSend only reads the first
+  // buffer via Payload::data()/size(), so chained IOBufs would be truncated.
+  if (buf) {
+    buf->coalesce();
+  }
+#endif
   return compat::Payload::wrap(std::move(buf));
 }
 
@@ -336,9 +344,6 @@ class CompatStreamPublisher : public SubgroupConsumer,
       Payload payload,
       Extensions extensions,
       bool finSubgroup) override {
-    std::cerr << "[DEBUG] Server sending object: id=" << objectID
-              << " payloadLen=" << (payload ? payload->computeChainDataLength() : 0)
-              << " fin=" << finSubgroup << "\n";
     if (!writeHandle_ || writeHandle_->isCancelled()) {
       return compat::makeUnexpected(
           MoQPublishError(MoQPublishError::CANCELLED, "stream cancelled"));
@@ -348,7 +353,6 @@ class CompatStreamPublisher : public SubgroupConsumer,
     header.length = payload ? payload->computeChainDataLength() : 0;
     header.status = ObjectStatus::NORMAL;
     header.extensions = std::move(extensions);
-
     compat::ByteBufferQueue writeBuf;
     moqFrameWriter_.writeStreamObject(
         writeBuf, StreamType::SUBGROUP_HEADER_SG, header, payloadToBuffer(payload));

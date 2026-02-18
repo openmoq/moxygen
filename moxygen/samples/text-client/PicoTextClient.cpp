@@ -50,6 +50,19 @@ inline std::string payloadToString(Payload& payload) {
 #endif
 }
 
+// Helper to append payload bytes to a vector (handles IOBuf chains in Folly mode)
+inline void appendPayloadBytes(
+    Payload& payload,
+    std::vector<uint8_t>& dest) {
+#if MOXYGEN_USE_FOLLY
+  // Coalesce IOBuf chain into a single buffer, then copy
+  payload->coalesce();
+#endif
+  auto* data = payload->data();
+  auto sz = payload->length();
+  dest.insert(dest.end(), data, data + sz);
+}
+
 // --- Command line arguments ---
 
 struct Args {
@@ -144,9 +157,7 @@ class SimpleSubgroupReceiver : public SubgroupConsumer {
     pendingLength_ = length;
     pendingData_.clear();
     if (initialPayload) {
-      auto* data = initialPayload->data();
-      auto sz = initialPayload->length();
-      pendingData_.insert(pendingData_.end(), data, data + sz);
+      appendPayloadBytes(initialPayload, pendingData_);
     }
     if (pendingData_.size() >= pendingLength_) {
       std::cout << std::string(pendingData_.begin(), pendingData_.end());
@@ -159,9 +170,7 @@ class SimpleSubgroupReceiver : public SubgroupConsumer {
       Payload payload,
       bool finSubgroup) override {
     if (payload) {
-      auto* data = payload->data();
-      auto sz = payload->length();
-      pendingData_.insert(pendingData_.end(), data, data + sz);
+      appendPayloadBytes(payload, pendingData_);
     }
     if (pendingData_.size() >= pendingLength_) {
       std::cout << std::string(pendingData_.begin(), pendingData_.end());
