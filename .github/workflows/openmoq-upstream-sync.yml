@@ -33,9 +33,21 @@ jobs:
           echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           echo "Upstream HEAD: $UPSTREAM_SHA"
 
-          # Check if this commit has passing CI status
-          STATE=$(gh api "repos/facebookexperimental/moxygen/commits/$UPSTREAM_SHA/status" -q .state)
-          echo "Upstream status: $STATE"
+          # Check if this commit has passing CI via check-suites
+          # (Meta repos use GitHub Actions check suites, not the commit status API)
+          STATE=$(gh api "repos/facebookexperimental/moxygen/commits/$UPSTREAM_SHA/check-suites" \
+            -q '[.check_suites[] | select(.app.name=="GitHub Actions")] |
+                if length == 0 then "failure"
+                elif any(.status == "queued" or .status == "in_progress") then "pending"
+                elif all(.conclusion == "success") then "success"
+                else "failure" end')
+          echo "Upstream check-suites status: $STATE"
+
+          # Log individual check-run results for visibility
+          echo "--- Upstream check-runs ---"
+          gh api "repos/facebookexperimental/moxygen/commits/$UPSTREAM_SHA/check-runs" \
+            -q '.check_runs[] | "[\(.conclusion // .status)] \(.name)"'
+          echo "---"
 
           if [ "$STATE" != "success" ]; then
             echo "Upstream is $STATE (not success). Skipping."
