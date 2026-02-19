@@ -43,6 +43,24 @@ option(BUILD_SHARED_LIBS
 # is generally discouraged.
 mark_as_advanced(BUILD_SHARED_LIBS)
 
+# Compat layer configuration
+# When ON (default): Use Folly, mvfst, proxygen - full featured mode
+# When OFF: Use std-mode alternatives - minimal dependencies
+option(MOXYGEN_USE_FOLLY
+  "Use Folly libraries (IOBuf, F14, coroutines). When OFF, use std alternatives."
+  ON
+)
+
+# Set compile definition for compat headers
+if(MOXYGEN_USE_FOLLY)
+  add_compile_definitions(MOXYGEN_USE_FOLLY=1)
+else()
+  add_compile_definitions(MOXYGEN_USE_FOLLY=0)
+endif()
+
+message(STATUS "Moxygen build configuration:")
+message(STATUS "  MOXYGEN_USE_FOLLY: ${MOXYGEN_USE_FOLLY}")
+
 include(FBBuildOptions)
 fb_activate_static_library_option()
 
@@ -79,6 +97,33 @@ option(BUILD_SAMPLES
   "If enabled, build moxygen sample executables and test tools."
   ON
 )
+
+# std-mode dependencies (Abseil + spdlog)
+if(NOT MOXYGEN_USE_FOLLY)
+  include(FetchContent)
+
+  # Abseil for high-performance containers
+  set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
+  set(ABSL_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    abseil-cpp
+    GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
+    GIT_TAG        20240116.2
+    GIT_SHALLOW    TRUE
+  )
+  FetchContent_MakeAvailable(abseil-cpp)
+
+  # spdlog for logging
+  set(SPDLOG_FMT_EXTERNAL OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    spdlog
+    GIT_REPOSITORY https://github.com/gabime/spdlog.git
+    GIT_TAG        v1.13.0
+    GIT_SHALLOW    TRUE
+  )
+  FetchContent_MakeAvailable(spdlog)
+  install(TARGETS spdlog EXPORT moxygen-exports)
+endif()
 
 list(APPEND
   _MOXYGEN_COMMON_COMPILE_OPTIONS
@@ -117,6 +162,9 @@ endif()
 
 include(MoxygenTest)
 include(MoxygenFunctions)
+
+# Compat layer (must come before moxygen for dependency resolution)
+add_subdirectory(moxygen/compat)
 
 add_subdirectory(moxygen)
 
