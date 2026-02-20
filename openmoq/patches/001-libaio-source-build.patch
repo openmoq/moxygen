@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenMOQ CI <ci@openmoq.org>
+Date: Thu, 20 Feb 2026 00:00:00 +0000
+Subject: [PATCH] Add source build option for libaio manifest
+
+The upstream libaio manifest only has [debs] and [rpms] system package
+mappings. When building on platforms without matching system package
+definitions (e.g., Debian Bookworm containers where getdeps detects
+distro=debian_gnu/ instead of matching [debs]), the build fails because
+there is no [download] section to fall back on.
+
+Add a [download] and [build] section so libaio can be built from source
+as a fallback. This mirrors the fix from the orly-integration branch.
+
+---
+ build/fbcode_builder/manifests/libaio | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/build/fbcode_builder/manifests/libaio b/build/fbcode_builder/manifests/libaio
+index e359919..0849dbb 100644
+--- a/build/fbcode_builder/manifests/libaio
++++ b/build/fbcode_builder/manifests/libaio
+@@ -6,3 +6,20 @@ libaio-dev
+
+ [rpms.distro=centos_stream]
+ libaio-devel
++
++[download]
++url = https://pagure.io/libaio/archive/libaio-0.3.113/libaio-libaio-0.3.113.tar.gz
++sha256 = 716c7059703247344eb066b54ecbc3ca2134f0103307192e6c2b7dab5f9528ab
++
++[build]
++builder = make
++subdir = libaio-libaio-0.3.113
++
++[make.build_args.shared_libs=off]
++ENABLE_SHARED=0
++
++[make.install_args]
++install
++
++[make.install_args.shared_libs=off]
++ENABLE_SHARED=0
+--
+2.43.0
+

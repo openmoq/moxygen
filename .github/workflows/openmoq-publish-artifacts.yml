@@ -75,13 +75,13 @@ jobs:
       - name: Install getdeps system deps
         run: |
           python3 build/fbcode_builder/getdeps.py \
-            --allow-system-packages install-system-deps \
+            install-system-deps \
             --recursive moxygen || true
 
       - name: Build moxygen + deps
         run: |
           python3 build/fbcode_builder/getdeps.py \
-            --allow-system-packages build \
+            build \
             --no-tests \
             --src-dir=. \
             --scratch-path "${{ runner.temp }}/moxygen-scratch" \
@@ -95,7 +95,7 @@ jobs:
 
           # Get all install directories (moxygen + transitive deps)
           python3 build/fbcode_builder/getdeps.py \
-            --allow-system-packages show-inst-dir \
+            show-inst-dir \
             --scratch-path "$SCRATCH" \
             --extra-cmake-defines '{"CMAKE_FIND_LIBRARY_SUFFIXES": ".a", "BUILD_SHARED_LIBS": "OFF"}' \
             --recursive moxygen 2>/dev/null \
