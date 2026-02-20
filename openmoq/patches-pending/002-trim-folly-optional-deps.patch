@@ -1,0 +1,65 @@
+From 75fb84518af2ec03a54a1b5df555fb24df065436 Mon Sep 17 00:00:00 2001
+From: Giovanni Marzot <gmarzot@marzresearch.net>
+Date: Fri, 20 Feb 2026 15:50:06 -0500
+Subject: [PATCH] Trim optional folly deps for moxygen relay builds
+
+Remove compression codecs (lz4, snappy, zstd, xz), libsodium,
+libaio, and libiberty from folly's dependency list. These are
+unused by the moxygen/proxygen/fizz/wangle/mvfst stack.
+
+fizz links zstd, zlib, and libsodium independently.
+libdwarf and libunwind retained for crash diagnostics.
+---
+ build/fbcode_builder/manifests/folly | 24 ++++++------------------
+ 1 file changed, 6 insertions(+), 18 deletions(-)
+
+diff --git a/build/fbcode_builder/manifests/folly b/build/fbcode_builder/manifests/folly
+index c9ac2cf..a5cccaf 100644
+--- a/build/fbcode_builder/manifests/folly
++++ b/build/fbcode_builder/manifests/folly
+@@ -18,20 +18,15 @@ googletest
+ boost
+ libdwarf
+ libevent
+-libsodium
+ double-conversion
+ fast_float
+ fmt
+-lz4
+-snappy
+-zstd
+-# no openssl or zlib in the linux case, why?
+-# these are usually installed on the system
+-# and are the easiest system deps to pull in.
+-# In the future we want to be able to express
+-# that a system dep is sufficient in the manifest
+-# for eg: openssl and zlib, but for now we don't
+-# have it.
++# OpenMOQ: removed optional deps not needed by moxygen/proxygen/fizz stack:
++#   lz4, snappy, zstd — folly::io::getCodec() compression codecs (unused)
++#   libsodium — folly::crypto::Blake2xb/LtHash (fizz links sodium independently)
++#   xz — LZMA/LZMA2 codec (unused)
++#   libaio — folly::AsyncIO (default libevent EventBase is used)
++#   libiberty — cplus_demangle (falls back to __cxa_demangle)
+ 
+ # macOS doesn't expose the openssl api so we need
+ # to build our own.
+@@ -45,15 +40,8 @@ openssl
+ zlib
+ 
+ [dependencies.os=linux]
+-libaio
+-libiberty
+ libunwind
+ 
+-# xz depends on autoconf which does not build on
+-# Windows
+-[dependencies.not(os=windows)]
+-xz
+-
+ [shipit.pathmap]
+ fbcode/folly/public_tld = .
+ fbcode/folly = folly
+-- 
+2.34.1
+
