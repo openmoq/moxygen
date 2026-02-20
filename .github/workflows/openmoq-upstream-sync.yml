@@ -6,7 +6,7 @@ name: OpenMOQ Upstream Sync
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # Daily at 06:00 UTC
+    - cron: '0 7 * * *'   # Daily at 02:00 ET (07:00 UTC)
   workflow_dispatch:
 
 permissions:
@@ -82,6 +82,7 @@ jobs:
 
       - name: Create candidate branch
         if: steps.upstream.outputs.should_sync == 'true'
+        id: merge
         run: |
           BRANCH="sync-upstream-${{ steps.upstream.outputs.short_sha }}"
           git config user.name "github-actions[bot]"
@@ -89,9 +90,45 @@ jobs:
 
           git checkout -b "$BRANCH"
 
-          # Merge upstream with no-ff to preserve history
-          git merge --no-ff upstream/main \
-            -m "Merge upstream moxygen ${{ steps.upstream.outputs.short_sha }}"
+          # Attempt merge — if clean, we're done
+          if git merge --no-ff upstream/main \
+               -m "Merge upstream moxygen ${{ steps.upstream.outputs.short_sha }}"; then
+            echo "Merge completed cleanly."
+            echo "conflicts_resolved=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Merge has conflicts — auto-resolve upstream-owned files, protect ours
+          echo "Merge conflicts detected. Attempting auto-resolution..."
+          CONFLICTS=$(git diff --name-only --diff-filter=U)
+          RESOLVED=0
+          OPENMOQ_CONFLICT=false
+
+          for file in $CONFLICTS; do
+            case "$file" in
+              openmoq/*|.github/workflows/openmoq-*)
+                echo "::error::Conflict in OpenMOQ-owned file: $file (requires manual resolution)"
+                OPENMOQ_CONFLICT=true
+                ;;
+              *)
+                echo "Auto-resolving (taking upstream): $file"
+                git checkout --theirs "$file"
+                git add "$file"
+                RESOLVED=$((RESOLVED + 1))
+                ;;
+            esac
+          done
+
+          if [ "$OPENMOQ_CONFLICT" = true ]; then
+            echo "::error::Conflicts in OpenMOQ-owned files cannot be auto-resolved"
+            git merge --abort
+            exit 1
+          fi
+
+          # Complete the merge commit
+          git commit --no-edit
+          echo "Auto-resolved $RESOLVED conflict(s) in upstream-owned files."
+          echo "conflicts_resolved=$RESOLVED" >> "$GITHUB_OUTPUT"
 
       # ── Step 3: Apply local patches from openmoq/patches/ ──
       - name: Apply OpenMOQ patches
@@ -102,24 +139,46 @@ jobs:
           if [ ! -d "$PATCH_DIR" ] || [ -z "$(ls -A "$PATCH_DIR"/*.patch 2>/dev/null)" ]; then
             echo "No patches to apply."
             echo "patches_applied=0" >> "$GITHUB_OUTPUT"
+            echo "patches_skipped=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          COUNT=0
+          APPLIED=0
+          SKIPPED=0
+          SKIPPED_LIST=""
           for patch in "$PATCH_DIR"/*.patch; do
-            echo "Applying: $patch"
-            if ! git am "$patch"; then
-              echo "::error::Patch failed: $patch"
-              git am --abort
+            BASENAME=$(basename "$patch")
+
+            # Check if patch applies cleanly
+            if git apply --check "$patch" 2>/dev/null; then
+              echo "Applying: $BASENAME"
+              if ! git am "$patch"; then
+                echo "::error::Patch failed during apply: $BASENAME"
+                git am --abort
+                echo "patch_failed=true" >> "$GITHUB_OUTPUT"
+                echo "failed_patch=$BASENAME" >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+              APPLIED=$((APPLIED + 1))
+
+            # Check if patch is already applied (reverse-apply succeeds)
+            elif git apply --reverse --check "$patch" 2>/dev/null; then
+              echo "Skipping (already applied upstream): $BASENAME"
+              SKIPPED=$((SKIPPED + 1))
+              SKIPPED_LIST="${SKIPPED_LIST}${BASENAME}, "
+
+            else
+              echo "::error::Patch cannot apply and is not already applied: $BASENAME"
               echo "patch_failed=true" >> "$GITHUB_OUTPUT"
-              echo "failed_patch=$patch" >> "$GITHUB_OUTPUT"
+              echo "failed_patch=$BASENAME" >> "$GITHUB_OUTPUT"
               exit 1
             fi
-            COUNT=$((COUNT + 1))
           done
 
-          echo "patches_applied=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "Applied $COUNT patches."
+          echo "patches_applied=$APPLIED" >> "$GITHUB_OUTPUT"
+          echo "patches_skipped=$SKIPPED" >> "$GITHUB_OUTPUT"
+          echo "patches_skipped_list=${SKIPPED_LIST%, }" >> "$GITHUB_OUTPUT"
+          echo "Applied $APPLIED patch(es), skipped $SKIPPED (already upstream)."
 
       # ── Step 4: Push candidate branch and create PR ──
       - name: Push candidate branch
@@ -136,7 +195,19 @@ jobs:
         run: |
           BRANCH="sync-upstream-${{ steps.upstream.outputs.short_sha }}"
           UPSTREAM_SHA="${{ steps.upstream.outputs.upstream_sha }}"
-          PATCHES="${{ steps.patches.outputs.patches_applied }}"
+          APPLIED="${{ steps.patches.outputs.patches_applied }}"
+          SKIPPED="${{ steps.patches.outputs.patches_skipped }}"
+          SKIPPED_LIST="${{ steps.patches.outputs.patches_skipped_list }}"
+          CONFLICTS="${{ steps.merge.outputs.conflicts_resolved }}"
+
+          # Build details section
+          DETAILS=""
+          if [ "${CONFLICTS:-0}" -gt 0 ]; then
+            DETAILS="${DETAILS}\n- **Merge conflicts auto-resolved:** ${CONFLICTS} (upstream-owned files)"
+          fi
+          if [ -n "$SKIPPED_LIST" ]; then
+            DETAILS="${DETAILS}\n- **Patches skipped (already upstream):** ${SKIPPED_LIST}"
+          fi
 
           PR_URL=$(gh pr create \
             --head "$BRANCH" \
@@ -147,7 +218,7 @@ jobs:
 
           - **Upstream commit:** [\`${UPSTREAM_SHA:0:12}\`](https://github.com/facebookexperimental/moxygen/commit/$UPSTREAM_SHA)
           - **Upstream status:** success (green)
-          - **Patches applied:** ${PATCHES:-0}
+          - **Patches applied:** ${APPLIED:-0}${DETAILS}
 
           The existing \`getdeps_linux\` and \`getdeps_mac\` workflows will validate this branch.
           On CI success, this PR will be auto-merged.
@@ -179,7 +250,7 @@ jobs:
           payload: |
             {
               "channel": "#github-notifications",
-              "text": ":arrows_counterclockwise: *moxygen upstream sync* — candidate PR created\nUpstream: `${{ steps.upstream.outputs.upstream_sha }}`\nPatches applied: ${{ steps.patches.outputs.patches_applied || '0' }}\n<${{ steps.pr.outputs.pr_url }}|View PR>"
+              "text": ":arrows_counterclockwise: *moxygen upstream sync* — candidate PR created\nUpstream: `${{ steps.upstream.outputs.upstream_sha }}`\nPatches applied: ${{ steps.patches.outputs.patches_applied || '0' }}, skipped: ${{ steps.patches.outputs.patches_skipped || '0' }}\nConflicts auto-resolved: ${{ steps.merge.outputs.conflicts_resolved || '0' }}\n<${{ steps.pr.outputs.pr_url }}|View PR>"
             }
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

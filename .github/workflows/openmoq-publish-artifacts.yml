@@ -56,9 +56,8 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build python3 python3-pip \
-            curl git pkg-config libssl-dev m4 ca-certificates \
-            autoconf automake libtool
+            build-essential python3 curl git ca-certificates \
+            pkg-config libssl-dev m4 autoconf automake libtool
 
       - name: Install system deps (Ubuntu runner)
         if: matrix.container == '' && runner.os == 'Linux'
