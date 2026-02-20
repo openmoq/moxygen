@@ -12,6 +12,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  workflows: write      # needed to push upstream changes to .github/workflows/
 
 jobs:
   sync:
