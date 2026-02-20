@@ -12,16 +12,18 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  workflows: write      # needed to push upstream changes to .github/workflows/
 
 jobs:
   sync:
     runs-on: ubuntu-22.04
     steps:
+      # PAT with 'workflow' scope required to push upstream changes to
+      # .github/workflows/ files. GITHUB_TOKEN cannot modify workflow files.
+      # Falls back to GITHUB_TOKEN if SYNC_PAT is not configured.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.OMOQ_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
 
       # ── Step 1: Check upstream for qualifying changes ──
       - name: Check upstream status
