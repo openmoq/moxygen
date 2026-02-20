@@ -28,9 +28,9 @@ jobs:
             artifact: moxygen-ubuntu-22.04-x86_64.tar.gz
             container: ""
 
-          - name: macos-14-arm64
-            runner: macos-14
-            artifact: moxygen-macos-14-arm64.tar.gz
+          - name: macos-15-arm64
+            runner: macos-15
+            artifact: moxygen-macos-15-arm64.tar.gz
             container: ""
 
           # Docker-compatible artifacts (built on bookworm for glibc compat)

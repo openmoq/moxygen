@@ -77,11 +77,24 @@ upstream facebookexperimental/moxygen.
 
 ### Published artifact builds (reproducible, all from source)
 
-The `openmoq-publish-artifacts.yml` workflow builds everything from source
-without `--allow-system-packages`. This ensures:
-- Pinned, reproducible dependency versions
-- Static libraries suitable for packaging
-- No dependency on host system library versions
+The `openmoq-publish-artifacts.yml` workflow builds static library bundles on
+every merge to `main`, publishing them as GitHub Release assets (`build-<sha>`).
+
+**Target platforms:**
+
+| Artifact | Runner | Notes |
+|---|---|---|
+| `moxygen-ubuntu-22.04-x86_64.tar.gz` | ubuntu-22.04 | Native CI builds |
+| `moxygen-macos-15-arm64.tar.gz` | macos-15 | Native macOS (Xcode 16 required for full C++20) |
+| `moxygen-bookworm-amd64.tar.gz` | debian:bookworm container | Docker AMD64 images |
+| `moxygen-bookworm-arm64.tar.gz` | debian:bookworm container on ARM64 | Docker ARM64 images |
+
+Linux and bookworm builds use `BUILD_SHARED_LIBS=OFF` and
+`CMAKE_FIND_LIBRARY_SUFFIXES=.a` for fully static, pinned artifacts without
+`--allow-system-packages`. The macOS build also uses static flags but requires
+`macos-15` (Xcode 16 / Apple Clang 16) because the moxygen source uses C++20
+parenthesized aggregate initialization (P0960R3) which Apple Clang 15 does not
+support.
 
 ### Local developer builds
 
