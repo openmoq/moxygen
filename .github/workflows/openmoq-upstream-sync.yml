@@ -145,11 +145,12 @@ jobs:
 
           APPLIED=0
           SKIPPED=0
+          MERGED=0
           SKIPPED_LIST=""
           for patch in "$PATCH_DIR"/*.patch; do
             BASENAME=$(basename "$patch")
 
-            # Check if patch applies cleanly
+            # 1) Clean apply — patch applies exactly as written
             if git apply --check "$patch" 2>/dev/null; then
               echo "Applying: $BASENAME"
               if ! git am "$patch"; then
@@ -161,14 +162,20 @@ jobs:
               fi
               APPLIED=$((APPLIED + 1))
 
-            # Check if patch is already applied (reverse-apply succeeds)
+            # 2) Fully absorbed — every hunk already present upstream
             elif git apply --reverse --check "$patch" 2>/dev/null; then
               echo "Skipping (already applied upstream): $BASENAME"
               SKIPPED=$((SKIPPED + 1))
               SKIPPED_LIST="${SKIPPED_LIST}${BASENAME}, "
 
+            # 3) Partial overlap — some hunks applied, some not. Use 3-way merge.
+            elif git am --3way "$patch" 2>/dev/null; then
+              echo "Applied with 3-way merge (partial upstream overlap): $BASENAME"
+              MERGED=$((MERGED + 1))
+
             else
-              echo "::error::Patch cannot apply and is not already applied: $BASENAME"
+              git am --abort 2>/dev/null || true
+              echo "::error::Patch cannot apply (clean, skip, or 3-way): $BASENAME"
               echo "patch_failed=true" >> "$GITHUB_OUTPUT"
               echo "failed_patch=$BASENAME" >> "$GITHUB_OUTPUT"
               exit 1
@@ -176,9 +183,10 @@ jobs:
           done
 
           echo "patches_applied=$APPLIED" >> "$GITHUB_OUTPUT"
+          echo "patches_merged=$MERGED" >> "$GITHUB_OUTPUT"
           echo "patches_skipped=$SKIPPED" >> "$GITHUB_OUTPUT"
           echo "patches_skipped_list=${SKIPPED_LIST%, }" >> "$GITHUB_OUTPUT"
-          echo "Applied $APPLIED patch(es), skipped $SKIPPED (already upstream)."
+          echo "Applied $APPLIED, 3-way merged $MERGED, skipped $SKIPPED (already upstream)."
 
       # ── Step 4: Push candidate branch and create PR ──
       - name: Push candidate branch
