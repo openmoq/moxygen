@@ -139,37 +139,40 @@ class MoQCacheTest : public ::testing::Test {
     auto [p, future] =
         folly::makePromiseContract<std::shared_ptr<FetchConsumer>>();
     EXPECT_CALL(*upstream_, fetch(_, _))
-        .WillOnce([start,
-                   end,
-                   endOfTrack,
-                   largest,
-                   order,
-                   promise = std::move(p),
-                   this](auto fetch, auto consumer) mutable {
-          auto [standalone, joining] = fetchType(fetch);
-          EXPECT_EQ(standalone->start, start);
-          EXPECT_EQ(standalone->end, end);
-          upstreamFetchConsumer_ = std::move(consumer);
-          promise.setValue(upstreamFetchConsumer_);
-          upstreamFetchHandle_ = std::make_shared<moxygen::MockFetchHandle>(
-              FetchOk{0, order, endOfTrack, largest});
-          return folly::coro::makeTask<Publisher::FetchResult>(
-              upstreamFetchHandle_);
-        })
+        .WillOnce(
+            [start,
+             end,
+             endOfTrack,
+             largest,
+             order,
+             promise = std::move(p),
+             this](
+                Fetch fetch, std::shared_ptr<FetchConsumer> consumer) mutable {
+              auto [standalone, joining] = fetchType(fetch);
+              EXPECT_EQ(standalone->start, start);
+              EXPECT_EQ(standalone->end, end);
+              upstreamFetchConsumer_ = std::move(consumer);
+              promise.setValue(upstreamFetchConsumer_);
+              upstreamFetchHandle_ = std::make_shared<moxygen::MockFetchHandle>(
+                  FetchOk{0, order, endOfTrack, largest});
+              return folly::coro::makeTask<Publisher::FetchResult>(
+                  upstreamFetchHandle_);
+            })
         .RetiresOnSaturation();
     return std::move(future);
   }
 
   void expectUpstreamFetch(const FetchError& err) {
     EXPECT_CALL(*upstream_, fetch(_, _))
-        .WillOnce(Return(
-            folly::coro::makeTask<Publisher::FetchResult>(
-                folly::makeUnexpected(err))));
+        .WillOnce([err](Fetch, std::shared_ptr<FetchConsumer>) {
+          return folly::coro::makeTask<Publisher::FetchResult>(
+              folly::makeUnexpected(err));
+        });
   }
 
   void expectUpstreamFetch(const FetchOk& ok) {
     EXPECT_CALL(*upstream_, fetch(_, _))
-        .WillOnce([ok, this](const auto&, auto consumer) {
+        .WillOnce([ok, this](Fetch, std::shared_ptr<FetchConsumer> consumer) {
           upstreamFetchConsumer_ = std::move(consumer);
           upstreamFetchConsumer_->endOfFetch();
           upstreamFetchHandle_ = std::make_shared<moxygen::MockFetchHandle>(ok);
@@ -726,8 +729,9 @@ CO_TEST_F(MoQCacheTest, TestConsumerObjectBlocked) {
           return folly::makeUnexpected(
               MoQPublishError(MoQPublishError::BLOCKED));
         });
-    EXPECT_CALL(*consumer_, awaitReadyToConsume())
-        .WillOnce(Return(uint64_t(0)));
+    EXPECT_CALL(*consumer_, awaitReadyToConsume()).WillOnce([] {
+      return folly::makeSemiFuture<uint64_t>(0);
+    });
     expectFetchObjects({0, 1}, {0, 2}, false);
   }
   auto res =
@@ -744,9 +748,9 @@ CO_TEST_F(MoQCacheTest, TestAwaitFails) {
       .WillOnce([](auto, auto, auto, auto, const auto&, auto, auto) {
         return folly::makeUnexpected(MoQPublishError(MoQPublishError::BLOCKED));
       });
-  EXPECT_CALL(*consumer_, awaitReadyToConsume())
-      .WillOnce(Return(
-          folly::makeUnexpected(MoQPublishError(MoQPublishError::CANCELLED))));
+  EXPECT_CALL(*consumer_, awaitReadyToConsume()).WillOnce([] {
+    return folly::makeUnexpected(MoQPublishError(MoQPublishError::CANCELLED));
+  });
   EXPECT_CALL(*consumer_, reset(_));
   auto res =
       co_await cache_.fetch(getFetch({0, 0}, {0, 2}), consumer_, upstream_);
@@ -2155,6 +2159,62 @@ CO_TEST_F(MoQCacheTest, TestFetchNewTrackWithFullCacheEvicts) {
   EXPECT_TRUE(cache_.hasTrack(track2));
   EXPECT_TRUE(cache_.hasTrack(track3));
   co_return;
+}
+
+// Regression test: SubgroupWriteback::objectPayload() crashes when
+// beginObject() was called with a null initialPayload. The cache entry is
+// created with payload=nullptr and complete=false. When objectPayload() is
+// subsequently called, it unconditionally does:
+//   object->payload->appendChain(payload->clone());
+// which dereferences the null payload pointer, causing a SEGV.
+// The FetchWriteback version of objectPayload() correctly handles this case
+// by checking for null and assigning instead of appending.
+TEST_F(MoQCacheTest, SubgroupWritebackObjectPayloadNullInitialPayload) {
+  auto writeback = cache_.getSubscribeWriteback(kTestTrackName, trackConsumer_);
+
+  // beginSubgroup to get a SubgroupWriteback
+  auto sgRes = writeback->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(sgRes.hasValue());
+  auto sg = std::move(sgRes.value());
+
+  // Call beginObject with a null initialPayload (length=100 bytes to come)
+  auto beginRes = sg->beginObject(
+      /*objectID=*/0,
+      /*length=*/100,
+      /*initialPayload=*/nullptr,
+      /*extensions=*/Extensions());
+  ASSERT_TRUE(beginRes.hasValue());
+
+  // Now call objectPayload - this will SEGV without the fix because
+  // the cache entry's payload is null from the nullptr initialPayload above
+  auto payload = makeBuf(100);
+  auto payloadRes = sg->objectPayload(std::move(payload), false);
+  EXPECT_TRUE(payloadRes.hasValue());
+}
+
+// Same test but with a non-null initialPayload followed by more payload data.
+// This should work correctly (and did before the bug).
+TEST_F(MoQCacheTest, SubgroupWritebackObjectPayloadWithInitialPayload) {
+  auto writeback = cache_.getSubscribeWriteback(kTestTrackName, trackConsumer_);
+
+  auto sgRes = writeback->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(sgRes.hasValue());
+  auto sg = std::move(sgRes.value());
+
+  // Call beginObject with a non-null initialPayload (50 of 100 bytes)
+  auto beginRes = sg->beginObject(
+      /*objectID=*/0,
+      /*length=*/100,
+      /*initialPayload=*/makeBuf(50),
+      /*extensions=*/Extensions());
+  ASSERT_TRUE(beginRes.hasValue());
+
+  // Call objectPayload with the remaining 50 bytes
+  auto payloadRes = sg->objectPayload(makeBuf(50), false);
+  EXPECT_TRUE(payloadRes.hasValue());
+
+  // Verify the object is marked complete in the cache
+  EXPECT_TRUE(cache_.hasCachedObject(kTestTrackName, {0, 0}));
 }
 
 } // namespace moxygen::test
