@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+Date: Wed, 19 Feb 2026 00:00:00 +0000
+Subject: [PATCH] openmoq: add fork marker file
+
+No-op patch to validate the OpenMOQ upstream sync patch application flow.
+Creates a small marker file that identifies this as the OpenMOQ fork.
+---
+ openmoq/.fork-marker | 1 +
+ 1 file changed, 1 insertion(+)
+ create mode 100644 openmoq/.fork-marker
+
+diff --git a/openmoq/.fork-marker b/openmoq/.fork-marker
+new file mode 100644
+index 0000000..f30438a
+--- /dev/null
++++ b/openmoq/.fork-marker
+@@ -0,0 +1 @@
++openmoq-moxygen-fork

@@ -54,7 +54,7 @@ class SubgroupConsumer {
 
   // SubgroupConsumer enforces API semantics.
   //
-  // It’s an error to deliver any object or status if the object ID isn’t
+  // It's an error to deliver any object or status if the object ID isn't
   // strictly larger than the last delivered one on this subgroup.
   //
   // When using beginObject/objectPayload to deliver a streaming object, the
@@ -63,6 +63,10 @@ class SubgroupConsumer {
   //
   // It's an error to begin delivering any object/status or close the
   // stream in the middle of a streaming object.
+  //
+  // If any method returns a MoQPublishError, the SubgroupConsumer is
+  // implicitly reset and no further API calls should be made on it.
+  // Calling reset() after an error is a no-op.
 
   // Deliver the next object on this subgroup.
   virtual folly::Expected<folly::Unit, MoQPublishError> object(
@@ -143,9 +147,14 @@ class TrackConsumer {
 
   // Begin delivering a new subgroup in the specified group.  If the consumer is
   // writing, this Can fail with MoQPublishError::BLOCKED when out of stream
-  // credit.
+  // credit.  containsLastInGroup indicates this subgroup contains the last
+  // object in the group.
   virtual folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
-  beginSubgroup(uint64_t groupID, uint64_t subgroupID, Priority priority) = 0;
+  beginSubgroup(
+      uint64_t groupID,
+      uint64_t subgroupID,
+      Priority priority,
+      bool containsLastInGroup = false) = 0;
 
   // Wait for additional stream credit.
   virtual folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
@@ -153,16 +162,20 @@ class TrackConsumer {
 
   // Deliver a single-object or object status subgroup.  header.length must
   // equal payload length, or be 0 for non-NORMAL status.  Can fail with
-  // MoQPublishError::BLOCKED when out of stream credit.
+  // MoQPublishError::BLOCKED when out of stream credit.  lastInGroup indicates
+  // the object is the last in the group.
   virtual folly::Expected<folly::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
-      Payload payload) = 0;
+      Payload payload,
+      bool lastInGroup = false) = 0;
 
   // Deliver a datagram in this track.  This can be dropped by the sender or
-  // receiver if resources are low.
+  // receiver if resources are low.  lastInGroup indicates the object is the
+  // last in the group.
   virtual folly::Expected<folly::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
-      Payload payload) = 0;
+      Payload payload,
+      bool lastInGroup = false) = 0;
 
   // Inform the consumer that the publisher will not open any new subgroups or
   // send any new datagrams for this track.
@@ -215,7 +228,8 @@ class FetchConsumer {
       uint64_t objectID,
       Payload payload,
       Extensions extensions = noExtensions(),
-      bool finFetch = false) = 0;
+      bool finFetch = false,
+      bool forwardingPreferenceIsDatagram = false) = 0;
 
   // Advance the reliable offset of the fetch stream to the current offset.
   virtual void checkpoint() {}
@@ -260,6 +274,15 @@ class FetchConsumer {
   // Wait for the fetch to become writable
   virtual folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>
   awaitReadyToConsume() = 0;
+
+  // Called when the publisher indicates a range of objects is unknown.
+  // Default implementation is a no-op. This is majorly a caching concern.
+  virtual folly::Expected<folly::Unit, MoQPublishError> endOfUnknownRange(
+      uint64_t /* groupID */,
+      uint64_t /* objectId */,
+      bool /* finFetch */ = false) {
+    return folly::unit;
+  }
 };
 
 } // namespace moxygen

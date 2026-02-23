@@ -62,14 +62,14 @@ void MoQTestClient::setLogger(const std::shared_ptr<MLogger>& logger) {
 
 folly::coro::Task<void> MoQTestClient::doSubscribeUpdate(
     std::shared_ptr<Publisher::SubscriptionHandle> handle,
-    SubscribeUpdate update) {
-  auto result = co_await handle->subscribeUpdate(std::move(update));
+    RequestUpdate update) {
+  auto result = co_await handle->requestUpdate(std::move(update));
   if (result.hasError()) {
-    XLOG(ERR) << "subscribeUpdate failed: error code="
+    XLOG(ERR) << "requestUpdate failed: error code="
               << static_cast<uint64_t>(result.error().errorCode)
               << ", reason=" << result.error().reasonPhrase;
   } else {
-    XLOG(INFO) << "subscribeUpdate succeeded: requestID="
+    XLOG(INFO) << "requestUpdate succeeded: requestID="
                << result.value().requestID.value;
   }
 }
@@ -84,9 +84,10 @@ void MoQTestClient::subscribeUpdate(SubscribeUpdate update) {
   }
 }
 
-folly::coro::Task<void> MoQTestClient::connect(folly::EventBase* evb) {
-  // Test client always uses experimental protocols for testing
-  std::vector<std::string> alpns = getDefaultMoqtProtocols(true);
+folly::coro::Task<void> MoQTestClient::connect(
+    folly::EventBase* evb,
+    const std::string& versions) {
+  auto alpns = getMoqtProtocols(versions, true);
 
   co_await moqClient_->setupMoQSession(
       std::chrono::milliseconds(FLAGS_connect_timeout),

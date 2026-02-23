@@ -6,6 +6,7 @@
 
 #include "moxygen/relay/MoQRelay.h"
 #include "moxygen/MoQFilters.h"
+#include "moxygen/MoQTrackProperties.h"
 
 namespace {
 constexpr uint8_t kDefaultUpstreamPriority = 128;
@@ -22,7 +23,7 @@ namespace moxygen {
 folly::coro::Task<void> MoQRelay::doSubscribeUpdate(
     std::shared_ptr<Publisher::SubscriptionHandle> handle,
     bool forward) {
-  auto updateRes = co_await handle->subscribeUpdate(
+  auto updateRes = co_await handle->requestUpdate(
       {RequestID(0),
        handle->subscribeOk().requestID,
        kLocationMin,
@@ -30,7 +31,7 @@ folly::coro::Task<void> MoQRelay::doSubscribeUpdate(
        kDefaultPriority,
        /*forward=*/forward});
   if (updateRes.hasError()) {
-    XLOG(ERR) << "subscribeUpdate failed: " << updateRes.error().reasonPhrase;
+    XLOG(ERR) << "requestUpdate failed: " << updateRes.error().reasonPhrase;
   }
 }
 
@@ -367,11 +368,11 @@ Subscriber::PublishResult MoQRelay::publish(
   // Set Forwarder Params
   forwarder->setGroupOrder(pub.groupOrder);
 
-  // Extract delivery timeout from publish request params and store in forwarder
-  auto deliveryTimeout = MoQSession::getDeliveryTimeoutIfPresent(
-      pub.params, session->getNegotiatedVersion().value());
-  if (deliveryTimeout && *deliveryTimeout > 0) {
-    forwarder->setDeliveryTimeout(*deliveryTimeout);
+  // Extract delivery timeout from publish request extensions and store in
+  // forwarder
+  auto deliveryTimeout = getPublisherDeliveryTimeout(pub);
+  if (deliveryTimeout && deliveryTimeout->count() > 0) {
+    forwarder->setDeliveryTimeout(deliveryTimeout->count());
   }
 
   auto subRes = subscriptions_.emplace(
@@ -479,6 +480,15 @@ class MoQRelay::NamespaceSubscription
       relay_->unsubscribeNamespace(trackNamespacePrefix_, std::move(session_));
       relay_.reset();
     }
+  }
+
+  folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) override {
+    co_return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::NOT_SUPPORTED,
+            "REQUEST_UPDATE not supported for relay SUBSCRIBE_NAMESPACE"});
   }
 
  private:
@@ -727,7 +737,6 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
       }
     });
     // Add subscriber first in case objects come before subscribe OK.
-    auto sessionVersion = session->getNegotiatedVersion();
     auto subscriber = forwarder->addSubscriber(
         std::move(session), subReq, std::move(consumer));
     if (!subscriber) {
@@ -766,16 +775,16 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     forwarder->setGroupOrder(pubGroupOrder);
 
     // Store upstream delivery timeout in forwarder
-    auto deliveryTimeout = MoQSession::getDeliveryTimeoutIfPresent(
-        subRes.value()->subscribeOk().params, sessionVersion.value());
+    auto deliveryTimeout =
+        getPublisherDeliveryTimeout(subRes.value()->subscribeOk());
 
     // Add delivery timeout to downstream subscriber explicitly as this is the
     // first subscriber. Forwarder can add it to subsequent subscribers
-    if (deliveryTimeout && *deliveryTimeout > 0) {
-      forwarder->setDeliveryTimeout(*deliveryTimeout);
+    if (deliveryTimeout && deliveryTimeout->count() > 0) {
+      forwarder->setDeliveryTimeout(deliveryTimeout->count());
       subscriber->setParam(
           {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
-           *deliveryTimeout});
+           static_cast<uint64_t>(deliveryTimeout->count())});
     }
 
     subscriber->setPublisherGroupOrder(pubGroupOrder);

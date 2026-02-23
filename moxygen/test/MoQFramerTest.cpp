@@ -9,6 +9,7 @@
 #include <folly/logging/xlog.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
+#include "moxygen/MoQTrackProperties.h"
 #include "moxygen/test/TestUtils.h"
 
 using namespace moxygen;
@@ -90,7 +91,7 @@ class MoQFramerTest : public ::testing::TestWithParam<uint64_t> {
     testUnderflowResult(r3);
 
     skip(cursor, 1);
-    auto r3a = parser_.parseSubscribeUpdate(cursor, frameLength(cursor));
+    auto r3a = parser_.parseRequestUpdate(cursor, frameLength(cursor));
     testUnderflowResult(r3a);
 
     skip(cursor, 1);
@@ -121,8 +122,7 @@ class MoQFramerTest : public ::testing::TestWithParam<uint64_t> {
     skip(cursor, 1);
     auto r8a = parser_.parsePublish(cursor, frameLength(cursor));
     testUnderflowResult(r8a);
-    EXPECT_TRUE(getFirstIntParam(
-        r8a->params, TrackRequestParamKey::PUBLISHER_PRIORITY));
+    EXPECT_TRUE(getPublisherPriority(*r8a).has_value());
 
     skip(cursor, 1);
     auto r8b = parser_.parsePublishOk(cursor, frameLength(cursor));
@@ -248,27 +248,34 @@ class MoQFramerTest : public ::testing::TestWithParam<uint64_t> {
     auto r22 =
         parser_.parseFetchObjectHeader(cursor, cursor.totalLength(), obj);
     testUnderflowResult(r22);
-    EXPECT_EQ(r22->value.id, 4);
-    skip(cursor, *r22->value.length);
+    ASSERT_TRUE(std::holds_alternative<ObjectHeader>(r22->value));
+    auto& r22obj = std::get<ObjectHeader>(r22->value);
+    EXPECT_EQ(r22obj.id, 4);
+    skip(cursor, *r22obj.length);
 
     auto r22a =
         parser_.parseFetchObjectHeader(cursor, cursor.totalLength(), obj);
     testUnderflowResult(r22a);
-    EXPECT_EQ(r22a->value.id, 5);
-    EXPECT_EQ(
-        r22a->value.extensions, Extensions(test::getTestExtensions(), {}));
-    skip(cursor, *r22a->value.length);
+    ASSERT_TRUE(std::holds_alternative<ObjectHeader>(r22a->value));
+    auto& r22aobj = std::get<ObjectHeader>(r22a->value);
+    EXPECT_EQ(r22aobj.id, 5);
+    EXPECT_EQ(r22aobj.extensions, Extensions(test::getTestExtensions(), {}));
+    skip(cursor, *r22aobj.length);
 
     auto r23 =
         parser_.parseFetchObjectHeader(cursor, cursor.totalLength(), obj);
     testUnderflowResult(r23);
-    EXPECT_EQ(r23->value.status, ObjectStatus::END_OF_GROUP);
+    ASSERT_TRUE(std::holds_alternative<ObjectHeader>(r23->value));
+    auto& r23obj = std::get<ObjectHeader>(r23->value);
+    EXPECT_EQ(r23obj.status, ObjectStatus::END_OF_GROUP);
 
     auto r23a =
         parser_.parseFetchObjectHeader(cursor, cursor.totalLength(), obj);
     testUnderflowResult(r23a);
-    EXPECT_EQ(r23a->value.extensions, Extensions({}, {}));
-    EXPECT_EQ(r23a->value.status, ObjectStatus::END_OF_GROUP);
+    ASSERT_TRUE(std::holds_alternative<ObjectHeader>(r23a->value));
+    auto& r23aobj = std::get<ObjectHeader>(r23a->value);
+    EXPECT_EQ(r23aobj.extensions, Extensions({}, {}));
+    EXPECT_EQ(r23aobj.status, ObjectStatus::END_OF_GROUP);
   }
 
  protected:
@@ -758,20 +765,24 @@ TEST_P(MoQFramerTest, ParseFetchHeader) {
   auto parseResult = parser_.parseFetchObjectHeader(
       cursor, cursor.totalLength(), headerTemplate);
   EXPECT_TRUE(parseResult.hasValue());
-  EXPECT_EQ(parseResult->value.group, 33);
-  EXPECT_EQ(parseResult->value.id, 44);
-  EXPECT_EQ(parseResult->value.priority, 55);
-  EXPECT_EQ(parseResult->value.status, ObjectStatus::NORMAL);
-  EXPECT_EQ(*parseResult->value.length, 4);
-  cursor.skip(*parseResult->value.length);
+  ASSERT_TRUE(std::holds_alternative<ObjectHeader>(parseResult->value));
+  auto& obj1 = std::get<ObjectHeader>(parseResult->value);
+  EXPECT_EQ(obj1.group, 33);
+  EXPECT_EQ(obj1.id, 44);
+  EXPECT_EQ(obj1.priority, 55);
+  EXPECT_EQ(obj1.status, ObjectStatus::NORMAL);
+  EXPECT_EQ(*obj1.length, 4);
+  cursor.skip(*obj1.length);
 
   parseResult = parser_.parseFetchObjectHeader(
       cursor, cursor.totalLength(), headerTemplate);
   EXPECT_TRUE(parseResult.hasValue());
-  EXPECT_EQ(parseResult->value.group, 33);
-  EXPECT_EQ(parseResult->value.id, 44);
-  EXPECT_EQ(parseResult->value.priority, 55);
-  EXPECT_EQ(parseResult->value.status, ObjectStatus::OBJECT_NOT_EXIST);
+  ASSERT_TRUE(std::holds_alternative<ObjectHeader>(parseResult->value));
+  auto& obj2 = std::get<ObjectHeader>(parseResult->value);
+  EXPECT_EQ(obj2.group, 33);
+  EXPECT_EQ(obj2.id, 44);
+  EXPECT_EQ(obj2.priority, 55);
+  EXPECT_EQ(obj2.status, ObjectStatus::OBJECT_NOT_EXIST);
 }
 
 TEST_P(MoQFramerTest, ParseClientSetupForMaxRequestID) {
@@ -1341,7 +1352,7 @@ TEST_P(MoQFramerAuthTest, AuthTokenUnderflowTest) {
     // sorts parameters by key, so AUTH_TOKEN (key=3) comes BEFORE
     // SUBSCRIPTION_FILTER (key=0x21=33), shortening the offset.
     const uint32_t kDraft16PreambleLength = 15;
-    const uint32_t kDraft15PreambleLength = 13;
+    const uint32_t kDraft15PreambleLength = 20;
     const uint32_t kDraft14PreambleLength = 19;
     uint32_t frontLength;
     if (getDraftMajorVersion(GetParam()) >= 16) {
@@ -1386,7 +1397,7 @@ TEST_P(MoQFramerAuthTest, AuthTokenUnderflowTest) {
         parser_.setTokenCacheMaxSize(0);
         parser_.setTokenCacheMaxSize(100);
       }
-      EXPECT_FALSE(parseResult.hasValue());
+      EXPECT_FALSE(parseResult.hasValue()) << "j=" << j << " i=" << i;
     }
     if (j == 1 || j == 2) { // register / delete mutate cache state
       auto toParse = front->clone();
@@ -1447,7 +1458,7 @@ TEST_P(MoQFramerTest, SubscribeUpdateWithSubscribeReqIDSerialization) {
   EXPECT_EQ(
       frameType->first, folly::to_underlying(FrameType::SUBSCRIBE_UPDATE));
 
-  auto parseResult = parser_.parseSubscribeUpdate(cursor, frameLength(cursor));
+  auto parseResult = parser_.parseRequestUpdate(cursor, frameLength(cursor));
   EXPECT_TRUE(parseResult.hasValue());
 
   if (getDraftMajorVersion(GetParam()) >= 14) {
@@ -1507,7 +1518,7 @@ TEST(MoQFramerTest, SubscribeUpdateDraft15ForwardUnset) {
   size_t frameLength = cursor.readBE<uint16_t>();
 
   // Parse the SUBSCRIBE_UPDATE
-  auto parseResult = parser.parseSubscribeUpdate(cursor, frameLength);
+  auto parseResult = parser.parseRequestUpdate(cursor, frameLength);
   EXPECT_TRUE(parseResult.hasValue()) << "Failed to parse SUBSCRIBE_UPDATE";
 
   EXPECT_EQ(parseResult->requestID.value, 123);
@@ -1717,6 +1728,44 @@ TEST(MoQFramerTestUtils, GetAlpnFromVersion) {
   auto alpnDraft16 = getAlpnFromVersion(kVersionDraft16);
   ASSERT_TRUE(alpnDraft16.has_value());
   EXPECT_EQ(*alpnDraft16, kAlpnMoqtDraft16Latest);
+
+  // Standard ALPNs (moqt-NN format)
+  auto stdAlpnDraft14 = getAlpnFromVersion(kVersionDraft14, true);
+  ASSERT_TRUE(stdAlpnDraft14.has_value());
+  EXPECT_EQ(*stdAlpnDraft14, "moq-00"); // legacy always
+
+  auto stdAlpnDraft15 = getAlpnFromVersion(kVersionDraft15, true);
+  ASSERT_TRUE(stdAlpnDraft15.has_value());
+  EXPECT_EQ(*stdAlpnDraft15, "moqt-15");
+
+  auto stdAlpnDraft16 = getAlpnFromVersion(kVersionDraft16, true);
+  ASSERT_TRUE(stdAlpnDraft16.has_value());
+  EXPECT_EQ(*stdAlpnDraft16, "moqt-16");
+}
+
+TEST(MoQFramerTestUtils, GetMoqtProtocols) {
+  // Empty = all supported versions
+  auto all = getMoqtProtocols("", true);
+  EXPECT_EQ(all.size(), 3);
+  EXPECT_EQ(all[0], "moqt-16");
+  EXPECT_EQ(all[1], "moqt-15");
+  EXPECT_EQ(all[2], "moq-00");
+
+  // Single version
+  auto just16 = getMoqtProtocols("16", true);
+  EXPECT_EQ(just16.size(), 1);
+  EXPECT_EQ(just16[0], "moqt-16");
+
+  // Multiple versions
+  auto v14and16 = getMoqtProtocols("14,16", true);
+  EXPECT_EQ(v14and16.size(), 2);
+  EXPECT_EQ(v14and16[0], "moq-00");
+  EXPECT_EQ(v14and16[1], "moqt-16");
+
+  // Meta-specific ALPNs
+  auto meta16 = getMoqtProtocols("16");
+  EXPECT_EQ(meta16.size(), 1);
+  EXPECT_EQ(meta16[0], kAlpnMoqtDraft16Latest);
 }
 
 // Test class for immutable extensions feature (draft 14+)
@@ -3425,6 +3474,209 @@ TEST_P(MoQFramerV16PlusTest, RequestErrorWithRetryInterval) {
   EXPECT_EQ(parseResult->reasonPhrase, requestError.reasonPhrase);
 }
 
+// Test parsing End of Unknown Range marker (0x10C) - v16+ only
+// End of Range markers require varint encoding which is only supported in v16+
+TEST_P(MoQFramerV16PlusTest, ParseEndOfUnknownRange) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  // Write FETCH header
+  writer_.writeFetchHeader(writeBuf, RequestID(1));
+
+  // Write End of Unknown Range marker (0x10C) + Group ID + Object ID
+  // 0x10C as varint: 0x80 | (0x10C & 0x3F) = 0x8C, then (0x10C >> 6) = 0x04
+  // Actually, QUIC varint encoding for 0x10C (268):
+  // 268 < 16384, so 2-byte encoding: 0x40 | (268 >> 8), 268 & 0xFF
+  // = 0x40 | 1 = 0x41, 0x0C
+  writeBuf.append(folly::IOBuf::copyBuffer("\x41\x0C")); // 0x10C as varint
+  // Group ID = 5, Object ID = 10
+  writeBuf.append(folly::IOBuf::copyBuffer("\x05\x0A"));
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  // Skip FETCH stream header
+  auto streamType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(streamType->first, folly::to_underlying(StreamType::FETCH_HEADER));
+
+  auto fetchHeaderResult =
+      parser_.parseFetchHeader(cursor, cursor.totalLength());
+  EXPECT_TRUE(fetchHeaderResult.hasValue());
+
+  ObjectHeader headerTemplate;
+  auto parseResult = parser_.parseFetchObjectHeader(
+      cursor, cursor.totalLength(), headerTemplate);
+
+  EXPECT_TRUE(parseResult.hasValue());
+  ASSERT_TRUE(
+      std::holds_alternative<MoQFrameParser::EndOfRangeMarker>(
+          parseResult->value));
+  auto& marker = std::get<MoQFrameParser::EndOfRangeMarker>(parseResult->value);
+  EXPECT_EQ(marker.groupId, 5);
+  EXPECT_EQ(marker.objectId, 10);
+  EXPECT_TRUE(marker.isUnknownOrNonexistent);
+}
+
+// Test parsing End of Non-Existent Range marker (0x8C) - v16+ only
+// End of Range markers require varint encoding which is only supported in v16+
+TEST_P(MoQFramerV16PlusTest, ParseEndOfNonExistentRange) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  // Write FETCH header
+  writer_.writeFetchHeader(writeBuf, RequestID(1));
+
+  // Write End of Non-Existent Range marker (0x8C) + Group ID + Object ID
+  // 0x8C (140) as varint: 140 >= 64, so 2-byte encoding
+  // 0x40 | (140 >> 8), 140 & 0xFF = 0x40 | 0, 0x8C
+  writeBuf.append(folly::IOBuf::copyBuffer("\x40\x8C")); // 0x8C as varint
+  // Group ID = 3, Object ID = 7
+  writeBuf.append(folly::IOBuf::copyBuffer("\x03\x07"));
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  // Skip FETCH stream header
+  auto streamType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(streamType->first, folly::to_underlying(StreamType::FETCH_HEADER));
+
+  auto fetchHeaderResult =
+      parser_.parseFetchHeader(cursor, cursor.totalLength());
+  EXPECT_TRUE(fetchHeaderResult.hasValue());
+
+  ObjectHeader headerTemplate;
+  auto parseResult = parser_.parseFetchObjectHeader(
+      cursor, cursor.totalLength(), headerTemplate);
+
+  EXPECT_TRUE(parseResult.hasValue());
+  ASSERT_TRUE(
+      std::holds_alternative<MoQFrameParser::EndOfRangeMarker>(
+          parseResult->value));
+  auto& marker = std::get<MoQFrameParser::EndOfRangeMarker>(parseResult->value);
+  EXPECT_EQ(marker.groupId, 3);
+  EXPECT_EQ(marker.objectId, 7);
+  EXPECT_FALSE(marker.isUnknownOrNonexistent);
+}
+
+// Test that invalid serialization flags >= 128 (not 0x8C or 0x10C) cause error
+// v16+ only since values >= 128 require varint encoding
+TEST_P(MoQFramerV16PlusTest, ParseInvalidSerializationFlags) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  // Write FETCH header
+  writer_.writeFetchHeader(writeBuf, RequestID(1));
+
+  // Write invalid serialization flags (0x80 = 128, which is >= 128 but not
+  // 0x8C or 0x10C)
+  // 128 as varint: 128 >= 64, so 2-byte encoding: 0x40 | (128 >> 8), 128 & 0xFF
+  // = 0x40 | 0, 0x80
+  writeBuf.append(folly::IOBuf::copyBuffer("\x40\x80"));
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  // Skip FETCH stream header
+  auto streamType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(streamType->first, folly::to_underlying(StreamType::FETCH_HEADER));
+
+  auto fetchHeaderResult =
+      parser_.parseFetchHeader(cursor, cursor.totalLength());
+  EXPECT_TRUE(fetchHeaderResult.hasValue());
+
+  ObjectHeader headerTemplate;
+  auto parseResult = parser_.parseFetchObjectHeader(
+      cursor, cursor.totalLength(), headerTemplate);
+
+  EXPECT_TRUE(parseResult.hasError());
+  EXPECT_EQ(parseResult.error(), ErrorCode::PROTOCOL_VIOLATION);
+}
+
+// Test that parsing FETCH object with datagram forwarding preference (bit 0x40)
+// succeeds in draft-16+
+TEST_P(MoQFramerV16PlusTest, FetchObjectWithDatagramForwardingPreference) {
+  // Use the public writeStreamObject API with
+  // forwardingPreferenceIsDatagram=true
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  // Write FETCH header using the public API
+  auto headerResult = writer_.writeFetchHeader(writeBuf, RequestID(1));
+  EXPECT_TRUE(headerResult.hasValue());
+
+  // Create an object header
+  ObjectHeader obj(
+      1, // group
+      2, // subgroup
+      3, // id
+      5, // priority
+      ObjectStatus::NORMAL,
+      Extensions({}, {}),
+      4 /* length */);
+
+  // Write a FETCH object with forwardingPreferenceIsDatagram = true
+  auto objResult = writer_.writeStreamObject(
+      writeBuf,
+      StreamType::FETCH_HEADER,
+      obj,
+      folly::IOBuf::copyBuffer("test"),
+      true /* forwardingPreferenceIsDatagram */);
+  EXPECT_TRUE(objResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  // Skip stream type
+  auto streamType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_TRUE(streamType.has_value());
+  EXPECT_EQ(streamType->first, folly::to_underlying(StreamType::FETCH_HEADER));
+
+  // Parse FETCH header
+  auto fetchHeaderResult =
+      parser_.parseFetchHeader(cursor, cursor.totalLength());
+  EXPECT_TRUE(fetchHeaderResult.hasValue());
+
+  // Parse the FETCH object - should succeed with bit 0x40 set in draft-16+
+  ObjectHeader headerTemplate;
+  auto objParseResult = parser_.parseFetchObjectHeader(
+      cursor, cursor.totalLength(), headerTemplate);
+  EXPECT_TRUE(objParseResult.hasValue())
+      << "FETCH object with datagram forwarding preference (bit 0x40) should "
+         "parse successfully in draft-16+";
+  auto& objHeader = std::get<ObjectHeader>(objParseResult->value);
+  EXPECT_EQ(objHeader.group, 1);
+  EXPECT_EQ(objHeader.id, 3);
+  EXPECT_EQ(objHeader.status, ObjectStatus::NORMAL);
+}
+
+// Test that parsing FETCH object with reserved bit 0x80 set returns error
+TEST_P(MoQFramerV16PlusTest, FetchObjectReservedBit0x80ReturnsError) {
+  // Manually construct a FETCH object with bit 0x80 set
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  // Write FETCH header
+  writer_.writeFetchHeader(writeBuf, RequestID(1));
+
+  // Now write a malformed FETCH object with reserved bit 0x80 set
+  // In draft-16+, flags are varint-encoded. 0x80 (128) as QUIC varint:
+  // 128 >= 64, so 2-byte encoding: 0x40 | (128 >> 8), 128 & 0xFF = 0x40, 0x80
+  writeBuf.append(folly::IOBuf::copyBuffer("\x40\x80"));
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  // Skip stream type
+  auto parsedStreamType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_TRUE(parsedStreamType.has_value());
+
+  auto fetchHeaderResult =
+      parser_.parseFetchHeader(cursor, cursor.totalLength());
+  EXPECT_TRUE(fetchHeaderResult.hasValue());
+
+  ObjectHeader headerTemplate;
+  auto objParseResult = parser_.parseFetchObjectHeader(
+      cursor, cursor.totalLength(), headerTemplate);
+  EXPECT_TRUE(objParseResult.hasError())
+      << "Should return error when reserved bit 0x80 is set";
+  EXPECT_EQ(objParseResult.error(), ErrorCode::PROTOCOL_VIOLATION);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     MoQFramerV16PlusTest,
     MoQFramerV16PlusTest,
@@ -3681,4 +3933,100 @@ TEST_F(ParameterValidationFlowTest, SubscribeOkRejectsInvalidParam) {
   // This should succeed
   EXPECT_TRUE(result2.hasValue());
   EXPECT_EQ(subscribeOk.params.size(), 1);
+}
+
+class UnknownParamTest : public ::testing::Test {
+ protected:
+  // Build a minimal SUBSCRIBE payload with one unknown parameter.
+  // For v16+, the param key is delta-encoded; for v15-, absolute.
+  folly::IOBufQueue buildSubscribeWithUnknownParam(uint64_t version) {
+    folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+    size_t size = 0;
+    bool error = false;
+
+    // Request ID = 0
+    writeVarint(writeBuf, 0, size, error);
+
+    // Full Track Name: 1 namespace tuple with "ns", track name "track"
+    // Namespace count
+    writeVarint(writeBuf, 1, size, error);
+    // Namespace entry "ns" - length-prefixed
+    writeVarint(writeBuf, 2, size, error);
+    writeBuf.append("ns", 2);
+    size += 2;
+    // Track name "t" - length-prefixed
+    writeVarint(writeBuf, 1, size, error);
+    writeBuf.append("t", 1);
+    size += 1;
+
+    // Number of params = 1 (the unknown param)
+    writeVarint(writeBuf, 1, size, error);
+
+    // Unknown even param key = 9998 (not in kParamAllowlist)
+    uint64_t unknownKey = 9998;
+    if (getDraftMajorVersion(version) >= 16) {
+      // Delta from 0 = key itself
+      writeVarint(writeBuf, unknownKey, size, error);
+    } else {
+      writeVarint(writeBuf, unknownKey, size, error);
+    }
+    // Even key -> int param: value varint
+    writeVarint(writeBuf, 42, size, error);
+
+    // Prepend frame header: frame type + 2-byte BE length
+    folly::IOBufQueue headerBuf{folly::IOBufQueue::cacheChainLength()};
+    size_t headerSize = 0;
+    writeVarint(
+        headerBuf,
+        folly::to_underlying(FrameType::SUBSCRIBE),
+        headerSize,
+        error);
+    // 2-byte big-endian length
+    uint16_t sizeVal = folly::Endian::big(static_cast<uint16_t>(size));
+    headerBuf.append(&sizeVal, 2);
+
+    headerBuf.append(writeBuf.move());
+    return headerBuf;
+  }
+};
+
+TEST_F(UnknownParamTest, UnknownParamRejectedInV16) {
+  auto buf = buildSubscribeWithUnknownParam(kVersionDraft16);
+  auto data = buf.move();
+  folly::io::Cursor cursor(data.get());
+
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft16);
+
+  // Skip frame type
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::SUBSCRIBE));
+
+  // Read length
+  auto length = static_cast<size_t>(cursor.readBE<uint16_t>());
+
+  auto result = parser.parseSubscribeRequest(cursor, length);
+  EXPECT_FALSE(result.hasValue());
+  EXPECT_EQ(result.error(), ErrorCode::PROTOCOL_VIOLATION);
+}
+
+TEST_F(UnknownParamTest, UnknownParamAcceptedInV15) {
+  auto buf = buildSubscribeWithUnknownParam(kVersionDraft15);
+  auto data = buf.move();
+  folly::io::Cursor cursor(data.get());
+
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft15);
+
+  // Skip frame type
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::SUBSCRIBE));
+
+  // Read length
+  auto length = static_cast<size_t>(cursor.readBE<uint16_t>());
+
+  auto result = parser.parseSubscribeRequest(cursor, length);
+  EXPECT_TRUE(result.hasValue());
 }

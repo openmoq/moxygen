@@ -31,13 +31,13 @@ class MoQChatClient : public Publisher,
   folly::coro::Task<Publisher::SubscribeResult> subscribe(
       SubscribeRequest subscribeReq,
       std::shared_ptr<TrackConsumer> consumer) override;
-  folly::coro::Task<folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
-  subscribeUpdate(SubscribeUpdate update) override {
+  folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) override {
     co_return folly::makeUnexpected(
-        SubscribeUpdateError{
-            update.requestID,
-            SubscribeUpdateErrorCode::NOT_SUPPORTED,
-            "Subscribe update not implemented"});
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::NOT_SUPPORTED,
+            "Request update not implemented"});
   }
   void unsubscribe() override;
 
@@ -102,6 +102,15 @@ class MoQChatClient : public Publisher,
     std::chrono::seconds timestamp;
     RequestID requestID;
     std::shared_ptr<Publisher::SubscriptionHandle> subscription;
+
+    static UserTrack
+    make(std::string device, std::chrono::seconds ts, RequestID reqId) {
+      UserTrack ut;
+      ut.deviceId = std::move(device);
+      ut.timestamp = ts;
+      ut.requestID = reqId;
+      return ut;
+    }
   };
   std::map<std::string, std::vector<UserTrack>> subscriptions_;
   std::pair<folly::coro::Promise<ServerSetup>, folly::coro::Future<ServerSetup>>

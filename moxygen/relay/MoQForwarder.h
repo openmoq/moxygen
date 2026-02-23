@@ -21,6 +21,12 @@ class MoQForwarder : public TrackConsumer {
       FullTrackName ftn,
       std::optional<AbsoluteLocation> largest = std::nullopt);
 
+  ~MoQForwarder() override;
+  MoQForwarder(const MoQForwarder&) = delete;
+  MoQForwarder& operator=(const MoQForwarder&) = delete;
+  MoQForwarder(MoQForwarder&&) = delete;
+  MoQForwarder& operator=(MoQForwarder&&) = delete;
+
   const FullTrackName& fullTrackName() const {
     return fullTrackName_;
   }
@@ -92,8 +98,8 @@ class MoQForwarder : public TrackConsumer {
     // updates existing param if key matches, otherwise adds new param
     void setParam(const TrackRequestParameter& param);
 
-    folly::coro::Task<folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
-    subscribeUpdate(SubscribeUpdate subscribeUpdate) override;
+    folly::coro::Task<folly::Expected<RequestOk, RequestError>> requestUpdate(
+        RequestUpdate requestUpdate) override;
 
     void unsubscribe() override;
 
@@ -164,26 +170,31 @@ class MoQForwarder : public TrackConsumer {
       TrackAlias alias) override;
 
   folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
-  beginSubgroup(uint64_t groupID, uint64_t subgroupID, Priority priority)
-      override;
+  beginSubgroup(
+      uint64_t groupID,
+      uint64_t subgroupID,
+      Priority priority,
+      bool containsLastInGroup = false) override;
 
   folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
   awaitStreamCredit() override;
 
   folly::Expected<folly::Unit, MoQPublishError> objectStream(
       const ObjectHeader& header,
-      Payload payload) override;
+      Payload payload,
+      bool lastInGroup = false) override;
 
   folly::Expected<folly::Unit, MoQPublishError> datagram(
       const ObjectHeader& header,
-      Payload payload) override;
+      Payload payload,
+      bool lastInGroup = false) override;
 
   folly::Expected<folly::Unit, MoQPublishError> publishDone(
       PublishDone pubDone) override;
 
   class SubgroupForwarder : public SubgroupConsumer {
     std::optional<uint64_t> currentObjectLength_;
-    MoQForwarder& forwarder_;
+    MoQForwarder* forwarder_;
     SubgroupIdentifier identifier_;
     Priority priority_;
 
@@ -208,12 +219,18 @@ class MoQForwarder : public TrackConsumer {
     folly::Expected<T, MoQPublishError> cleanupOnError(
         const folly::Expected<T, MoQPublishError>& result);
 
+    // Updates largest on the forwarder (no-op if detached)
+    void updateLargest(uint64_t group, uint64_t object);
+
    public:
     SubgroupForwarder(
         MoQForwarder& forwarder,
         uint64_t group,
         uint64_t subgroup,
         Priority priority);
+
+    // Detach from the owning MoQForwarder (called from MoQForwarder destructor)
+    void detach();
 
     folly::Expected<folly::Unit, MoQPublishError> object(
         uint64_t objectID,
@@ -262,6 +279,16 @@ class MoQForwarder : public TrackConsumer {
       folly::F14FastMap<MoQSession*, std::shared_ptr<Subscriber>>::iterator
           subIt,
       std::optional<PublishDone> pubDone,
+      const std::string& callsite);
+
+  // Handles errors on a subgroup for a specific subscriber.
+  // Soft errors (CANCELLED - from STOP_SENDING or delivery timeout) tombstone
+  // the subgroup by setting it to nullptr, preventing reopening but keeping
+  // the subscription alive. Hard errors remove the entire subscription.
+  void handleSubgroupError(
+      Subscriber& sub,
+      const SubgroupIdentifier& subgroupId,
+      const MoQPublishError& err,
       const std::string& callsite);
 
   FullTrackName fullTrackName_;

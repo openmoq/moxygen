@@ -16,6 +16,8 @@
 #include <quic/codec/QuicInteger.h>
 #include <quic/folly_utils/Utils.h>
 
+#include <variant>
+
 namespace moxygen {
 
 //////// Constants ////////
@@ -132,13 +134,26 @@ class MoQFrameParser {
     ObjectHeader objectHeader;
   };
 
+  // Marker for End of Range results from FETCH parsing (MOQT spec)
+  // Indicates a range of objects that either don't exist or have unknown status
+  struct EndOfRangeMarker {
+    uint64_t groupId;
+    uint64_t objectId;
+    bool isUnknownOrNonexistent; // true = 0x10C (unknown), false = 0x8C
+                                 // (non-existent)
+  };
+
+  // Result from parsing FETCH objects - can be either a normal object or an
+  // End of Range marker
+  using FetchObjectParseResult = std::variant<ObjectHeader, EndOfRangeMarker>;
+
   folly::Expected<ParseResultAndLength<SubgroupHeaderResult>, ErrorCode>
   parseSubgroupHeader(
       folly::io::Cursor& cursor,
       size_t length,
       const SubgroupOptions& options) const noexcept;
 
-  folly::Expected<ParseResultAndLength<ObjectHeader>, ErrorCode>
+  folly::Expected<ParseResultAndLength<FetchObjectParseResult>, ErrorCode>
   parseFetchObjectHeader(
       folly::io::Cursor& cursor,
       size_t length,
@@ -155,7 +170,7 @@ class MoQFrameParser {
       folly::io::Cursor& cursor,
       size_t length) const noexcept;
 
-  folly::Expected<SubscribeUpdate, ErrorCode> parseSubscribeUpdate(
+  folly::Expected<RequestUpdate, ErrorCode> parseRequestUpdate(
       folly::io::Cursor& cursor,
       size_t length) const noexcept;
 
@@ -297,7 +312,7 @@ class MoQFrameParser {
       const ObjectHeader& headerTemplate) const noexcept;
 
   // Draft-15+ FETCH object parser with Serialization Flags
-  folly::Expected<ObjectHeader, ErrorCode> parseFetchObjectDraft15(
+  folly::Expected<FetchObjectParseResult, ErrorCode> parseFetchObjectDraft15(
       folly::io::Cursor& cursor,
       size_t& length,
       const ObjectHeader& headerTemplate) const noexcept;
@@ -356,7 +371,7 @@ class MoQFrameParser {
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
   void handleRequestSpecificParams(
-      SubscribeUpdate& subscribeUpdate,
+      RequestUpdate& requestUpdate,
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
   void handleRequestSpecificParams(
@@ -388,6 +403,11 @@ class MoQFrameParser {
   void handleForwardParam(
       std::optional<bool>& forwardField,
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
+  // Version translation: convert track property params to extensions for < v16
+  void convertTrackPropertyParamsToExtensions(
+      const TrackRequestParameters& params,
+      Extensions& extensions) const noexcept;
 
   std::optional<uint64_t> version_;
   mutable MoQTokenCache tokenCache_;
@@ -441,13 +461,15 @@ class MoQFrameWriter {
       folly::IOBufQueue& writeBuf,
       TrackAlias trackAlias,
       const ObjectHeader& objectHeader,
-      std::unique_ptr<folly::IOBuf> objectPayload) const noexcept;
+      std::unique_ptr<folly::IOBuf> objectPayload,
+      bool endOfGroup = false) const noexcept;
 
   WriteResult writeStreamObject(
       folly::IOBufQueue& writeBuf,
       StreamType streamType,
       const ObjectHeader& objectHeader,
-      std::unique_ptr<folly::IOBuf> objectPayload) const noexcept;
+      std::unique_ptr<folly::IOBuf> objectPayload,
+      bool forwardingPreferenceIsDatagram = false) const noexcept;
 
   WriteResult writeSingleObjectStream(
       folly::IOBufQueue& writeBuf,
@@ -459,9 +481,16 @@ class MoQFrameWriter {
       folly::IOBufQueue& writeBuf,
       const SubscribeRequest& subscribeRequest) const noexcept;
 
+  WriteResult writeRequestUpdate(
+      folly::IOBufQueue& writeBuf,
+      const RequestUpdate& update) const noexcept;
+
+  // Backward compatibility forwarder
   WriteResult writeSubscribeUpdate(
       folly::IOBufQueue& writeBuf,
-      const SubscribeUpdate& update) const noexcept;
+      const SubscribeUpdate& update) const noexcept {
+    return writeRequestUpdate(writeBuf, update);
+  }
 
   WriteResult writeSubscribeOk(
       folly::IOBufQueue& writeBuf,
@@ -590,7 +619,8 @@ class MoQFrameWriter {
       folly::IOBufQueue& writeBuf,
       const Extensions& extensions,
       size_t& size,
-      bool& error) const noexcept;
+      bool& error,
+      bool withLengthPrefix = true) const noexcept;
 
  private:
   void writeKeyValuePairs(
@@ -642,9 +672,15 @@ class MoQFrameWriter {
       folly::IOBufQueue& writeBuf,
       const ObjectHeader& objectHeader,
       size_t& size,
-      bool& error) const noexcept;
+      bool& error,
+      bool forwardingPreferenceIsDatagram = false) const noexcept;
 
   void resetWriterFetchContext() const noexcept;
+
+  // Version translation: convert track property extensions to params for < v16
+  void convertTrackPropertyExtensionsToParams(
+      const Extensions& extensions,
+      TrackRequestParameters& params) const noexcept;
 
   std::optional<uint64_t> version_;
   mutable std::optional<uint64_t> previousObjectID_;
@@ -655,7 +691,7 @@ class MoQFrameWriter {
 };
 
 // Parses the frame type from the beginning of the buffer without consuming it.
-// Returns folly::none if there isn't enough data to parse the frame type.
-folly::Optional<FrameType> getFrameType(const folly::IOBufQueue& readBuf);
+// Returns std::nullopt if there isn't enough data to parse the frame type.
+std::optional<FrameType> getFrameType(const folly::IOBufQueue& readBuf);
 
 } // namespace moxygen

@@ -36,11 +36,10 @@ DEFINE_string(
 DEFINE_bool(quic_transport, false, "Use raw QUIC transport");
 DEFINE_bool(publish, false, "Send PUBLISH to subscriber");
 DEFINE_string(ns, "moq-date", "Namespace for date track");
-DEFINE_bool(
-    use_legacy_setup,
-    false,
-    "If true, use only moq-00 ALPN (legacy). If false, use latest "
-    "draft ALPN with fallback to legacy");
+DEFINE_string(
+    versions,
+    "",
+    "Comma-separated MoQ draft versions (e.g. \"14,16\"). Empty = all supported.");
 DEFINE_int32(delivery_timeout, 0, "the delivery timeout in ms for server");
 DEFINE_bool(
     insecure,
@@ -68,13 +67,13 @@ class DateSubscriptionHandle : public Publisher::SubscriptionHandle {
   void unsubscribe() override {}
 
   // To Be Implemented
-  folly::coro::Task<folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
-  subscribeUpdate(SubscribeUpdate update) override {
+  folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) override {
     co_return folly::makeUnexpected(
-        SubscribeUpdateError{
-            update.requestID,
-            SubscribeUpdateErrorCode::NOT_SUPPORTED,
-            "Subscribe update not implemented"});
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::NOT_SUPPORTED,
+            "Request update not implemented"});
   }
 };
 
@@ -244,6 +243,14 @@ class DatePublisher : public Publisher {
     explicit FetchHandle(FetchOk ok) : Publisher::FetchHandle(std::move(ok)) {}
     void fetchCancel() override {
       cancelSource.requestCancellation();
+    }
+    folly::coro::Task<RequestUpdateResult> requestUpdate(
+        RequestUpdate reqUpdate) override {
+      co_return folly::makeUnexpected(
+          RequestError{
+              reqUpdate.requestID,
+              RequestErrorCode::NOT_SUPPORTED,
+              "Request update not implemented"});
     }
     folly::CancellationSource cancelSource;
   };
@@ -586,8 +593,7 @@ std::unique_ptr<MoQRelayClient> createRelayClient(
     relayClient->setLogger(loggerFactory->createMLogger());
   }
 
-  std::vector<std::string> alpns =
-      getDefaultMoqtProtocols(!FLAGS_use_legacy_setup);
+  auto alpns = getMoqtProtocols(FLAGS_versions, true);
 
   folly::coro::blockingWait(
       relayClient
@@ -653,7 +659,7 @@ int main(int argc, char* argv[]) {
         quic::samples::createFizzServerContextWithInsecureDefault(
             []() {
               std::vector<std::string> alpns = {"h3"};
-              auto moqt = getDefaultMoqtProtocols(!FLAGS_use_legacy_setup);
+              auto moqt = getMoqtProtocols(FLAGS_versions, true);
               alpns.insert(alpns.end(), moqt.begin(), moqt.end());
               return alpns;
             }(),

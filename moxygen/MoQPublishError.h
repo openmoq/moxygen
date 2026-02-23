@@ -11,6 +11,7 @@
 #include <fmt/core.h>
 
 #include <string>
+#include <type_traits>
 
 namespace moxygen {
 
@@ -19,7 +20,7 @@ struct MoQPublishError {
   enum Code {
     API_ERROR = 1,        // Semantic error (APIs called out of order)
     WRITE_ERROR = 2,      // The underlying write failed
-    CANCELLED = 3,        // The subgroup was/should be reset
+    CANCELLED = 3,        // The subgroup was reset (implicitly by the error)
     TOO_FAR_BEHIND = 5,   // Subscriber exceeded buffer limit (subscribe only)
     BLOCKED = 4,          // Consumer cannot accept more data (fetch only),
                           //  or out of stream credit (subscribe and fetch)
@@ -36,7 +37,10 @@ struct MoQPublishError {
       : code(inCode), msg(std::move(inMsg)) {}
 
   std::string describe() const {
-    return fmt::format("error={} msg={}", fmt::underlying(code), msg);
+    return fmt::format(
+        "error={} msg={}",
+        static_cast<std::underlying_type_t<Code>>(code),
+        msg);
   }
 
   const char* what() const noexcept {

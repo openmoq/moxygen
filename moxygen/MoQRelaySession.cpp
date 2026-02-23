@@ -95,6 +95,15 @@ class MoQRelaySession::PublisherPublishNamespaceHandle
     }
   }
 
+  folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) override {
+    co_return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::NOT_SUPPORTED,
+            "REQUEST_UPDATE not supported for PUBLISH_NAMESPACE"});
+  }
+
  private:
   TrackNamespace trackNamespace_;
   std::shared_ptr<MoQRelaySession> session_;
@@ -133,6 +142,15 @@ class MoQRelaySession::SubscribeNamespaceHandle
       session_->unsubscribeNamespace(msg);
       session_.reset();
     }
+  }
+
+  folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate reqUpdate) override {
+    co_return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::NOT_SUPPORTED,
+            "REQUEST_UPDATE not supported for SUBSCRIBE_NAMESPACE"});
   }
 
  private:
@@ -269,10 +287,10 @@ void MoQRelaySession::cleanup() {
   publishNamespaceCallbacks_.clear();
   legacyPublisherNamespaceToReqId_.clear();
 
-  for (auto& ann : publishNamespaceHanldes_) {
+  for (auto& ann : publishNamespaceHandles_) {
     ann.second->publishNamespaceDone();
   }
-  publishNamespaceHanldes_.clear();
+  publishNamespaceHandles_.clear();
   legacySubscriberNamespaceToReqId_.clear();
 
   // Clean up subscribeNamespace handles
@@ -286,6 +304,124 @@ void MoQRelaySession::cleanup() {
 
   // Call parent cleanup to handle base class cleanup
   MoQSession::cleanup();
+}
+
+void MoQRelaySession::onRequestUpdate(RequestUpdate requestUpdate) {
+  // Only intercept for v16+ and announcement types
+  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 16) {
+    auto existingRequestID = requestUpdate.existingRequestID;
+
+    // Check publishNamespaceHandles_ for PUBLISH_NAMESPACE (formerly ANNOUNCE)
+    auto announceIt = publishNamespaceHandles_.find(existingRequestID);
+    if (announceIt != publishNamespaceHandles_.end()) {
+      handlePublishNamespaceRequestUpdate(requestUpdate, announceIt->second);
+      return;
+    }
+
+    // Check subscribeNamespaceHandles_ for SUBSCRIBE_NAMESPACE (formerly
+    // SUBSCRIBE_ANNOUNCES)
+    auto subAnnIt = subscribeNamespaceHandles_.find(existingRequestID);
+    if (subAnnIt != subscribeNamespaceHandles_.end()) {
+      handleSubscribeNamespaceRequestUpdate(requestUpdate, subAnnIt->second);
+      return;
+    }
+  }
+
+  // Delegate to base class for all other cases
+  MoQSession::onRequestUpdate(std::move(requestUpdate));
+}
+
+void MoQRelaySession::handlePublishNamespaceRequestUpdate(
+    RequestUpdate requestUpdate,
+    std::shared_ptr<Subscriber::PublishNamespaceHandle> announceHandle) {
+  XLOG(DBG1) << __func__ << " requestID=" << requestUpdate.existingRequestID
+             << " sess=" << this;
+
+  auto existingRequestID = requestUpdate.existingRequestID;
+  auto updateRequestID = requestUpdate.requestID;
+
+  // Handle asynchronously with shared ownership to prevent use-after-free
+  co_withExecutor(
+      getExecutor(),
+      folly::coro::co_invoke(
+          [this,
+           announceHandle = std::move(announceHandle),
+           update = std::move(requestUpdate),
+           existingRequestID,
+           updateRequestID]() mutable -> folly::coro::Task<void> {
+            // Call the handle's requestUpdate
+            auto updateResult = co_await co_awaitTry(co_withCancellation(
+                cancellationSource_.getToken(),
+                announceHandle->requestUpdate(std::move(update))));
+
+            // Only send responses for v15+
+            if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
+              if (updateResult.hasException()) {
+                XLOG(ERR) << "Exception in requestUpdate ex="
+                          << updateResult.exception().what();
+                requestUpdateError(
+                    RequestError{
+                        updateRequestID,
+                        RequestErrorCode::INTERNAL_ERROR,
+                        "Exception in requestUpdate"},
+                    existingRequestID);
+              } else if (updateResult->hasError()) {
+                auto updateErr = updateResult->error();
+                requestUpdateError(updateErr, existingRequestID);
+              } else {
+                RequestOk requestOk{.requestID = updateRequestID};
+                requestUpdateOk(requestOk);
+              }
+            }
+          }))
+      .start();
+}
+
+void MoQRelaySession::handleSubscribeNamespaceRequestUpdate(
+    RequestUpdate requestUpdate,
+    std::shared_ptr<Publisher::SubscribeNamespaceHandle>
+        subscribeNamespaceHandle) {
+  XLOG(DBG1) << __func__ << " requestID=" << requestUpdate.existingRequestID
+             << " sess=" << this;
+
+  auto existingRequestID = requestUpdate.existingRequestID;
+  auto updateRequestID = requestUpdate.requestID;
+
+  // Handle asynchronously with shared ownership to prevent use-after-free
+  co_withExecutor(
+      getExecutor(),
+      folly::coro::co_invoke(
+          [this,
+           subscribeNamespaceHandle = std::move(subscribeNamespaceHandle),
+           update = std::move(requestUpdate),
+           existingRequestID,
+           updateRequestID]() mutable -> folly::coro::Task<void> {
+            // Call the handle's requestUpdate
+            auto updateResult = co_await co_awaitTry(co_withCancellation(
+                cancellationSource_.getToken(),
+                subscribeNamespaceHandle->requestUpdate(std::move(update))));
+
+            // Only send responses for v15+
+            if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
+              if (updateResult.hasException()) {
+                XLOG(ERR) << "Exception in requestUpdate ex="
+                          << updateResult.exception().what();
+                requestUpdateError(
+                    RequestError{
+                        updateRequestID,
+                        RequestErrorCode::INTERNAL_ERROR,
+                        "Exception in requestUpdate"},
+                    existingRequestID);
+              } else if (updateResult->hasError()) {
+                auto updateErr = updateResult->error();
+                requestUpdateError(updateErr, existingRequestID);
+              } else {
+                RequestOk requestOk{.requestID = updateRequestID};
+                requestUpdateOk(requestOk);
+              }
+            }
+          }))
+      .start();
 }
 
 // PublishNamespace publisher methods
@@ -381,7 +517,7 @@ void MoQRelaySession::onRequestOk(RequestOk requestOk, FrameType frameType) {
         case PendingRequestState::Type::SUBSCRIBE_NAMESPACE:
           handleSubscribeNamespaceOkFromRequestOk(requestOk, reqIt);
           break;
-        case PendingRequestState::Type::SUBSCRIBE_UPDATE:
+        case PendingRequestState::Type::REQUEST_UPDATE:
           // Use base class helper
           handleSubscribeUpdateOkFromRequestOk(requestOk, reqIt);
           shouldErasePendingRequest = false;
@@ -602,7 +738,7 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
     auto handle = std::move(publishNamespaceResult->value());
     auto publishNamespaceOkMsg = handle->publishNamespaceOk();
     publishNamespaceOk(publishNamespaceOkMsg);
-    publishNamespaceHanldes_[publishNamespace.requestID] = std::move(handle);
+    publishNamespaceHandles_[publishNamespace.requestID] = std::move(handle);
     if (getDraftMajorVersion(*getNegotiatedVersion()) < 16) {
       // Legacy: also store NS->RequestID mapping for lookups
       legacySubscriberNamespaceToReqId_[publishNamespace.trackNamespace] =
@@ -638,7 +774,7 @@ void MoQRelaySession::publishNamespaceCancel(
   controlWriteEvent_.signal();
 
   if (annCan.requestID.has_value()) {
-    publishNamespaceHanldes_.erase(*annCan.requestID);
+    publishNamespaceHandles_.erase(*annCan.requestID);
   }
   retireRequestID(/*signalWriteLoop=*/false);
 
@@ -684,13 +820,13 @@ void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone unAnn) {
     legacySubscriberNamespaceToReqId_.erase(nsIt);
   }
 
-  auto it = publishNamespaceHanldes_.find(reqId);
-  if (it == publishNamespaceHanldes_.end()) {
+  auto it = publishNamespaceHandles_.find(reqId);
+  if (it == publishNamespaceHandles_.end()) {
     XLOG(ERR) << "PublishNamespaceDone for unknown requestID=" << reqId;
     return;
   }
   handle = std::move(it->second);
-  publishNamespaceHanldes_.erase(it);
+  publishNamespaceHandles_.erase(it);
 
   // Common action
   handle->publishNamespaceDone();
@@ -770,7 +906,9 @@ void MoQRelaySession::unsubscribeNamespace(
 }
 
 // SubscribeNamespace publisher methods
-void MoQRelaySession::onSubscribeNamespace(SubscribeNamespace sa) {
+void MoQRelaySession::onSubscribeNamespaceImpl(
+    const SubscribeNamespace& sa,
+    std::unique_ptr<SubNSReply>&& subNsReply) {
   XLOG(DBG1) << __func__ << " prefix=" << sa.trackNamespacePrefix
              << " sess=" << this;
   if (logger_) {
@@ -786,14 +924,18 @@ void MoQRelaySession::onSubscribeNamespace(SubscribeNamespace sa) {
         SubscribeNamespaceError{
             sa.requestID,
             SubscribeNamespaceErrorCode::NOT_SUPPORTED,
-            "Not a publisher"});
+            "Not a publisher"},
+        std::move(subNsReply));
     return;
   }
-  co_withExecutor(exec_.get(), handleSubscribeNamespace(std::move(sa))).start();
+  co_withExecutor(
+      exec_.get(), handleSubscribeNamespace(sa, std::move(subNsReply)))
+      .start();
 }
 
 folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
-    SubscribeNamespace subAnn) {
+    SubscribeNamespace subAnn,
+    std::unique_ptr<SubNSReply> subNsReply) {
   folly::RequestContextScopeGuard guard;
   setRequestSession();
   auto subAnnResult = co_await co_awaitTry(co_withCancellation(
@@ -806,7 +948,8 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
         SubscribeNamespaceError{
             subAnn.requestID,
             SubscribeNamespaceErrorCode::INTERNAL_ERROR,
-            subAnnResult.exception().what().toStdString()});
+            subAnnResult.exception().what().toStdString()},
+        std::move(subNsReply));
     co_return;
   }
   if (subAnnResult->hasError()) {
@@ -815,11 +958,11 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
     auto subAnnErr = std::move(subAnnResult->error());
     subAnnErr.requestID = subAnn.requestID; // In case app got it wrong
     // trackNamespacePrefix removed from unified RequestError
-    subscribeNamespaceError(subAnnErr);
+    subscribeNamespaceError(subAnnErr, std::move(subNsReply));
   } else {
     auto handle = std::move(subAnnResult->value());
     auto subAnnOk = handle->subscribeNamespaceOk();
-    subscribeNamespaceOk(subAnnOk);
+    subscribeNamespaceOk(subAnnOk, std::move(subNsReply));
 
     // Store by RequestID (primary key)
     subscribeNamespaceHandles_[subAnn.requestID] = std::move(handle);
@@ -831,10 +974,12 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
   }
 }
 
-void MoQRelaySession::subscribeNamespaceOk(const SubscribeNamespaceOk& saOk) {
+void MoQRelaySession::subscribeNamespaceOk(
+    const SubscribeNamespaceOk& saOk,
+    std::unique_ptr<SubNSReply>&& subNsReply) {
   XLOG(DBG1) << __func__ << " id=" << saOk.requestID << " sess=" << this;
   MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscribeNamespaceSuccess);
-  auto res = moqFrameWriter_.writeSubscribeNamespaceOk(controlWriteBuf_, saOk);
+  auto res = subNsReply->ok(saOk);
   if (!res) {
     XLOG(ERR) << "writeSubscribeNamespaceOk failed sess=" << this;
     return;
@@ -957,6 +1102,62 @@ void MoQRelaySession::handleSubscribeNamespaceOkFromRequestOk(
   }
 
   subscribeNamespacePtr->setValue(requestOk);
+}
+
+WriteResult SeparateStreamSubNsReply::ok(const SubscribeNamespaceOk& subNsOk) {
+  if (errorSent_) {
+    // We already sent an ERROR; protocol doesn't allow OK after that.
+    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
+  }
+  auto res = moqFrameWriter_.writeSubscribeNamespaceOk(writeBuf_, subNsOk);
+  writeHandle_->writeStreamData(writeBuf_.move(), false /* fin */, nullptr);
+  okSent_ = true;
+  flushPendingMessages();
+  return res;
+}
+
+WriteResult SeparateStreamSubNsReply::namespaceMsg(const Namespace& msg) {
+  if (errorSent_) {
+    // No NAMESPACE frames allowed after we send an ERROR on this stream.
+    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
+  }
+  auto res = moqFrameWriter_.writeNamespace(writeBuf_, msg);
+  namespaceFrameSent_ = true;
+  if (okSent_) {
+    writeHandle_->writeStreamData(writeBuf_.move(), false /* fin */, nullptr);
+  } else {
+    pendingBuf_.append(writeBuf_.move());
+  }
+  return res;
+}
+
+WriteResult SeparateStreamSubNsReply::namespaceDoneMsg(
+    const NamespaceDone& msg) {
+  if (errorSent_) {
+    // No NAMESPACE_DONE frames allowed after we send an ERROR on this stream.
+    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
+  }
+  auto res = moqFrameWriter_.writeNamespaceDone(writeBuf_, msg);
+  if (okSent_) {
+    writeHandle_->writeStreamData(writeBuf_.move(), true /* fin */, nullptr);
+  } else {
+    pendingBuf_.append(writeBuf_.move());
+    pendingFin_ = true;
+  }
+  return res;
+}
+
+void SeparateStreamSubNsReply::flushPendingMessages() {
+  if (errorSent_) {
+    // If we sent error before OK, we should never flush queued NAMESPACE
+    // frames.
+    pendingBuf_.move();
+    pendingFin_ = false;
+    return;
+  }
+  if (!pendingBuf_.empty()) {
+    writeHandle_->writeStreamData(pendingBuf_.move(), pendingFin_, nullptr);
+  }
 }
 
 } // namespace moxygen

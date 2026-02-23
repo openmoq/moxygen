@@ -261,25 +261,50 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
       }
       case ParseState::MULTI_OBJECT_HEADER: {
         size_t remainingLength = ingress_.chainLength() - totalBytesConsumed;
-        folly::Expected<
-            MoQFrameParser::ParseResultAndLength<ObjectHeader>,
-            ErrorCode>
-            res;
         if (streamType_ == StreamType::FETCH_HEADER) {
-          res = moqFrameParser_.parseFetchObjectHeader(
+          auto fetchRes = moqFrameParser_.parseFetchObjectHeader(
               cursor, remainingLength, curObjectHeader_);
+          if (fetchRes.hasError()) {
+            XLOG(DBG4) << __func__ << " " << uint32_t(fetchRes.error());
+            connError_ = fetchRes.error();
+            break;
+          }
+          totalBytesConsumed += fetchRes->bytesConsumed;
+
+          // Handle the variant result
+          if (std::holds_alternative<MoQFrameParser::EndOfRangeMarker>(
+                  fetchRes->value)) {
+            // End of Range marker received
+            auto& marker =
+                std::get<MoQFrameParser::EndOfRangeMarker>(fetchRes->value);
+            if (callback_) {
+              auto result = callback_->onEndOfRange(
+                  marker.groupId,
+                  marker.objectId,
+                  marker.isUnknownOrNonexistent);
+              if (result == ParseResult::ERROR_TERMINATE) {
+                XLOG(DBG) << "onEndOfRange callback returned ERROR_TERMINATE";
+                return result;
+              }
+            }
+            // Stay in MULTI_OBJECT_HEADER to parse next object
+            break;
+          }
+
+          // Normal object header
+          curObjectHeader_ = std::get<ObjectHeader>(fetchRes->value);
         } else {
           DCHECK(streamType_ == StreamType::SUBGROUP_HEADER_SG);
-          res = moqFrameParser_.parseSubgroupObjectHeader(
+          auto subgroupRes = moqFrameParser_.parseSubgroupObjectHeader(
               cursor, remainingLength, curObjectHeader_, subgroupOptions_);
+          if (subgroupRes.hasError()) {
+            XLOG(DBG4) << __func__ << " " << uint32_t(subgroupRes.error());
+            connError_ = subgroupRes.error();
+            break;
+          }
+          totalBytesConsumed += subgroupRes->bytesConsumed;
+          curObjectHeader_ = subgroupRes->value;
         }
-        if (res.hasError()) {
-          XLOG(DBG4) << __func__ << " " << uint32_t(res.error());
-          connError_ = res.error();
-          break;
-        }
-        totalBytesConsumed += res->bytesConsumed;
-        curObjectHeader_ = res->value;
         if (curObjectHeader_.status == ObjectStatus::NORMAL) {
           XLOG(DBG2) << "Parsing object with length, need="
                      << *curObjectHeader_.length
@@ -305,7 +330,8 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
                 *curObjectHeader_.length,
                 std::move(payload),
                 endOfObject,
-                endOfStream && ingress_.chainLength() == 0);
+                endOfStream && ingress_.chainLength() == 0,
+                curObjectHeader_.forwardingPreferenceIsDatagram);
             if (result == ParseResult::BLOCKED) {
               XLOG(ERR)
                   << "onObjectBegin returned BLOCKED, converting to ERROR";
@@ -479,11 +505,11 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       }
       break;
     }
-    case FrameType::SUBSCRIBE_UPDATE: {
-      auto res = moqFrameParser_.parseSubscribeUpdate(cursor, curFrameLength_);
+    case FrameType::REQUEST_UPDATE: {
+      auto res = moqFrameParser_.parseRequestUpdate(cursor, curFrameLength_);
       if (res) {
         if (callback_) {
-          callback_->onSubscribeUpdate(std::move(res.value()));
+          callback_->onRequestUpdate(std::move(res.value()));
         }
       } else {
         return folly::makeUnexpected(res.error());
@@ -534,7 +560,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       }
       break;
     }
-    case FrameType::SUBSCRIBE_DONE: {
+    case FrameType::PUBLISH_DONE: {
       auto res = moqFrameParser_.parsePublishDone(cursor, curFrameLength_);
       if (res) {
         if (callback_) {

@@ -26,8 +26,8 @@ const char* getFrameTypeString(moxygen::FrameType type) {
       return "SUBSCRIBE_OK";
     case moxygen::FrameType::SUBSCRIBE_ERROR:
       return "SUBSCRIBE_ERROR";
-    case moxygen::FrameType::SUBSCRIBE_DONE:
-      return "SUBSCRIBE_DONE";
+    case moxygen::FrameType::PUBLISH_DONE:
+      return "PUBLISH_DONE";
     case moxygen::FrameType::MAX_REQUEST_ID:
       return "MAX_REQUEST_ID";
     case moxygen::FrameType::UNSUBSCRIBE:
@@ -242,6 +242,11 @@ const folly::F14FastSet<FrameType> kAllowAllParamsFrameTypes = {
     FrameType::LEGACY_CLIENT_SETUP,
     FrameType::LEGACY_SERVER_SETUP,
 };
+
+bool Parameters::isKnownParamKey(uint64_t key) {
+  return kParamAllowlist.find(static_cast<TrackRequestParamKey>(key)) !=
+      kParamAllowlist.end();
+}
 
 bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
   // Setup frame types allow all parameters

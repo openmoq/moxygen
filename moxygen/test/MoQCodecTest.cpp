@@ -84,7 +84,7 @@ class MoQCodecTest : public ::testing::TestWithParam<uint64_t> {
     MoQControlCodec& codec = *codecPtr;
     auto& callback = *callbackPtr;
     EXPECT_CALL(callback, onSubscribe(testing::_));
-    EXPECT_CALL(callback, onSubscribeUpdate(testing::_));
+    EXPECT_CALL(callback, onRequestUpdate(testing::_));
     EXPECT_CALL(callback, onSubscribeOk(testing::_));
     expectOnRequestError(callback, GetParam(), FrameType::SUBSCRIBE_ERROR);
     EXPECT_CALL(callback, onUnsubscribe(testing::_));
@@ -137,7 +137,7 @@ class MoQCodecTest : public ::testing::TestWithParam<uint64_t> {
     MoQControlCodec& codec = *codecPtr;
     auto& callback = *callbackPtr;
     EXPECT_CALL(callback, onSubscribe(testing::_));
-    EXPECT_CALL(callback, onSubscribeUpdate(testing::_));
+    EXPECT_CALL(callback, onRequestUpdate(testing::_));
     EXPECT_CALL(callback, onSubscribeOk(testing::_));
     expectOnRequestError(callback, GetParam(), FrameType::SUBSCRIBE_ERROR);
     EXPECT_CALL(callback, onUnsubscribe(testing::_));
@@ -216,7 +216,8 @@ TEST_P(MoQCodecTest, AllObject) {
           testing::_,
           testing::_,
           true,
-          false))
+          false,
+          testing::_))
       .Times(2);
   EXPECT_CALL(
       objectStreamCodecCallback_,
@@ -250,6 +251,7 @@ TEST_P(MoQCodecTest, UnderflowObjects) {
           testing::_,
           testing::_,
           testing::_,
+          testing::_,
           testing::_))
       .Times(2);
   EXPECT_CALL(
@@ -274,7 +276,8 @@ TEST_P(MoQCodecTest, ObjectStreamPayloadFin) {
       onSubgroup(TrackAlias(1), 2, 3, std::optional<uint8_t>(5), testing::_));
   EXPECT_CALL(
       objectStreamCodecCallback_,
-      onObjectBegin(2, 3, 4, testing::_, testing::_, testing::_, true, true));
+      onObjectBegin(
+          2, 3, 4, testing::_, testing::_, testing::_, true, true, testing::_));
 
   objectStreamCodec_.onIngress(writeBuf.move(), true);
 }
@@ -292,7 +295,8 @@ TEST_P(MoQCodecTest, ObjectStreamPayload) {
       onSubgroup(TrackAlias(1), 2, 3, std::optional<uint8_t>(5), testing::_));
   EXPECT_CALL(
       objectStreamCodecCallback_,
-      onObjectBegin(2, 3, 4, testing::_, testing::_, _, true, false));
+      onObjectBegin(
+          2, 3, 4, testing::_, testing::_, _, true, false, testing::_));
 
   objectStreamCodec_.onIngress(writeBuf.move(), false);
   EXPECT_CALL(objectStreamCodecCallback_, onEndOfStream());
@@ -355,7 +359,8 @@ TEST_P(MoQCodecTest, TruncatedObjectPayload) {
 
   EXPECT_CALL(
       objectStreamCodecCallback_,
-      onObjectBegin(2, 3, 4, testing::_, testing::_, _, false, false));
+      onObjectBegin(
+          2, 3, 4, testing::_, testing::_, _, false, false, testing::_));
   objectStreamCodec_.onIngress(writeBuf.move(), false);
   EXPECT_CALL(objectStreamCodecCallback_, onConnectionError(testing::_));
   writeBuf.append(std::string("hello"));
@@ -407,7 +412,7 @@ TEST_P(MoQCodecTest, Fetch) {
   EXPECT_CALL(objectStreamCodecCallback_, onFetchHeader(testing::_));
   EXPECT_CALL(
       objectStreamCodecCallback_,
-      onObjectBegin(2, 3, 4, testing::_, 5, _, true, false));
+      onObjectBegin(2, 3, 4, testing::_, 5, _, true, false, testing::_));
   EXPECT_CALL(
       objectStreamCodecCallback_,
       onObjectStatus(
@@ -552,14 +557,23 @@ TEST_P(MoQCodecTest, CallbackReturnsErrorTerminateOnObjectBegin) {
       onSubgroup(TrackAlias(1), 2, 3, std::optional<uint8_t>(5), testing::_));
   EXPECT_CALL(
       objectStreamCodecCallback_,
-      onObjectBegin(2, 3, 4, testing::_, testing::_, testing::_, true, false))
+      onObjectBegin(
+          2, 3, 4, testing::_, testing::_, testing::_, true, false, testing::_))
       .WillOnce(testing::Return(MoQCodec::ParseResult::ERROR_TERMINATE));
 
   // onObjectBegin for second object should NOT be called due to short-circuit
   EXPECT_CALL(
       objectStreamCodecCallback_,
       onObjectBegin(
-          2, 3, 5, testing::_, testing::_, testing::_, testing::_, testing::_))
+          2,
+          3,
+          5,
+          testing::_,
+          testing::_,
+          testing::_,
+          testing::_,
+          testing::_,
+          testing::_))
       .Times(0);
 
   auto result = objectStreamCodec_.onIngress(writeBuf.move(), true);
@@ -582,7 +596,16 @@ TEST_P(MoQCodecTest, CallbackReturnsErrorTerminateOnObjectPayload) {
       onSubgroup(TrackAlias(1), 2, 3, std::optional<uint8_t>(5), testing::_));
   EXPECT_CALL(
       objectStreamCodecCallback_,
-      onObjectBegin(2, 3, 4, testing::_, testing::_, testing::_, false, false))
+      onObjectBegin(
+          2,
+          3,
+          4,
+          testing::_,
+          testing::_,
+          testing::_,
+          false,
+          false,
+          testing::_))
       .WillOnce(testing::Return(MoQCodec::ParseResult::CONTINUE));
 
   objectStreamCodec_.onIngress(writeBuf.move(), false);
@@ -629,7 +652,15 @@ TEST_P(MoQCodecTest, CallbackReturnsErrorTerminateOnObjectStatus) {
   EXPECT_CALL(
       objectStreamCodecCallback_,
       onObjectBegin(
-          2, 3, 5, testing::_, testing::_, testing::_, testing::_, testing::_))
+          2,
+          3,
+          5,
+          testing::_,
+          testing::_,
+          testing::_,
+          testing::_,
+          testing::_,
+          testing::_))
       .Times(0);
 
   auto result = objectStreamCodec_.onIngress(writeBuf.move(), true);
@@ -656,6 +687,7 @@ TEST_P(MoQCodecTest, CallbackReturnsErrorTerminateOnSubgroup) {
   EXPECT_CALL(
       objectStreamCodecCallback_,
       onObjectBegin(
+          testing::_,
           testing::_,
           testing::_,
           testing::_,
@@ -695,6 +727,7 @@ TEST_P(MoQCodecTest, CallbackReturnsErrorTerminateOnFetchHeader) {
           testing::_,
           testing::_,
           testing::_,
+          testing::_,
           testing::_))
       .Times(0);
 
@@ -717,7 +750,8 @@ TEST_P(MoQCodecTest, CallbackReturnsContinue) {
       .WillOnce(testing::Return(MoQCodec::ParseResult::CONTINUE));
   EXPECT_CALL(
       objectStreamCodecCallback_,
-      onObjectBegin(2, 3, 4, testing::_, testing::_, testing::_, true, false))
+      onObjectBegin(
+          2, 3, 4, testing::_, testing::_, testing::_, true, false, testing::_))
       .WillOnce(testing::Return(MoQCodec::ParseResult::CONTINUE));
 
   auto result = objectStreamCodec_.onIngress(writeBuf.move(), false);
@@ -771,7 +805,87 @@ TEST_P(MoQCodecTest, ZeroLengthObjectFollowedByNormalObject) {
   // fix)
   EXPECT_CALL(
       objectStreamCodecCallback_,
-      onObjectBegin(2, 3, 5, testing::_, 5, testing::_, true, false))
+      onObjectBegin(
+          2, 3, 5, testing::_, 5, testing::_, true, false, testing::_))
+      .WillOnce(testing::Return(MoQCodec::ParseResult::CONTINUE));
+
+  auto result = objectStreamCodec_.onIngress(writeBuf.move(), false);
+  EXPECT_EQ(result, MoQCodec::ParseResult::CONTINUE);
+}
+
+// Test that onEndOfRange callback is invoked for End of Unknown Range (0x10C)
+TEST_P(MoQCodecTest, FetchEndOfUnknownRange) {
+  // End of Range markers require varint encoding, only supported in v16+
+  if (getDraftMajorVersion(GetParam()) < 16) {
+    GTEST_SKIP() << "End of Range not supported in draft < 16";
+  }
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  RequestID requestID(1);
+  ObjectHeader obj(2, 3, 4, 5);
+  StreamType streamType = StreamType::FETCH_HEADER;
+
+  auto res = moqFrameWriter_.writeFetchHeader(writeBuf, requestID);
+  EXPECT_TRUE(res);
+  obj.length = 5;
+  res = moqFrameWriter_.writeStreamObject(
+      writeBuf, streamType, obj, folly::IOBuf::copyBuffer("hello"));
+  EXPECT_TRUE(res);
+
+  // Write End of Unknown Range marker (0x10C) + Group ID (5) + Object ID (10)
+  // 0x10C as 2-byte varint: 0x41 0x0C
+  folly::IOBufQueue endOfRangeBuf{folly::IOBufQueue::cacheChainLength()};
+  endOfRangeBuf.append(folly::IOBuf::copyBuffer("\x41\x0C")); // 0x10C varint
+  endOfRangeBuf.append(folly::IOBuf::copyBuffer("\x05"));     // Group 5
+  endOfRangeBuf.append(folly::IOBuf::copyBuffer("\x0A"));     // Object 10
+  writeBuf.append(endOfRangeBuf.move());
+
+  EXPECT_CALL(objectStreamCodecCallback_, onFetchHeader(testing::_))
+      .WillOnce(testing::Return(MoQCodec::ParseResult::CONTINUE));
+  EXPECT_CALL(
+      objectStreamCodecCallback_,
+      onObjectBegin(2, 3, 4, testing::_, 5, testing::_, true, false, false))
+      .WillOnce(testing::Return(MoQCodec::ParseResult::CONTINUE));
+  EXPECT_CALL(objectStreamCodecCallback_, onEndOfRange(5, 10, true))
+      .WillOnce(testing::Return(MoQCodec::ParseResult::CONTINUE));
+
+  auto result = objectStreamCodec_.onIngress(writeBuf.move(), false);
+  EXPECT_EQ(result, MoQCodec::ParseResult::CONTINUE);
+}
+
+// Test that onEndOfRange callback is invoked for End of Non-Existent Range
+// (0x8C)
+TEST_P(MoQCodecTest, FetchEndOfNonExistentRange) {
+  // End of Range markers require varint encoding, only supported in v16+
+  if (getDraftMajorVersion(GetParam()) < 16) {
+    GTEST_SKIP() << "End of Range not supported in draft < 16";
+  }
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  RequestID requestID(1);
+  ObjectHeader obj(2, 3, 4, 5);
+  StreamType streamType = StreamType::FETCH_HEADER;
+
+  auto res = moqFrameWriter_.writeFetchHeader(writeBuf, requestID);
+  EXPECT_TRUE(res);
+  obj.length = 5;
+  res = moqFrameWriter_.writeStreamObject(
+      writeBuf, streamType, obj, folly::IOBuf::copyBuffer("hello"));
+  EXPECT_TRUE(res);
+
+  // Write End of Non-Existent Range marker (0x8C) + Group ID (3) + Object ID
+  // (7) 0x8C (140) as 2-byte varint: 0x40 0x8C
+  folly::IOBufQueue endOfRangeBuf{folly::IOBufQueue::cacheChainLength()};
+  endOfRangeBuf.append(folly::IOBuf::copyBuffer("\x40\x8C")); // 0x8C varint
+  endOfRangeBuf.append(folly::IOBuf::copyBuffer("\x03"));     // Group 3
+  endOfRangeBuf.append(folly::IOBuf::copyBuffer("\x07"));     // Object 7
+  writeBuf.append(endOfRangeBuf.move());
+
+  EXPECT_CALL(objectStreamCodecCallback_, onFetchHeader(testing::_))
+      .WillOnce(testing::Return(MoQCodec::ParseResult::CONTINUE));
+  EXPECT_CALL(
+      objectStreamCodecCallback_,
+      onObjectBegin(2, 3, 4, testing::_, 5, testing::_, true, false, false))
+      .WillOnce(testing::Return(MoQCodec::ParseResult::CONTINUE));
+  EXPECT_CALL(objectStreamCodecCallback_, onEndOfRange(3, 7, false))
       .WillOnce(testing::Return(MoQCodec::ParseResult::CONTINUE));
 
   auto result = objectStreamCodec_.onIngress(writeBuf.move(), false);

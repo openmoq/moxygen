@@ -103,16 +103,16 @@ class MoQStatsCallback {
   virtual void onUnsubscribe() = 0;
 
   /*
-   * Publisher: Sent a SUBSCRIBE_DONE
-   * Subscriber: Received a SUBSCRIBE_DONE
+   * Publisher: Sent a PUBLISH_DONE
+   * Subscriber: Received a PUBLISH_DONE
    */
   virtual void onPublishDone(PublishDoneStatusCode statusCode) = 0;
 
   /*
-   * Publisher: Received a SUBSCRIBE_UPDATE
-   * Subscriber: Sent a SUBSCRIBE_UPDATE
+   * Publisher: Received a REQUEST_UPDATE
+   * Subscriber: Sent a REQUEST_UPDATE
    */
-  virtual void onSubscribeUpdate() = 0;
+  virtual void onRequestUpdate() = 0;
 
   /*
    * Publisher: Opened a subscription stream to the subscriber
