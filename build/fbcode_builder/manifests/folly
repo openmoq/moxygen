@@ -15,16 +15,12 @@ job_weight_mib = 1024
 gflags
 glog
 googletest
-boost
+boost-minimal
 libdwarf
 libevent
-libsodium
 double-conversion
 fast_float
 fmt
-lz4
-snappy
-zstd
 # no openssl or zlib in the linux case, why?
 # these are usually installed on the system
 # and are the easiest system deps to pull in.
@@ -45,14 +41,11 @@ openssl
 zlib
 
 [dependencies.os=linux]
-libaio
-libiberty
 libunwind
 
 # xz depends on autoconf which does not build on
 # Windows
 [dependencies.not(os=windows)]
-xz
 
 [shipit.pathmap]
 fbcode/folly/public_tld = .
