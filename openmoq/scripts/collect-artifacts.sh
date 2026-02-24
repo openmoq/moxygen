@@ -171,19 +171,17 @@ elif [[ "$OS" == "Linux" ]]; then
     REL="${lib#$STAGE/}"
     LIBNAME=$(basename "$lib")
 
-    # Only process files that actually contain debug info
-    if ! objdump -h "$lib" 2>/dev/null | grep -q '\.debug_info'; then
-      continue
+    # Extract debug info if present (check for any debug/DWARF sections)
+    if objdump -h "$lib" 2>/dev/null | grep -qE '\.(z?debug_|gnu\.debuglto_)'; then
+      DEBUGDIR="$DEBUG_STAGE/$(dirname "$REL")/.debug"
+      mkdir -p "$DEBUGDIR"
+      if objcopy --only-keep-debug "$lib" "$DEBUGDIR/${LIBNAME}.debug" 2>/dev/null; then
+        DEBUG_CREATED=$((DEBUG_CREATED + 1))
+      fi
     fi
 
-    # Extract debug info into separate staging area (mirrors STAGE layout)
-    DEBUGDIR="$DEBUG_STAGE/$(dirname "$REL")/.debug"
-    mkdir -p "$DEBUGDIR"
-    if objcopy --only-keep-debug "$lib" "$DEBUGDIR/${LIBNAME}.debug" 2>/dev/null; then
-      DEBUG_CREATED=$((DEBUG_CREATED + 1))
-    fi
-
-    # Strip the original in place
+    # Always strip — catches debug info in all formats (DWARF4, DWARF5,
+    # compressed .zdebug_*, split DWARF, LTO debug sections)
     if strip --strip-debug "$lib" 2>/dev/null; then
       STRIPPED=$((STRIPPED + 1))
     fi
