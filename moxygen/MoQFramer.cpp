@@ -755,7 +755,7 @@ folly::Expected<ClientSetup, ErrorCode> MoQFrameParser::parseClientSetup(
       numParams->first,
       clientSetup.params,
       requestSpecificParams,
-      tokenCache_,
+      *tokenCache_,
       ParamsType::ClientSetup);
   if (res.hasError()) {
     return folly::makeUnexpected(res.error());
@@ -806,7 +806,7 @@ folly::Expected<ServerSetup, ErrorCode> MoQFrameParser::parseServerSetup(
       numParams->first,
       serverSetup.params,
       requestSpecificParams,
-      tokenCache_,
+      *tokenCache_,
       ParamsType::ServerSetup);
   if (res.hasError()) {
     return folly::makeUnexpected(res.error());
@@ -1477,7 +1477,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseTrackRequestParams(
       numParams,
       params,
       requestSpecificParams,
-      tokenCache_,
+      *tokenCache_,
       ParamsType::Request);
 }
 
@@ -2022,24 +2022,26 @@ folly::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
     length--;
   }
 
-  if (length < 1) {
-    XLOG(DBG4) << "parsePublish: UNDERFLOW on contentExists";
-    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
-  }
-  uint8_t contentExists = cursor.readBE<uint8_t>();
-  if (contentExists > 1) {
-    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-  }
-  length--;
-
-  if (contentExists == 1) {
-    auto location = parseAbsoluteLocation(cursor, length);
-    if (!location) {
-      return folly::makeUnexpected(location.error());
+  if (getDraftMajorVersion(*version_) < 15) {
+    if (length < 1) {
+      XLOG(DBG4) << "parsePublish: UNDERFLOW on contentExists";
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
-    publish.largest = *location;
-  } else {
-    publish.largest = std::nullopt;
+    uint8_t contentExists = cursor.readBE<uint8_t>();
+    if (contentExists > 1) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+    length--;
+
+    if (contentExists == 1) {
+      auto location = parseAbsoluteLocation(cursor, length);
+      if (!location) {
+        return folly::makeUnexpected(location.error());
+      }
+      publish.largest = *location;
+    } else {
+      publish.largest = std::nullopt;
+    }
   }
 
   if (getDraftMajorVersion(*version_) < 15) {
@@ -2117,6 +2119,15 @@ void MoQFrameParser::handleRequestSpecificParams(
 
   // FORWARD
   handleForwardParam(publishRequest.forward, requestSpecificParams);
+
+  // LARGEST_OBJECT
+  for (const auto& param : requestSpecificParams) {
+    if (param.key ==
+        folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT)) {
+      publishRequest.largest = param.largestObject;
+      break;
+    }
+  }
 }
 
 folly::Expected<PublishOk, ErrorCode> MoQFrameParser::parsePublishOk(
@@ -2910,6 +2921,8 @@ MoQFrameParser::parseSubscribeNamespace(
     length -= options->second;
     subscribeNamespace.options =
         static_cast<SubscribeNamespaceOptions>(options->first);
+  } else {
+    subscribeNamespace.options = SubscribeNamespaceOptions::BOTH;
   }
 
   // Parse Parameters
@@ -4689,13 +4702,15 @@ WriteResult MoQFrameWriter::writePublish(
     size += 1;
   }
 
-  uint8_t contentExists = publish.largest.has_value() ? 1 : 0;
-  writeBuf.append(&contentExists, 1);
-  size += 1;
+  if (getDraftMajorVersion(*version_) < 15) {
+    uint8_t contentExists = publish.largest.has_value() ? 1 : 0;
+    writeBuf.append(&contentExists, 1);
+    size += 1;
 
-  if (publish.largest.has_value()) {
-    writeVarint(writeBuf, publish.largest->group, size, error);
-    writeVarint(writeBuf, publish.largest->object, size, error);
+    if (publish.largest.has_value()) {
+      writeVarint(writeBuf, publish.largest->group, size, error);
+      writeVarint(writeBuf, publish.largest->object, size, error);
+    }
   }
 
   std::vector<Parameter> requestSpecificParams;
@@ -4715,6 +4730,12 @@ WriteResult MoQFrameWriter::writePublish(
       forwardParam.key = folly::to_underlying(TrackRequestParamKey::FORWARD);
       forwardParam.asUint64 = 0;
       requestSpecificParams.push_back(forwardParam);
+    }
+
+    if (publish.largest.has_value()) {
+      requestSpecificParams.push_back(Parameter(
+          folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT),
+          publish.largest));
     }
   } else {
     uint8_t forwardFlag = publish.forward ? 1 : 0;
