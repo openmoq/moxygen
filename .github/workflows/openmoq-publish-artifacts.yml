@@ -57,7 +57,8 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential python3 curl git ca-certificates \
-            pkg-config libssl-dev m4 autoconf automake libtool
+            pkg-config libssl-dev m4 autoconf automake libtool \
+            binutils
 
       - name: Install system deps (Ubuntu runner)
         if: matrix.container == '' && runner.os == 'Linux'
@@ -87,44 +88,21 @@ jobs:
             --extra-cmake-defines '{"CMAKE_FIND_LIBRARY_SUFFIXES": ".a", "BUILD_SHARED_LIBS": "OFF"}' \
             moxygen
 
-      - name: Collect installed artifacts
-        id: collect
+      # Use the collect-artifacts script instead of inline logic.
+      # Writes tarball to $GITHUB_WORKSPACE/ so it's accessible from both
+      # the container and the host (fixes bookworm upload-artifact path issue).
+      - name: Collect and package artifacts
         run: |
-          SCRATCH="${{ runner.temp }}/moxygen-scratch"
-
-          # Get all install directories (moxygen + transitive deps)
-          python3 build/fbcode_builder/getdeps.py \
-            show-inst-dir \
-            --scratch-path "$SCRATCH" \
-            --extra-cmake-defines '{"CMAKE_FIND_LIBRARY_SUFFIXES": ".a", "BUILD_SHARED_LIBS": "OFF"}' \
-            --recursive moxygen 2>/dev/null \
-            | grep "^/" > "${{ runner.temp }}/inst-dirs.txt"
-
-          # Create a staging directory with all artifacts
-          STAGE="${{ runner.temp }}/artifact-stage"
-          mkdir -p "$STAGE"
-
-          while IFS= read -r dir; do
-            if [ -d "$dir" ]; then
-              cp -a "$dir/." "$STAGE/"
-            fi
-          done < "${{ runner.temp }}/inst-dirs.txt"
-
-          # Also save the cmake_prefix_path for consumers
-          cat "${{ runner.temp }}/inst-dirs.txt" | tr '\n' ';' > "$STAGE/cmake_prefix_path.txt"
-
-          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
-
-      - name: Create tarball
-        run: |
-          cd "${{ steps.collect.outputs.stage }}"
-          tar czf "${{ runner.temp }}/${{ matrix.artifact }}" .
+          bash openmoq/scripts/collect-artifacts.sh \
+            --scratch-path "${{ runner.temp }}/moxygen-scratch" \
+            --output "$GITHUB_WORKSPACE/${{ matrix.artifact }}" \
+            --src-dir .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ runner.temp }}/${{ matrix.artifact }}
+          path: ${{ github.workspace }}/${{ matrix.artifact }}
           retention-days: 90
 
   # ──────────────────────────────────────────────────────────────
@@ -141,57 +119,14 @@ jobs:
         with:
           path: artifacts/
 
-      - name: Create release
+      - name: Create release and prune old builds
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          SHORT_SHA="${GITHUB_SHA:0:12}"
-          TAG="build-${SHORT_SHA}"
-
-          # Delete existing release with this tag if it exists (idempotent)
-          gh release delete "$TAG" --yes 2>/dev/null || true
-          git tag -d "$TAG" 2>/dev/null || true
-          git push origin ":refs/tags/$TAG" 2>/dev/null || true
-
-          # Flatten artifacts (download-artifact creates subdirs per artifact name)
-          mkdir -p release-assets/
-          find artifacts/ -name '*.tar.gz' -exec cp {} release-assets/ \;
-
-          # Create the release
-          gh release create "$TAG" \
-            --title "Build artifacts for ${SHORT_SHA}" \
-            --notes "$(cat <<EOF
-          Automated build artifacts for commit \`${SHORT_SHA}\`.
-
-          These bundles contain moxygen and all transitive Meta dependencies
-          (folly, fizz, wangle, mvfst, proxygen) as static libraries with
-          headers and CMake config files.
-
-          **Usage in o-rly CI:**
-          \`\`\`bash
-          gh release download "${TAG}" --repo openmoq/moxygen \\
-            --pattern "moxygen-<platform>.tar.gz" --dir .scratch/
-          tar xzf .scratch/moxygen-*.tar.gz -C .scratch/
-          \`\`\`
-          EOF
-          )" \
-            release-assets/*.tar.gz
-
-          echo "Release created: $TAG"
-
-      - name: Prune old build releases
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          KEEP=20
-          gh release list --limit 100 \
-            | grep '^build-' \
-            | tail -n +$((KEEP + 1)) \
-            | awk '{print $1}' \
-            | while read -r tag; do
-                echo "Deleting old release: $tag"
-                gh release delete "$tag" --yes --cleanup-tag
-              done
+          bash openmoq/scripts/create-release.sh \
+            --artifacts-dir artifacts/ \
+            --sha "$GITHUB_SHA" \
+            --keep 20
 
       # ── Notifications ──
       - name: Notify Slack
