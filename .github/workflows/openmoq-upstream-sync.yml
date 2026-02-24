@@ -202,7 +202,7 @@ jobs:
         if: steps.upstream.outputs.should_sync == 'true'
         id: pr
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.OMOQ_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="sync-upstream-${{ steps.upstream.outputs.short_sha }}"
           UPSTREAM_SHA="${{ steps.upstream.outputs.upstream_sha }}"
@@ -220,11 +220,9 @@ jobs:
             DETAILS="${DETAILS}\n- **Patches skipped (already upstream):** ${SKIPPED_LIST}"
           fi
 
-          PR_URL=$(gh pr create \
-            --head "$BRANCH" \
-            --base main \
-            --title "sync: upstream moxygen ${{ steps.upstream.outputs.short_sha }}" \
-            --body "$(cat <<EOF
+          # Use REST API for PR creation — GraphQL createPullRequest is
+          # blocked on fork repos for both GITHUB_TOKEN and fine-grained PATs.
+          BODY=$(cat <<EOF
           Automated upstream sync.
 
           - **Upstream commit:** [\`${UPSTREAM_SHA:0:12}\`](https://github.com/facebookexperimental/moxygen/commit/$UPSTREAM_SHA)
@@ -236,7 +234,14 @@ jobs:
 
           Created by \`openmoq-upstream-sync\` workflow.
           EOF
-          )")
+          )
+
+          PR_URL=$(gh api repos/${{ github.repository }}/pulls \
+            -f title="sync: upstream moxygen ${{ steps.upstream.outputs.short_sha }}" \
+            -f body="$BODY" \
+            -f head="$BRANCH" \
+            -f base="main" \
+            --jq '.html_url')
 
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
           echo "Created PR: $PR_URL"
@@ -245,7 +250,7 @@ jobs:
       - name: Enable auto-merge
         if: steps.upstream.outputs.should_sync == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.OMOQ_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="sync-upstream-${{ steps.upstream.outputs.short_sha }}"
           PR_NUM=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number')
