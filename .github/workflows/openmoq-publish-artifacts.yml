@@ -105,6 +105,16 @@ jobs:
           path: ${{ github.workspace }}/${{ matrix.artifact }}
           retention-days: 90
 
+      # Debug symbols are in a separate -dbg.tar.gz produced by collect-artifacts.sh
+      - name: Upload debug symbols artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-dbg
+          path: ${{ github.workspace }}/*-dbg.tar.gz
+          if-no-files-found: ignore
+          retention-days: 90
+
   # ──────────────────────────────────────────────────────────────
   # Create GitHub Release with all artifacts
   # ──────────────────────────────────────────────────────────────

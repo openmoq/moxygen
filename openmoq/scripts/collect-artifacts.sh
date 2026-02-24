@@ -160,32 +160,32 @@ if [[ "$OS" == "Darwin" ]]; then
   echo "    macOS: stripped $STRIPPED libraries (no .debug files generated)"
 
 elif [[ "$OS" == "Linux" ]]; then
-  # Linux: extract .debug sidecar files, then strip.
-  # .debug files go alongside the original in a .debug/ subdirectory,
-  # mirroring the original directory structure.
+  # Linux: strip debug symbols from libraries.
+  # .debug sidecar files are created in a separate staging area so they
+  # can be packaged into an optional debug tarball without inflating the
+  # main artifact.
+  DEBUG_STAGE=$(mktemp -d)
+
   while IFS= read -r -d '' lib; do
-    LIBDIR=$(dirname "$lib")
+    # Path relative to STAGE (e.g. lib/libfolly.a)
+    REL="${lib#$STAGE/}"
     LIBNAME=$(basename "$lib")
-    DEBUGDIR="$LIBDIR/.debug"
 
     # Only process files that actually contain debug info
     if ! objdump -h "$lib" 2>/dev/null | grep -q '\.debug_info'; then
       continue
     fi
 
+    # Extract debug info into separate staging area (mirrors STAGE layout)
+    DEBUGDIR="$DEBUG_STAGE/$(dirname "$REL")/.debug"
     mkdir -p "$DEBUGDIR"
-
-    # Extract debug info into sidecar file
     if objcopy --only-keep-debug "$lib" "$DEBUGDIR/${LIBNAME}.debug" 2>/dev/null; then
       DEBUG_CREATED=$((DEBUG_CREATED + 1))
     fi
 
-    # Strip the original
+    # Strip the original in place
     if strip --strip-debug "$lib" 2>/dev/null; then
       STRIPPED=$((STRIPPED + 1))
-
-      # Add debuglink so GDB can find the .debug file automatically
-      objcopy --add-gnu-debuglink="$DEBUGDIR/${LIBNAME}.debug" "$lib" 2>/dev/null || true
     fi
   done < <(find "$STAGE" \( -name '*.a' -o -name '*.so' -o -name '*.so.*' \) -type f -print0)
   echo "    Linux: stripped $STRIPPED libraries, created $DEBUG_CREATED .debug files"
@@ -197,17 +197,27 @@ fi
 POST_STRIP_SIZE=$(du -sh "$STAGE" | cut -f1)
 echo "    Staged size (after strip): $POST_STRIP_SIZE"
 
-# ── Step 5: Create tarball ───────────────────────────────────────────────────
-
-echo "==> Creating tarball: $OUTPUT"
+# ── Step 5: Create tarballs ──────────────────────────────────────────────────
 
 # Ensure output directory exists
 mkdir -p "$(dirname "$OUTPUT")"
 
+# Main tarball (stripped libraries + headers + cmake configs)
+echo "==> Creating tarball: $OUTPUT"
 tar czf "$OUTPUT" -C "$STAGE" .
 
 TARBALL_SIZE=$(du -sh "$OUTPUT" | cut -f1)
 echo "    Tarball size: $TARBALL_SIZE"
+
+# Debug symbols tarball (optional, separate download)
+if [[ "$OS" == "Linux" && -n "${DEBUG_STAGE:-}" && "$DEBUG_CREATED" -gt 0 ]]; then
+  DEBUG_OUTPUT="${OUTPUT%.tar.gz}-dbg.tar.gz"
+  echo "==> Creating debug tarball: $DEBUG_OUTPUT"
+  tar czf "$DEBUG_OUTPUT" -C "$DEBUG_STAGE" .
+  DEBUG_SIZE=$(du -sh "$DEBUG_OUTPUT" | cut -f1)
+  echo "    Debug tarball size: $DEBUG_SIZE"
+  rm -rf "$DEBUG_STAGE"
+fi
 
 # Check against GitHub Release 2GB limit
 TARBALL_BYTES=$(stat --format=%s "$OUTPUT" 2>/dev/null || stat -f%z "$OUTPUT" 2>/dev/null)
