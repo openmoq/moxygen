@@ -2344,9 +2344,11 @@ folly::coro::Task<ServerSetup> MoQSession::setup(ClientSetup setup) {
     setupSerializationVersion = *negotiatedVersion_;
   }
 
-  // This sets the receive token cache size, but it's necesarily empty
-  controlCodec_->setMaxAuthTokenCacheSize(
-      getMaxAuthTokenCacheSizeIfPresent(setup.params));
+  // Set up the shared receive-side token cache and point the control codec
+  // at it. The cache is necessarily empty at this point.
+  receiveTokenCache_.setMaxSize(
+      getMaxAuthTokenCacheSizeIfPresent(setup.params), /*evict=*/false);
+  controlCodec_->setTokenCache(&receiveTokenCache_);
   // Optimistically registers params without knowing peer's capabilities
   aliasifyAuthTokens(setup.params, setupSerializationVersion);
   auto res =
@@ -2424,10 +2426,10 @@ void MoQSession::onServerSetup(ServerSetup serverSetup) {
   }
 
   peerMaxRequestID_ = getMaxRequestIDIfPresent(serverSetup.params);
+  auto peerAuthCacheSize =
+      getMaxAuthTokenCacheSizeIfPresent(serverSetup.params);
   tokenCache_.setMaxSize(
-      std::min(
-          kMaxSendTokenCacheSize,
-          getMaxAuthTokenCacheSizeIfPresent(serverSetup.params)),
+      std::min(kMaxSendTokenCacheSize, peerAuthCacheSize),
       /*evict=*/true);
   setupPromise_.setValue(std::move(serverSetup));
 }
@@ -2447,10 +2449,10 @@ void MoQSession::onClientSetup(ClientSetup clientSetup) {
   }
 
   peerMaxRequestID_ = getMaxRequestIDIfPresent(clientSetup.params);
+  auto peerAuthCacheSize =
+      getMaxAuthTokenCacheSizeIfPresent(clientSetup.params);
   tokenCache_.setMaxSize(
-      std::min(
-          kMaxSendTokenCacheSize,
-          getMaxAuthTokenCacheSizeIfPresent(clientSetup.params)),
+      std::min(kMaxSendTokenCacheSize, peerAuthCacheSize),
       /*evict=*/true);
 
   auto serverSetup =
@@ -2506,9 +2508,11 @@ void MoQSession::onClientSetup(ClientSetup clientSetup) {
   }
   auto maxRequestID = getMaxRequestIDIfPresent(serverSetup->params);
 
-  // This sets the receive cache size and may evict received tokens
-  controlCodec_->setMaxAuthTokenCacheSize(
-      getMaxAuthTokenCacheSizeIfPresent(serverSetup->params));
+  // Set up the shared receive-side token cache and point the control codec
+  // at it. May evict tokens optimistically registered during CLIENT_SETUP.
+  receiveTokenCache_.setMaxSize(
+      getMaxAuthTokenCacheSizeIfPresent(serverSetup->params), /*evict=*/true);
+  controlCodec_->setTokenCache(&receiveTokenCache_);
   aliasifyAuthTokens(serverSetup->params);
   auto res =
       writeServerSetup(controlWriteBuf_, *serverSetup, *getNegotiatedVersion());
@@ -2522,51 +2526,6 @@ void MoQSession::onClientSetup(ClientSetup clientSetup) {
   setupComplete_ = true;
   controlWriteEvent_.signal();
 }
-
-class MoQNamespacePublishHandle : public Publisher::NamespacePublishHandle {
- public:
-  MoQNamespacePublishHandle(
-      proxygen::WebTransport::StreamWriteHandle* writeHandle,
-      uint64_t negotiatedVersion)
-      : writeHandle_(writeHandle) {
-    moqFrameWriter_.initializeVersion(negotiatedVersion);
-  }
-
-  void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) override {
-    Namespace ns;
-    ns.trackNamespaceSuffix = trackNamespaceSuffix;
-    auto writeResult = moqFrameWriter_.writeNamespace(writeBuf_, ns);
-    if (!writeResult) {
-      XLOG(ERR) << "writeNamespace failed";
-      return;
-    }
-    auto res = writeHandle_->writeStreamData(writeBuf_.move(), false, nullptr);
-    if (!res) {
-      XLOG(ERR) << "writeStreamData for NAMESPACE failed error="
-                << uint64_t(res.error());
-    }
-  }
-
-  void namespaceDoneMsg() override {
-    NamespaceDone namespaceDone;
-    auto writeResult =
-        moqFrameWriter_.writeNamespaceDone(writeBuf_, namespaceDone);
-    if (!writeResult) {
-      XLOG(ERR) << "writeNamespaceDone failed";
-      return;
-    }
-    auto res = writeHandle_->writeStreamData(writeBuf_.move(), true, nullptr);
-    if (!res) {
-      XLOG(ERR) << "writeStreamData for NAMESPACE_DONE failed error="
-                << uint64_t(res.error());
-    }
-  }
-
- private:
-  proxygen::WebTransport::StreamWriteHandle* writeHandle_;
-  MoQFrameWriter moqFrameWriter_;
-  folly::IOBufQueue writeBuf_{folly::IOBufQueue::cacheChainLength()};
-};
 
 folly::coro::Task<void> MoQSession::controlReadLoop(
     proxygen::WebTransport::StreamReadHandle* readHandle,
@@ -2641,6 +2600,7 @@ folly::coro::Task<void> MoQSession::subscribeNamespaceReceiverReadLoop(
         return;
       }
       receivedSubscribeNamespace_ = true;
+      requestID_ = subscribeNamespace.requestID;
 
       auto subNsReply =
           session_->getSubNsReply(bufQueue_, bidiStreamHandle_.writeHandle);
@@ -2657,24 +2617,45 @@ folly::coro::Task<void> MoQSession::subscribeNamespaceReceiverReadLoop(
       session_->close(error);
     }
 
+    bool receivedSubscribeNamespace() const {
+      return receivedSubscribeNamespace_;
+    }
+
+    std::optional<RequestID> requestID() const {
+      return requestID_;
+    }
+
    private:
     MoQSession* session_;
     proxygen::WebTransport::BidiStreamHandle bidiStreamHandle_;
     folly::IOBufQueue& bufQueue_;
-    MoQFrameWriter& moqFrameWriter_;
+    [[maybe_unused]] MoQFrameWriter& moqFrameWriter_;
     bool receivedSubscribeNamespace_{false};
+    std::optional<RequestID> requestID_;
   };
 
   folly::IOBufQueue bufQueue;
   auto moQSubNsReceiverCodec = std::make_shared<MoQSubNsReceiverCodec>(nullptr);
   moQSubNsReceiverCodec->initializeVersion(*negotiatedVersion_);
-
+  // Point at the session-wide receive token cache so that auth-token aliases
+  // registered on the control stream are visible here, and vice versa.
+  moQSubNsReceiverCodec->setTokenCache(&receiveTokenCache_);
   SubNsCb cb(this, bh, bufQueue, moqFrameWriter_);
   moQSubNsReceiverCodec->setCallback(&cb);
 
   // TODO: Could perhaps return controlReadLoop instead of awaiting
   co_await controlReadLoop(
       bh.readHandle, std::move(initialData), moQSubNsReceiverCodec.get());
+
+  // If the peer closes the SUBSCRIBE_NAMESPACE stream (FIN) or resets it
+  // (draft16+), treat it as an unsubscribe
+  auto token = co_await folly::coro::co_current_cancellation_token;
+  if (!token.isCancellationRequested() && cb.receivedSubscribeNamespace() &&
+      cb.requestID()) {
+    UnsubscribeNamespace unsub;
+    unsub.requestID = cb.requestID().value();
+    onUnsubscribeNamespace(std::move(unsub));
+  }
 }
 
 std::shared_ptr<MoQSession::SubscribeTrackReceiveState>
@@ -3261,6 +3242,7 @@ folly::coro::Task<void> MoQSession::unidirectionalReadLoop(
       } else if (result == MoQCodec::ParseResult::ERROR_TERMINATE) {
         XLOG(ERR) << "Error parsing/consuming stream id=" << id
                   << " sess=" << this;
+        dcb.reset(ResetStreamErrorCode::INTERNAL_ERROR);
         break;
       }
     } // else empty read
@@ -5616,14 +5598,14 @@ void MoQSession::onPublishNamespaceCancel(
 }
 
 void MoQSession::onSubscribeNamespace(SubscribeNamespace subscribeNamespace) {
-  auto subNsReply = std::make_unique<ControlStreamSubNsReply>(
+  auto subNsReply = std::make_shared<ControlStreamSubNsReply>(
       moqFrameWriter_, controlWriteBuf_, controlWriteEvent_);
   onSubscribeNamespaceImpl(subscribeNamespace, std::move(subNsReply));
 }
 
 void MoQSession::onSubscribeNamespaceImpl(
     const SubscribeNamespace& subscribeNamespace,
-    std::unique_ptr<SubNSReply>&& subNsReply) {
+    std::shared_ptr<SubNSReply> subNsReply) {
   XLOG(DBG1) << __func__
              << " prefix=" << subscribeNamespace.trackNamespacePrefix
              << " - sending NOT_SUPPORTED error, sess=" << this;
@@ -5706,7 +5688,7 @@ void MoQSession::publishNamespaceError(
 
 void MoQSession::subscribeNamespaceError(
     const SubscribeNamespaceError& subscribeNamespaceError,
-    std::unique_ptr<SubNSReply>&& subNsReply) {
+    std::shared_ptr<SubNSReply>&& subNsReply) {
   XLOG(DBG1) << __func__ << " reqID=" << subscribeNamespaceError.requestID.value
              << " sess=" << this;
   MOQ_PUBLISHER_STATS(
