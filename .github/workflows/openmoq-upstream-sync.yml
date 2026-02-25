@@ -31,50 +31,64 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Get latest commit on upstream main
-          UPSTREAM_SHA=$(gh api repos/facebookexperimental/moxygen/commits/main -q .sha)
-          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
-          echo "Upstream HEAD: $UPSTREAM_SHA"
+          # Walk recent upstream commits (newest first) and find the latest
+          # one with passing CI that we haven't already integrated.
+          COMMITS=$(gh api 'repos/facebookexperimental/moxygen/commits?per_page=20' \
+            --jq '.[].sha')
 
-          # Check if this commit has passing CI via check-suites
-          # (Meta repos use GitHub Actions check suites, not the commit status API)
-          STATE=$(gh api "repos/facebookexperimental/moxygen/commits/$UPSTREAM_SHA/check-suites" \
-            -q '[.check_suites[] | select(.app.name=="GitHub Actions")] |
-                if length == 0 then "failure"
-                elif any(.status == "queued" or .status == "in_progress") then "pending"
-                elif all(.conclusion == "success") then "success"
-                else "failure" end')
-          echo "Upstream check-suites status: $STATE"
+          echo "Scanning up to 20 recent upstream commits..."
+          UPSTREAM_SHA=""
 
-          # Log individual check-run results for visibility
-          echo "--- Upstream check-runs ---"
+          for SHA in $COMMITS; do
+            SHORT="${SHA:0:12}"
+
+            # Skip if already integrated
+            if git merge-base --is-ancestor "$SHA" HEAD 2>/dev/null; then
+              echo "  $SHORT: already integrated (stopping scan)"
+              break
+            fi
+
+            # Skip if candidate branch already exists
+            if git ls-remote --heads origin "sync-upstream-${SHORT}" | grep -q .; then
+              echo "  $SHORT: candidate branch already exists (skipping)"
+              continue
+            fi
+
+            # Check CI status via check-suites
+            STATE=$(gh api "repos/facebookexperimental/moxygen/commits/$SHA/check-suites" \
+              -q '[.check_suites[] | select(.app.name=="GitHub Actions")] |
+                  if length == 0 then "failure"
+                  elif any(.status == "queued" or .status == "in_progress") then "pending"
+                  elif all(.conclusion == "success") then "success"
+                  else "failure" end')
+
+            echo "  $SHORT: $STATE"
+
+            if [ "$STATE" = "success" ]; then
+              UPSTREAM_SHA="$SHA"
+              break
+            fi
+          done
+
+          if [ -z "$UPSTREAM_SHA" ]; then
+            echo "No qualifying upstream commit found. Skipping."
+            echo "should_sync=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SHORT_SHA="${UPSTREAM_SHA:0:12}"
+          echo ""
+          echo "Selected upstream commit: $SHORT_SHA"
+
+          # Log check-runs for the selected commit
+          echo "--- Check-runs for $SHORT_SHA ---"
           gh api "repos/facebookexperimental/moxygen/commits/$UPSTREAM_SHA/check-runs" \
             -q '.check_runs[] | "[\(.conclusion // .status)] \(.name)"'
           echo "---"
 
-          if [ "$STATE" != "success" ]; then
-            echo "Upstream is $STATE (not success). Skipping."
-            echo "should_sync=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Check if we already have this commit (merged or as an open candidate PR)
-          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD 2>/dev/null; then
-            echo "Already integrated. Nothing to do."
-            echo "should_sync=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Check if a candidate branch already exists for this SHA
-          SHORT_SHA="${UPSTREAM_SHA:0:12}"
-          if git ls-remote --heads origin "sync-upstream-${SHORT_SHA}" | grep -q .; then
-            echo "Candidate branch sync-upstream-${SHORT_SHA} already exists."
-            echo "should_sync=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "should_sync=true" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "should_sync=true" >> "$GITHUB_OUTPUT"
 
       # ── Step 2: Create candidate branch and merge upstream ──
       - name: Add upstream remote
@@ -220,11 +234,9 @@ jobs:
             DETAILS="${DETAILS}\n- **Patches skipped (already upstream):** ${SKIPPED_LIST}"
           fi
 
-          PR_URL=$(gh pr create \
-            --head "$BRANCH" \
-            --base main \
-            --title "sync: upstream moxygen ${{ steps.upstream.outputs.short_sha }}" \
-            --body "$(cat <<EOF
+          # Use REST API for PR creation — GraphQL createPullRequest is
+          # blocked on fork repos for both GITHUB_TOKEN and fine-grained PATs.
+          BODY=$(cat <<EOF
           Automated upstream sync.
 
           - **Upstream commit:** [\`${UPSTREAM_SHA:0:12}\`](https://github.com/facebookexperimental/moxygen/commit/$UPSTREAM_SHA)
@@ -236,7 +248,14 @@ jobs:
 
           Created by \`openmoq-upstream-sync\` workflow.
           EOF
-          )")
+          )
+
+          PR_URL=$(gh api repos/${{ github.repository }}/pulls \
+            -f title="sync: upstream moxygen ${{ steps.upstream.outputs.short_sha }}" \
+            -f body="$BODY" \
+            -f head="$BRANCH" \
+            -f base="main" \
+            --jq '.html_url')
 
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
           echo "Created PR: $PR_URL"
@@ -253,45 +272,15 @@ jobs:
             gh pr merge "$PR_NUM" --auto --merge || echo "Auto-merge not available (branch protection may not be configured)."
           fi
 
-      # ── Notifications ──
-      - name: Notify Slack (candidate created)
-        if: steps.upstream.outputs.should_sync == 'true'
+      # ── Notifications (failures only — successful syncs are quiet) ──
+      - name: Notify Slack (sync failure)
+        if: failure()
+        continue-on-error: true
         uses: slackapi/slack-github-action@v1.26
         with:
           payload: |
             {
-              "channel": "#github-notifications",
-              "text": ":arrows_counterclockwise: *moxygen upstream sync* — candidate PR created\nUpstream: `${{ steps.upstream.outputs.upstream_sha }}`\nPatches applied: ${{ steps.patches.outputs.patches_applied || '0' }}, skipped: ${{ steps.patches.outputs.patches_skipped || '0' }}\nConflicts auto-resolved: ${{ steps.merge.outputs.conflicts_resolved || '0' }}\n<${{ steps.pr.outputs.pr_url }}|View PR>"
+              "text": ":x: *moxygen upstream sync FAILED*\nUpstream: `${{ steps.upstream.outputs.upstream_sha || 'unknown' }}`\nFailed patch: `${{ steps.patches.outputs.failed_patch || 'n/a' }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
             }
         env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-
-      - name: Notify Slack (patch failure)
-        if: failure() && steps.patches.outputs.patch_failed == 'true'
-        uses: slackapi/slack-github-action@v1.26
-        with:
-          payload: |
-            {
-              "channel": "#github-notifications",
-              "text": ":x: *moxygen upstream sync FAILED* — patch application error\nUpstream: `${{ steps.upstream.outputs.upstream_sha }}`\nFailed patch: `${{ steps.patches.outputs.failed_patch }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
-            }
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-
-      - name: Notify email (candidate created)
-        if: steps.upstream.outputs.should_sync == 'true'
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "[moxygen] upstream sync — candidate PR created"
-          to: github-notifications@openmoq.org
-          from: github-ci@openmoq.org
-          body: |
-            Upstream sync candidate PR created for openmoq/moxygen.
-
-            Upstream commit: ${{ steps.upstream.outputs.upstream_sha }}
-            Patches applied: ${{ steps.patches.outputs.patches_applied || '0' }}
-            PR: ${{ steps.pr.outputs.pr_url }}
+          SLACK_WEBHOOK_URL: ${{ secrets.OMOQ_SLACK_WEBHOOK_URL }}

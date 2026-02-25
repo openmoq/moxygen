@@ -105,21 +105,35 @@ jobs:
           path: ${{ github.workspace }}/${{ matrix.artifact }}
           retention-days: 90
 
+      # Debug symbols are in a separate -dbg.tar.gz produced by collect-artifacts.sh
+      - name: Upload debug symbols artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-dbg
+          path: ${{ github.workspace }}/*-dbg.tar.gz
+          if-no-files-found: ignore
+          retention-days: 90
+
   # ──────────────────────────────────────────────────────────────
   # Create GitHub Release with all artifacts
   # ──────────────────────────────────────────────────────────────
   release:
     runs-on: ubuntu-22.04
     needs: [build]
+    if: always()
     steps:
       - uses: actions/checkout@v4
+        if: needs.build.result == 'success'
 
       - name: Download all artifacts
+        if: needs.build.result == 'success'
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
 
       - name: Create release and prune old builds
+        if: needs.build.result == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -130,28 +144,13 @@ jobs:
 
       # ── Notifications ──
       - name: Notify Slack
+        if: always()
+        continue-on-error: true
         uses: slackapi/slack-github-action@v1.26
         with:
           payload: |
             {
-              "channel": "#github-notifications",
-              "text": ":package: *moxygen build artifacts published*\nCommit: `${{ github.sha }}`\nTag: `build-${GITHUB_SHA:0:12}`\n<${{ github.server_url }}/${{ github.repository }}/releases/tag/build-${GITHUB_SHA:0:12}|View release>"
+              "text": "${{ needs.build.result == 'success' && ':package: *moxygen build artifacts published*' || ':x: *moxygen artifact build FAILED*' }}\nCommit: `${{ github.sha }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
             }
         env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-
-      - name: Notify email
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "[moxygen] build artifacts published — ${{ github.sha }}"
-          to: github-notifications@openmoq.org
-          from: github-ci@openmoq.org
-          body: |
-            Moxygen build artifacts published for openmoq/moxygen.
-
-            Commit: ${{ github.sha }}
-            Release: ${{ github.server_url }}/${{ github.repository }}/releases/tag/build-${GITHUB_SHA:0:12}
+          SLACK_WEBHOOK_URL: ${{ secrets.OMOQ_SLACK_WEBHOOK_URL }}
