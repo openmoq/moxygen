@@ -434,6 +434,13 @@ Subscriber::PublishResult MoQRelay::publish(
     forwarder->setDeliveryTimeout(deliveryTimeout->count());
   }
 
+  // Extract dynamic groups from publish request extensions and store in
+  // forwarder
+  auto dynamicGroups = getPublisherDynamicGroups(pub);
+  if (dynamicGroups.has_value()) {
+    forwarder->setDynamicGroups(*dynamicGroups);
+  }
+
   auto subRes = subscriptions_.emplace(
       std::piecewise_construct,
       std::forward_as_tuple(pub.fullTrackName),
@@ -876,6 +883,14 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
       subscriber->setParam(
           {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
            static_cast<uint64_t>(deliveryTimeout->count())});
+    }
+
+    // Store dynamic groups in forwarder and send to the first subscriber
+    auto dynGroups =
+        getPublisherDynamicGroups(subRes.value()->subscribeOk());
+    if (dynGroups.has_value()) {
+      forwarder->setDynamicGroups(*dynGroups);
+      subscriber->setDynamicGroupsExtension(*dynGroups);
     }
 
     subscriber->setPublisherGroupOrder(pubGroupOrder);
