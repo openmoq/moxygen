@@ -8,6 +8,7 @@
 #include <folly/io/async/EventBase.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
+#include <moxygen/MoQTrackProperties.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
 #include <moxygen/relay/MoQForwarder.h>
 #include <moxygen/relay/MoQRelay.h>
@@ -2010,6 +2011,92 @@ TEST_F(MoQRelayTest, ResetDuringDrainingMultipleSubscribersDoesNotCrash) {
   subgroup->reset(ResetStreamErrorCode::INTERNAL_ERROR);
 
   EXPECT_EQ(forwarder, nullptr);
+}
+
+// ============================================================
+// Dynamic Groups Extension Tests
+// ============================================================
+
+// Test: relay PUBLISH path – dynamic groups from PublishRequest extensions
+// is stored in the forwarder and forwarded to every downstream subscriber
+TEST_F(MoQRelayTest, RelayPublishPropagatesDynamicGroupsToSubscribers) {
+  auto publisherSession = createMockSession();
+  auto subscriberSession = createMockSession();
+
+  // Build a PublishRequest with DYNAMIC_GROUPS enabled
+  PublishRequest pub;
+  pub.fullTrackName = kTestTrackName;
+  setPublisherDynamicGroups(pub, true);
+
+  withSessionContext(publisherSession, [&]() {
+    auto res = relay_->publish(std::move(pub), createMockSubscriptionHandle());
+    ASSERT_TRUE(res.hasValue());
+    getOrCreateMockState(publisherSession)->publishConsumers.push_back(
+        res->consumer);
+  });
+
+  auto consumer = createMockConsumer();
+  auto handle =
+      subscribeToTrack(subscriberSession, kTestTrackName, consumer, RequestID(1));
+  ASSERT_NE(handle, nullptr);
+
+  auto dynGroups = getPublisherDynamicGroups(handle->subscribeOk());
+  ASSERT_TRUE(dynGroups.has_value());
+  EXPECT_TRUE(*dynGroups);
+
+  removeSession(publisherSession);
+  removeSession(subscriberSession);
+}
+
+// Test: relay SUBSCRIBE path – dynamic groups from the upstream SubscribeOk is
+// stored in the forwarder and forwarded to both the first and late-joining
+// downstream subscribers
+TEST_F(MoQRelayTest, RelaySubscribePropagatesDynamicGroupsToAllSubscribers) {
+  auto publisherSession = createMockSession();
+  auto subscriber1 = createMockSession();
+  auto subscriber2 = createMockSession();
+
+  doPublishNamespace(publisherSession, kTestNamespace);
+
+  // Upstream returns a SubscribeOk with DYNAMIC_GROUPS = true
+  SubscribeOk upstreamOk;
+  upstreamOk.requestID = RequestID(1);
+  upstreamOk.trackAlias = TrackAlias(1);
+  upstreamOk.expires = std::chrono::milliseconds(0);
+  upstreamOk.groupOrder = GroupOrder::OldestFirst;
+  setPublisherDynamicGroups(upstreamOk, true);
+
+  EXPECT_CALL(*publisherSession, subscribe(_, _))
+      .WillOnce([upstreamOk](auto /*req*/, auto /*consumer*/) {
+        auto handle =
+            std::make_shared<NiceMock<MockSubscriptionHandle>>(upstreamOk);
+        return folly::coro::makeTask<Publisher::SubscribeResult>(
+            folly::Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>(
+                handle));
+      });
+
+  // First subscriber
+  auto consumer1 = createMockConsumer();
+  auto handle1 =
+      subscribeToTrack(subscriber1, kTestTrackName, consumer1, RequestID(1));
+  ASSERT_NE(handle1, nullptr);
+  auto dynGroups1 = getPublisherDynamicGroups(handle1->subscribeOk());
+  ASSERT_TRUE(dynGroups1.has_value());
+  EXPECT_TRUE(*dynGroups1);
+
+  // Late-joining second subscriber – forwarder should propagate the stored
+  // dynamic groups value without another upstream roundtrip
+  auto consumer2 = createMockConsumer();
+  auto handle2 =
+      subscribeToTrack(subscriber2, kTestTrackName, consumer2, RequestID(2));
+  ASSERT_NE(handle2, nullptr);
+  auto dynGroups2 = getPublisherDynamicGroups(handle2->subscribeOk());
+  ASSERT_TRUE(dynGroups2.has_value());
+  EXPECT_TRUE(*dynGroups2);
+
+  removeSession(publisherSession);
+  removeSession(subscriber1);
+  removeSession(subscriber2);
 }
 
 } // namespace moxygen::test
