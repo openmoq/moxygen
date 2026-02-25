@@ -1552,6 +1552,8 @@ TEST_F(MoQRelayTest, TrackStatusViaPrefixMatching) {
 
   removeSession(publisher);
   removeSession(requester);
+}
+
 // Test: Subgroup is tombstoned after CANCELLED error (soft error)
 // Verifies that a CANCELLED error on a subgroup sets it to nullptr (tombstone)
 // but keeps the subscription alive
