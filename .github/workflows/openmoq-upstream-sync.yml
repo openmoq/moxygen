@@ -272,45 +272,15 @@ jobs:
             gh pr merge "$PR_NUM" --auto --merge || echo "Auto-merge not available (branch protection may not be configured)."
           fi
 
-      # ── Notifications ──
-      - name: Notify Slack (candidate created)
-        if: steps.upstream.outputs.should_sync == 'true'
+      # ── Notifications (failures only — successful syncs are quiet) ──
+      - name: Notify Slack (sync failure)
+        if: failure()
+        continue-on-error: true
         uses: slackapi/slack-github-action@v1.26
         with:
           payload: |
             {
-              "channel": "#github-notifications",
-              "text": ":arrows_counterclockwise: *moxygen upstream sync* — candidate PR created\nUpstream: `${{ steps.upstream.outputs.upstream_sha }}`\nPatches applied: ${{ steps.patches.outputs.patches_applied || '0' }}, skipped: ${{ steps.patches.outputs.patches_skipped || '0' }}\nConflicts auto-resolved: ${{ steps.merge.outputs.conflicts_resolved || '0' }}\n<${{ steps.pr.outputs.pr_url }}|View PR>"
+              "text": ":x: *moxygen upstream sync FAILED*\nUpstream: `${{ steps.upstream.outputs.upstream_sha || 'unknown' }}`\nFailed patch: `${{ steps.patches.outputs.failed_patch || 'n/a' }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
             }
         env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-
-      - name: Notify Slack (patch failure)
-        if: failure() && steps.patches.outputs.patch_failed == 'true'
-        uses: slackapi/slack-github-action@v1.26
-        with:
-          payload: |
-            {
-              "channel": "#github-notifications",
-              "text": ":x: *moxygen upstream sync FAILED* — patch application error\nUpstream: `${{ steps.upstream.outputs.upstream_sha }}`\nFailed patch: `${{ steps.patches.outputs.failed_patch }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
-            }
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-
-      - name: Notify email (candidate created)
-        if: steps.upstream.outputs.should_sync == 'true'
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "[moxygen] upstream sync — candidate PR created"
-          to: github-notifications@openmoq.org
-          from: github-ci@openmoq.org
-          body: |
-            Upstream sync candidate PR created for openmoq/moxygen.
-
-            Upstream commit: ${{ steps.upstream.outputs.upstream_sha }}
-            Patches applied: ${{ steps.patches.outputs.patches_applied || '0' }}
-            PR: ${{ steps.pr.outputs.pr_url }}
+          SLACK_WEBHOOK_URL: ${{ secrets.OMOQ_SLACK_WEBHOOK_URL }}
