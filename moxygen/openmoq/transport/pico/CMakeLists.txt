@@ -12,6 +12,7 @@ moxygen_add_library(openmoq_pico_transport
   SRCS
     PicoQuicExecutor.cpp
     PicoQuicWebTransport.cpp
+    MoQPicoQuicServer.cpp
   EXPORTED_DEPS
     moxygen_events_moq_executor
     proxygen::proxygen_http_webtransport
@@ -19,6 +20,8 @@ moxygen_add_library(openmoq_pico_transport
     Folly::folly_function
     Folly::folly_logging_logging
     Folly::folly_network_address
+    Folly::folly_string
+    Folly::folly_coro_blocking_wait
     ${FILTERED_PICOQUIC_LIBRARIES}
 )
 
