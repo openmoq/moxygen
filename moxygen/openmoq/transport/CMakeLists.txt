@@ -1,0 +1,7 @@
+find_package(picoquic QUIET)
+message(STATUS "picoquic_FOUND=${picoquic_FOUND} picoquic_DIR=${picoquic_DIR}")
+if(picoquic_FOUND)
+  add_subdirectory(pico)
+else()
+  message(STATUS "picoquic not found, skipping pico transport")
+endif()
