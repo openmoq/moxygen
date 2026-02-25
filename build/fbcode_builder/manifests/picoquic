@@ -8,6 +8,7 @@ branch = master
 [build]
 builder = cmake
 subdir = .
+patchfile = picoquic_picotls_openssl35.patch
 
 [cmake.defines]
 PICOQUIC_FETCH_PTLS = ON
