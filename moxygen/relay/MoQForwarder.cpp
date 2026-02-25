@@ -5,6 +5,7 @@
  */
 
 #include "moxygen/relay/MoQForwarder.h"
+#include "moxygen/MoQTrackProperties.h"
 
 namespace moxygen {
 
@@ -138,6 +139,10 @@ void MoQForwarder::setDeliveryTimeout(uint64_t timeout) {
   upstreamDeliveryTimeout_ = std::chrono::milliseconds(timeout);
 }
 
+void MoQForwarder::setDynamicGroups(bool enabled) {
+  upstreamDynamicGroups_ = enabled;
+}
+
 void MoQForwarder::setLargest(AbsoluteLocation largest) {
   largest_ = largest;
 }
@@ -175,6 +180,9 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
     subscriber->setParam(
         {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
          static_cast<uint64_t>(upstreamDeliveryTimeout_.count())});
+  }
+  if (upstreamDynamicGroups_.has_value()) {
+    subscriber->setDynamicGroupsExtension(*upstreamDynamicGroups_);
   }
   subscribers_.emplace(sessionPtr, subscriber);
   if (subReq.forward) {
@@ -563,6 +571,10 @@ void MoQForwarder::Subscriber::setParam(const TrackRequestParameter& param) {
     XLOG(ERR) << "setParam: param not allowed for SubscribeOk, key="
               << param.key;
   }
+}
+
+void MoQForwarder::Subscriber::setDynamicGroupsExtension(bool enabled) {
+  setPublisherDynamicGroups(*subscribeOk_, enabled);
 }
 
 folly::coro::Task<folly::Expected<RequestOk, RequestError>>

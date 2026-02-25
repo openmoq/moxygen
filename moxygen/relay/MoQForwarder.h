@@ -45,6 +45,12 @@ class MoQForwarder : public TrackConsumer {
     return upstreamDeliveryTimeout_;
   }
 
+  void setDynamicGroups(bool enabled);
+
+  std::optional<bool> upstreamDynamicGroups() const {
+    return upstreamDynamicGroups_;
+  }
+
   void setLargest(AbsoluteLocation largest);
 
   std::optional<AbsoluteLocation> largest() {
@@ -97,6 +103,9 @@ class MoQForwarder : public TrackConsumer {
     // Updates the params of the subscribeOk
     // updates existing param if key matches, otherwise adds new param
     void setParam(const TrackRequestParameter& param);
+
+    // Adds or replaces the DYNAMIC_GROUPS extension on the subscribeOk
+    void setDynamicGroupsExtension(bool enabled);
 
     folly::coro::Task<folly::Expected<RequestOk, RequestError>> requestUpdate(
         RequestUpdate requestUpdate) override;
@@ -303,6 +312,7 @@ class MoQForwarder : public TrackConsumer {
   std::optional<AbsoluteLocation> largest_;
   // This should eventually be a vector of params that can be cascaded e2e
   std::chrono::milliseconds upstreamDeliveryTimeout_{};
+  std::optional<bool> upstreamDynamicGroups_{};
   std::shared_ptr<Callback> callback_;
   uint64_t forwardingSubscribers_{0};
   bool draining_{false};
