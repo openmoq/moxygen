@@ -71,14 +71,20 @@ class MoQRelaySession : public MoQSession {
       SubscribeNamespace subAnn,
       std::shared_ptr<NamespacePublishHandle> namespacePublishHandle) override;
 
+  folly::coro::Task<void> subscribeNamespaceSenderReadLoop(
+      proxygen::WebTransport::StreamReadHandle* readHandle,
+      std::shared_ptr<Publisher::NamespacePublishHandle>
+          namespacePublishHandle);
+
+ protected:
   void onSubscribeNamespaceImpl(
       const SubscribeNamespace& subscribeNamespace,
-      std::unique_ptr<SubNSReply>&& subNsReply) override;
+      std::shared_ptr<SubNSReply> subNsReply) override;
 
-  std::unique_ptr<SubNSReply> getSubNsReply(
+  std::shared_ptr<SubNSReply> getSubNsReply(
       folly::IOBufQueue& bufQueue,
       proxygen::WebTransport::StreamWriteHandle* writeHandle) override {
-    return std::make_unique<SeparateStreamSubNsReplyBase>(
+    return std::make_shared<SeparateStreamSubNsReply>(
         moqFrameWriter_, bufQueue, writeHandle);
   }
 
@@ -103,10 +109,10 @@ class MoQRelaySession : public MoQSession {
   // Internal publishNamespace handling methods
   folly::coro::Task<void> handleSubscribeNamespace(
       SubscribeNamespace sa,
-      std::unique_ptr<SubNSReply> subNsReply);
+      std::shared_ptr<SubNSReply> subNsReply);
   void subscribeNamespaceOk(
       const SubscribeNamespaceOk& saOk,
-      std::unique_ptr<SubNSReply>&& subNsReply);
+      std::shared_ptr<SubNSReply>&& subNsReply);
   void unsubscribeNamespace(const UnsubscribeNamespace& unsubAnn);
 
   folly::coro::Task<void> handlePublishNamespace(
