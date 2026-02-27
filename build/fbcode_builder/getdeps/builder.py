@@ -137,7 +137,16 @@ class BuilderBase(object):
             return
         old_wd = os.getcwd()
         os.chdir(self.src_dir)
-        print(f"Patching {self.manifest.name} with {self.patchfile} in {self.src_dir}")
+        # Apply patches from the git repo root so paths resolve correctly
+        # even when src_dir is a subdirectory of the repo.
+        try:
+            git_root = subprocess.check_output(
+                ["git", "rev-parse", "--show-toplevel"], text=True
+            ).strip()
+            os.chdir(git_root)
+        except subprocess.CalledProcessError:
+            pass  # not a git repo, stay in src_dir
+        print(f"Patching {self.manifest.name} with {self.patchfile} in {os.getcwd()}")
         patchfile = os.path.join(
             self.build_opts.fbcode_builder_dir, "patches", self.patchfile
         )
@@ -426,6 +435,8 @@ class AutoconfBuilder(BuilderBase):
             inst_dir,
         )
         self.args = args or []
+        if not build_opts.shared_libs and "--disable-shared" not in self.args:
+            self.args.append("--disable-shared")
         self.conf_env_args = conf_env_args or {}
 
     @property

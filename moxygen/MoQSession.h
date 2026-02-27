@@ -170,10 +170,10 @@ class MoQSession : public Subscriber,
     return negotiatedVersion_;
   }
 
-  virtual std::unique_ptr<SubNSReply> getSubNsReply(
+  virtual std::shared_ptr<SubNSReply> getSubNsReply(
       folly::IOBufQueue& bufQueue,
       proxygen::WebTransport::StreamWriteHandle* writeHandle) {
-    return std::make_unique<SeparateStreamSubNsReplyBase>(
+    return std::make_shared<SeparateStreamSubNsReplyBase>(
         moqFrameWriter_, bufQueue, writeHandle);
   }
 
@@ -432,6 +432,7 @@ class MoQSession : public Subscriber,
   class SubscribeTrackReceiveState;
   class FetchTrackReceiveState;
   friend class FetchTrackReceiveState;
+  friend class SubNsStreamCallback;
 
   std::shared_ptr<SubscribeTrackReceiveState> getSubscribeTrackReceiveState(
       TrackAlias alias);
@@ -455,10 +456,6 @@ class MoQSession : public Subscriber,
 
   folly::coro::Task<void> controlWriteLoop(
       proxygen::WebTransport::StreamWriteHandle* writeHandle);
-  folly::coro::Task<void> controlReadLoop(
-      proxygen::WebTransport::StreamReadHandle* readHandle,
-      proxygen::WebTransport::StreamData initialData,
-      MoQControlCodec* controlCodec);
 
   folly::coro::Task<void> unidirectionalReadLoop(
       std::shared_ptr<MoQSession> session,
@@ -570,6 +567,11 @@ class MoQSession : public Subscriber,
 
   void requestUpdate(const RequestUpdate& reqUpdate);
 
+  folly::coro::Task<void> controlReadLoop(
+      proxygen::WebTransport::StreamReadHandle* readHandle,
+      proxygen::WebTransport::StreamData initialData,
+      MoQControlCodec* controlCodec);
+
   // Core session state
   MoQControlCodec::Direction dir_;
   folly::MaybeManagedPtr<proxygen::WebTransport> wt_;
@@ -625,11 +627,11 @@ class MoQSession : public Subscriber,
       const PublishNamespaceError& publishNamespaceError);
   void subscribeNamespaceError(
       const SubscribeNamespaceError& subscribeNamespaceError,
-      std::unique_ptr<SubNSReply>&& subNsReply);
+      std::shared_ptr<SubNSReply>&& subNsReply);
 
   virtual void onSubscribeNamespaceImpl(
       const SubscribeNamespace& subscribeNamespace,
-      std::unique_ptr<SubNSReply>&& subNsReply);
+      std::shared_ptr<SubNSReply> subNsReply);
 
   // REQUEST_UPDATE error response - available for subclass handlers
   void requestUpdateError(
@@ -862,6 +864,12 @@ class MoQSession : public Subscriber,
  protected:
   std::optional<uint64_t> negotiatedVersion_;
 
+  // Shared receive-side auth token cache. All codecs that parse auth tokens
+  // (control stream, draft16+ SUBSCRIBE_NAMESPACE bidi streams, etc.) point to
+  // this cache so that aliases registered on one stream are visible on all
+  // others and the total budget is enforced once rather than per-codec.
+  MoQTokenCache receiveTokenCache_;
+
  private:
   // Private implementation methods
   void initializeNegotiatedVersion(uint64_t negotiatedVersion);
@@ -893,6 +901,7 @@ class MoQSession : public Subscriber,
   MoQSessionCloseCallback* closeCallback_{nullptr};
   MoQSettings moqSettings_;
 
+  // Send-side auth token cache (for aliasifyAuthTokens).
   MoQTokenCache tokenCache_{1024};
 
   // Cached transport info to avoid expensive getTransportInfo calls

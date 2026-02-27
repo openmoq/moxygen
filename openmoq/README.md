@@ -8,6 +8,8 @@ This directory contains OpenMOQ-specific files that are not part of the upstream
 - **`patches/`** — Ordered patch files applied during upstream sync. Named with
   numeric prefixes for application order (e.g., `001-libaio-source-build.patch`).
   Applied sequentially via `git am` in the `openmoq-upstream-sync` workflow.
+- **`scripts/`** — Build and CI scripts extracted from workflows for local testing.
+  See [Scripts](#scripts) below.
 
 ## Workflow Files
 
@@ -65,6 +67,41 @@ that would otherwise be overwritten on each sync.
   overwritten on the next upstream sync.
 - **Direct changes** — for OpenMOQ-owned files (`openmoq/`, `.github/workflows/openmoq-*.yml`,
   `docker/` Dockerfiles) that are not overwritten by upstream syncs.
+
+## Scripts
+
+### `openmoq/scripts/collect-artifacts.sh`
+
+Collects getdeps install directories into a release tarball. Extracted from the
+`openmoq-publish-artifacts.yml` workflow so it can be tested locally.
+
+**What it does:**
+- Queries `getdeps.py show-inst-dir --recursive` for all install dirs
+- Excludes build-tool dependencies (ninja, cmake, autoconf, automake, libtool, gperf)
+- Strips debug symbols from static libraries (`.a`) and shared objects (`.so`)
+- On Linux: saves `.debug` sidecar files in `.debug/` subdirectories with GNU debuglink
+- Reports before/after sizes and fails if the tarball exceeds the 2 GiB GitHub Release limit
+
+```bash
+# Local testing (requires a getdeps scratch dir from a previous build)
+openmoq/scripts/collect-artifacts.sh \
+  --scratch-path /tmp/moxygen-scratch \
+  --output /tmp/test-artifact.tar.gz \
+  --src-dir .
+```
+
+### `openmoq/scripts/create-release.sh`
+
+Creates a GitHub Release from artifact tarballs and prunes old releases.
+
+```bash
+# Local testing (with --dry-run)
+openmoq/scripts/create-release.sh \
+  --artifacts-dir ./my-artifacts \
+  --sha "$(git rev-parse HEAD)" \
+  --keep 20 \
+  --dry-run
+```
 
 ## Building Moxygen
 

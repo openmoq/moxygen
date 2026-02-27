@@ -33,6 +33,7 @@ class MoQFramerTest : public ::testing::TestWithParam<uint64_t> {
   void SetUp() override {
     parser_.initializeVersion(GetParam());
     writer_.initializeVersion(GetParam());
+    parser_.setTokenCache(&tokenCache_);
   }
 
   StreamType parseStreamType(folly::io::Cursor& cursor) {
@@ -172,22 +173,27 @@ class MoQFramerTest : public ::testing::TestWithParam<uint64_t> {
     auto r14 = parser_.parseGoaway(cursor, frameLength(cursor));
     testUnderflowResult(r14);
 
-    skip(cursor, 1);
-    auto r9a = parser_.parseSubscribeNamespace(cursor, frameLength(cursor));
-    testUnderflowResult(r9a);
+    // SubscribeNamespace messages are not on control stream for draft 16+
+    if (getDraftMajorVersion(GetParam()) < 16) {
+      skip(cursor, 1);
+      auto r9a = parser_.parseSubscribeNamespace(cursor, frameLength(cursor));
+      testUnderflowResult(r9a);
 
-    skip(cursor, 1);
-    auto r10a = parser_.parseSubscribeNamespaceOk(cursor, frameLength(cursor));
-    testUnderflowResult(r10a);
+      skip(cursor, 1);
+      auto r10a =
+          parser_.parseSubscribeNamespaceOk(cursor, frameLength(cursor));
+      testUnderflowResult(r10a);
 
-    skip(cursor, 1);
-    auto r11a = parser_.parseRequestError(
-        cursor, frameLength(cursor), FrameType::SUBSCRIBE_NAMESPACE_ERROR);
-    testUnderflowResult(r11a);
+      skip(cursor, 1);
+      auto r11a = parser_.parseRequestError(
+          cursor, frameLength(cursor), FrameType::SUBSCRIBE_NAMESPACE_ERROR);
+      testUnderflowResult(r11a);
 
-    skip(cursor, 1);
-    auto r13a = parser_.parseUnsubscribeNamespace(cursor, frameLength(cursor));
-    testUnderflowResult(r13a);
+      skip(cursor, 1);
+      auto r13a =
+          parser_.parseUnsubscribeNamespace(cursor, frameLength(cursor));
+      testUnderflowResult(r13a);
+    }
 
     skip(cursor, 1);
     auto r16 = parser_.parseFetch(cursor, frameLength(cursor));
@@ -281,6 +287,7 @@ class MoQFramerTest : public ::testing::TestWithParam<uint64_t> {
  protected:
   MoQFrameParser parser_;
   MoQFrameWriter writer_;
+  MoQTokenCache tokenCache_;
 
   ObjectHeader testUnderflowDatagramHelper(
       folly::IOBufQueue& writeBuf,
@@ -2382,6 +2389,8 @@ TEST(MoQFramerTest, WriteServerSetupWithAlpnVersion15NoVersionField) {
 TEST(MoQFramerTest, ClientSetupRejectsDelete) {
   MoQFrameParser parser;
   parser.initializeVersion(kVersionDraftCurrent);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
   parser.setTokenCacheMaxSize(100);
 
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
@@ -2430,6 +2439,8 @@ TEST(MoQFramerTest, ClientSetupRejectsDelete) {
 TEST(MoQFramerTest, ClientSetupRejectsUseAlias) {
   MoQFrameParser parser;
   parser.initializeVersion(kVersionDraftCurrent);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
   parser.setTokenCacheMaxSize(100);
 
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
@@ -3241,6 +3252,68 @@ TEST_P(MoQFramerV15PlusTest, SubscribeNamespaceForwardFalse) {
       subscribeNamespace.trackNamespacePrefix);
   EXPECT_EQ(parseResult->forward, subscribeNamespace.forward);
   EXPECT_EQ(parseResult->forward, false);
+}
+
+// Test PUBLISH with largest location roundtrips correctly for v15+
+// (largest is sent as LARGEST_OBJECT parameter, not fixed fields)
+TEST_P(MoQFramerV15PlusTest, PublishWithLargestLocation) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  PublishRequest publishRequest;
+  publishRequest.requestID = RequestID(100);
+  publishRequest.fullTrackName =
+      FullTrackName({TrackNamespace({"test"}), "pub"});
+  publishRequest.trackAlias = TrackAlias(42);
+  publishRequest.groupOrder = GroupOrder::NewestFirst;
+  publishRequest.largest = AbsoluteLocation{5, 10};
+  publishRequest.forward = true;
+
+  auto writeResult = writer_.writePublish(writeBuf, publishRequest);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::PUBLISH));
+
+  auto parseResult = parser_.parsePublish(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  EXPECT_EQ(parseResult->requestID, publishRequest.requestID);
+  EXPECT_EQ(parseResult->trackAlias, publishRequest.trackAlias);
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::NewestFirst);
+  EXPECT_TRUE(parseResult->largest.has_value());
+  EXPECT_EQ(parseResult->largest->group, 5);
+  EXPECT_EQ(parseResult->largest->object, 10);
+  EXPECT_TRUE(parseResult->forward);
+}
+
+// Test PUBLISH without largest location roundtrips correctly for v15+
+TEST_P(MoQFramerV15PlusTest, PublishWithoutLargestLocation) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  PublishRequest publishRequest;
+  publishRequest.requestID = RequestID(101);
+  publishRequest.fullTrackName =
+      FullTrackName({TrackNamespace({"test"}), "pub"});
+  publishRequest.trackAlias = TrackAlias(43);
+  publishRequest.largest = std::nullopt;
+
+  auto writeResult = writer_.writePublish(writeBuf, publishRequest);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::PUBLISH));
+
+  auto parseResult = parser_.parsePublish(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  EXPECT_EQ(parseResult->requestID, publishRequest.requestID);
+  EXPECT_FALSE(parseResult->largest.has_value());
 }
 
 INSTANTIATE_TEST_SUITE_P(
