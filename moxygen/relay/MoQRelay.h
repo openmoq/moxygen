@@ -205,9 +205,6 @@ class MoQRelay : public Publisher,
       std::shared_ptr<Publisher::SubscriptionHandle> handle,
       bool forward);
 
-  // Sends a REQUEST_UPDATE carrying only the NEW_GROUP_REQUEST parameter
-  // (range and priority are left at their defaults; forward is unset so the
-  // upstream keeps its current state).
   folly::coro::Task<void> doNewGroupRequestUpdate(
       std::shared_ptr<Publisher::SubscriptionHandle> handle,
       uint64_t newGroupRequestValue);
