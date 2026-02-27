@@ -212,6 +212,26 @@ jobs:
           BRANCH="sync-upstream-${{ steps.upstream.outputs.short_sha }}"
           git push origin "$BRANCH"
 
+      - name: Close stale sync PRs
+        if: steps.upstream.outputs.should_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.OMOQ_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          NEW_BRANCH="sync-upstream-${{ steps.upstream.outputs.short_sha }}"
+          # Close any open sync PRs targeting a different (older) upstream commit
+          gh api repos/${{ github.repository }}/pulls?state=open \
+            --jq '.[] | select(.head.ref | startswith("sync-upstream-")) | "\(.number) \(.head.ref)"' \
+          | while read -r NUM REF; do
+              if [ "$REF" != "$NEW_BRANCH" ]; then
+                echo "Closing stale sync PR #$NUM ($REF)"
+                gh api repos/${{ github.repository }}/pulls/$NUM \
+                  -X PATCH -f state=closed || true
+                # Delete the stale branch
+                gh api repos/${{ github.repository }}/git/refs/heads/$REF \
+                  -X DELETE || true
+              fi
+            done
+
       - name: Create candidate PR
         if: steps.upstream.outputs.should_sync == 'true'
         id: pr
@@ -260,17 +280,52 @@ jobs:
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
           echo "Created PR: $PR_URL"
 
-      # ── Step 5: Enable auto-merge ──
-      - name: Enable auto-merge
+      # ── Step 5: Wait for CI and merge ──
+      - name: Wait for CI checks and merge
         if: steps.upstream.outputs.should_sync == 'true'
         env:
           GH_TOKEN: ${{ secrets.OMOQ_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="sync-upstream-${{ steps.upstream.outputs.short_sha }}"
-          PR_NUM=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number')
-          if [ -n "$PR_NUM" ]; then
-            gh pr merge "$PR_NUM" --auto --merge || echo "Auto-merge not available (branch protection may not be configured)."
+          PR_NUM=$(gh api repos/${{ github.repository }}/pulls \
+            --jq ".[] | select(.head.ref==\"$BRANCH\") | .number")
+
+          if [ -z "$PR_NUM" ]; then
+            echo "::error::Could not find PR for branch $BRANCH"
+            exit 1
           fi
+
+          echo "Waiting for CI checks on PR #$PR_NUM (up to 90 minutes)..."
+          MAX_WAIT=5400  # 90 minutes
+          INTERVAL=60    # check every 60 seconds
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+
+            # Get combined check status for the PR head
+            STATUS=$(gh api repos/${{ github.repository }}/commits/$BRANCH/status \
+              --jq '.state')
+
+            echo "  ${ELAPSED}s: status=$STATUS"
+
+            if [ "$STATUS" = "success" ]; then
+              echo "CI passed. Merging PR #$PR_NUM..."
+              gh api repos/${{ github.repository }}/pulls/$PR_NUM/merge \
+                -X PUT \
+                -f merge_method=merge \
+                --jq '.message'
+              echo "Merged successfully."
+              exit 0
+            elif [ "$STATUS" = "failure" ] || [ "$STATUS" = "error" ]; then
+              echo "::warning::CI failed on PR #$PR_NUM. Leaving PR open for manual review."
+              exit 0
+            fi
+            # "pending" — keep waiting
+          done
+
+          echo "::warning::CI did not complete within 90 minutes. Leaving PR #$PR_NUM open."
 
       # ── Notifications (failures only — successful syncs are quiet) ──
       - name: Notify Slack (sync failure)
