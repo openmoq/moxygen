@@ -51,18 +51,15 @@ class MoQForwarder : public TrackConsumer {
     return upstreamDynamicGroups_;
   }
 
-  // Record a NEW_GROUP_REQUEST that was forwarded upstream (e.g. on the first
-  // subscriber path where we pass the value through unconditionally).
   void setOutstandingNewGroupRequest(uint64_t value);
 
-  // Returns true if the NEW_GROUP_REQUEST with the given value should be sent
-  // upstream. Does not mutate state; call setOutstandingNewGroupRequest()
-  // before triggering the upstream update.
   bool shouldForwardNewGroupRequest(uint64_t requestedGroup) const;
 
   std::optional<uint64_t> outstandingNewGroupRequest() const {
     return outstandingNewGroupRequest_;
   }
+
+  void triggerUpstreamNewGroupRequest();
 
   void setLargest(AbsoluteLocation largest);
 

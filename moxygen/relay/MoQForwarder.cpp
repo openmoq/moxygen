@@ -535,17 +535,17 @@ void MoQForwarder::removeForwardingSubscriber() {
 }
 
 bool MoQForwarder::shouldForwardNewGroupRequest(uint64_t requestedGroup) const {
-  // Condition 1: the track must support dynamic groups.
+  // the track must support dynamic groups.
   if (!upstreamDynamicGroups_.has_value() || !*upstreamDynamicGroups_) {
     return false;
   }
-  // Condition 2: non-zero value <= LargestGroup means the new group is already
+  // non-zero value <= LargestGroup means the new group is already
   // available — do not send upstream.
   if (requestedGroup != 0 && largest_.has_value() &&
       requestedGroup <= largest_->group) {
     return false;
   }
-  // Condition 3: already have an outstanding request with >= value.
+  // already have an outstanding request with >= value.
   if (outstandingNewGroupRequest_.has_value() &&
       *outstandingNewGroupRequest_ >= requestedGroup) {
     return false;

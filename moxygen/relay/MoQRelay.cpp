@@ -36,8 +36,6 @@ folly::coro::Task<void> MoQRelay::doSubscribeUpdate(
 }
 
 // Sends a REQUEST_UPDATE that carries only the NEW_GROUP_REQUEST parameter.
-// Range and priority are left at their defaults; forward is left unset so the
-// upstream keeps whichever forwarding state it already has.
 folly::coro::Task<void> MoQRelay::doNewGroupRequestUpdate(
     std::shared_ptr<Publisher::SubscriptionHandle> handle,
     uint64_t newGroupRequestValue) {
@@ -1197,8 +1195,8 @@ void MoQRelay::newGroupRequestDetected(MoQForwarder* forwarder) {
     return;
   }
   auto& subscription = subscriptionIt->second;
-  if (!subscription.promise.isFulfilled()) {
-    // Ignore: upstream subscribe is still in flight, no handle available yet.
+  auto ngr = forwarder->outstandingNewGroupRequest();
+  if (!ngr.has_value()) {
     return;
   }
   XLOG(INFO) << "New group request detected for " << subscriptionIt->first;
@@ -1206,8 +1204,7 @@ void MoQRelay::newGroupRequestDetected(MoQForwarder* forwarder) {
   auto exec = subscription.upstream->getExecutor();
   co_withExecutor(
       exec,
-      doNewGroupRequestUpdate(
-          subscription.handle, forwarder->outstandingNewGroupRequest().value()))
+      doNewGroupRequestUpdate(subscription.handle, *ngr))
       .start();
 }
 
