@@ -404,6 +404,10 @@ class MoQFrameParser {
       std::optional<bool>& forwardField,
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
+  void handleNewGroupRequestParam(
+      std::optional<uint64_t>& newGroupRequestField,
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
   // Version translation: convert track property params to extensions for < v16
   void convertTrackPropertyParamsToExtensions(
       const TrackRequestParameters& params,

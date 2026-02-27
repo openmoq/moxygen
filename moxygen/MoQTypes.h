@@ -443,6 +443,7 @@ enum class TrackRequestParamKey : uint64_t {
   GROUP_ORDER = 0x22,
   LARGEST_OBJECT = 0x9,
   FORWARD = 0x10,
+  NEW_GROUP_REQUEST = 0x32,
 };
 
 class Parameters {
@@ -969,6 +970,7 @@ struct SubscribeRequest {
   LocationType locType;
   std::optional<AbsoluteLocation> start;
   uint64_t endGroup;
+  std::optional<uint64_t> newGroupRequest{};
   TrackRequestParameters params{FrameType::SUBSCRIBE};
 };
 
@@ -981,6 +983,7 @@ struct RequestUpdate {
   // Draft 15+: Optional forward field. When absent, existing forward state is
   // preserved. For earlier drafts, this is always set during parsing.
   std::optional<bool> forward;
+  std::optional<uint64_t> newGroupRequest{};
   TrackRequestParameters params{FrameType::SUBSCRIBE_UPDATE};
 };
 
@@ -1030,6 +1033,7 @@ struct PublishOk {
   LocationType locType;
   std::optional<AbsoluteLocation> start;
   std::optional<uint64_t> endGroup;
+  std::optional<uint64_t> newGroupRequest{};
   TrackRequestParameters params{FrameType::PUBLISH_OK};
 };
 

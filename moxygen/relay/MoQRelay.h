@@ -175,6 +175,7 @@ class MoQRelay : public Publisher,
 
   void onEmpty(MoQForwarder* forwarder) override;
   void forwardChanged(MoQForwarder* forwarder) override;
+  void newGroupRequestDetected(MoQForwarder* forwarder) override;
 
   folly::coro::Task<void> publishNamespaceToSession(
       std::shared_ptr<MoQSession> session,
@@ -190,6 +191,13 @@ class MoQRelay : public Publisher,
   folly::coro::Task<void> doSubscribeUpdate(
       std::shared_ptr<Publisher::SubscriptionHandle> handle,
       bool forward);
+
+  // Sends a REQUEST_UPDATE carrying only the NEW_GROUP_REQUEST parameter
+  // (range and priority are left at their defaults; forward is unset so the
+  // upstream keeps its current state).
+  folly::coro::Task<void> doNewGroupRequestUpdate(
+      std::shared_ptr<Publisher::SubscriptionHandle> handle,
+      uint64_t newGroupRequestValue);
 
   void publishNamespaceDone(
       const TrackNamespace& trackNamespace,
