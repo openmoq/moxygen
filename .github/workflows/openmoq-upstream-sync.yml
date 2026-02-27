@@ -1,0 +1,205 @@
+name: OpenMOQ Upstream Sync
+
+# Two-branch model: mirrors upstream to `main`, creates merge PR to `openmoq-main`.
+# See: https://github.com/openmoq/o-rly/blob/main/design/GITHUB_WORKFLOW.md
+
+on:
+  schedule:
+    - cron: '0 7 * * *'   # Daily at 02:00 ET (07:00 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    steps:
+      # ── Generate GitHub App token (bot identity for PRs) ──
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.OMOQ_APP_ID }}
+          private-key: ${{ secrets.OMOQ_APP_PRIV_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: openmoq-main
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      # ── Step 1: Find newest green upstream commit ──
+      - name: Check upstream status
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git remote add upstream https://github.com/facebookexperimental/moxygen.git || true
+          git fetch upstream main
+          git fetch origin main
+
+          COMMITS=$(gh api 'repos/facebookexperimental/moxygen/commits?per_page=20' \
+            --jq '.[].sha')
+
+          echo "Scanning up to 20 recent upstream commits..."
+          UPSTREAM_SHA=""
+
+          for SHA in $COMMITS; do
+            SHORT="${SHA:0:12}"
+
+            # Skip if already on our main mirror
+            if git merge-base --is-ancestor "$SHA" origin/main 2>/dev/null; then
+              echo "  $SHORT: already on main mirror (stopping scan)"
+              break
+            fi
+
+            # Check CI status
+            STATE=$(gh api "repos/facebookexperimental/moxygen/commits/$SHA/check-suites" \
+              -q '[.check_suites[] | select(.app.name=="GitHub Actions")] |
+                  if length == 0 then "failure"
+                  elif any(.status == "queued" or .status == "in_progress") then "pending"
+                  elif all(.conclusion == "success") then "success"
+                  else "failure" end')
+
+            echo "  $SHORT: $STATE"
+
+            if [ "$STATE" = "success" ]; then
+              UPSTREAM_SHA="$SHA"
+              break
+            fi
+          done
+
+          if [ -z "$UPSTREAM_SHA" ]; then
+            echo "No qualifying upstream commit found. Skipping."
+            echo "should_sync=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SHORT_SHA="${UPSTREAM_SHA:0:12}"
+          echo ""
+          echo "Selected upstream commit: $SHORT_SHA"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "should_sync=true" >> "$GITHUB_OUTPUT"
+
+      # ── Step 2: Fast-forward main to upstream ──
+      - name: Update main mirror
+        if: steps.upstream.outputs.should_sync == 'true'
+        run: |
+          UPSTREAM_SHA="${{ steps.upstream.outputs.upstream_sha }}"
+
+          # Verify fast-forward (upstream should never rewrite history)
+          if ! git merge-base --is-ancestor origin/main "$UPSTREAM_SHA"; then
+            echo "::error::Upstream is not a fast-forward from current main."
+            exit 1
+          fi
+
+          git push origin "$UPSTREAM_SHA:refs/heads/main"
+          echo "Updated main mirror to ${{ steps.upstream.outputs.short_sha }}"
+
+      # ── Step 3: Check if merge to openmoq-main is needed ──
+      - name: Check merge status
+        if: steps.upstream.outputs.should_sync == 'true'
+        id: merge
+        run: |
+          git fetch origin main openmoq-main
+          if git merge-base --is-ancestor origin/main origin/openmoq-main; then
+            echo "openmoq-main already contains all commits from main. Nothing to merge."
+            echo "needs_merge=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New upstream commits need merging into openmoq-main."
+            echo "needs_merge=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Step 4: Create or update PR main → openmoq-main ──
+      - name: Check for existing sync PR
+        if: steps.merge.outputs.needs_merge == 'true'
+        id: existing_pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # If a sync PR already exists, it auto-updates when main advances
+          PR_NUM=$(gh api repos/${{ github.repository }}/pulls \
+            -f state=open -f base=openmoq-main -f head=main \
+            --jq '.[0].number // empty')
+
+          if [ -n "$PR_NUM" ]; then
+            echo "Existing sync PR #$PR_NUM will auto-include new commits."
+            echo "pr_exists=true" >> "$GITHUB_OUTPUT"
+            echo "pr_num=$PR_NUM" >> "$GITHUB_OUTPUT"
+          else
+            echo "No existing sync PR. Will create one."
+            echo "pr_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create sync PR
+        if: steps.merge.outputs.needs_merge == 'true' && steps.existing_pr.outputs.pr_exists == 'false'
+        id: new_pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          UPSTREAM_SHA="${{ steps.upstream.outputs.upstream_sha }}"
+          SHORT_SHA="${{ steps.upstream.outputs.short_sha }}"
+
+          PR_NUM=$(gh api repos/${{ github.repository }}/pulls \
+            -f title="sync: upstream moxygen $SHORT_SHA" \
+            -f body="$(cat <<EOF
+          Automated upstream sync.
+
+          - **Upstream commit:** [\`${SHORT_SHA}\`](https://github.com/facebookexperimental/moxygen/commit/$UPSTREAM_SHA)
+          - **Upstream status:** success (green)
+          - **Merge type:** git merge (main → openmoq-main)
+
+          CI will validate the standalone build. On success, this PR auto-merges.
+
+          Created by \`openmoq-upstream-sync\` workflow.
+          EOF
+          )" \
+            -f head="main" \
+            -f base="openmoq-main" \
+            --jq '.number')
+
+          echo "Created sync PR #$PR_NUM"
+          echo "pr_num=$PR_NUM" >> "$GITHUB_OUTPUT"
+
+      # ── Step 5: Approve and enable auto-merge ──
+      - name: Approve PR
+        if: steps.merge.outputs.needs_merge == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.OMOQ_SYNC_TOKEN }}
+        run: |
+          PR_NUM="${{ steps.new_pr.outputs.pr_num || steps.existing_pr.outputs.pr_num }}"
+          [ -z "$PR_NUM" ] && { echo "::warning::No PR number"; exit 0; }
+
+          echo "Approving PR #$PR_NUM..."
+          gh api repos/${{ github.repository }}/pulls/$PR_NUM/reviews \
+            -f event=APPROVE \
+            -f body="Auto-approved by upstream sync workflow." \
+            --jq '.state'
+
+      - name: Enable auto-merge
+        if: steps.merge.outputs.needs_merge == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          PR_NUM="${{ steps.new_pr.outputs.pr_num || steps.existing_pr.outputs.pr_num }}"
+          [ -z "$PR_NUM" ] && { echo "::warning::No PR number"; exit 0; }
+
+          echo "Enabling auto-merge on PR #$PR_NUM..."
+          gh pr merge "$PR_NUM" --auto --merge \
+            || echo "::warning::Auto-merge not enabled (check repo settings)."
+
+      # ── Notifications (failures only) ──
+      - name: Notify Slack (sync failure)
+        if: failure()
+        continue-on-error: true
+        uses: slackapi/slack-github-action@v1.26
+        with:
+          payload: |
+            {
+              "text": ":x: *moxygen upstream sync FAILED*\nUpstream: `${{ steps.upstream.outputs.upstream_sha || 'unknown' }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.OMOQ_SLACK_WEBHOOK_URL }}
