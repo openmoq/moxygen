@@ -484,6 +484,24 @@ folly::coro::Task<void> MoQRelay::publishToSession(
   subscriber->range =
       toSubscribeRange(pubOk.start, end, pubOk.locType, forwarder->largest());
   subscriber->shouldForward = pubOk.forward;
+
+  // If the downstream PUBLISH_OK carries a NEW_GROUP_REQUEST, forward it
+  // upstream via REQUEST_UPDATE if it passes the forwarding check.
+  // Re-lookup subscriptions_ since the co_await above may have invalidated
+  // any prior state, and null-check handle since onPublishDone may have fired.
+  if (pubOk.newGroupRequest.has_value() &&
+      forwarder->shouldForwardNewGroupRequest(*pubOk.newGroupRequest)) {
+    forwarder->setOutstandingNewGroupRequest(*pubOk.newGroupRequest);
+    auto subIt = subscriptions_.find(pub.fullTrackName);
+    if (subIt != subscriptions_.end() && subIt->second.handle) {
+      auto exec = subIt->second.upstream->getExecutor();
+      co_withExecutor(
+          exec,
+          doNewGroupRequestUpdate(
+              subIt->second.handle, *pubOk.newGroupRequest))
+          .start();
+    }
+  }
 }
 
 class MoQRelay::NamespaceSubscription
