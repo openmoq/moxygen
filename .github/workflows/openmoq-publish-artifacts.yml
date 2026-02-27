@@ -1,0 +1,156 @@
+name: OpenMOQ Publish Artifacts
+
+# Implements GITHUB_WORKFLOW.md Section 5: Moxygen Fork CI — Artifact Publishing
+# On merge to main, builds moxygen + all Meta deps on each target platform and
+# publishes per-architecture artifact bundles as a GitHub Release keyed by commit SHA.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create releases
+  packages: write   # GHCR (future)
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Build artifact bundles per platform/architecture
+  # ──────────────────────────────────────────────────────────────
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native CI artifacts (for o-rly native builds)
+          - name: ubuntu-22.04-x86_64
+            runner: ubuntu-22.04
+            artifact: moxygen-ubuntu-22.04-x86_64.tar.gz
+            container: ""
+
+          - name: macos-15-arm64
+            runner: macos-15
+            artifact: moxygen-macos-15-arm64.tar.gz
+            container: ""
+
+          # Docker-compatible artifacts (built on bookworm for glibc compat)
+          - name: bookworm-amd64
+            runner: ubuntu-22.04
+            artifact: moxygen-bookworm-amd64.tar.gz
+            container: debian:bookworm
+
+          - name: bookworm-arm64
+            runner: ubuntu-22.04-arm
+            artifact: moxygen-bookworm-arm64.tar.gz
+            container: debian:bookworm
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container || null }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps (container)
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential python3 curl git ca-certificates \
+            pkg-config libssl-dev m4 autoconf automake libtool \
+            binutils
+
+      - name: Install system deps (Ubuntu runner)
+        if: matrix.container == '' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3 curl pkg-config \
+            libssl-dev m4
+
+      - name: Install system deps (macOS runner)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja openssl pkg-config
+
+      - name: Install getdeps system deps
+        run: |
+          python3 build/fbcode_builder/getdeps.py \
+            install-system-deps \
+            --recursive moxygen || true
+
+      - name: Build moxygen + deps
+        run: |
+          python3 build/fbcode_builder/getdeps.py \
+            build \
+            --no-tests \
+            --src-dir=. \
+            --scratch-path "${{ runner.temp }}/moxygen-scratch" \
+            --extra-cmake-defines '{"CMAKE_FIND_LIBRARY_SUFFIXES": ".a", "BUILD_SHARED_LIBS": "OFF"}' \
+            moxygen
+
+      # Use the collect-artifacts script instead of inline logic.
+      # Writes tarball to $GITHUB_WORKSPACE/ so it's accessible from both
+      # the container and the host (fixes bookworm upload-artifact path issue).
+      - name: Collect and package artifacts
+        run: |
+          bash openmoq/scripts/collect-artifacts.sh \
+            --scratch-path "${{ runner.temp }}/moxygen-scratch" \
+            --output "$GITHUB_WORKSPACE/${{ matrix.artifact }}" \
+            --src-dir .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ github.workspace }}/${{ matrix.artifact }}
+          retention-days: 90
+
+      # Debug symbols are in a separate -dbg.tar.gz produced by collect-artifacts.sh
+      - name: Upload debug symbols artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-dbg
+          path: ${{ github.workspace }}/*-dbg.tar.gz
+          if-no-files-found: ignore
+          retention-days: 90
+
+  # ──────────────────────────────────────────────────────────────
+  # Create GitHub Release with all artifacts
+  # ──────────────────────────────────────────────────────────────
+  release:
+    runs-on: ubuntu-22.04
+    needs: [build]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+        if: needs.build.result == 'success'
+
+      - name: Download all artifacts
+        if: needs.build.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create release and prune old builds
+        if: needs.build.result == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash openmoq/scripts/create-release.sh \
+            --artifacts-dir artifacts/ \
+            --sha "$GITHUB_SHA" \
+            --keep 20
+
+      # ── Notifications ──
+      - name: Notify Slack
+        if: always()
+        continue-on-error: true
+        uses: slackapi/slack-github-action@v1.26
+        with:
+          payload: |
+            {
+              "text": "${{ needs.build.result == 'success' && ':package: *moxygen build artifacts published*' || ':x: *moxygen artifact build FAILED*' }}\nCommit: `${{ github.sha }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.OMOQ_SLACK_WEBHOOK_URL }}
