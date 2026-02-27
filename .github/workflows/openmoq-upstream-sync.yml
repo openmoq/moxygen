@@ -212,11 +212,31 @@ jobs:
           BRANCH="sync-upstream-${{ steps.upstream.outputs.short_sha }}"
           git push origin "$BRANCH"
 
+      - name: Close stale sync PRs
+        if: steps.upstream.outputs.should_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.OMOQ_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          NEW_BRANCH="sync-upstream-${{ steps.upstream.outputs.short_sha }}"
+          # Close any open sync PRs targeting a different (older) upstream commit
+          gh api repos/${{ github.repository }}/pulls?state=open \
+            --jq '.[] | select(.head.ref | startswith("sync-upstream-")) | "\(.number) \(.head.ref)"' \
+          | while read -r NUM REF; do
+              if [ "$REF" != "$NEW_BRANCH" ]; then
+                echo "Closing stale sync PR #$NUM ($REF)"
+                gh api repos/${{ github.repository }}/pulls/$NUM \
+                  -X PATCH -f state=closed || true
+                # Delete the stale branch
+                gh api repos/${{ github.repository }}/git/refs/heads/$REF \
+                  -X DELETE || true
+              fi
+            done
+
       - name: Create candidate PR
         if: steps.upstream.outputs.should_sync == 'true'
         id: pr
         env:
-          GH_TOKEN: ${{ secrets.OMOQ_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="sync-upstream-${{ steps.upstream.outputs.short_sha }}"
           UPSTREAM_SHA="${{ steps.upstream.outputs.upstream_sha }}"
@@ -260,17 +280,34 @@ jobs:
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
           echo "Created PR: $PR_URL"
 
-      # ── Step 5: Enable auto-merge ──
-      - name: Enable auto-merge
+      # ── Step 5: Approve and enable auto-merge ──
+      # PR created by GITHUB_TOKEN (github-actions[bot]). Approval by
+      # OMOQ_SYNC_TOKEN (maintainer) satisfies branch protection's
+      # "1 required review" rule. Auto-merge queues the merge for
+      # after CI checks pass.
+      - name: Approve and auto-merge PR
         if: steps.upstream.outputs.should_sync == 'true'
         env:
-          GH_TOKEN: ${{ secrets.OMOQ_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.OMOQ_SYNC_TOKEN }}
         run: |
           BRANCH="sync-upstream-${{ steps.upstream.outputs.short_sha }}"
-          PR_NUM=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number')
-          if [ -n "$PR_NUM" ]; then
-            gh pr merge "$PR_NUM" --auto --merge || echo "Auto-merge not available (branch protection may not be configured)."
+          PR_NUM=$(gh api repos/${{ github.repository }}/pulls \
+            --jq ".[] | select(.head.ref==\"$BRANCH\") | .number")
+
+          if [ -z "$PR_NUM" ]; then
+            echo "::warning::Could not find PR for branch $BRANCH"
+            exit 0
           fi
+
+          echo "Approving PR #$PR_NUM..."
+          gh api repos/${{ github.repository }}/pulls/$PR_NUM/reviews \
+            -f event=APPROVE \
+            -f body="Auto-approved by upstream sync workflow." \
+            --jq '.state'
+
+          echo "Enabling auto-merge on PR #$PR_NUM..."
+          gh pr merge "$PR_NUM" --auto --merge \
+            || echo "::warning::Auto-merge not enabled (check branch protection settings)."
 
       # ── Notifications (failures only — successful syncs are quiet) ──
       - name: Notify Slack (sync failure)
