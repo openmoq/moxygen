@@ -51,6 +51,19 @@ class MoQForwarder : public TrackConsumer {
     return upstreamDynamicGroups_;
   }
 
+  // Record a NEW_GROUP_REQUEST that was forwarded upstream (e.g. on the first
+  // subscriber path where we pass the value through unconditionally).
+  void setOutstandingNewGroupRequest(uint64_t value);
+
+  // Returns true if the NEW_GROUP_REQUEST with the given value should be sent
+  // upstream. Does not mutate state; call setOutstandingNewGroupRequest()
+  // before triggering the upstream update.
+  bool shouldForwardNewGroupRequest(uint64_t requestedGroup) const;
+
+  std::optional<uint64_t> outstandingNewGroupRequest() const {
+    return outstandingNewGroupRequest_;
+  }
+
   void setLargest(AbsoluteLocation largest);
 
   std::optional<AbsoluteLocation> largest() {
@@ -62,6 +75,7 @@ class MoQForwarder : public TrackConsumer {
     virtual ~Callback() = default;
     virtual void onEmpty(MoQForwarder*) = 0;
     virtual void forwardChanged(MoQForwarder*) {}
+    virtual void newGroupRequestDetected(MoQForwarder*) {}
   };
 
   void setCallback(std::shared_ptr<Callback> callback);
@@ -313,6 +327,9 @@ class MoQForwarder : public TrackConsumer {
   // This should eventually be a vector of params that can be cascaded e2e
   std::chrono::milliseconds upstreamDeliveryTimeout_{};
   std::optional<bool> upstreamDynamicGroups_{};
+  // The NEW_GROUP_REQUEST value most recently forwarded upstream; cleared when
+  // the upstream Largest Group advances (indicating the request was fulfilled).
+  std::optional<uint64_t> outstandingNewGroupRequest_{};
   std::shared_ptr<Callback> callback_;
   uint64_t forwardingSubscribers_{0};
   bool draining_{false};
