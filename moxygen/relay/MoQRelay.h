@@ -57,6 +57,9 @@ class MoQRelay : public Publisher,
     XLOG(INFO) << "Processing goaway uri=" << goaway.newSessionUri;
   }
 
+  folly::coro::Task<Publisher::TrackStatusResult> trackStatus(
+      TrackStatus req) override;
+
   std::shared_ptr<MoQSession> findPublishNamespaceSession(
       const TrackNamespace& ns);
 
@@ -185,6 +188,7 @@ class MoQRelay : public Publisher,
 
   void onEmpty(MoQForwarder* forwarder) override;
   void forwardChanged(MoQForwarder* forwarder) override;
+  void newGroupRequestDetected(MoQForwarder* forwarder) override;
 
   folly::coro::Task<void> publishNamespaceToSession(
       std::shared_ptr<MoQSession> session,
@@ -200,6 +204,10 @@ class MoQRelay : public Publisher,
   folly::coro::Task<void> doSubscribeUpdate(
       std::shared_ptr<Publisher::SubscriptionHandle> handle,
       bool forward);
+
+  folly::coro::Task<void> doNewGroupRequestUpdate(
+      std::shared_ptr<Publisher::SubscriptionHandle> handle,
+      uint64_t newGroupRequestValue);
 
   void publishNamespaceDone(
       const TrackNamespace& trackNamespace,

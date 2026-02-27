@@ -45,6 +45,22 @@ class MoQForwarder : public TrackConsumer {
     return upstreamDeliveryTimeout_;
   }
 
+  void setDynamicGroups(bool enabled);
+
+  std::optional<bool> upstreamDynamicGroups() const {
+    return upstreamDynamicGroups_;
+  }
+
+  void setOutstandingNewGroupRequest(uint64_t value);
+
+  bool shouldForwardNewGroupRequest(uint64_t requestedGroup) const;
+
+  std::optional<uint64_t> outstandingNewGroupRequest() const {
+    return outstandingNewGroupRequest_;
+  }
+
+  void triggerUpstreamNewGroupRequest();
+
   void setLargest(AbsoluteLocation largest);
 
   std::optional<AbsoluteLocation> largest() {
@@ -56,6 +72,7 @@ class MoQForwarder : public TrackConsumer {
     virtual ~Callback() = default;
     virtual void onEmpty(MoQForwarder*) = 0;
     virtual void forwardChanged(MoQForwarder*) {}
+    virtual void newGroupRequestDetected(MoQForwarder*) {}
   };
 
   void setCallback(std::shared_ptr<Callback> callback);
@@ -97,6 +114,9 @@ class MoQForwarder : public TrackConsumer {
     // Updates the params of the subscribeOk
     // updates existing param if key matches, otherwise adds new param
     void setParam(const TrackRequestParameter& param);
+
+    // Adds or replaces the DYNAMIC_GROUPS extension on the subscribeOk
+    void setDynamicGroupsExtension(bool enabled);
 
     folly::coro::Task<folly::Expected<RequestOk, RequestError>> requestUpdate(
         RequestUpdate requestUpdate) override;
@@ -303,6 +323,10 @@ class MoQForwarder : public TrackConsumer {
   std::optional<AbsoluteLocation> largest_;
   // This should eventually be a vector of params that can be cascaded e2e
   std::chrono::milliseconds upstreamDeliveryTimeout_{};
+  std::optional<bool> upstreamDynamicGroups_{};
+  // The NEW_GROUP_REQUEST value most recently forwarded upstream; cleared when
+  // the upstream Largest Group advances (indicating the request was fulfilled).
+  std::optional<uint64_t> outstandingNewGroupRequest_{};
   std::shared_ptr<Callback> callback_;
   uint64_t forwardingSubscribers_{0};
   bool draining_{false};

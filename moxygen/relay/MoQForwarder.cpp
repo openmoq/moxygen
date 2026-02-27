@@ -5,6 +5,7 @@
  */
 
 #include "moxygen/relay/MoQForwarder.h"
+#include "moxygen/MoQTrackProperties.h"
 
 namespace moxygen {
 
@@ -138,6 +139,14 @@ void MoQForwarder::setDeliveryTimeout(uint64_t timeout) {
   upstreamDeliveryTimeout_ = std::chrono::milliseconds(timeout);
 }
 
+void MoQForwarder::setDynamicGroups(bool enabled) {
+  upstreamDynamicGroups_ = enabled;
+}
+
+void MoQForwarder::setOutstandingNewGroupRequest(uint64_t value) {
+  outstandingNewGroupRequest_ = value;
+}
+
 void MoQForwarder::setLargest(AbsoluteLocation largest) {
   largest_ = largest;
 }
@@ -175,6 +184,9 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
     subscriber->setParam(
         {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
          static_cast<uint64_t>(upstreamDeliveryTimeout_.count())});
+  }
+  if (upstreamDynamicGroups_.has_value()) {
+    subscriber->setDynamicGroupsExtension(*upstreamDynamicGroups_);
   }
   subscribers_.emplace(sessionPtr, subscriber);
   if (subReq.forward) {
@@ -349,6 +361,11 @@ void MoQForwarder::removeSubscriberIt(
 void MoQForwarder::updateLargest(uint64_t group, uint64_t object) {
   AbsoluteLocation now{group, object};
   if (!largest_ || now > *largest_) {
+    // Clear any outstanding NEW_GROUP_REQUEST once the upstream group advances.
+    if (outstandingNewGroupRequest_.has_value() &&
+        (!largest_ || group > largest_->group)) {
+      outstandingNewGroupRequest_.reset();
+    }
     largest_ = now;
   }
 }
@@ -517,6 +534,31 @@ void MoQForwarder::removeForwardingSubscriber() {
   }
 }
 
+bool MoQForwarder::shouldForwardNewGroupRequest(uint64_t requestedGroup) const {
+  // the track must support dynamic groups.
+  if (!upstreamDynamicGroups_.has_value() || !*upstreamDynamicGroups_) {
+    return false;
+  }
+  // non-zero value <= LargestGroup means the new group is already
+  // available — do not send upstream.
+  if (requestedGroup != 0 && largest_.has_value() &&
+      requestedGroup <= largest_->group) {
+    return false;
+  }
+  // already have an outstanding request with >= value.
+  if (outstandingNewGroupRequest_.has_value() &&
+      *outstandingNewGroupRequest_ >= requestedGroup) {
+    return false;
+  }
+  return true;
+}
+
+void MoQForwarder::triggerUpstreamNewGroupRequest() {
+  if (callback_) {
+    callback_->newGroupRequestDetected(this);
+  }
+}
+
 Payload MoQForwarder::maybeClone(const Payload& payload) {
   return payload ? payload->clone() : nullptr;
 }
@@ -565,6 +607,10 @@ void MoQForwarder::Subscriber::setParam(const TrackRequestParameter& param) {
   }
 }
 
+void MoQForwarder::Subscriber::setDynamicGroupsExtension(bool enabled) {
+  setPublisherDynamicGroups(*subscribeOk_, enabled);
+}
+
 folly::coro::Task<folly::Expected<RequestOk, RequestError>>
 MoQForwarder::Subscriber::requestUpdate(RequestUpdate requestUpdate) {
   // Validation:
@@ -572,6 +618,7 @@ MoQForwarder::Subscriber::requestUpdate(RequestUpdate requestUpdate) {
   // - End location can increase or decrease
   // - For bounded subscriptions (endGroup > 0), end must be >= start
   // - Forward state is optional and only updated if explicitly provided
+  // - A New Group can be requested
 
   // Only update start if provided
   if (requestUpdate.start.has_value()) {
@@ -605,6 +652,14 @@ MoQForwarder::Subscriber::requestUpdate(RequestUpdate requestUpdate) {
     forwarder.addForwardingSubscriber();
   } else if (wasForwarding && !shouldForward) {
     forwarder.removeForwardingSubscriber();
+  }
+
+  // Only update new group request if provided
+  if (requestUpdate.newGroupRequest.has_value()) {
+    if (forwarder.shouldForwardNewGroupRequest(*requestUpdate.newGroupRequest)) {
+      forwarder.setOutstandingNewGroupRequest(*requestUpdate.newGroupRequest);
+      forwarder.triggerUpstreamNewGroupRequest();
+    }
   }
 
   co_return RequestOk{.requestID = requestUpdate.requestID};

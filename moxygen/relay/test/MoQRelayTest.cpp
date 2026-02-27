@@ -8,6 +8,7 @@
 #include <folly/io/async/EventBase.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
+#include <moxygen/MoQTrackProperties.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
 #include <moxygen/relay/MoQForwarder.h>
 #include <moxygen/relay/MoQRelay.h>
@@ -1456,6 +1457,104 @@ TEST_F(MoQRelayTest, SubscribeUpdateStartLocationCanDecrease) {
   removeSession(subscriberSession);
 }
 
+// Test: TrackStatus on non-existent track
+TEST_F(MoQRelayTest, TrackStatusNonExistentTrack) {
+  auto clientSession = createMockSession();
+
+  // Request trackStatus for a track that doesn't exist
+  TrackStatus trackStatus;
+  trackStatus.fullTrackName = kTestTrackName;
+  trackStatus.requestID = RequestID(1);
+
+  withSessionContext(clientSession, [&]() {
+    auto task = relay_->trackStatus(trackStatus);
+    auto res = folly::coro::blockingWait(std::move(task), exec_.get());
+
+    // Should return error indicating track not found
+    EXPECT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().errorCode, TrackStatusErrorCode::TRACK_NOT_EXIST);
+    EXPECT_FALSE(res.error().reasonPhrase.empty());
+  });
+
+  removeSession(clientSession);
+}
+
+// Test: TrackStatus on existing track - returns forwarder state (no upstream call)
+TEST_F(MoQRelayTest, TrackStatusSuccessfulForward) {
+  auto publisherSession = createMockSession();
+  auto clientSession = createMockSession();
+
+  doPublish(publisherSession, kTestTrackName);
+
+  auto consumer = createMockConsumer();
+  subscribeToTrack(clientSession, kTestTrackName, consumer, RequestID(1));
+
+  TrackStatus trackStatus;
+  trackStatus.fullTrackName = kTestTrackName;
+  trackStatus.requestID = RequestID(2);
+
+  withSessionContext(clientSession, [&]() {
+    auto task = relay_->trackStatus(trackStatus);
+    auto res = folly::coro::blockingWait(std::move(task), exec_.get());
+
+    // Should return status from local forwarder
+    // Since no data was sent, statusCode should be TRACK_NOT_STARTED
+    EXPECT_TRUE(res.hasValue());
+    EXPECT_EQ(res.value().statusCode, TrackStatusCode::TRACK_NOT_STARTED);
+    EXPECT_EQ(res.value().fullTrackName, kTestTrackName);
+  });
+
+  removeSession(publisherSession);
+  removeSession(clientSession);
+}
+
+// Test: TrackStatus using namespace prefix matching (no exact subscription)
+// Verifies that when there's no exact subscription but a publisher has
+// published a matching namespace prefix, the relay correctly routes TRACK_STATUS
+// upstream using prefix matching
+TEST_F(MoQRelayTest, TrackStatusViaPrefixMatching) {
+  auto publisher = createMockSession();
+  auto requester = createMockSession();
+
+  // Publisher publishes namespace but NOT the specific track
+  doPublishNamespace(publisher, kTestNamespace);
+
+  // No exact subscription exists for kTestTrackName, so trackStatus should
+  // use prefix matching to find the publisher
+
+  // Mock the upstream trackStatus call
+  TrackStatusOk statusOk;
+  statusOk.requestID = RequestID(1);
+  statusOk.trackAlias = TrackAlias(0);
+  statusOk.largest = AbsoluteLocation{50, 25};
+
+  EXPECT_CALL(*publisher, trackStatus(_))
+      .WillOnce([statusOk](auto /*ts*/) {
+        return folly::coro::makeTask<Publisher::TrackStatusResult>(statusOk);
+      });
+
+  // Execute trackStatus from requester's perspective
+  TrackStatus trackStatus;
+  trackStatus.requestID = RequestID(1);
+  trackStatus.fullTrackName = kTestTrackName;
+
+  withSessionContext(requester, [&]() {
+    auto task = relay_->trackStatus(trackStatus);
+    auto result = folly::coro::blockingWait(std::move(task), exec_.get());
+
+    // Should successfully forward via prefix matching and return the result
+    EXPECT_TRUE(result.hasValue())
+        << "TrackStatus via namespace prefix matching should succeed";
+    EXPECT_EQ(result.value().requestID, RequestID(1));
+    EXPECT_TRUE(result.value().largest.has_value());
+    EXPECT_EQ(result.value().largest->group, 50);
+    EXPECT_EQ(result.value().largest->object, 25);
+  });
+
+  removeSession(publisher);
+  removeSession(requester);
+}
+
 // Test: Subgroup is tombstoned after CANCELLED error (soft error)
 // Verifies that a CANCELLED error on a subgroup sets it to nullptr (tombstone)
 // but keeps the subscription alive
@@ -1912,6 +2011,92 @@ TEST_F(MoQRelayTest, ResetDuringDrainingMultipleSubscribersDoesNotCrash) {
   subgroup->reset(ResetStreamErrorCode::INTERNAL_ERROR);
 
   EXPECT_EQ(forwarder, nullptr);
+}
+
+// ============================================================
+// Dynamic Groups Extension Tests
+// ============================================================
+
+// Test: relay PUBLISH path – dynamic groups from PublishRequest extensions
+// is stored in the forwarder and forwarded to every downstream subscriber
+TEST_F(MoQRelayTest, RelayPublishPropagatesDynamicGroupsToSubscribers) {
+  auto publisherSession = createMockSession();
+  auto subscriberSession = createMockSession();
+
+  // Build a PublishRequest with DYNAMIC_GROUPS enabled
+  PublishRequest pub;
+  pub.fullTrackName = kTestTrackName;
+  setPublisherDynamicGroups(pub, true);
+
+  withSessionContext(publisherSession, [&]() {
+    auto res = relay_->publish(std::move(pub), createMockSubscriptionHandle());
+    ASSERT_TRUE(res.hasValue());
+    getOrCreateMockState(publisherSession)->publishConsumers.push_back(
+        res->consumer);
+  });
+
+  auto consumer = createMockConsumer();
+  auto handle =
+      subscribeToTrack(subscriberSession, kTestTrackName, consumer, RequestID(1));
+  ASSERT_NE(handle, nullptr);
+
+  auto dynGroups = getPublisherDynamicGroups(handle->subscribeOk());
+  ASSERT_TRUE(dynGroups.has_value());
+  EXPECT_TRUE(*dynGroups);
+
+  removeSession(publisherSession);
+  removeSession(subscriberSession);
+}
+
+// Test: relay SUBSCRIBE path – dynamic groups from the upstream SubscribeOk is
+// stored in the forwarder and forwarded to both the first and late-joining
+// downstream subscribers
+TEST_F(MoQRelayTest, RelaySubscribePropagatesDynamicGroupsToAllSubscribers) {
+  auto publisherSession = createMockSession();
+  auto subscriber1 = createMockSession();
+  auto subscriber2 = createMockSession();
+
+  doPublishNamespace(publisherSession, kTestNamespace);
+
+  // Upstream returns a SubscribeOk with DYNAMIC_GROUPS = true
+  SubscribeOk upstreamOk;
+  upstreamOk.requestID = RequestID(1);
+  upstreamOk.trackAlias = TrackAlias(1);
+  upstreamOk.expires = std::chrono::milliseconds(0);
+  upstreamOk.groupOrder = GroupOrder::OldestFirst;
+  setPublisherDynamicGroups(upstreamOk, true);
+
+  EXPECT_CALL(*publisherSession, subscribe(_, _))
+      .WillOnce([upstreamOk](auto /*req*/, auto /*consumer*/) {
+        auto handle =
+            std::make_shared<NiceMock<MockSubscriptionHandle>>(upstreamOk);
+        return folly::coro::makeTask<Publisher::SubscribeResult>(
+            folly::Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>(
+                handle));
+      });
+
+  // First subscriber
+  auto consumer1 = createMockConsumer();
+  auto handle1 =
+      subscribeToTrack(subscriber1, kTestTrackName, consumer1, RequestID(1));
+  ASSERT_NE(handle1, nullptr);
+  auto dynGroups1 = getPublisherDynamicGroups(handle1->subscribeOk());
+  ASSERT_TRUE(dynGroups1.has_value());
+  EXPECT_TRUE(*dynGroups1);
+
+  // Late-joining second subscriber – forwarder should propagate the stored
+  // dynamic groups value without another upstream roundtrip
+  auto consumer2 = createMockConsumer();
+  auto handle2 =
+      subscribeToTrack(subscriber2, kTestTrackName, consumer2, RequestID(2));
+  ASSERT_NE(handle2, nullptr);
+  auto dynGroups2 = getPublisherDynamicGroups(handle2->subscribeOk());
+  ASSERT_TRUE(dynGroups2.has_value());
+  EXPECT_TRUE(*dynGroups2);
+
+  removeSession(publisherSession);
+  removeSession(subscriber1);
+  removeSession(subscriber2);
 }
 
 } // namespace moxygen::test

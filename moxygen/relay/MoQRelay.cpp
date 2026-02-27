@@ -35,6 +35,21 @@ folly::coro::Task<void> MoQRelay::doSubscribeUpdate(
   }
 }
 
+// Sends a REQUEST_UPDATE that carries only the NEW_GROUP_REQUEST parameter.
+folly::coro::Task<void> MoQRelay::doNewGroupRequestUpdate(
+    std::shared_ptr<Publisher::SubscriptionHandle> handle,
+    uint64_t newGroupRequestValue) {
+  RequestUpdate update;
+  update.requestID = RequestID(0);
+  update.existingRequestID = handle->subscribeOk().requestID;
+  update.newGroupRequest = newGroupRequestValue;
+  auto updateRes = co_await handle->requestUpdate(std::move(update));
+  if (updateRes.hasError()) {
+    XLOG(ERR) << "NEW_GROUP_REQUEST update failed: "
+              << updateRes.error().reasonPhrase;
+  }
+}
+
 std::shared_ptr<MoQRelay::NamespaceNode> MoQRelay::findNamespaceNode(
     const TrackNamespace& ns,
     bool createMissingNodes,
@@ -434,6 +449,13 @@ Subscriber::PublishResult MoQRelay::publish(
     forwarder->setDeliveryTimeout(deliveryTimeout->count());
   }
 
+  // Extract dynamic groups from publish request extensions and store in
+  // forwarder
+  auto dynamicGroups = getPublisherDynamicGroups(pub);
+  if (dynamicGroups.has_value()) {
+    forwarder->setDynamicGroups(*dynamicGroups);
+  }
+
   auto subRes = subscriptions_.emplace(
       std::piecewise_construct,
       std::forward_as_tuple(pub.fullTrackName),
@@ -521,6 +543,24 @@ folly::coro::Task<void> MoQRelay::publishToSession(
   subscriber->range =
       toSubscribeRange(pubOk.start, end, pubOk.locType, forwarder->largest());
   subscriber->shouldForward = pubOk.forward;
+
+  // If the downstream PUBLISH_OK carries a NEW_GROUP_REQUEST, forward it
+  // upstream via REQUEST_UPDATE if it passes the forwarding check.
+  // Re-lookup subscriptions_ since the co_await above may have invalidated
+  // any prior state, and null-check handle since onPublishDone may have fired.
+  if (pubOk.newGroupRequest.has_value() &&
+      forwarder->shouldForwardNewGroupRequest(*pubOk.newGroupRequest)) {
+    forwarder->setOutstandingNewGroupRequest(*pubOk.newGroupRequest);
+    auto subIt = subscriptions_.find(pub.fullTrackName);
+    if (subIt != subscriptions_.end() && subIt->second.handle) {
+      auto exec = subIt->second.upstream->getExecutor();
+      co_withExecutor(
+          exec,
+          doNewGroupRequestUpdate(
+              subIt->second.handle, *pubOk.newGroupRequest))
+          .start();
+    }
+  }
 }
 
 class MoQRelay::NamespaceSubscription
@@ -878,6 +918,14 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
            static_cast<uint64_t>(deliveryTimeout->count())});
     }
 
+    // Store dynamic groups in forwarder and send to the first subscriber
+    auto dynGroups =
+        getPublisherDynamicGroups(subRes.value()->subscribeOk());
+    if (dynGroups.has_value()) {
+      forwarder->setDynamicGroups(*dynGroups);
+      subscriber->setDynamicGroupsExtension(*dynGroups);
+    }
+
     subscriber->setPublisherGroupOrder(pubGroupOrder);
     auto it = subscriptions_.find(subReq.fullTrackName);
     // There are cases that remove the subscription like failing to
@@ -891,6 +939,11 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     auto& rsub = it->second;
     rsub.requestID = subRes.value()->subscribeOk().requestID;
     rsub.handle = std::move(subRes.value());
+    // Record NGR as outstanding only if upstream supports dynamic groups.
+    if (subReq.newGroupRequest.has_value() &&
+        forwarder->upstreamDynamicGroups().value_or(false)) {
+      forwarder->setOutstandingNewGroupRequest(*subReq.newGroupRequest);
+    }
     rsub.promise.setValue(folly::unit);
     co_return subscriber;
   } else {
@@ -929,6 +982,17 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
       co_withExecutor(
           exec,
           doSubscribeUpdate(subscriptionIt->second.handle, /*forward=*/true))
+          .start();
+    }
+
+    if (subReq.newGroupRequest.has_value() &&
+        forwarder->shouldForwardNewGroupRequest(*subReq.newGroupRequest)) {
+      forwarder->setOutstandingNewGroupRequest(*subReq.newGroupRequest);
+      auto exec = subscriptionIt->second.upstream->getExecutor();
+      co_withExecutor(
+          exec,
+          doNewGroupRequestUpdate(
+              subscriptionIt->second.handle, *subReq.newGroupRequest))
           .start();
     }
     co_return subscriber;
@@ -1008,6 +1072,71 @@ folly::coro::Task<Publisher::FetchResult> MoQRelay::fetch(
       fetch, std::move(consumer), std::move(upstreamSession));
 }
 
+folly::coro::Task<Publisher::TrackStatusResult> MoQRelay::trackStatus(
+    TrackStatus trackStatus) {
+  XLOG(DBG1) << __func__ << " ftn=" << trackStatus.fullTrackName;
+  
+  if (trackStatus.fullTrackName.trackNamespace.empty()) {
+    co_return folly::makeUnexpected(TrackStatusError(
+        {trackStatus.requestID,
+         TrackStatusErrorCode::TRACK_NOT_EXIST,
+         "namespace required"}));
+  }
+
+  auto subscriptionIt = subscriptions_.find(trackStatus.fullTrackName);
+  if (subscriptionIt != subscriptions_.end() &&
+      subscriptionIt->second.forwarder->numForwardingSubscribers() > 0) {
+    // We have active subscription - answer directly from local forwarder state
+    auto& subscription = subscriptionIt->second;
+    auto& forwarder = subscription.forwarder;
+    
+    TrackStatusCode statusCode = TrackStatusCode::TRACK_NOT_STARTED;
+    if (forwarder->largest()) {
+      if (subscription.handle) {
+        statusCode = TrackStatusCode::IN_PROGRESS;
+      } else {
+        // Publisher has terminated
+        statusCode = TrackStatusCode::TRACK_ENDED;
+      }
+    }
+    
+    TrackStatusOk trackStatusOk;
+    trackStatusOk.requestID = trackStatus.requestID;
+    trackStatusOk.groupOrder = forwarder->groupOrder();
+    trackStatusOk.largest = forwarder->largest();
+    trackStatusOk.fullTrackName = trackStatus.fullTrackName;
+    trackStatusOk.statusCode = statusCode;
+    
+    XLOG(DBG1) << "Returning local track status for " << trackStatus.fullTrackName
+               << " statusCode=" << (uint32_t)statusCode;
+    co_return trackStatusOk;
+  } else {
+    // No subscription - forward to upstream
+    auto upstreamSession =
+        findPublishNamespaceSession(trackStatus.fullTrackName.trackNamespace);
+    
+    if (!upstreamSession) {
+      XLOG(DBG1) << "No upstream session for track: " << trackStatus.fullTrackName;
+      co_return folly::makeUnexpected(
+          TrackStatusError{
+              trackStatus.requestID,
+              TrackStatusErrorCode::TRACK_NOT_EXIST,
+              "no such namespace or track"});
+    }
+
+    // Forward the trackStatus request to the upstream publisher session
+    auto result = co_await upstreamSession->trackStatus(trackStatus);
+
+    if (result.hasError()) {
+      XLOG(DBG1) << "Upstream trackStatus failed: " << result.error().reasonPhrase;
+    } else {
+      XLOG(DBG1) << "Upstream trackStatus succeeded";
+    }
+    co_return result;
+  }
+}
+
+
 void MoQRelay::onEmpty(MoQForwarder* forwarder) {
   auto subscriptionIt = subscriptions_.find(forwarder->fullTrackName());
   if (subscriptionIt == subscriptions_.end()) {
@@ -1057,6 +1186,25 @@ void MoQRelay::forwardChanged(MoQForwarder* forwarder) {
       doSubscribeUpdate(
           subscription.handle,
           /*forward=*/forwarder->numForwardingSubscribers() > 0))
+      .start();
+}
+
+void MoQRelay::newGroupRequestDetected(MoQForwarder* forwarder) {
+  auto subscriptionIt = subscriptions_.find(forwarder->fullTrackName());
+  if (subscriptionIt == subscriptions_.end()) {
+    return;
+  }
+  auto& subscription = subscriptionIt->second;
+  auto ngr = forwarder->outstandingNewGroupRequest();
+  if (!ngr.has_value()) {
+    return;
+  }
+  XLOG(INFO) << "New group request detected for " << subscriptionIt->first;
+
+  auto exec = subscription.upstream->getExecutor();
+  co_withExecutor(
+      exec,
+      doNewGroupRequestUpdate(subscription.handle, *ngr))
       .start();
 }
 
