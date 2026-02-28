@@ -144,6 +144,7 @@ message(STATUS "Fetching Meta OSS dependencies using pinned revisions...")
 FetchContent_Declare(fast_float
     GIT_REPOSITORY https://github.com/fastfloat/fast_float.git
     GIT_TAG v8.0.0
+    GIT_SHALLOW ON
 )
 FetchContent_GetProperties(fast_float)
 if(NOT fast_float_POPULATED)
@@ -170,6 +171,7 @@ endif()
 FetchContent_Declare(folly
     GIT_REPOSITORY ${_FOLLY_REPO}
     GIT_TAG ${_FOLLY_REV}
+    GIT_SHALLOW ON
 )
 
 # Allow overriding fizz repo/rev via -DFIZZ_REPO_OVERRIDE and
@@ -190,16 +192,19 @@ endif()
 FetchContent_Declare(fizz
     GIT_REPOSITORY ${_FIZZ_REPO}
     GIT_TAG ${_FIZZ_REV}
+    GIT_SHALLOW ON
 )
 
 FetchContent_Declare(wangle
     GIT_REPOSITORY https://github.com/facebook/wangle.git
     GIT_TAG ${WANGLE_REV}
+    GIT_SHALLOW ON
 )
 
 FetchContent_Declare(mvfst
     GIT_REPOSITORY https://github.com/facebook/mvfst.git
     GIT_TAG ${MVFST_REV}
+    GIT_SHALLOW ON
 )
 
 # Allow overriding proxygen repo/rev via -DPROXYGEN_REPO_OVERRIDE and
@@ -221,6 +226,7 @@ endif()
 FetchContent_Declare(proxygen
     GIT_REPOSITORY ${_PROXYGEN_REPO}
     GIT_TAG ${_PROXYGEN_REV}
+    GIT_SHALLOW ON
 )
 
 # Override find_package for deps we provide via FetchContent, since sub-projects

@@ -39,7 +39,8 @@ jobs:
 
       - name: Configure
         run: |
-          cmake -B _build -S standalone \
+          cmake -B _build -S standalone -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DBUILD_TESTING=ON \
             -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/_install
 

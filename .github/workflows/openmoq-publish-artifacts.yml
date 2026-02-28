@@ -65,7 +65,8 @@ jobs:
 
       - name: Configure
         run: |
-          cmake -B _build -S standalone \
+          cmake -B _build -S standalone -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=OFF \
             -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install
