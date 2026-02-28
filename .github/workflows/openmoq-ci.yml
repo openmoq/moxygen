@@ -44,3 +44,6 @@ jobs:
 
       - name: Test
         run: ctest --test-dir _build --output-on-failure
+
+      - name: Install (smoke test)
+        run: cmake --install _build --prefix _install
