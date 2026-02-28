@@ -67,9 +67,17 @@ jobs:
           restore-keys: |
             publish-ninja-${{ matrix.name }}-deps-
 
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: publish-${{ matrix.name }}
+          max-size: 500M
+
       - name: Configure
         run: |
           cmake -B _build -S standalone -G Ninja \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DBUILD_TESTING=OFF \
             -DBUILD_SHARED_LIBS=OFF \
