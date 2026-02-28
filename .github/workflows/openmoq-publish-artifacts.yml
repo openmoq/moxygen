@@ -139,3 +139,29 @@ jobs:
             }
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.OMOQ_SLACK_WEBHOOK_URL }}
+
+      - name: Notify email
+        if: always()
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.OMOQ_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OMOQ_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          RESULT="${{ needs.build.result }}"
+          if [ "$RESULT" = "success" ]; then
+            SUBJECT="[moxygen] artifacts published"
+            BODY="Artifacts published successfully."
+          else
+            SUBJECT="[moxygen] artifact build FAILED"
+            BODY="Artifact build failed — needs attention."
+          fi
+          BODY="$BODY\n\nCommit: ${{ github.sha }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          aws ses send-email \
+            --from "noreply@ci.openmoq.org" \
+            --destination '{"ToAddresses":["github-notifications@openmoq.org"]}' \
+            --message "{
+              \"Subject\": {\"Data\": \"$SUBJECT\"},
+              \"Body\": {\"Text\": {\"Data\": \"$BODY\"}}
+            }"
