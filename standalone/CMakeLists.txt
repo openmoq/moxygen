@@ -22,6 +22,7 @@ add_compile_definitions(GLOG_USE_GLOG_EXPORT)
 # =============================================================================
 option(BUILD_TESTS "Build tests" ON)
 option(BUILD_SHARED_LIBS "Build shared libraries (discouraged)" OFF)
+option(BUILD_PICOQUIC "Build with picoquic transport support" OFF)
 
 # =============================================================================
 # Linking preferences
@@ -216,6 +217,13 @@ FetchContent_Declare(proxygen
     GIT_TAG ${_PROXYGEN_REV}
 )
 
+if(BUILD_PICOQUIC)
+    FetchContent_Declare(picoquic
+        GIT_REPOSITORY https://github.com/afrind/picoquic.git
+        GIT_TAG cmake-fetchcontent-support
+    )
+endif()
+
 # Populate and add dependencies with EXCLUDE_FROM_ALL so only moxygen
 # targets are in 'all' (avoids building unwanted dep samples/tools).
 # Dep libraries still get built as transitive dependencies of moxygen.
@@ -230,6 +238,9 @@ FetchContent_Declare(proxygen
 # Skip lzma unless libunwind is available (lzma is used for symbolization).
 set(_FETCHCONTENT_PROVIDED_DEPS folly fizz wangle mvfst proxygen GTest GMock
     BZip2 LZ4 Snappy glog Glog)
+if(BUILD_PICOQUIC)
+    list(APPEND _FETCHCONTENT_PROVIDED_DEPS picoquic)
+endif()
 if(NOT LibUnwind_FOUND)
     list(APPEND _FETCHCONTENT_PROVIDED_DEPS LibLZMA)
     message(STATUS "LibUnwind not found, disabling lzma")
@@ -276,6 +287,32 @@ if(NOT proxygen_POPULATED)
     FetchContent_Populate(proxygen)
     add_subdirectory(
         ${proxygen_SOURCE_DIR} ${proxygen_BINARY_DIR} EXCLUDE_FROM_ALL)
+endif()
+
+if(BUILD_PICOQUIC)
+    # Save and override settings for picoquic build
+    set(_SAVED_BUILD_TESTING ${BUILD_TESTING})
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(PICOQUIC_FETCH_PTLS ON CACHE BOOL "Build picotls from source" FORCE)
+
+    FetchContent_GetProperties(picoquic)
+    if(NOT picoquic_POPULATED)
+        FetchContent_Populate(picoquic)
+        add_subdirectory(
+            ${picoquic_SOURCE_DIR} ${picoquic_BINARY_DIR} EXCLUDE_FROM_ALL)
+    endif()
+
+    set(BUILD_TESTING ${_SAVED_BUILD_TESTING} CACHE BOOL "" FORCE)
+
+    # picoquic's CMakeLists.txt exports picoquic_FOUND, picoquic_INCLUDE_DIR,
+    # and picoquic_LIBRARIES when used via add_subdirectory/FetchContent.
+
+    # Add picoquic and picotls targets to the moxygen export set.
+    install(TARGETS ${picoquic_LIBRARIES}
+        EXPORT moxygen-exports
+        ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
+        LIBRARY DESTINATION ${LIB_INSTALL_DIR}
+    )
 endif()
 
 # =============================================================================
