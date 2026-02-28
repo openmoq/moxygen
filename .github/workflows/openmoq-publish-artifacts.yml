@@ -59,7 +59,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: _build/_deps
-          key: publish-${{ matrix.name }}-deps-${{ hashFiles('build/deps/github_hashes/**/*-rev.txt') }}
+          key: publish-${{ matrix.name }}-deps-${{ hashFiles('build/deps/github_hashes/**/*-rev.txt', 'standalone/patches/**') }}
           restore-keys: |
             publish-${{ matrix.name }}-deps-
 

@@ -33,7 +33,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: _build/_deps
-          key: ci-${{ matrix.os }}-deps-${{ hashFiles('build/deps/github_hashes/**/*-rev.txt') }}
+          key: ci-${{ matrix.os }}-deps-${{ hashFiles('build/deps/github_hashes/**/*-rev.txt', 'standalone/patches/**') }}
           restore-keys: |
             ci-${{ matrix.os }}-deps-
 
