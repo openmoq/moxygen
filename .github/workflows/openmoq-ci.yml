@@ -54,7 +54,7 @@ jobs:
         if: success() || failure()
         with:
           name: "Tests (${{ matrix.name }})"
-          path: test-results.xml
+          path: _build/test-results.xml
           reporter: java-junit
 
       - name: Install (smoke test)
