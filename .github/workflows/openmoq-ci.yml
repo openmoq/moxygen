@@ -1,0 +1,46 @@
+name: OpenMOQ CI
+
+# Standalone build validation for PRs to openmoq-main.
+# This is the required status check for branch protection.
+
+on:
+  pull_request:
+    branches: [openmoq-main]
+
+permissions:
+  contents: read
+
+jobs:
+  standalone-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            name: linux
+          - os: macos-15
+            name: macos
+    name: standalone (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: bash standalone/install-system-deps.sh
+
+      - name: Cache FetchContent downloads
+        uses: actions/cache@v4
+        with:
+          path: _build/_deps
+          key: ci-${{ matrix.os }}-deps-${{ hashFiles('build/deps/github_hashes/**/*-rev.txt') }}
+          restore-keys: |
+            ci-${{ matrix.os }}-deps-
+
+      - name: Configure
+        run: cmake -B _build -S standalone -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build _build -j$(getconf _NPROCESSORS_ONLN)
+
+      - name: Test
+        run: ctest --test-dir _build --output-on-failure

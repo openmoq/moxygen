@@ -222,8 +222,14 @@ FetchContent_Declare(proxygen
     GIT_TAG ${_PROXYGEN_REV}
 )
 
-# Populate and add dependencies with EXCLUDE_FROM_ALL so only moxygen
-# targets are in 'all'
+# When BUNDLE_DEPS is ON, all dependency libraries and headers are included
+# in cmake --install, producing a self-contained artifact bundle. When OFF
+# (default), only moxygen itself is installed — suitable for development builds
+# where deps are already available on the system or in the build tree.
+option(BUNDLE_DEPS
+    "Include dependency libraries in install (for self-contained artifacts)"
+    OFF)
+
 # Override find_package for deps we provide via FetchContent, since sub-projects
 # (fizz, wangle, mvfst, proxygen) call find_package(folly),
 # find_package(fizz), etc.
@@ -247,37 +253,45 @@ macro(find_package PKG_NAME)
     endif()
 endmacro()
 
+if(BUNDLE_DEPS)
+    set(_EXCLUDE_FLAG "")
+else()
+    set(_EXCLUDE_FLAG EXCLUDE_FROM_ALL)
+endif()
+
 FetchContent_GetProperties(folly)
 if(NOT folly_POPULATED)
     FetchContent_Populate(folly)
-    add_subdirectory(${folly_SOURCE_DIR} ${folly_BINARY_DIR} EXCLUDE_FROM_ALL)
+    add_subdirectory(${folly_SOURCE_DIR} ${folly_BINARY_DIR}
+        ${_EXCLUDE_FLAG})
 endif()
 
 FetchContent_GetProperties(fizz)
 if(NOT fizz_POPULATED)
     FetchContent_Populate(fizz)
-    add_subdirectory(
-        ${fizz_SOURCE_DIR}/fizz ${fizz_BINARY_DIR} EXCLUDE_FROM_ALL)
+    add_subdirectory(${fizz_SOURCE_DIR}/fizz ${fizz_BINARY_DIR}
+        ${_EXCLUDE_FLAG})
 endif()
 
 FetchContent_GetProperties(wangle)
 if(NOT wangle_POPULATED)
     FetchContent_Populate(wangle)
-    add_subdirectory(
-        ${wangle_SOURCE_DIR}/wangle ${wangle_BINARY_DIR} EXCLUDE_FROM_ALL)
+    add_subdirectory(${wangle_SOURCE_DIR}/wangle ${wangle_BINARY_DIR}
+        ${_EXCLUDE_FLAG})
 endif()
 
 FetchContent_GetProperties(mvfst)
 if(NOT mvfst_POPULATED)
     FetchContent_Populate(mvfst)
-    add_subdirectory(${mvfst_SOURCE_DIR} ${mvfst_BINARY_DIR} EXCLUDE_FROM_ALL)
+    add_subdirectory(${mvfst_SOURCE_DIR} ${mvfst_BINARY_DIR}
+        ${_EXCLUDE_FLAG})
 endif()
 
 FetchContent_GetProperties(proxygen)
 if(NOT proxygen_POPULATED)
     FetchContent_Populate(proxygen)
-    add_subdirectory(
-        ${proxygen_SOURCE_DIR} ${proxygen_BINARY_DIR} EXCLUDE_FROM_ALL)
+    add_subdirectory(${proxygen_SOURCE_DIR} ${proxygen_BINARY_DIR}
+        ${_EXCLUDE_FLAG})
 endif()
 
 # =============================================================================
