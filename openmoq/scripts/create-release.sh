@@ -120,7 +120,7 @@ headers and CMake config files.
 
 Each platform has two tarballs:
 - \`moxygen-<platform>.tar.gz\` — stripped release build
-- \`moxygen-<platform>-dbg.tar.gz\` — unstripped (with debug symbols)
+- \`moxygen-<platform>-dbg.tar.gz\` — split debug symbols (.debug sidecar files)
 
 **Usage in o-rly CI:**
 \`\`\`bash
