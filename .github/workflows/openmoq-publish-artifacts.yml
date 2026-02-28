@@ -55,6 +55,14 @@ jobs:
       - name: Install system dependencies
         run: bash standalone/install-system-deps.sh
 
+      - name: Install extra deps for bundled artifacts
+        run: |
+          if [[ "$(uname)" == "Darwin" ]]; then
+            brew install icu4c
+          elif command -v apt-get &>/dev/null; then
+            apt-get install -y --no-install-recommends libicu-dev
+          fi
+
       - name: Cache FetchContent downloads
         uses: actions/cache@v4
         with:
@@ -68,6 +76,7 @@ jobs:
           cmake -B _build -S standalone \
             -DBUILD_TESTING=OFF \
             -DBUILD_SHARED_LIBS=OFF \
+            -DBUNDLE_DEPS=ON \
             -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install
 
       - name: Build
