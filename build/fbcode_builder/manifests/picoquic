@@ -1,0 +1,28 @@
+[manifest]
+name = picoquic
+
+[git]
+repo_url = https://github.com/private-octopus/picoquic.git
+branch = master
+
+[build]
+builder = cmake
+subdir = .
+patchfile = picoquic_picotls_openssl35.patch
+
+[cmake.defines]
+PICOQUIC_FETCH_PTLS = ON
+
+[cmake.defines.test=on]
+BUILD_TESTING = ON
+
+[cmake.defines.test=off]
+BUILD_TESTING = OFF
+
+[dependencies]
+openssl
+
+[dependencies.test=on]
+googletest
+
+[shipit.pathmap]
