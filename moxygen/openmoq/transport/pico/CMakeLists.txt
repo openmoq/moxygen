@@ -31,3 +31,7 @@ target_include_directories(openmoq_pico_transport
   PRIVATE
     ${picoquic_INCLUDE_DIR}
 )
+
+if(BUILD_SAMPLES)
+  add_subdirectory(sample)
+endif()
