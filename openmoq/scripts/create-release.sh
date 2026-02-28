@@ -116,8 +116,11 @@ Automated build artifacts for commit \`${SHORT_SHA}\`.
 
 These bundles contain moxygen and all transitive Meta dependencies
 (folly, fizz, wangle, mvfst, proxygen) as static libraries with
-headers and CMake config files. Debug symbols are in \`.debug/\`
-sidecar files (Linux only).
+headers and CMake config files.
+
+Each platform has two tarballs:
+- \`moxygen-<platform>.tar.gz\` — stripped release build
+- \`moxygen-<platform>-dbg.tar.gz\` — unstripped (with debug symbols)
 
 **Usage in o-rly CI:**
 \`\`\`bash
