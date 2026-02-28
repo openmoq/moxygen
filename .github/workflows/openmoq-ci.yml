@@ -37,10 +37,16 @@ jobs:
             ci-${{ matrix.os }}-deps-
 
       - name: Configure
-        run: cmake -B _build -S standalone -DBUILD_TESTING=ON
+        run: |
+          cmake -B _build -S standalone \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/_install
 
       - name: Build
         run: cmake --build _build -j$(getconf _NPROCESSORS_ONLN)
 
       - name: Test
         run: ctest --test-dir _build --output-on-failure
+
+      - name: Install (smoke test)
+        run: cmake --install _build
