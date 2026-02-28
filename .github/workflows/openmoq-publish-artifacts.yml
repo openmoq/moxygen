@@ -74,34 +74,20 @@ jobs:
         run: cmake --build _build -j$(getconf _NPROCESSORS_ONLN)
 
       - name: Install
-        run: |
-          # Install moxygen (EXCLUDE_FROM_ALL means only moxygen targets)
-          cmake --install _build
+        run: cmake --install _build
 
-          # Install dep libraries+headers from their build subdirectories
-          PREFIX="${{ github.workspace }}/install"
-          for dep in folly-build fizz-build wangle-build mvfst-build proxygen-build; do
-            SCRIPT="_build/_deps/$dep/cmake_install.cmake"
-            if [[ -f "$SCRIPT" ]]; then
-              echo "==> Installing $dep"
-              cmake -DCMAKE_INSTALL_PREFIX="$PREFIX" -P "$SCRIPT"
-            else
-              echo "Warning: $SCRIPT not found, skipping"
-            fi
-          done
-
-      - name: Package artifacts
+      - name: Package
         run: |
           bash openmoq/scripts/collect-artifacts-standalone.sh \
-            --install-prefix "${{ github.workspace }}/install" \
-            --output "${{ github.workspace }}/${{ matrix.artifact }}" \
+            --install-prefix install \
+            --output "${{ matrix.artifact }}" \
             --src-dir .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ github.workspace }}/${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
           retention-days: 90
 
   release:
@@ -118,7 +104,7 @@ jobs:
         with:
           path: artifacts/
 
-      - name: Create release and prune old builds
+      - name: Create release
         if: needs.build.result == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
