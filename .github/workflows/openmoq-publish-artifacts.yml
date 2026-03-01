@@ -93,10 +93,10 @@ jobs:
       - name: Package
         run: |
           bash openmoq/scripts/collect-artifacts-standalone.sh \
-            --install-prefix install \
+            --install-prefix ${{ github.workspace }}/install \
             --output "${{ matrix.artifact }}" \
             --debug-output "${{ matrix.debug_artifact }}" \
-            --src-dir .
+            --src-dir ${{ github.workspace }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
