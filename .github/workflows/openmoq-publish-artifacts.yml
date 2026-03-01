@@ -81,6 +81,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DBUILD_TESTING=OFF \
             -DBUILD_SHARED_LIBS=OFF \
+            -DBUNDLE_DEPS=ON \
             -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install
 
       - name: Build
