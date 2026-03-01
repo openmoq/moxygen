@@ -67,12 +67,21 @@ jobs:
           restore-keys: |
             publish-ninja-${{ matrix.name }}-deps-
 
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: publish-${{ matrix.name }}
+          max-size: 500M
+
       - name: Configure
         run: |
           cmake -B _build -S standalone -G Ninja \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DBUILD_TESTING=OFF \
             -DBUILD_SHARED_LIBS=OFF \
+            -DBUNDLE_DEPS=ON \
             -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install
 
       - name: Build
@@ -84,10 +93,10 @@ jobs:
       - name: Package
         run: |
           bash openmoq/scripts/collect-artifacts-standalone.sh \
-            --install-prefix install \
+            --install-prefix ${{ github.workspace }}/install \
             --output "${{ matrix.artifact }}" \
             --debug-output "${{ matrix.debug_artifact }}" \
-            --src-dir .
+            --src-dir ${{ github.workspace }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

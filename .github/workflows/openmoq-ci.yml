@@ -37,9 +37,17 @@ jobs:
           restore-keys: |
             ci-ninja-${{ matrix.os }}-deps-
 
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ci-${{ matrix.os }}
+          max-size: 500M
+
       - name: Configure
         run: |
           cmake -B _build -S standalone -G Ninja \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DBUILD_TESTING=ON \
             -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/_install
 

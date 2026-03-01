@@ -22,6 +22,7 @@ add_compile_definitions(GLOG_USE_GLOG_EXPORT)
 # =============================================================================
 option(BUILD_TESTS "Build tests" ON)
 option(BUILD_SHARED_LIBS "Build shared libraries (discouraged)" OFF)
+option(BUNDLE_DEPS "Build all dep targets for artifact bundling" OFF)
 
 # =============================================================================
 # Linking preferences
@@ -249,39 +250,47 @@ endmacro()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/apply-patches.cmake)
 
+# When BUNDLE_DEPS is OFF (default), only build dep targets that moxygen
+# actually needs. When ON, build everything for artifact bundling.
+if(BUNDLE_DEPS)
+    set(_EXCLUDE_FLAG "")
+else()
+    set(_EXCLUDE_FLAG EXCLUDE_FROM_ALL)
+endif()
+
 FetchContent_GetProperties(folly)
 if(NOT folly_POPULATED)
     FetchContent_Populate(folly)
     apply_dep_patches(folly "${folly_SOURCE_DIR}")
-    add_subdirectory(${folly_SOURCE_DIR} ${folly_BINARY_DIR})
+    add_subdirectory(${folly_SOURCE_DIR} ${folly_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
 FetchContent_GetProperties(fizz)
 if(NOT fizz_POPULATED)
     FetchContent_Populate(fizz)
     apply_dep_patches(fizz "${fizz_SOURCE_DIR}")
-    add_subdirectory(${fizz_SOURCE_DIR}/fizz ${fizz_BINARY_DIR})
+    add_subdirectory(${fizz_SOURCE_DIR}/fizz ${fizz_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
 FetchContent_GetProperties(wangle)
 if(NOT wangle_POPULATED)
     FetchContent_Populate(wangle)
     apply_dep_patches(wangle "${wangle_SOURCE_DIR}")
-    add_subdirectory(${wangle_SOURCE_DIR}/wangle ${wangle_BINARY_DIR})
+    add_subdirectory(${wangle_SOURCE_DIR}/wangle ${wangle_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
 FetchContent_GetProperties(mvfst)
 if(NOT mvfst_POPULATED)
     FetchContent_Populate(mvfst)
     apply_dep_patches(mvfst "${mvfst_SOURCE_DIR}")
-    add_subdirectory(${mvfst_SOURCE_DIR} ${mvfst_BINARY_DIR})
+    add_subdirectory(${mvfst_SOURCE_DIR} ${mvfst_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
 FetchContent_GetProperties(proxygen)
 if(NOT proxygen_POPULATED)
     FetchContent_Populate(proxygen)
     apply_dep_patches(proxygen "${proxygen_SOURCE_DIR}")
-    add_subdirectory(${proxygen_SOURCE_DIR} ${proxygen_BINARY_DIR})
+    add_subdirectory(${proxygen_SOURCE_DIR} ${proxygen_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
 # =============================================================================
