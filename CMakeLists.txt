@@ -43,6 +43,24 @@ option(BUILD_SHARED_LIBS
 # is generally discouraged.
 mark_as_advanced(BUILD_SHARED_LIBS)
 
+# Compat layer configuration
+# When ON (default): Use Folly, mvfst, proxygen - full featured mode
+# When OFF: Use std-mode alternatives - minimal dependencies
+option(MOXYGEN_USE_FOLLY
+  "Use Folly libraries (IOBuf, F14, coroutines). When OFF, use std alternatives."
+  ON
+)
+
+# Set compile definition for compat headers
+if(MOXYGEN_USE_FOLLY)
+  add_compile_definitions(MOXYGEN_USE_FOLLY=1)
+else()
+  add_compile_definitions(MOXYGEN_USE_FOLLY=0)
+endif()
+
+message(STATUS "Moxygen build configuration:")
+message(STATUS "  MOXYGEN_USE_FOLLY: ${MOXYGEN_USE_FOLLY}")
+
 include(FBBuildOptions)
 fb_activate_static_library_option()
 
