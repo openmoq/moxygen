@@ -1,0 +1,43 @@
+name: OpenMoQ Upstream Sync
+
+on:
+  workflow_dispatch: # Enables the manual button
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout OpenMoQ Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify Facebook Moxygen Status
+        id: fb_status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get latest commit from upstream
+          UPSTREAM_SHA=$(gh api repos/facebookexperimental/moxygen/commits/main -q .sha)
+          echo "Checking upstream SHA: $UPSTREAM_SHA"
+          
+          # Check if it's green
+          STATE=$(gh api repos/facebookexperimental/moxygen/commits/$UPSTREAM_SHA/status -q .state)
+          
+          if [ "$STATE" == "success" ]; then
+            echo "Upstream is GREEN."
+            echo "should_sync=true" >> $GITHUB_OUTPUT
+          else
+            echo "Upstream is $STATE. Skipping."
+            echo "should_sync=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Manual Test Output
+        run: |
+          echo "Sync logic would trigger here if upstream was green."
