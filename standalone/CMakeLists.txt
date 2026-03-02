@@ -323,6 +323,8 @@ endif()
 # Include moxygen's main CMakeLists.txt
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../moxygen moxygen)
 
+moxygen_install_headers(moxygen ${CMAKE_CURRENT_SOURCE_DIR}/../moxygen)
+
 # =============================================================================
 # Installation (mirrors main CMakeLists.txt)
 # =============================================================================
