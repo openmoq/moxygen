@@ -188,7 +188,7 @@ class MoQRelay : public Publisher,
 
   void onEmpty(MoQForwarder* forwarder) override;
   void forwardChanged(MoQForwarder* forwarder) override;
-  void newGroupRequestDetected(MoQForwarder* forwarder) override;
+  void newGroupRequested(MoQForwarder* forwarder, uint64_t group) override;
 
   folly::coro::Task<void> publishNamespaceToSession(
       std::shared_ptr<MoQSession> session,

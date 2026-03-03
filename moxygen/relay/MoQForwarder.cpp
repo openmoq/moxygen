@@ -536,7 +536,7 @@ void MoQForwarder::removeForwardingSubscriber() {
 
 bool MoQForwarder::shouldForwardNewGroupRequest(uint64_t requestedGroup) const {
   // the track must support dynamic groups.
-  if (!upstreamDynamicGroups_.has_value() || !*upstreamDynamicGroups_) {
+  if (!upstreamDynamicGroups_.value_or(false)) {
     return false;
   }
   // non-zero value <= LargestGroup means the new group is already
@@ -553,9 +553,9 @@ bool MoQForwarder::shouldForwardNewGroupRequest(uint64_t requestedGroup) const {
   return true;
 }
 
-void MoQForwarder::triggerUpstreamNewGroupRequest() {
-  if (callback_) {
-    callback_->newGroupRequestDetected(this);
+void MoQForwarder::fireNewGroupRequest() {
+  if (callback_ && outstandingNewGroupRequest_.has_value()) {
+    callback_->newGroupRequested(this, *outstandingNewGroupRequest_);
   }
 }
 
@@ -655,10 +655,12 @@ MoQForwarder::Subscriber::requestUpdate(RequestUpdate requestUpdate) {
   }
 
   // Only update new group request if provided
-  if (requestUpdate.newGroupRequest.has_value()) {
-    if (forwarder.shouldForwardNewGroupRequest(*requestUpdate.newGroupRequest)) {
-      forwarder.setOutstandingNewGroupRequest(*requestUpdate.newGroupRequest);
-      forwarder.triggerUpstreamNewGroupRequest();
+  auto newGroupRequestValue = getFirstIntParam(
+      requestUpdate.params, TrackRequestParamKey::NEW_GROUP_REQUEST);
+  if (newGroupRequestValue.has_value()) {
+    if (forwarder.shouldForwardNewGroupRequest(*newGroupRequestValue)) {
+      forwarder.setOutstandingNewGroupRequest(*newGroupRequestValue);
+      forwarder.fireNewGroupRequest();
     }
   }
 
