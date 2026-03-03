@@ -113,6 +113,10 @@ class MoQForwarder : public TrackConsumer {
     // Adds or replaces the DYNAMIC_GROUPS extension on the subscribeOk
     void setDynamicGroupsExtension(bool enabled);
 
+    // Process PUBLISH_OK response, updating range, forward flag, and handling
+    // NEW_GROUP_REQUEST forwarding via callback
+    void onPublishOk(const PublishOk& pubOk);
+
     folly::coro::Task<folly::Expected<RequestOk, RequestError>> requestUpdate(
         RequestUpdate requestUpdate) override;
 

@@ -539,33 +539,10 @@ folly::coro::Task<void> MoQRelay::publishToSession(
   guard.dismiss();
   XLOG(DBG1) << "Publish OK sess=" << session.get();
   auto& pubOk = pubResult.value().value();
-  std::optional<AbsoluteLocation> end;
-  if (pubOk.endGroup) {
-    end = AbsoluteLocation{*pubOk.endGroup, 0};
-  }
-  subscriber->range =
-      toSubscribeRange(pubOk.start, end, pubOk.locType, forwarder->largest());
-  subscriber->shouldForward = pubOk.forward;
-
-  // If the downstream PUBLISH_OK carries a NEW_GROUP_REQUEST, forward it
-  // upstream via REQUEST_UPDATE if it passes the forwarding check.
-  // Re-lookup subscriptions_ since the co_await above may have invalidated
-  // any prior state, and null-check handle since onPublishDone may have fired.
-  auto newGroupRequestValue = getFirstIntParam(
-      pubOk.params, TrackRequestParamKey::NEW_GROUP_REQUEST);
-  if (newGroupRequestValue.has_value() &&
-      forwarder->shouldForwardNewGroupRequest(*newGroupRequestValue)) {
-    forwarder->setOutstandingNewGroupRequest(*newGroupRequestValue);
-    auto subIt = subscriptions_.find(pub.fullTrackName);
-    if (subIt != subscriptions_.end() && subIt->second.handle) {
-      auto exec = subIt->second.upstream->getExecutor();
-      co_withExecutor(
-          exec,
-          doNewGroupRequestUpdate(
-              subIt->second.handle, *newGroupRequestValue))
-          .start();
-    }
-  }
+  
+  // Process the PUBLISH_OK response - updates range, forward flag, and
+  // handles NEW_GROUP_REQUEST forwarding via callback
+  subscriber->onPublishOk(pubOk);
 }
 
 class MoQRelay::NamespaceSubscription
@@ -1204,12 +1181,16 @@ void MoQRelay::newGroupRequested(MoQForwarder* forwarder, uint64_t group) {
     return;
   }
   auto& subscription = subscriptionIt->second;
+  // Check if handle is still valid (publisher may have terminated)
+  if (!subscription.handle) {
+    XLOG(DBG4) << "Ignoring NEW_GROUP_REQUEST for " << subscriptionIt->first
+               << " - publisher terminated";
+    return;
+  }
   XLOG(INFO) << "New group request detected for " << subscriptionIt->first;
 
   auto exec = subscription.upstream->getExecutor();
-  co_withExecutor(
-      exec,
-      doNewGroupRequestUpdate(subscription.handle, group))
+  co_withExecutor(exec, doNewGroupRequestUpdate(subscription.handle, group))
       .start();
 }
 

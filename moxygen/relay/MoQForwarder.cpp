@@ -611,6 +611,28 @@ void MoQForwarder::Subscriber::setDynamicGroupsExtension(bool enabled) {
   setPublisherDynamicGroups(*subscribeOk_, enabled);
 }
 
+void MoQForwarder::Subscriber::onPublishOk(const PublishOk& pubOk) {
+  // Update subscriber range from PUBLISH_OK
+  std::optional<AbsoluteLocation> end;
+  if (pubOk.endGroup) {
+    end = AbsoluteLocation{*pubOk.endGroup, 0};
+  }
+  range =
+      toSubscribeRange(pubOk.start, end, pubOk.locType, forwarder.largest());
+
+  // Update forward flag
+  shouldForward = pubOk.forward;
+
+  // Handle NEW_GROUP_REQUEST forwarding if present
+  auto newGroupRequestValue =
+      getFirstIntParam(pubOk.params, TrackRequestParamKey::NEW_GROUP_REQUEST);
+  if (newGroupRequestValue.has_value() &&
+      forwarder.shouldForwardNewGroupRequest(*newGroupRequestValue)) {
+    forwarder.setOutstandingNewGroupRequest(*newGroupRequestValue);
+    forwarder.fireNewGroupRequest();
+  }
+}
+
 folly::coro::Task<folly::Expected<RequestOk, RequestError>>
 MoQForwarder::Subscriber::requestUpdate(RequestUpdate requestUpdate) {
   // Validation:
