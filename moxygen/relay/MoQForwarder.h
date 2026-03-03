@@ -55,12 +55,6 @@ class MoQForwarder : public TrackConsumer {
 
   bool shouldForwardNewGroupRequest(uint64_t requestedGroup) const;
 
-  std::optional<uint64_t> outstandingNewGroupRequest() const {
-    return outstandingNewGroupRequest_;
-  }
-
-  void triggerUpstreamNewGroupRequest();
-
   void setLargest(AbsoluteLocation largest);
 
   std::optional<AbsoluteLocation> largest() {
@@ -72,7 +66,8 @@ class MoQForwarder : public TrackConsumer {
     virtual ~Callback() = default;
     virtual void onEmpty(MoQForwarder*) = 0;
     virtual void forwardChanged(MoQForwarder*) {}
-    virtual void newGroupRequestDetected(MoQForwarder*) {}
+    // This fires whenever an unseen NGR is received
+    virtual void newGroupRequested(MoQForwarder*, uint64_t group) {}
   };
 
   void setCallback(std::shared_ptr<Callback> callback);
@@ -310,6 +305,8 @@ class MoQForwarder : public TrackConsumer {
       const SubgroupIdentifier& subgroupId,
       const MoQPublishError& err,
       const std::string& callsite);
+
+  void fireNewGroupRequest();
 
   FullTrackName fullTrackName_;
   std::optional<TrackAlias> trackAlias_;

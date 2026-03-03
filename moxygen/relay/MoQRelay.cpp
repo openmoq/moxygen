@@ -39,10 +39,13 @@ folly::coro::Task<void> MoQRelay::doSubscribeUpdate(
 folly::coro::Task<void> MoQRelay::doNewGroupRequestUpdate(
     std::shared_ptr<Publisher::SubscriptionHandle> handle,
     uint64_t newGroupRequestValue) {
+  XLOG(DBG4) << "Sending NEW_GROUP_REQUEST update: " << newGroupRequestValue;
   RequestUpdate update;
   update.requestID = RequestID(0);
   update.existingRequestID = handle->subscribeOk().requestID;
-  update.newGroupRequest = newGroupRequestValue;
+  update.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::NEW_GROUP_REQUEST),
+      newGroupRequestValue));
   auto updateRes = co_await handle->requestUpdate(std::move(update));
   if (updateRes.hasError()) {
     XLOG(ERR) << "NEW_GROUP_REQUEST update failed: "
@@ -548,16 +551,18 @@ folly::coro::Task<void> MoQRelay::publishToSession(
   // upstream via REQUEST_UPDATE if it passes the forwarding check.
   // Re-lookup subscriptions_ since the co_await above may have invalidated
   // any prior state, and null-check handle since onPublishDone may have fired.
-  if (pubOk.newGroupRequest.has_value() &&
-      forwarder->shouldForwardNewGroupRequest(*pubOk.newGroupRequest)) {
-    forwarder->setOutstandingNewGroupRequest(*pubOk.newGroupRequest);
+  auto newGroupRequestValue = getFirstIntParam(
+      pubOk.params, TrackRequestParamKey::NEW_GROUP_REQUEST);
+  if (newGroupRequestValue.has_value() &&
+      forwarder->shouldForwardNewGroupRequest(*newGroupRequestValue)) {
+    forwarder->setOutstandingNewGroupRequest(*newGroupRequestValue);
     auto subIt = subscriptions_.find(pub.fullTrackName);
     if (subIt != subscriptions_.end() && subIt->second.handle) {
       auto exec = subIt->second.upstream->getExecutor();
       co_withExecutor(
           exec,
           doNewGroupRequestUpdate(
-              subIt->second.handle, *pubOk.newGroupRequest))
+              subIt->second.handle, *newGroupRequestValue))
           .start();
     }
   }
@@ -940,9 +945,11 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     rsub.requestID = subRes.value()->subscribeOk().requestID;
     rsub.handle = std::move(subRes.value());
     // Record NGR as outstanding only if upstream supports dynamic groups.
-    if (subReq.newGroupRequest.has_value() &&
+    auto newGroupRequestValue = getFirstIntParam(
+        subReq.params, TrackRequestParamKey::NEW_GROUP_REQUEST);
+    if (newGroupRequestValue.has_value() &&
         forwarder->upstreamDynamicGroups().value_or(false)) {
-      forwarder->setOutstandingNewGroupRequest(*subReq.newGroupRequest);
+      forwarder->setOutstandingNewGroupRequest(*newGroupRequestValue);
     }
     rsub.promise.setValue(folly::unit);
     co_return subscriber;
@@ -985,14 +992,16 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
           .start();
     }
 
-    if (subReq.newGroupRequest.has_value() &&
-        forwarder->shouldForwardNewGroupRequest(*subReq.newGroupRequest)) {
-      forwarder->setOutstandingNewGroupRequest(*subReq.newGroupRequest);
+    auto newGroupRequestValue = getFirstIntParam(
+        subReq.params, TrackRequestParamKey::NEW_GROUP_REQUEST);
+    if (newGroupRequestValue.has_value() &&
+        forwarder->shouldForwardNewGroupRequest(*newGroupRequestValue)) {
+      forwarder->setOutstandingNewGroupRequest(*newGroupRequestValue);
       auto exec = subscriptionIt->second.upstream->getExecutor();
       co_withExecutor(
           exec,
           doNewGroupRequestUpdate(
-              subscriptionIt->second.handle, *subReq.newGroupRequest))
+              subscriptionIt->second.handle, *newGroupRequestValue))
           .start();
     }
     co_return subscriber;
@@ -1189,22 +1198,18 @@ void MoQRelay::forwardChanged(MoQForwarder* forwarder) {
       .start();
 }
 
-void MoQRelay::newGroupRequestDetected(MoQForwarder* forwarder) {
+void MoQRelay::newGroupRequested(MoQForwarder* forwarder, uint64_t group) {
   auto subscriptionIt = subscriptions_.find(forwarder->fullTrackName());
   if (subscriptionIt == subscriptions_.end()) {
     return;
   }
   auto& subscription = subscriptionIt->second;
-  auto ngr = forwarder->outstandingNewGroupRequest();
-  if (!ngr.has_value()) {
-    return;
-  }
   XLOG(INFO) << "New group request detected for " << subscriptionIt->first;
 
   auto exec = subscription.upstream->getExecutor();
   co_withExecutor(
       exec,
-      doNewGroupRequestUpdate(subscription.handle, *ngr))
+      doNewGroupRequestUpdate(subscription.handle, group))
       .start();
 }
 

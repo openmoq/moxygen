@@ -219,7 +219,6 @@ const folly::F14FastSet<FrameType> kAllowedFramesForForward = {
 const folly::F14FastSet<FrameType> kAllowedFramesForNewGroupRequest = {
     FrameType::SUBSCRIBE,
     FrameType::REQUEST_UPDATE,
-    FrameType::SUBSCRIBE_UPDATE,
     FrameType::PUBLISH_OK};
 
 // Allowlist mapping: TrackRequestParamKey -> set of allowed FrameTypes

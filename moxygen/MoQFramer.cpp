@@ -196,12 +196,6 @@ const folly::F14FastSet<FrameType> kAllowedFramesForForward = {
     FrameType::PUBLISH_OK,
     FrameType::SUBSCRIBE_NAMESPACE};
 
-const folly::F14FastSet<FrameType> kAllowedFramesForNewGroupRequest = {
-    FrameType::SUBSCRIBE,
-    FrameType::REQUEST_UPDATE,
-    FrameType::SUBSCRIBE_UPDATE,
-    FrameType::PUBLISH_OK};
-
 // Allowlist mapping: TrackRequestParamKey -> set of allowed FrameTypes
 // Empty set means allowed for all frame types
 const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
@@ -219,8 +213,6 @@ const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
         {TrackRequestParamKey::GROUP_ORDER, kAllowedFramesForGroupOrder},
         {TrackRequestParamKey::LARGEST_OBJECT, kAllowedFramesForLargestObject},
         {TrackRequestParamKey::FORWARD, kAllowedFramesForForward},
-        {TrackRequestParamKey::NEW_GROUP_REQUEST,
-         kAllowedFramesForNewGroupRequest},
 };
 
 // Frame types that allow all parameters (no validation)
@@ -1662,10 +1654,6 @@ void MoQFrameParser::handleRequestSpecificParams(
 
     // FORWARD
     handleForwardParam(subscribeRequest.forward, requestSpecificParams);
-
-    // NEW_GROUP_REQUEST
-    handleNewGroupRequestParam(
-        subscribeRequest.newGroupRequest, requestSpecificParams);
   }
 }
 
@@ -1785,10 +1773,6 @@ void MoQFrameParser::handleRequestSpecificParams(
 
     // FORWARD
     handleForwardParam(requestUpdate.forward, requestSpecificParams);
-
-    // NEW_GROUP_REQUEST
-    handleNewGroupRequestParam(
-        requestUpdate.newGroupRequest, requestSpecificParams);
   }
 }
 
@@ -2296,10 +2280,6 @@ void MoQFrameParser::handleRequestSpecificParams(
 
     // FORWARD
     handleForwardParam(publishOk.forward, requestSpecificParams);
-
-    // NEW_GROUP_REQUEST
-    handleNewGroupRequestParam(
-        publishOk.newGroupRequest, requestSpecificParams);
   }
 }
 
@@ -2345,16 +2325,6 @@ void MoQFrameParser::handleForwardParam(
       getFirstIntParam(requestSpecificParams, TrackRequestParamKey::FORWARD);
   if (maybeForward.has_value()) {
     forwardField = (*maybeForward == 1);
-  }
-}
-
-void MoQFrameParser::handleNewGroupRequestParam(
-    std::optional<uint64_t>& newGroupRequestField,
-    const std::vector<Parameter>& requestSpecificParams) const noexcept {
-  auto maybeValue = getFirstIntParam(
-      requestSpecificParams, TrackRequestParamKey::NEW_GROUP_REQUEST);
-  if (maybeValue.has_value()) {
-    newGroupRequestField = *maybeValue;
   }
 }
 
@@ -4444,11 +4414,13 @@ WriteResult MoQFrameWriter::writeSubscribeRequestHelper(
       requestSpecificParams.push_back(forwardParam);
     }
 
-    if (subscribeRequest.newGroupRequest.has_value()) {
+    auto newGroupRequestValue = getFirstIntParam(
+        subscribeRequest.params, TrackRequestParamKey::NEW_GROUP_REQUEST);
+    if (newGroupRequestValue.has_value()) {
       Parameter newGroupRequestParam;
       newGroupRequestParam.key =
           folly::to_underlying(TrackRequestParamKey::NEW_GROUP_REQUEST);
-      newGroupRequestParam.asUint64 = *subscribeRequest.newGroupRequest;
+      newGroupRequestParam.asUint64 = *newGroupRequestValue;
       requestSpecificParams.push_back(newGroupRequestParam);
     }
   } else {
@@ -4538,11 +4510,13 @@ WriteResult MoQFrameWriter::writeRequestUpdate(
       requestSpecificParams.push_back(forwardParam);
     }
 
-    if (update.newGroupRequest.has_value()) {
+    auto newGroupRequestValue = getFirstIntParam(
+        update.params, TrackRequestParamKey::NEW_GROUP_REQUEST);
+    if (newGroupRequestValue.has_value()) {
       Parameter newGroupRequestParam;
       newGroupRequestParam.key =
           folly::to_underlying(TrackRequestParamKey::NEW_GROUP_REQUEST);
-      newGroupRequestParam.asUint64 = *update.newGroupRequest;
+      newGroupRequestParam.asUint64 = *newGroupRequestValue;
       requestSpecificParams.push_back(newGroupRequestParam);
     }
   } else {
@@ -4871,11 +4845,13 @@ WriteResult MoQFrameWriter::writePublishOk(
       requestSpecificParams.push_back(forwardParam);
     }
 
-    if (publishOk.newGroupRequest.has_value()) {
+    auto newGroupRequestValue = getFirstIntParam(
+        publishOk.params, TrackRequestParamKey::NEW_GROUP_REQUEST);
+    if (newGroupRequestValue.has_value()) {
       Parameter newGroupRequestParam;
       newGroupRequestParam.key =
           folly::to_underlying(TrackRequestParamKey::NEW_GROUP_REQUEST);
-      newGroupRequestParam.asUint64 = *publishOk.newGroupRequest;
+      newGroupRequestParam.asUint64 = *newGroupRequestValue;
       requestSpecificParams.push_back(newGroupRequestParam);
     }
   } else {
