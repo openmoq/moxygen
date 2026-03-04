@@ -51,10 +51,6 @@ class MoQForwarder : public TrackConsumer {
     return extensions_;
   }
 
-  std::optional<bool> upstreamDynamicGroups() const {
-    return upstreamDynamicGroups_;
-  }
-
   void setOutstandingNewGroupRequest(uint64_t value);
 
   bool shouldForwardNewGroupRequest(uint64_t requestedGroup) const;
@@ -339,7 +335,6 @@ class MoQForwarder : public TrackConsumer {
   // This should eventually be a vector of params that can be cascaded e2e
   std::chrono::milliseconds upstreamDeliveryTimeout_{};
   Extensions extensions_;
-  std::optional<bool> upstreamDynamicGroups_{};
   // The NEW_GROUP_REQUEST value most recently forwarded upstream; cleared when
   // the upstream Largest Group advances (indicating the request was fulfilled).
   std::optional<uint64_t> outstandingNewGroupRequest_{};

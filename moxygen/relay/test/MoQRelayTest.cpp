@@ -2300,4 +2300,299 @@ TEST_F(MoQRelayTest, ExtensionsIncludedInSubscribeOkForSubscribers) {
       subscriber3->subscribeOk().extensions.getIntExtension(0xDEAD'0000), 123);
 }
 
+// ============================================================
+// New Group Request (NGR) Tests
+// ============================================================
+
+// Forwarder unit test: shouldForwardNewGroupRequest gating logic —
+// blocks when dynamic groups disabled, group already visible, or
+// an outstanding request already covers it; allows otherwise.
+TEST_F(MoQRelayTest, ForwarderShouldForwardNGRGatingConditions) {
+  auto forwarder = std::make_shared<MoQForwarder>(kTestTrackName);
+
+  // Gate 1: dynamic groups not enabled - always false
+  EXPECT_FALSE(forwarder->shouldForwardNewGroupRequest(5));
+
+  // Enable dynamic groups for the remaining checks
+  PublishRequest pub;
+  setPublisherDynamicGroups(pub, true);
+  forwarder->setExtensions(pub.extensions);
+
+  // Baseline: no largest, no outstanding - should forward
+  EXPECT_TRUE(forwarder->shouldForwardNewGroupRequest(5));
+
+  // Gate 2: group already covered by largest
+  forwarder->setLargest({10, 0});
+  EXPECT_FALSE(forwarder->shouldForwardNewGroupRequest(5));
+  EXPECT_FALSE(forwarder->shouldForwardNewGroupRequest(10));
+  EXPECT_TRUE(forwarder->shouldForwardNewGroupRequest(11));
+
+  // Gate 3: outstanding request already covers the value
+  forwarder->setOutstandingNewGroupRequest(11);
+  EXPECT_FALSE(forwarder->shouldForwardNewGroupRequest(11));
+  EXPECT_FALSE(forwarder->shouldForwardNewGroupRequest(10));
+  EXPECT_TRUE(forwarder->shouldForwardNewGroupRequest(12));
+}
+
+// Forwarder unit test: updateLargest clears the outstanding NGR so that
+// a higher group value can be re-requested later
+TEST_F(MoQRelayTest, ForwarderUpdateLargestClearsOutstandingNGR) {
+  auto forwarder = std::make_shared<MoQForwarder>(kTestTrackName);
+  PublishRequest pub;
+  setPublisherDynamicGroups(pub, true);
+  forwarder->setExtensions(pub.extensions);
+
+  // Set an outstanding NGR for group 5
+  forwarder->setOutstandingNewGroupRequest(5);
+  // Outstanding deduplication blocks re-requesting group 5
+  EXPECT_FALSE(forwarder->shouldForwardNewGroupRequest(5));
+
+  // Advance largest past group 5 - outstanding NGR should be cleared
+  forwarder->updateLargest(6, 0);
+  // Group 5 is now <= largest (blocked by visibility), but group 7 is future
+  // and should be forwardable now that outstanding is cleared
+  EXPECT_TRUE(forwarder->shouldForwardNewGroupRequest(7));
+}
+
+
+// Relay test: When a late-joining subscriber sends NEW_GROUP_REQUEST in its
+// SUBSCRIBE, the relay forwards it upstream via REQUEST_UPDATE
+TEST_F(MoQRelayTest, RelaySubscribeLateJoinerNGRForwardedUpstream) {
+  auto publisherSession = createMockSession();
+  auto subscriber1 = createMockSession();
+  auto subscriber2 = createMockSession();
+
+  doPublishNamespace(publisherSession, kTestNamespace);
+
+  // Upstream SubscribeOk advertises DYNAMIC_GROUPS = true
+  SubscribeOk upstreamOk;
+  upstreamOk.requestID = RequestID(100);
+  upstreamOk.trackAlias = TrackAlias(1);
+  upstreamOk.expires = std::chrono::milliseconds(0);
+  upstreamOk.groupOrder = GroupOrder::OldestFirst;
+  setPublisherDynamicGroups(upstreamOk, true);
+
+  auto upstreamHandle =
+      std::make_shared<NiceMock<MockSubscriptionHandle>>(upstreamOk);
+  ON_CALL(*upstreamHandle, requestUpdateResult())
+      .WillByDefault(
+          Return(folly::makeExpected<RequestError>(RequestOk{RequestID(0)})));
+
+  EXPECT_CALL(*publisherSession, subscribe(_, _))
+      .WillOnce([&upstreamHandle](auto /*req*/, auto /*consumer*/) {
+        return folly::coro::makeTask<Publisher::SubscribeResult>(
+            folly::Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>(
+                upstreamHandle));
+      });
+
+  // First subscriber establishes the upstream subscription (no NGR)
+  auto consumer1 = createMockConsumer();
+  auto handle1 =
+      subscribeToTrack(subscriber1, kTestTrackName, consumer1, RequestID(1));
+  ASSERT_NE(handle1, nullptr);
+
+  // Second subscriber includes NEW_GROUP_REQUEST=8
+  auto consumer2 = createMockConsumer();
+  SubscribeRequest sub2;
+  sub2.fullTrackName = kTestTrackName;
+  sub2.requestID = RequestID(2);
+  sub2.locType = LocationType::LargestObject;
+  sub2.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::NEW_GROUP_REQUEST),
+      uint64_t(8)));
+
+  // The relay must forward NGR=8 upstream via REQUEST_UPDATE
+  EXPECT_CALL(*upstreamHandle, requestUpdateCalled(_))
+      .WillOnce([](RequestUpdate update) {
+        auto ngrValue = getFirstIntParam(
+            update.params, TrackRequestParamKey::NEW_GROUP_REQUEST);
+        ASSERT_TRUE(ngrValue.has_value());
+        EXPECT_EQ(*ngrValue, 8);
+      });
+
+  std::shared_ptr<SubscriptionHandle> handle2{nullptr};
+  withSessionContext(subscriber2, [&]() {
+    auto task = relay_->subscribe(std::move(sub2), consumer2);
+    auto res = folly::coro::blockingWait(std::move(task), exec_.get());
+    ASSERT_TRUE(res.hasValue());
+    handle2 = *res;
+  });
+  exec_->drive();
+
+  // Register handle2 so removeSession(subscriber2) will unsubscribe it,
+  // allowing the forwarder to become empty and release the upstream handle.
+  getOrCreateMockState(subscriber2)->subscribeHandles.push_back(handle2);
+
+  removeSession(publisherSession);
+  removeSession(subscriber1);
+  removeSession(subscriber2);
+  exec_->drive();
+}
+
+// Relay test: A downstream subscriber sending REQUEST_UPDATE with
+// NEW_GROUP_REQUEST causes the relay to cascade the NGR upstream
+TEST_F(MoQRelayTest, RelayRequestUpdateNGRCascadedUpstream) {
+  auto publisherSession = createMockSession();
+  auto subscriberSession = createMockSession();
+
+  doPublishNamespace(publisherSession, kTestNamespace);
+
+  // Upstream SubscribeOk advertises DYNAMIC_GROUPS = true
+  SubscribeOk upstreamOk;
+  upstreamOk.requestID = RequestID(100);
+  upstreamOk.trackAlias = TrackAlias(1);
+  upstreamOk.expires = std::chrono::milliseconds(0);
+  upstreamOk.groupOrder = GroupOrder::OldestFirst;
+  setPublisherDynamicGroups(upstreamOk, true);
+
+  auto upstreamHandle =
+      std::make_shared<NiceMock<MockSubscriptionHandle>>(upstreamOk);
+  ON_CALL(*upstreamHandle, requestUpdateResult())
+      .WillByDefault(
+          Return(folly::makeExpected<RequestError>(RequestOk{RequestID(0)})));
+
+  EXPECT_CALL(*publisherSession, subscribe(_, _))
+      .WillOnce([&upstreamHandle](auto /*req*/, auto /*consumer*/) {
+        return folly::coro::makeTask<Publisher::SubscribeResult>(
+            folly::Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>(
+                upstreamHandle));
+      });
+
+  // Subscribe downstream session - triggers upstream subscribe
+  auto consumer = createMockConsumer();
+  auto handle =
+      subscribeToTrack(subscriberSession, kTestTrackName, consumer, RequestID(1));
+  ASSERT_NE(handle, nullptr);
+
+  auto* subscriber = dynamic_cast<MoQForwarder::Subscriber*>(handle.get());
+  ASSERT_NE(subscriber, nullptr);
+
+  // The relay must cascade NGR=9 upstream via REQUEST_UPDATE
+  EXPECT_CALL(*upstreamHandle, requestUpdateCalled(_))
+      .WillOnce([](RequestUpdate update) {
+        auto ngrValue = getFirstIntParam(
+            update.params, TrackRequestParamKey::NEW_GROUP_REQUEST);
+        ASSERT_TRUE(ngrValue.has_value());
+        EXPECT_EQ(*ngrValue, 9);
+      });
+
+  // Downstream subscriber sends REQUEST_UPDATE carrying NEW_GROUP_REQUEST=9
+  RequestUpdate update;
+  update.requestID = RequestID(2);
+  update.existingRequestID = RequestID(1);
+  update.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::NEW_GROUP_REQUEST),
+      uint64_t(9)));
+  folly::coro::blockingWait(subscriber->requestUpdate(std::move(update)));
+  exec_->drive();
+
+  removeSession(publisherSession);
+  removeSession(subscriberSession);
+}
+
+// Unit test: Subscriber::onPublishOk postprocessing
+// Verifies that onPublishOk correctly updates:
+// 1. Subscriber range based on PublishOk fields
+// 2. shouldForward flag
+// 3. NEW_GROUP_REQUEST forwarding when it passes gating checks
+TEST_F(MoQRelayTest, SubscriberOnPublishOkPostprocessing) {
+  auto publisherSession = createMockSession();
+  auto subscriberSession = createMockSession();
+
+  // Publish track and subscribe
+  auto publishConsumer = doPublish(publisherSession, kTestTrackName);
+  auto consumer = createMockConsumer();
+  auto handle =
+      subscribeToTrack(subscriberSession, kTestTrackName, consumer, RequestID(1));
+  ASSERT_NE(handle, nullptr);
+
+  // Cast to access Subscriber internals
+  auto* subscriber = dynamic_cast<MoQForwarder::Subscriber*>(handle.get());
+  ASSERT_NE(subscriber, nullptr);
+
+  // Test 1: Range update from PublishOk
+  // Create a PublishOk with specific start/end locations
+  PublishOk pubOk1{
+      RequestID(1),                      // requestID
+      true,                              // forward
+      0,                                 // subscriberPriority
+      GroupOrder::OldestFirst,           // groupOrder
+      LocationType::AbsoluteStart,       // locType
+      AbsoluteLocation{5, 0},            // start
+      uint64_t(15),                      // endGroup
+      TrackRequestParameters(FrameType::PUBLISH_OK)};
+
+  // Apply the postprocessing
+  subscriber->onPublishOk(pubOk1);
+
+  // Verify range was updated
+  EXPECT_EQ(subscriber->range.start.group, 5);
+
+  // Test 2: Forward flag update
+  subscriber->shouldForward = true;
+  PublishOk pubOk2{
+      RequestID(2),
+      false, // forward = false
+      0,
+      GroupOrder::OldestFirst,
+      LocationType::AbsoluteStart,
+      AbsoluteLocation{5, 0},
+      uint64_t(15),
+      TrackRequestParameters(FrameType::PUBLISH_OK)};
+  subscriber->onPublishOk(pubOk2);
+  EXPECT_FALSE(subscriber->shouldForward)
+      << "Forward flag should be updated to false";
+
+  subscriber->shouldForward = false;
+  PublishOk pubOk3{
+      RequestID(3),
+      true, // forward = true
+      0,
+      GroupOrder::OldestFirst,
+      LocationType::AbsoluteStart,
+      AbsoluteLocation{5, 0},
+      uint64_t(15),
+      TrackRequestParameters(FrameType::PUBLISH_OK)};
+  subscriber->onPublishOk(pubOk3);
+  EXPECT_TRUE(subscriber->shouldForward)
+      << "Forward flag should be updated to true";
+
+  // Test 3: NEW_GROUP_REQUEST forwarding
+  // Enable dynamic groups on the forwarder first
+  PublishRequest pub;
+  setPublisherDynamicGroups(pub, true);
+  subscriber->forwarder.setExtensions(pub.extensions);
+
+  // Verify baseline: NGR should be forwardable for group 20
+  EXPECT_TRUE(subscriber->forwarder.shouldForwardNewGroupRequest(20));
+
+  // Create a PublishOk with NEW_GROUP_REQUEST parameter
+  TrackRequestParameters ngrParams(FrameType::PUBLISH_OK);
+  ngrParams.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::NEW_GROUP_REQUEST),
+      uint64_t(20)));
+
+  PublishOk pubOk4{
+      RequestID(4),
+      true,
+      0,
+      GroupOrder::OldestFirst,
+      LocationType::AbsoluteStart,
+      AbsoluteLocation{10, 0},
+      std::nullopt,
+      std::move(ngrParams)};
+
+  // Apply postprocessing - should process NEW_GROUP_REQUEST
+  subscriber->onPublishOk(pubOk4);
+  
+  // The outstanding NGR should now be set to 20
+  EXPECT_FALSE(subscriber->forwarder.shouldForwardNewGroupRequest(20))
+      << "Group 20 should now be covered by outstanding NGR";
+  EXPECT_TRUE(subscriber->forwarder.shouldForwardNewGroupRequest(21))
+      << "Group 21 should still be forwardable";
+
+  removeSession(publisherSession);
+  removeSession(subscriberSession);
+}
+
 } // namespace moxygen::test

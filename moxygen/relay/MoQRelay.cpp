@@ -898,7 +898,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     auto newGroupRequestValue = getFirstIntParam(
         subReq.params, TrackRequestParamKey::NEW_GROUP_REQUEST);
     if (newGroupRequestValue.has_value() &&
-        forwarder->upstreamDynamicGroups().value_or(false)) {
+        getPublisherDynamicGroups(forwarder->extensions()).value_or(false)) {
       forwarder->setOutstandingNewGroupRequest(*newGroupRequestValue);
     }
     rsub.promise.setValue(folly::unit);

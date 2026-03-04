@@ -141,7 +141,6 @@ void MoQForwarder::setDeliveryTimeout(uint64_t timeout) {
 
 void MoQForwarder::setExtensions(Extensions extensions) {
   extensions_ = std::move(extensions);
-  upstreamDynamicGroups_ = getPublisherDynamicGroups(extensions_);
 }
 
 void MoQForwarder::setOutstandingNewGroupRequest(uint64_t value) {
@@ -531,7 +530,7 @@ void MoQForwarder::removeForwardingSubscriber() {
 
 bool MoQForwarder::shouldForwardNewGroupRequest(uint64_t requestedGroup) const {
   // the track must support dynamic groups.
-  if (!upstreamDynamicGroups_.value_or(false)) {
+  if (!getPublisherDynamicGroups(extensions_).value_or(false)) {
     return false;
   }
   // non-zero value <= LargestGroup means the new group is already
