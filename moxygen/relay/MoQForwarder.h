@@ -45,7 +45,11 @@ class MoQForwarder : public TrackConsumer {
     return upstreamDeliveryTimeout_;
   }
 
-  void setDynamicGroups(bool enabled);
+  void setExtensions(Extensions extensions);
+
+  const Extensions& extensions() const {
+    return extensions_;
+  }
 
   std::optional<bool> upstreamDynamicGroups() const {
     return upstreamDynamicGroups_;
@@ -54,6 +58,7 @@ class MoQForwarder : public TrackConsumer {
   void setOutstandingNewGroupRequest(uint64_t value);
 
   bool shouldForwardNewGroupRequest(uint64_t requestedGroup) const;
+
 
   void setLargest(AbsoluteLocation largest);
 
@@ -110,8 +115,11 @@ class MoQForwarder : public TrackConsumer {
     // updates existing param if key matches, otherwise adds new param
     void setParam(const TrackRequestParameter& param);
 
-    // Adds or replaces the DYNAMIC_GROUPS extension on the subscribeOk
-    void setDynamicGroupsExtension(bool enabled);
+    void setExtensions(Extensions extensions);
+
+    // Constructs a PublishRequest from the forwarder's track-level state.
+    // requestID and trackAlias are placeholders (overwritten by MoQSession).
+    PublishRequest getPublishRequest() const;
 
     // Process PUBLISH_OK response, updating range, forward flag, and handling
     // NEW_GROUP_REQUEST forwarding via callback
@@ -153,7 +161,13 @@ class MoQForwarder : public TrackConsumer {
 
   std::shared_ptr<MoQForwarder::Subscriber> addSubscriber(
       std::shared_ptr<MoQSession> session,
-      const PublishRequest& pub);
+      bool forward);
+
+  std::shared_ptr<MoQForwarder::Subscriber> addSubscriber(
+      std::shared_ptr<MoQSession> session,
+      const PublishRequest& pub) {
+    return addSubscriber(std::move(session), pub.forward);
+  }
 
   folly::Expected<SubscribeRange, FetchError> resolveJoiningFetch(
       const std::shared_ptr<MoQSession>& session,
@@ -324,6 +338,7 @@ class MoQForwarder : public TrackConsumer {
   std::optional<AbsoluteLocation> largest_;
   // This should eventually be a vector of params that can be cascaded e2e
   std::chrono::milliseconds upstreamDeliveryTimeout_{};
+  Extensions extensions_;
   std::optional<bool> upstreamDynamicGroups_{};
   // The NEW_GROUP_REQUEST value most recently forwarded upstream; cleared when
   // the upstream Largest Group advances (indicating the request was fulfilled).

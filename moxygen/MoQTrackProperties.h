@@ -47,6 +47,12 @@ std::optional<uint64_t> getIntExtension(const Msg& msg, uint64_t type) {
   return msg.extensions.getIntExtension(type);
 }
 
+inline std::optional<uint64_t> getIntExtension(
+    const Extensions& ext,
+    uint64_t type) {
+  return ext.getIntExtension(type);
+}
+
 } // namespace detail
 
 // ============================================================================
@@ -93,6 +99,7 @@ void setPublisherGroupOrder(
     Msg& msg,
     GroupOrder order,
     bool immutable = false) {
+  msg.groupOrder = order;
   detail::setIntExtension(
       msg,
       kPublisherGroupOrderExtensionType,

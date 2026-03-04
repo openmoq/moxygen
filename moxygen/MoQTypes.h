@@ -456,6 +456,10 @@ class Parameters {
     return frameType_;
   }
 
+  void setMajorVersion(uint64_t majorVersion) {
+    majorVersion_ = majorVersion;
+  }
+
   // Validates if a parameter is allowed for frameType_
   bool isParamAllowed(TrackRequestParamKey key) const;
 
@@ -549,6 +553,7 @@ class Parameters {
 
  private:
   FrameType frameType_{};
+  std::optional<uint64_t> majorVersion_;
   std::vector<Parameter> params_;
 };
 
