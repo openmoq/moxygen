@@ -95,8 +95,7 @@ jobs:
           bash openmoq/scripts/collect-artifacts-standalone.sh \
             --install-prefix "$GITHUB_WORKSPACE/install" \
             --output "${{ matrix.artifact }}" \
-            --debug-output "${{ matrix.debug_artifact }}" \
-            --src-dir "$GITHUB_WORKSPACE"
+            --debug-output "${{ matrix.debug_artifact }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
