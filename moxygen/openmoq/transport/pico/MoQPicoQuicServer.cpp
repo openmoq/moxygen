@@ -158,13 +158,9 @@ void MoQPicoQuicServer::start(const folly::SocketAddress &addr) {
              << supportedAlpns.size() << " supported ALPNs";
 
   // Set up packet loop parameters
-  impl_->loopParam_ = {0};
+  impl_->loopParam_ = {};
   impl_->loopParam_.local_port =
       static_cast<uint16_t>(impl_->serverAddr_.getPort());
-  impl_->loopParam_.local_af = 0; // 0 = any
-  impl_->loopParam_.dest_if = 0;
-  impl_->loopParam_.socket_buffer_size = 0; // 0 = default
-  impl_->loopParam_.do_not_use_gso = 0;
 
   // Start the network thread using picoquic's network thread API
   int ret = 0;
