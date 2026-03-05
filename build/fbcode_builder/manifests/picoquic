@@ -21,7 +21,4 @@ BUILD_TESTING = OFF
 [dependencies]
 openssl
 
-[dependencies.test=on]
-googletest
-
 [shipit.pathmap]
