@@ -1,6 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
- * This source code is licensed under the MIT license found in the
+ * This source code is licensed under the Apache 2.0 license found in the
  * LICENSE file in the root directory of this source tree.
  */
 
@@ -136,11 +136,21 @@ MoQForwarder::~MoQForwarder() {
 }
 
 void MoQForwarder::setDeliveryTimeout(uint64_t timeout) {
-  upstreamDeliveryTimeout_ = std::chrono::milliseconds(timeout);
+  extensions_.insertMutableExtension(
+      Extension{kDeliveryTimeoutExtensionType, timeout});
 }
 
 void MoQForwarder::setExtensions(Extensions extensions) {
   extensions_ = std::move(extensions);
+  auto groupOrder = getPublisherGroupOrder(extensions_);
+  if (groupOrder) {
+    groupOrder_ = *groupOrder;
+  }
+  // Update existing subscribers (typically at most the first subscriber
+  // added before the upstream SubscribeOk arrived)
+  for (auto& [_, sub] : subscribers_) {
+    sub->setExtensions(extensions_);
+  }
 }
 
 void MoQForwarder::setOutstandingNewGroupRequest(uint64_t value) {
@@ -587,6 +597,11 @@ void MoQForwarder::Subscriber::updateLargest(AbsoluteLocation largest) {
 
 void MoQForwarder::Subscriber::setExtensions(Extensions extensions) {
   subscribeOk_->extensions = std::move(extensions);
+  auto groupOrder = getPublisherGroupOrder(*subscribeOk_);
+  if (groupOrder) {
+    subscribeOk_->groupOrder =
+        MoQSession::resolveGroupOrder(*groupOrder, subscribeOk_->groupOrder);
+  }
 }
 
 PublishRequest MoQForwarder::Subscriber::getPublishRequest() const {

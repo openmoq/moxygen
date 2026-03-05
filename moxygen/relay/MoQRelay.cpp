@@ -1,6 +1,6 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
- * This source code is licensed under the MIT license found in the
+ * This source code is licensed under the Apache 2.0 license found in the
  * LICENSE file in the root directory of this source tree.
  */
 
@@ -443,15 +443,7 @@ Subscriber::PublishResult MoQRelay::publish(
       std::make_shared<MoQForwarder>(pub.fullTrackName, pub.largest);
 
   // Set Forwarder Params
-  forwarder->setGroupOrder(pub.groupOrder);
   forwarder->setExtensions(pub.extensions);
-
-  // Extract delivery timeout from publish request extensions and store in
-  // forwarder
-  auto deliveryTimeout = getPublisherDeliveryTimeout(pub);
-  if (deliveryTimeout && deliveryTimeout->count() > 0) {
-    forwarder->setDeliveryTimeout(deliveryTimeout->count());
-  }
 
   auto subRes = subscriptions_.emplace(
       std::piecewise_construct,
@@ -863,25 +855,14 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
       forwarder->updateLargest(largest->group, largest->object);
       subscriber->updateLargest(*largest);
     }
-    auto pubGroupOrder = subRes.value()->subscribeOk().groupOrder;
-    forwarder->setGroupOrder(pubGroupOrder);
-
-    // Store upstream delivery timeout in forwarder
-    auto deliveryTimeout =
-        getPublisherDeliveryTimeout(subRes.value()->subscribeOk());
-    if (deliveryTimeout && deliveryTimeout->count() > 0) {
-      forwarder->setDeliveryTimeout(deliveryTimeout->count());
-    }
-
-    // Save full extensions to forwarder, first subscriber, and cache
+    // Save upstream extensions to forwarder (and existing subscribers) and
+    // cache
     auto& upstreamExtensions = subRes.value()->subscribeOk().extensions;
     forwarder->setExtensions(upstreamExtensions);
-    subscriber->setExtensions(upstreamExtensions);
     if (cache_) {
       cache_->setTrackExtensions(subReq.fullTrackName, upstreamExtensions);
     }
 
-    subscriber->setPublisherGroupOrder(pubGroupOrder);
     auto it = subscriptions_.find(subReq.fullTrackName);
     // There are cases that remove the subscription like failing to
     // publish a datagram that was received before the subscribeOK
