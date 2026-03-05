@@ -5,7 +5,7 @@ name: OpenMOQ Publish Artifacts
 
 on:
   push:
-    branches: [openmoq-main]
+    branches: [openmoq-main, main]
   workflow_dispatch:
 
 permissions:
