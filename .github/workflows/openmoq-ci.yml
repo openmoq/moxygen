@@ -20,7 +20,7 @@ jobs:
             name: linux
           - os: macos-15
             name: macos
-    name: standalone (${{ matrix.name }})
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
