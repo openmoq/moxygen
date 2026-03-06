@@ -6,7 +6,6 @@
 
 #include "moxygen/openmoq/transport/pico/MoQPicoQuicServer.h"
 #include <folly/String.h>
-#include <folly/experimental/coro/BlockingWait.h>
 #include <folly/logging/xlog.h>
 #include <moxygen/MoQFramer.h> // For getDefaultMoqtProtocols
 #include <moxygen/MoQSession.h>

@@ -13,7 +13,6 @@ moxygen_add_library(openmoq_pico_transport
     Folly::folly_logging_logging
     Folly::folly_network_address
     Folly::folly_string
-    Folly::folly_coro_blocking_wait
     picoquic::picoquic-core
 )
 
