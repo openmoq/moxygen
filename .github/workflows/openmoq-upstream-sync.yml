@@ -1,4 +1,4 @@
-name: OpenMOQ Upstream Sync
+name: upstream sync
 
 # Mirrors upstream to `origin/upstream` branch, creates sync/<sha> PR branches
 # for merging into `main`. One PR at a time — blocks if one is pending.

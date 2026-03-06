@@ -1,4 +1,4 @@
-name: OpenMOQ CI
+name: pull request ci
 
 # Standalone build validation for PRs. Required status check for branch protection.
 
@@ -60,7 +60,7 @@ jobs:
         uses: dorny/test-reporter@v1.9.1
         if: success() || failure()
         with:
-          name: "Tests (${{ matrix.name }})"
+          name: "test (${{ matrix.name }})"
           path: _build/test-results.xml
           reporter: java-junit
 
@@ -68,7 +68,7 @@ jobs:
         run: cmake --install _build
 
   asan-build:
-    name: asan (linux)
+    name: asan debug
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -113,6 +113,6 @@ jobs:
         uses: dorny/test-reporter@v1.9.1
         if: success() || failure()
         with:
-          name: "Tests (linux-asan)"
+          name: "test (asan debug)"
           path: _build/test-results.xml
           reporter: java-junit

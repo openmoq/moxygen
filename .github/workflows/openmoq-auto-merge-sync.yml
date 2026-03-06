@@ -1,4 +1,4 @@
-name: OpenMOQ Auto-Merge Sync
+name: sync auto-merge
 
 # Fires when OpenMOQ CI completes on a sync/* branch.
 # If CI passed, merges the corresponding open sync PR into main.
@@ -11,7 +11,7 @@ name: OpenMOQ Auto-Merge Sync
 
 on:
   workflow_run:
-    workflows: ["OpenMOQ CI"]
+    workflows: ["pull request ci"]
     types: [completed]
     branches:
       - sync/**
