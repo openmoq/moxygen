@@ -1,4 +1,4 @@
-name: cmake
+name: build
 
 # Standalone build validation for PRs. Required status check for branch protection.
 
