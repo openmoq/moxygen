@@ -7,7 +7,7 @@
 #include "moxygen/openmoq/transport/pico/MoQPicoQuicServer.h"
 #include <folly/String.h>
 #include <folly/logging/xlog.h>
-#include <moxygen/MoQFramer.h> // For getDefaultMoqtProtocols
+#include <moxygen/MoQVersions.h>
 #include <moxygen/MoQSession.h>
 #include <moxygen/mlog/MLogger.h>
 #include <moxygen/openmoq/transport/pico/PicoQuicExecutor.h>
@@ -30,37 +30,6 @@ struct ConnectionContext {
   MoQPicoQuicServer *server;
 };
 
-// Static ALPN selection callback for picoquic
-static size_t alpnSelectCallback(picoquic_quic_t *quic, picoquic_iovec_t *list,
-                                 size_t count) {
-  // Get list of supported MoQT ALPNs (in preference order)
-  auto supportedAlpns = getDefaultMoqtProtocols(true);
-
-  // First pass: build list of client-proposed ALPNs
-  std::vector<std::string> clientAlpns;
-  for (size_t i = 0; i < count; i++) {
-    if (list[i].base && list[i].len > 0) {
-      clientAlpns.emplace_back(reinterpret_cast<const char *>(list[i].base),
-                               list[i].len);
-    }
-  }
-  XLOG(DBG4) << "Client proposed ALPNs: " << folly::join(", ", clientAlpns);
-
-  // Second pass: find the first ALPN from our preference list that the client
-  // supports
-  for (const auto &ourAlpn : supportedAlpns) {
-    for (size_t i = 0; i < clientAlpns.size(); i++) {
-      if (clientAlpns[i] == ourAlpn) {
-        XLOG(DBG1) << "Selected ALPN: " << ourAlpn << " (index " << i << ")";
-        return i;
-      }
-    }
-  }
-
-  XLOG(WARN) << "No common ALPN found between client and server";
-  return count; // Return invalid index
-}
-
 struct MoQPicoQuicServer::Impl {
   // Picoquic callback - static function that routes to instance methods
   static int picoCallback(picoquic_cnx_t *cnx, uint64_t stream_id,
@@ -68,12 +37,17 @@ struct MoQPicoQuicServer::Impl {
                           picoquic_call_back_event_t fin_or_event,
                           void *callback_ctx, void *v_stream_ctx);
 
+  // ALPN selection callback for picoquic
+  static size_t alpnSelectCallback(picoquic_quic_t *quic,
+                                   picoquic_iovec_t *list, size_t count);
+
   // Handle new connection event
   void onNewConnection(MoQPicoQuicServer *server, picoquic_cnx_t *cnx);
 
   // Server parameters
   std::string cert_;
   std::string key_;
+  std::vector<std::string> supportedAlpns_;
 
   // Picoquic context
   picoquic_quic_t *quic_{nullptr};
@@ -90,11 +64,15 @@ struct MoQPicoQuicServer::Impl {
   std::shared_ptr<PicoQuicExecutor> executor_;
 };
 
-MoQPicoQuicServer::MoQPicoQuicServer(std::string cert, std::string key,
-                                     std::string endpoint)
+MoQPicoQuicServer::MoQPicoQuicServer(
+    std::string cert,
+    std::string key,
+    std::string endpoint,
+    std::string versions)
     : MoQServerBase(std::move(endpoint)), impl_(std::make_unique<Impl>()) {
   impl_->cert_ = std::move(cert);
   impl_->key_ = std::move(key);
+  impl_->supportedAlpns_ = getMoqtProtocols(versions, true);
 }
 
 MoQPicoQuicServer::~MoQPicoQuicServer() { stop(); }
@@ -113,10 +91,8 @@ void MoQPicoQuicServer::start(const folly::SocketAddress &addr) {
   // Create the QUIC context
   uint64_t current_time = picoquic_current_time();
 
-  // Get list of supported MoQT ALPNs (in preference order)
-  auto supportedAlpns = getDefaultMoqtProtocols(true);
-
-  XLOG(INFO) << "Supported ALPNs: " << folly::join(", ", supportedAlpns);
+  XLOG(INFO) << "Supported ALPNs: "
+             << folly::join(", ", impl_->supportedAlpns_);
 
   // Pass NULL as default ALPN - we'll use the selection callback instead
   impl_->quic_ =
@@ -145,7 +121,7 @@ void MoQPicoQuicServer::start(const folly::SocketAddress &addr) {
   }
 
   // Set ALPN selection callback to handle multiple ALPNs
-  picoquic_set_alpn_select_fn_v2(impl_->quic_, alpnSelectCallback);
+  picoquic_set_alpn_select_fn_v2(impl_->quic_, Impl::alpnSelectCallback);
 
   // Configure picoquic settings
   picoquic_set_cookie_mode(impl_->quic_, 2);
@@ -154,7 +130,7 @@ void MoQPicoQuicServer::start(const folly::SocketAddress &addr) {
 
   XLOG(INFO) << "Starting MoQPicoQuicServer on "
              << impl_->serverAddr_.describe() << " with "
-             << supportedAlpns.size() << " supported ALPNs";
+             << impl_->supportedAlpns_.size() << " supported ALPNs";
 
   // Set up packet loop parameters
   impl_->loopParam_ = {};
@@ -202,6 +178,37 @@ void MoQPicoQuicServer::stop() {
   }
 
   XLOG(INFO) << "MoQPicoQuicServer stopped";
+}
+
+size_t MoQPicoQuicServer::Impl::alpnSelectCallback(picoquic_quic_t *quic,
+                                                   picoquic_iovec_t *list,
+                                                   size_t count) {
+  auto *server = static_cast<MoQPicoQuicServer *>(
+      picoquic_get_default_callback_context(quic));
+  const auto &supportedAlpns = server->impl_->supportedAlpns_;
+
+  // First pass: build list of client-proposed ALPNs
+  std::vector<std::string> clientAlpns;
+  for (size_t i = 0; i < count; i++) {
+    if (list[i].base && list[i].len > 0) {
+      clientAlpns.emplace_back(reinterpret_cast<const char *>(list[i].base),
+                               list[i].len);
+    }
+  }
+  XLOG(DBG4) << "Client proposed ALPNs: " << folly::join(", ", clientAlpns);
+
+  // Find the first ALPN from our preference list that the client supports
+  for (const auto &ourAlpn : supportedAlpns) {
+    for (size_t i = 0; i < clientAlpns.size(); i++) {
+      if (clientAlpns[i] == ourAlpn) {
+        XLOG(DBG1) << "Selected ALPN: " << ourAlpn << " (index " << i << ")";
+        return i;
+      }
+    }
+  }
+
+  XLOG(WARN) << "No common ALPN found between client and server";
+  return count; // Return invalid index
 }
 
 int MoQPicoQuicServer::Impl::picoCallback(

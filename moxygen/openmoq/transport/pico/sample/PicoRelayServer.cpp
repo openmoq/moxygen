@@ -20,6 +20,10 @@ DEFINE_string(cert, "", "Cert path");
 DEFINE_string(key, "", "Key path");
 DEFINE_string(endpoint, "/moq-relay", "End point");
 DEFINE_int32(port, 9668, "Relay Server Port");
+DEFINE_string(
+    versions,
+    "",
+    "Comma-separated MoQ draft versions (e.g. \"14,16\"). Empty = all supported.");
 DEFINE_int32(
     max_cached_tracks,
     100,
@@ -47,8 +51,10 @@ class PicoRelayServer : public MoQPicoQuicServer {
       const std::string& cert,
       const std::string& key,
       const std::string& endpoint,
+      const std::string& versions,
       std::shared_ptr<MoQRelay> relay)
-      : MoQPicoQuicServer(cert, key, endpoint), relay_(std::move(relay)) {}
+      : MoQPicoQuicServer(cert, key, endpoint, versions),
+        relay_(std::move(relay)) {}
 
   void onNewSession(std::shared_ptr<MoQSession> clientSession) override {
     clientSession->setPublishHandler(relay_);
@@ -77,7 +83,7 @@ int main(int argc, char* argv[]) {
       FLAGS_max_cached_tracks, FLAGS_max_cached_groups_per_track);
 
   auto server = std::make_shared<PicoRelayServer>(
-      FLAGS_cert, FLAGS_key, FLAGS_endpoint, relay);
+      FLAGS_cert, FLAGS_key, FLAGS_endpoint, FLAGS_versions, relay);
 
   folly::SocketAddress addr("::", FLAGS_port);
   server->start(addr);

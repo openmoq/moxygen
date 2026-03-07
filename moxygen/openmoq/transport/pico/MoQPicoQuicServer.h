@@ -21,7 +21,11 @@ namespace moxygen {
  */
 class MoQPicoQuicServer : public MoQServerBase {
 public:
-  MoQPicoQuicServer(std::string cert, std::string key, std::string endpoint);
+  MoQPicoQuicServer(
+      std::string cert,
+      std::string key,
+      std::string endpoint,
+      std::string versions = "");
 
   MoQPicoQuicServer(const MoQPicoQuicServer &) = delete;
   MoQPicoQuicServer(MoQPicoQuicServer &&) = delete;
