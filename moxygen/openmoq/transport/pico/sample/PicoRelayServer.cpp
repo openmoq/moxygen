@@ -8,6 +8,7 @@
 #include "moxygen/openmoq/transport/pico/MoQPicoQuicServer.h"
 #include "moxygen/relay/MoQRelay.h"
 
+#include <folly/init/Init.h>
 #include <gflags/gflags.h>
 
 #include <atomic>
@@ -70,7 +71,7 @@ class PicoRelayServer : public MoQPicoQuicServer {
 } // namespace
 
 int main(int argc, char* argv[]) {
-  gflags::ParseCommandLineFlags(&argc, &argv, true);
+  folly::Init init(&argc, &argv, true);
 
   auto relay = std::make_shared<moxygen::MoQRelay>(
       FLAGS_max_cached_tracks, FLAGS_max_cached_groups_per_track);
