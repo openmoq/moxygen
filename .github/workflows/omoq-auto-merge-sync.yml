@@ -36,9 +36,9 @@ jobs:
             --jq "[.[] | select(.head.ref == \"${HEAD_BRANCH}\")] | .[0].number // empty")
           echo "pr_num=${PR_NUM}" >> "$GITHUB_OUTPUT"
 
-      # ── build failed: notify ──────────────────────────────────────────
+      # ── verification failed: notify ───────────────────────────────────
 
-      - name: Notify Slack (build failure)
+      - name: Notify Slack (verification failure)
         if: github.event.workflow_run.conclusion != 'success'
         continue-on-error: true
         env:
@@ -48,12 +48,12 @@ jobs:
           PR_URL="${{ github.server_url }}/${{ github.repository }}/pull/${PR_NUM}"
           CI_RUN_URL="${{ github.event.workflow_run.html_url }}"
           BRANCH="${{ github.event.workflow_run.head_branch }}"
-          TEXT=":x: *${{ github.repository }}* \`${BRANCH}\` build failed — PR: <${PR_URL}|#${PR_NUM}> run: <${CI_RUN_URL}|view>"
+          TEXT=":x: *${{ github.repository }}* \`${BRANCH}\` verification failed — PR: <${PR_URL}|#${PR_NUM}> run: <${CI_RUN_URL}|view>"
           curl -s -X POST "$SLACK_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             --data "{\"text\": \"${TEXT}\"}"
 
-      - name: Notify email (build failure)
+      - name: Notify email (verification failure)
         if: github.event.workflow_run.conclusion != 'success'
         continue-on-error: true
         env:
@@ -65,8 +65,8 @@ jobs:
           BRANCH="${{ github.event.workflow_run.head_branch }}"
           PR_URL="${{ github.server_url }}/${{ github.repository }}/pull/${PR_NUM}"
           CI_RUN_URL="${{ github.event.workflow_run.html_url }}"
-          SUBJECT="[moxygen] sync build failed — ${BRANCH}"
-          BODY="Sync branch build failed — needs conflict resolution.\n\nBranch: ${BRANCH}\nPR: ${PR_URL}\nRun: ${CI_RUN_URL}"
+          SUBJECT="[moxygen] sync verification failed — ${BRANCH}"
+          BODY="Sync branch verification failed — needs conflict resolution.\n\nBranch: ${BRANCH}\nPR: ${PR_URL}\nRun: ${CI_RUN_URL}"
           aws ses send-email \
             --from "noreply@ci.openmoq.org" \
             --destination '{"ToAddresses":["github-notifications@openmoq.org"]}' \
