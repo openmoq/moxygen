@@ -26,6 +26,12 @@ option(BUNDLE_DEPS "Build all dep targets for artifact bundling" OFF)
 # Linking preferences
 # =============================================================================
 
+# When building artifacts for distribution, prefer static system libraries
+# so the final binary only needs libc/libstdc++/libssl at runtime.
+if(BUNDLE_DEPS)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+endif()
+
 find_package(ZLIB REQUIRED)
 find_library(ZSTD_LIBRARY NAMES zstd)
 
