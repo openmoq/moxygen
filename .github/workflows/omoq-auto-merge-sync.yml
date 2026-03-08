@@ -46,9 +46,8 @@ jobs:
         run: |
           PR_NUM="${{ steps.find-pr.outputs.pr_num }}"
           PR_URL="${{ github.server_url }}/${{ github.repository }}/pull/${PR_NUM}"
-          CI_RUN_URL="${{ github.event.workflow_run.html_url }}"
           BRANCH="${{ github.event.workflow_run.head_branch }}"
-          TEXT=":x: *${{ github.repository }}* \`${BRANCH}\` verification failed — PR: <${PR_URL}|#${PR_NUM}> run: <${CI_RUN_URL}|view>"
+          TEXT=":x: *${{ github.repository }}* \`${BRANCH}\` — verification failed: PR: <${PR_URL}|#${PR_NUM}>"
           curl -s -X POST "$SLACK_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             --data "{\"text\": \"${TEXT}\"}"
