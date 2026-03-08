@@ -25,7 +25,7 @@ struct ConnectionContext {
   static constexpr uint32_t kMagic = 0xC099EC71; // "CONNECT1"
   uint32_t magic{kMagic};
 
-  std::shared_ptr<proxygen::WebTransport> webTransport;
+  std::shared_ptr<PicoQuicWebTransport> webTransport;
   std::shared_ptr<MoQSession> moqSession;
   MoQPicoQuicServer *server;
 };
@@ -281,9 +281,7 @@ int MoQPicoQuicServer::Impl::picoCallback(
                << " to PicoQuicWebTransport"
                << " webTransport=" << (void *)ctx->webTransport.get();
     if (ctx->webTransport) {
-      auto *pqwt = static_cast<PicoQuicWebTransport *>(
-          ctx->webTransport.get());
-      return pqwt->handlePicoEvent(
+      return ctx->webTransport->handlePicoEvent(
           cnx, stream_id, bytes, length,
           static_cast<int>(fin_or_event), v_stream_ctx);
     }
