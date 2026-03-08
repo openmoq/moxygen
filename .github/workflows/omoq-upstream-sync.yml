@@ -120,7 +120,7 @@ jobs:
               break
             fi
 
-            # Check CI status
+            # Check build status
             STATE=$(gh api "repos/facebookexperimental/moxygen/commits/$SHA/check-suites" \
               -q '[.check_suites[] | select(.app.name=="GitHub Actions")] |
                   if length == 0 then "failure"
@@ -207,7 +207,7 @@ jobs:
           - **Upstream status:** success (green)
           - **Merge type:** git merge (sync/$SYNC_SHA → main)
 
-          CI will validate the standalone build. On success, this PR auto-merges.
+          The verify workflow will validate the standalone build. On success, this PR auto-merges.
           Devs can push conflict-resolution commits to \`$BRANCH\` if needed.
 
           Created by \`omoq-upstream-sync\` workflow.
