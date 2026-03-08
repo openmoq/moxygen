@@ -64,7 +64,7 @@ jobs:
         run: |
           PR_NUM="${{ steps.blocking.outputs.pr_num }}"
           PR_URL="${{ github.server_url }}/${{ github.repository }}/pull/${PR_NUM}"
-          TEXT=":pause_button: moxygen sync paused — PR <${PR_URL}|#${PR_NUM}> pending"
+          TEXT=":pause_button: *${{ github.repository }}* sync paused — PR <${PR_URL}|#${PR_NUM}> pending"
           curl -s -X POST "$SLACK_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             --data "{\"text\": \"${TEXT}\"}"
@@ -243,7 +243,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.OMOQ_SLACK_WEBHOOK_URL }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          TEXT=":warning: moxygen upstream sync failed — run: <${RUN_URL}|#${{ github.run_number }}>"
+          TEXT=":warning: *${{ github.repository }}* upstream sync failed — run: <${RUN_URL}|#${{ github.run_number }}>"
           curl -s -X POST "$SLACK_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             --data "{\"text\": \"${TEXT}\"}"
