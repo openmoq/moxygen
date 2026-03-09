@@ -65,6 +65,9 @@ class MoQPicoQuicEventBaseServer : public MoQPicoServerBase {
    */
   void stop() override;
 
+ protected:
+  void onWebTransportCreated(PicoQuicWebTransport& wt) noexcept override;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
