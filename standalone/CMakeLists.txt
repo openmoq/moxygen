@@ -90,6 +90,17 @@ find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(gflags CONFIG REQUIRED)
 find_package(Glog REQUIRED)
+# FindGlog.cmake internally calls find_package(LibUnwind), which with
+# CMAKE_FIND_LIBRARY_SUFFIXES=".a" picks up libunwind.a.  On Debian/Ubuntu
+# x86_64 that file is not compiled with -fPIC, causing PIE link failure.
+# Patch the glog target to use the shared library instead.
+if(BUNDLE_DEPS AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET glog::glog)
+    get_target_property(_glog_link_libs glog::glog IMPORTED_LINK_INTERFACE_LIBRARIES)
+    if(_glog_link_libs)
+        string(REGEX REPLACE "([/a-zA-Z0-9._-]*)libunwind\\.a" "\\1libunwind.so" _glog_link_libs "${_glog_link_libs}")
+        set_target_properties(glog::glog PROPERTIES IMPORTED_LINK_INTERFACE_LIBRARIES "${_glog_link_libs}")
+    endif()
+endif()
 find_package(fmt CONFIG REQUIRED)
 find_package(double-conversion CONFIG REQUIRED)
 find_package(Boost 1.70 REQUIRED COMPONENTS
