@@ -31,11 +31,14 @@ option(BUILD_PICOQUIC "Build with picoquic transport support" OFF)
 # When building artifacts for distribution, prefer static system libraries
 # so the tarball consumers only need libc/libstdc++/libssl at runtime.
 if(BUNDLE_DEPS)
-    # MODULE-mode find_package() and find_library() respect this:
-    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+    # MODULE-mode find_package() and find_library() respect this.
+    # Linux only: macOS/homebrew doesn't ship .a for zlib, fmt, etc.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+    endif()
 
     # CONFIG-mode packages ignore CMAKE_FIND_LIBRARY_SUFFIXES and hardcode
-    # .so paths in their cmake configs. Use per-package variables instead:
+    # .so/.dylib paths in their cmake configs. Use per-package variables:
     set(GFLAGS_SHARED OFF CACHE BOOL "" FORCE)
     set(Boost_USE_STATIC_LIBS ON)
 endif()
@@ -97,12 +100,14 @@ find_package(LibEvent REQUIRED)
 find_package(Sodium REQUIRED)
 
 # Check for libunwind to decide if we need lzma for symbolization.
-# System libunwind.a on Ubuntu/Debian is not compiled with -fPIC, so it
-# can't link into PIE executables. Always find the shared library.
-set(_saved_find_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
-set(CMAKE_FIND_LIBRARY_SUFFIXES ".so;.a")
-find_package(LibUnwind QUIET)
-set(CMAKE_FIND_LIBRARY_SUFFIXES "${_saved_find_suffixes}")
+# When BUNDLE_DEPS is on and CMAKE_FIND_LIBRARY_SUFFIXES=".a", folly's
+# internal find_library(LIBUNWIND) picks up libunwind.a which on
+# Ubuntu/Debian x86_64 is not compiled with -fPIC (PIE link failure).
+# Skip libunwind entirely for bundled builds — crash symbolizer is a
+# debug convenience, not needed in distributed artifacts.
+if(NOT BUNDLE_DEPS)
+    find_package(LibUnwind QUIET)
+endif()
 
 # =============================================================================
 # FetchContent: Meta OSS Dependencies (using pinned hashes)
