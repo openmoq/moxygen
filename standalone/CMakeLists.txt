@@ -38,8 +38,13 @@ if(BUNDLE_DEPS)
     endif()
 
     # CONFIG-mode packages ignore CMAKE_FIND_LIBRARY_SUFFIXES and hardcode
-    # .so/.dylib paths in their cmake configs. Use per-package variables:
-    set(GFLAGS_SHARED OFF CACHE BOOL "" FORCE)
+    # .so/.dylib paths in their cmake configs. Use per-package variables.
+    # GFLAGS_SHARED OFF is Linux-only: on macOS, glog is always shared
+    # (homebrew has no libglog.a), and glog.dylib links gflags.dylib;
+    # mixing static gflags with shared glog causes dual-linkage crashes.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(GFLAGS_SHARED OFF CACHE BOOL "" FORCE)
+    endif()
     set(Boost_USE_STATIC_LIBS ON)
 endif()
 
