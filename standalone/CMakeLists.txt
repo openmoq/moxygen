@@ -100,12 +100,17 @@ find_package(LibEvent REQUIRED)
 find_package(Sodium REQUIRED)
 
 # Check for libunwind to decide if we need lzma for symbolization.
-# When BUNDLE_DEPS is on and CMAKE_FIND_LIBRARY_SUFFIXES=".a", folly's
-# internal find_library(LIBUNWIND) picks up libunwind.a which on
-# Ubuntu/Debian x86_64 is not compiled with -fPIC (PIE link failure).
-# Skip libunwind entirely for bundled builds — crash symbolizer is a
-# debug convenience, not needed in distributed artifacts.
-if(NOT BUNDLE_DEPS)
+# When BUNDLE_DEPS is on, CMAKE_FIND_LIBRARY_SUFFIXES=".a" would cause
+# folly to pick up libunwind.a which on Ubuntu/Debian x86_64 is not
+# compiled with -fPIC (PIE link failure). Find it here with .so preference
+# so the result is cached; folly's internal find_package(LibUnwind) is
+# then skipped via _FETCHCONTENT_PROVIDED_DEPS below.
+if(BUNDLE_DEPS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(_saved_find_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".so;.a")
+    find_package(LibUnwind QUIET)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES "${_saved_find_suffixes}")
+else()
     find_package(LibUnwind QUIET)
 endif()
 
@@ -260,6 +265,11 @@ set(_FETCHCONTENT_PROVIDED_DEPS folly fizz wangle mvfst proxygen GTest GMock
     BZip2 LZ4 Snappy glog Glog)
 if(BUILD_PICOQUIC)
     list(APPEND _FETCHCONTENT_PROVIDED_DEPS picoquic)
+endif()
+# When BUNDLE_DEPS is on, we already found libunwind with .so preference
+# above. Skip folly's internal re-find to prevent it picking up .a.
+if(BUNDLE_DEPS)
+    list(APPEND _FETCHCONTENT_PROVIDED_DEPS LibUnwind)
 endif()
 if(NOT LibUnwind_FOUND)
     list(APPEND _FETCHCONTENT_PROVIDED_DEPS LibLZMA)
