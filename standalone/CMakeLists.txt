@@ -28,6 +28,18 @@ option(BUILD_PICOQUIC "Build with picoquic transport support" OFF)
 # Linking preferences
 # =============================================================================
 
+# When building artifacts for distribution, prefer static system libraries
+# so the tarball consumers only need libc/libstdc++/libssl at runtime.
+if(BUNDLE_DEPS)
+    # MODULE-mode find_package() and find_library() respect this:
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+
+    # CONFIG-mode packages ignore CMAKE_FIND_LIBRARY_SUFFIXES and hardcode
+    # .so paths in their cmake configs. Use per-package variables instead:
+    set(GFLAGS_SHARED OFF CACHE BOOL "" FORCE)
+    set(Boost_USE_STATIC_LIBS ON)
+endif()
+
 find_package(ZLIB REQUIRED)
 find_library(ZSTD_LIBRARY NAMES zstd)
 
@@ -84,8 +96,13 @@ find_package(Zstd REQUIRED)
 find_package(LibEvent REQUIRED)
 find_package(Sodium REQUIRED)
 
-# Check for libunwind to decide if we need lzma for symbolization
+# Check for libunwind to decide if we need lzma for symbolization.
+# System libunwind.a on Ubuntu/Debian is not compiled with -fPIC, so it
+# can't link into PIE executables. Always find the shared library.
+set(_saved_find_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
+set(CMAKE_FIND_LIBRARY_SUFFIXES ".so;.a")
 find_package(LibUnwind QUIET)
+set(CMAKE_FIND_LIBRARY_SUFFIXES "${_saved_find_suffixes}")
 
 # =============================================================================
 # FetchContent: Meta OSS Dependencies (using pinned hashes)
