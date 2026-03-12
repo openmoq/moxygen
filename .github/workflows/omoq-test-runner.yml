@@ -1,0 +1,89 @@
+name: test runner
+
+# One-shot workflow to validate a self-hosted runner can do a full publish build.
+# Delete this file after validation.
+#
+# Usage: Actions → test runner → Run workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner label (e.g. linode, self-hosted)'
+        required: true
+        default: 'linode'
+        type: string
+      use_container:
+        description: 'Run inside debian:bookworm container'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  test-build:
+    name: test (${{ inputs.runner_label }}${{ inputs.use_container && ' + bookworm' || '' }})
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    container: ${{ inputs.use_container && 'debian:bookworm' || null }}
+
+    steps:
+      - name: Runner info
+        run: |
+          echo "=== Runner ==="
+          echo "Hostname: $(hostname)"
+          echo "OS: $(cat /etc/os-release 2>/dev/null | head -3 || echo 'unknown')"
+          echo "CPUs: $(nproc)"
+          echo "RAM: $(free -h | awk '/Mem:/ {print $2}')"
+          df -h / | awk 'NR==2 {printf "Disk: %s used of %s (%s free)\n", $3, $2, $4}'
+          echo ""
+          echo "=== Tools ==="
+          for cmd in git cmake ninja gcc g++ ccache docker; do
+            command -v $cmd && echo "  ✓ $cmd" || echo "  ✗ $cmd"
+          done
+
+      - name: Install container base deps
+        if: inputs.use_container
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates curl pkg-config sudo
+
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: bash standalone/install-system-deps.sh
+
+      - name: Configure (BUNDLE_DEPS publish-style)
+        run: |
+          cmake -B _build -S standalone -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUNDLE_DEPS=ON \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install"
+
+      - name: Build
+        run: |
+          echo "Build start: $(date)"
+          cmake --build _build -j$(nproc)
+          echo "Build end: $(date)"
+
+      - name: Install
+        run: cmake --install _build
+
+      - name: Verify install
+        run: |
+          echo "=== Install tree ==="
+          find "$GITHUB_WORKSPACE/install" -type f | head -30
+          echo ""
+          NLIBS=$(find "$GITHUB_WORKSPACE/install/lib" -name '*.a' 2>/dev/null | wc -l)
+          NHDRS=$(find "$GITHUB_WORKSPACE/install/include" -name '*.h' 2>/dev/null | wc -l)
+          echo "Static libs: $NLIBS"
+          echo "Headers: $NHDRS"
+          if [[ $NLIBS -eq 0 ]]; then
+            echo "ERROR: no static libraries in install prefix" >&2
+            exit 1
+          fi
+          echo "✓ Runner validation passed"
