@@ -31,7 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-22.04
+          - runner: [self-hosted, linode]
             name: linux
             cache_prefix: ci-ninja-ubuntu-22.04
           - runner: macos-15
@@ -108,14 +108,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
+          - runner: [self-hosted, linode]
             name: linux
             cache_prefix: ci-pico-ninja-ubuntu-22.04
-          - os: macos-15
+          - runner: macos-15
             name: macos
             cache_prefix: ci-pico-ninja-macos-15
     name: pico (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -123,6 +123,7 @@ jobs:
         run: bash standalone/install-system-deps.sh
 
       - name: Cache FetchContent downloads
+        if: ${{ !contains(toJSON(matrix.runner), 'linode') }}
         uses: actions/cache@v4
         with:
           path: _build/_deps
@@ -131,6 +132,7 @@ jobs:
             ${{ matrix.cache_prefix }}-deps-
 
       - name: Set up ccache
+        if: ${{ !contains(toJSON(matrix.runner), 'linode') }}
         uses: hendrikmuhs/ccache-action@v1
         with:
           key: ${{ matrix.cache_prefix }}
