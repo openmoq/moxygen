@@ -5,9 +5,9 @@ name: ci main
 #
 # Job graph:
 #
-#   build (linux, macos, asan debug) ───────────────────┐
-#   build-pico (linux, macos) ──────────────────────────┼── release ── notify
-#   publish (4 platforms, needs: [build]) ──────────────┘  (snapshot)  (always)
+#   build (linux, macos, asan debug) ───────────────────────────────────────────┐
+#   build-pico (linux, macos) ──────────────────────────────────────────────────┤
+#   publish (4 platforms) ── docker-docker-smoke-test (bookworm) ──────────────────────┼── release ── notify
 
 on:
   push:
@@ -264,11 +264,52 @@ jobs:
           retention-days: 90
 
   # ════════════════════════════════════════════════════════════════════════════
+  # Smoke test: verify bookworm tarball runs in a clean bookworm-slim container
+  # ════════════════════════════════════════════════════════════════════════════
+
+  docker-docker-smoke-test:
+    needs: [publish]
+    name: docker smoke test (bookworm-amd64)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download bookworm artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: moxygen-bookworm-amd64.tar.gz
+          path: artifact/
+
+      - name: Extract tarball
+        run: |
+          mkdir -p install
+          tar xzf artifact/moxygen-bookworm-amd64.tar.gz -C install
+
+      - name: Smoke test in bookworm-slim
+        run: |
+          docker run --rm -v "$PWD/install:/mnt:ro" debian:bookworm-slim bash -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y --no-install-recommends libunwind8 >/dev/null
+            echo "==> ldd /mnt/bin/moqrelayserver"
+            ldd /mnt/bin/moqrelayserver
+            if ldd /mnt/bin/moqrelayserver | grep -q "not found"; then
+              echo "ERROR: missing shared libraries"
+              exit 1
+            fi
+            echo "==> Running moqrelayserver --helpshort"
+            /mnt/bin/moqrelayserver --helpshort; RC=$?
+            if [ "$RC" -gt 1 ]; then
+              echo "ERROR: unexpected exit code $RC (crash or missing dep)"
+              exit 1
+            fi
+            echo "==> Smoke test passed"
+          '
+
+  # ════════════════════════════════════════════════════════════════════════════
   # Release: create/update snapshot-latest pre-release (main only, all green)
   # ════════════════════════════════════════════════════════════════════════════
 
   release:
-    needs: [build, build-pico, publish]
+    needs: [build, build-pico, publish, docker-smoke-test]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -291,7 +332,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
 
   notify:
-    needs: [build, build-pico, publish, release]
+    needs: [build, build-pico, publish, docker-smoke-test, release]
     if: always()
     runs-on: ubuntu-22.04
     steps:
