@@ -7,7 +7,7 @@ name: ci main
 #
 #   build (linux, macos, asan debug) ───────────────────────────────────────────┐
 #   build-pico (linux, macos) ──────────────────────────────────────────────────┤
-#   publish (4 platforms) ── docker-docker-smoke-test (bookworm) ──────────────────────┼── release ── notify
+#   publish (4 platforms) ── docker-smoke-test (bookworm) ──────────────────────┼── release ── notify
 
 on:
   push:
@@ -267,7 +267,7 @@ jobs:
   # Smoke test: verify bookworm tarball runs in a clean bookworm-slim container
   # ════════════════════════════════════════════════════════════════════════════
 
-  docker-docker-smoke-test:
+  docker-smoke-test:
     needs: [publish]
     name: docker smoke test (bookworm-amd64)
     runs-on: ubuntu-22.04
