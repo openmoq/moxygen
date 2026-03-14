@@ -286,7 +286,7 @@ endif()
 # Also skip optional compression codecs not needed for moxygen.
 # Skip lzma unless libunwind is available (lzma is used for symbolization).
 set(_FETCHCONTENT_PROVIDED_DEPS folly fizz wangle mvfst proxygen GTest GMock
-    BZip2 LZ4 Snappy glog Glog fmt)
+    BZip2 LZ4 Snappy glog Glog fmt Fmt)
 if(BUILD_PICOQUIC)
     list(APPEND _FETCHCONTENT_PROVIDED_DEPS picoquic)
 endif()
@@ -331,6 +331,11 @@ if(NOT fmt_POPULATED)
     set(CMAKE_INSTALL_DIR "lib/cmake/fmt" CACHE STRING "" FORCE)
     add_subdirectory(${fmt_SOURCE_DIR} ${fmt_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
+# Tell folly's folly-deps.cmake that fmt is already configured so it
+# doesn't fall back to FindFmt.cmake (which would conflict with the
+# ALIAS target created by fmt's own CMakeLists.txt).
+set(fmt_FOUND TRUE)
+set(fmt_CONFIG "${fmt_SOURCE_DIR}/CMakeLists.txt")
 
 FetchContent_GetProperties(folly)
 if(NOT folly_POPULATED)
