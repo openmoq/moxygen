@@ -103,3 +103,62 @@ jobs:
       - name: Install (smoke test)
         if: matrix.name != 'asan debug'
         run: cmake --install _build
+
+  # TEMPORARY: produce tarballs on PR to validate o-rly consumption
+  publish-test:
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-22.04-amd64
+            runner: ubuntu-22.04
+            artifact: moxygen-ubuntu-22.04-amd64.tar.gz
+            container: ""
+          - name: bookworm-amd64
+            runner: ubuntu-22.04
+            artifact: moxygen-bookworm-amd64.tar.gz
+            container: debian:bookworm
+    name: publish-test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container || null }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install container base deps
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates curl pkg-config sudo
+
+      - name: Install system dependencies
+        run: bash standalone/install-system-deps.sh
+
+      - name: Configure
+        run: |
+          cmake -B _build -S standalone -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUNDLE_DEPS=ON \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install"
+
+      - name: Build
+        run: cmake --build _build -j$(getconf _NPROCESSORS_ONLN)
+
+      - name: Install
+        run: cmake --install _build
+
+      - name: Package
+        run: |
+          bash openmoq/scripts/collect-artifacts-standalone.sh \
+            --install-prefix "$GITHUB_WORKSPACE/install" \
+            --output "${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          retention-days: 7
