@@ -131,7 +131,7 @@ jobs:
             git ca-certificates curl pkg-config sudo
 
       - name: Install system dependencies
-        if: ${{ !contains(toJSON(matrix.runner), 'linode') }}
+        if: ${{ !contains(toJSON(matrix.runner), 'linode') || matrix.container != '' }}
         run: bash standalone/install-system-deps.sh
 
       - name: Cache FetchContent downloads
