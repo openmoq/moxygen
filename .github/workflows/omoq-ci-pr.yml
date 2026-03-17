@@ -93,3 +93,102 @@ jobs:
       - name: Install (smoke test)
         if: matrix.name != 'asan debug'
         run: cmake --install _build
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Publish (test): validate BUNDLE_DEPS artifact builds on PR
+  # ════════════════════════════════════════════════════════════════════════════
+
+  publish-test:
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-22.04-amd64
+            runner: ubuntu-22.04
+            artifact: moxygen-ubuntu-22.04-amd64.tar.gz
+            debug_artifact: moxygen-ubuntu-22.04-amd64-dbg.tar.gz
+            container: ""
+
+          - name: bookworm-amd64
+            runner: [self-hosted, linode]
+            artifact: moxygen-bookworm-amd64.tar.gz
+            debug_artifact: moxygen-bookworm-amd64-dbg.tar.gz
+            container: debian:bookworm
+
+    name: publish-test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container || null }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install container base deps
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates curl pkg-config sudo
+
+      - name: Install system dependencies
+        if: ${{ !contains(toJSON(matrix.runner), 'linode') }}
+        run: bash standalone/install-system-deps.sh
+
+      - name: Cache FetchContent downloads
+        if: ${{ !contains(toJSON(matrix.runner), 'linode') }}
+        uses: actions/cache@v4
+        with:
+          path: _build/_deps
+          key: publish-ninja-${{ matrix.name }}-deps-${{ hashFiles('build/deps/github_hashes/**/*-rev.txt', 'standalone/patches/**') }}
+          restore-keys: |
+            publish-ninja-${{ matrix.name }}-deps-
+
+      - name: Set up ccache
+        if: ${{ !contains(toJSON(matrix.runner), 'linode') }}
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: publish-${{ matrix.name }}
+          max-size: 500M
+
+      - name: Configure
+        run: |
+          EXTRA_FLAGS=()
+          if echo '${{ toJSON(matrix.runner) }}' | grep -q linode; then
+            EXTRA_FLAGS+=(-DFETCHCONTENT_BASE_DIR="$HOME/.cache/moxygen-publish-${{ matrix.name }}/_deps")
+          fi
+          cmake -B _build -S standalone -G Ninja \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUNDLE_DEPS=ON \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
+            "${EXTRA_FLAGS[@]}"
+
+      - name: Build
+        run: cmake --build _build -j$(getconf _NPROCESSORS_ONLN)
+
+      - name: Install
+        run: cmake --install _build
+
+      - name: Package
+        run: |
+          bash openmoq/scripts/collect-artifacts-standalone.sh \
+            --install-prefix "$GITHUB_WORKSPACE/install" \
+            --output "${{ matrix.artifact }}" \
+            --debug-output "${{ matrix.debug_artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          retention-days: 7
+
+      - name: Upload debug artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.debug_artifact }}
+          path: ${{ matrix.debug_artifact }}
+          retention-days: 7
