@@ -135,6 +135,7 @@ jobs:
             artifact: moxygen-bookworm-amd64.tar.gz
             debug_artifact: moxygen-bookworm-amd64-dbg.tar.gz
             container: debian:bookworm
+            cache_opts: "-v /home/github-runner/.cache/moxygen-publish-bookworm-amd64:/cache"
 
           # bookworm-arm64 disabled — no current consumers
           # - name: bookworm-arm64
@@ -145,7 +146,9 @@ jobs:
 
     name: publish (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container || null }}
+    container:
+      image: ${{ matrix.container || null }}
+      options: ${{ matrix.cache_opts || '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -180,8 +183,13 @@ jobs:
       - name: Configure
         run: |
           EXTRA_FLAGS=()
-          # On self-hosted: persist FetchContent outside workspace
-          if echo '${{ toJSON(matrix.runner) }}' | grep -q linode; then
+          # On self-hosted with volume mount: persist FetchContent + ccache
+          if [ -d /cache ]; then
+            mkdir -p /cache/_deps /cache/ccache
+            export CCACHE_DIR=/cache/ccache
+            EXTRA_FLAGS+=(-DFETCHCONTENT_BASE_DIR=/cache/_deps)
+          elif echo '${{ toJSON(matrix.runner) }}' | grep -q linode; then
+            # Self-hosted without container: use home dir
             EXTRA_FLAGS+=(-DFETCHCONTENT_BASE_DIR="$HOME/.cache/moxygen-publish-${{ matrix.name }}/_deps")
           fi
           cmake -B _build -S standalone -G Ninja \
