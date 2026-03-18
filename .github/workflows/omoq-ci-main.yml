@@ -158,7 +158,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            git ca-certificates curl pkg-config sudo bash
+            git ca-certificates curl pkg-config sudo bash ccache
 
       - name: Install system dependencies
         if: ${{ !contains(toJSON(matrix.runner), 'linode') || matrix.container != '' }}
