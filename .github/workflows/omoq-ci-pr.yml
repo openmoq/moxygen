@@ -102,6 +102,11 @@ jobs:
     runs-on: [self-hosted, linode]
     name: asan debug (linode)
     steps:
+      - name: Fix workspace ownership (self-hosted)
+        run: |
+          sudo rm -rf "$GITHUB_WORKSPACE/_build" "$GITHUB_WORKSPACE/install"
+          sudo chown -R $(id -u):$(id -g) "$GITHUB_WORKSPACE"
+
       - uses: actions/checkout@v4
 
       - name: Configure
