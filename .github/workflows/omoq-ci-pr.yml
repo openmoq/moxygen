@@ -131,7 +131,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            git ca-certificates curl pkg-config sudo
+            git ca-certificates curl pkg-config sudo bash
 
       - name: Install system dependencies
         if: ${{ !contains(toJSON(matrix.runner), 'linode') || matrix.container != '' }}
@@ -154,6 +154,7 @@ jobs:
           max-size: 500M
 
       - name: Configure
+        shell: bash
         run: |
           EXTRA_FLAGS=()
           # On self-hosted with volume mount: persist FetchContent + ccache
