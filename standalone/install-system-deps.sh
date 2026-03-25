@@ -28,6 +28,8 @@ install_ubuntu() {
         libfmt-dev \
         zlib1g-dev \
         libc-ares-dev \
+        libgtest-dev \
+        libgmock-dev \
         gperf
 }
 
@@ -47,6 +49,8 @@ install_fedora() {
         fmt-devel \
         zlib-devel \
         c-ares-devel \
+        gtest-devel \
+        gmock-devel \
         gperf
     # ninja-build is available on Fedora but not CentOS/RHEL base repos.
     # Try to install it; if unavailable, warn with alternatives.
