@@ -24,6 +24,16 @@ moxygen_add_library(openmoq_pico_server_base
     moxygen_events_moq_executor
     Folly::folly_function
 )
+# picohttp needed for h3zero WebTransport headers/impl.
+# Link to the library file directly (not the target) to avoid CMake export dependency.
+# The include directories are needed at compile time; the library at link time.
+if(TARGET picohttp-core)
+  target_include_directories(openmoq_pico_server_base PRIVATE
+    ${picoquic_SOURCE_DIR}/picohttp)
+  # Use generator expression to get the library file path, avoiding target link dep
+  target_link_libraries(openmoq_pico_server_base PRIVATE
+    $<TARGET_FILE:picohttp-core>)
+endif()
 
 # Thread-based server: picoquic runs its own network thread via
 # picoquic_start_network_thread; bridged to moxygen via PicoQuicExecutor.

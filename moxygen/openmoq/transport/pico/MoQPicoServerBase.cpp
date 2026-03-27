@@ -11,8 +11,11 @@
 #include <moxygen/MoQSession.h>
 #include <moxygen/MoQVersions.h>
 #include <moxygen/openmoq/transport/pico/PicoConnectionContext.h>
+#include <moxygen/openmoq/transport/pico/PicoProtocolDispatcher.h>
 #include <picoquic.h>
 #include <picoquic_bbr.h>
+#include <h3zero_common.h>
+#include <pico_webtransport.h>
 
 namespace moxygen {
 
@@ -22,8 +25,17 @@ struct MoQPicoServerBaseCallbacks {
   static void onNewConnection(MoQPicoServerBase* server, void* cnx) {
     server->onNewConnectionImpl(cnx);
   }
+  static void onNewWebTransportConnection(MoQPicoServerBase* server, void* cnx) {
+    server->onNewWebTransportConnectionImpl(cnx);
+  }
   static const std::string& getVersions(MoQPicoServerBase* server) {
     return server->versions_;
+  }
+  static const PicoWebTransportConfig& getWTConfig(MoQPicoServerBase* server) {
+    return server->wtConfig_;
+  }
+  static h3zero_callback_ctx_t* getH3Ctx(MoQPicoServerBase* server) {
+    return server->h3Ctx_;
   }
 };
 
@@ -34,8 +46,23 @@ static size_t alpnSelectCallback(picoquic_quic_t* quic,
                                  size_t count) {
   auto* server = static_cast<MoQPicoServerBase*>(
       picoquic_get_default_callback_context(quic));
-  auto supportedAlpns =
-      getMoqtProtocols(MoQPicoServerBaseCallbacks::getVersions(server), true);
+  const auto& wtConfig = MoQPicoServerBaseCallbacks::getWTConfig(server);
+
+  // Build list of supported ALPNs based on configuration
+  std::vector<std::string> supportedAlpns;
+
+  // Add h3 first if WebTransport is enabled (higher priority for browsers)
+  if (wtConfig.enableWebTransport) {
+    supportedAlpns.push_back("h3");
+  }
+
+  // Add raw MoQ ALPNs if enabled
+  if (wtConfig.enableRawMoQ) {
+    auto moqtAlpns =
+        getMoqtProtocols(MoQPicoServerBaseCallbacks::getVersions(server), true);
+    supportedAlpns.insert(
+        supportedAlpns.end(), moqtAlpns.begin(), moqtAlpns.end());
+  }
 
   std::vector<std::string> clientAlpns;
   for (size_t i = 0; i < count; i++) {
@@ -80,7 +107,22 @@ static int picoCallback(picoquic_cnx_t* cnx,
     }
     if (fin_or_event == picoquic_callback_ready) {
       XLOG(DBG1) << "New connection ready";
-      MoQPicoServerBaseCallbacks::onNewConnection(server, cnx);
+
+      // Determine protocol based on negotiated ALPN
+      const char* alpn = picoquic_tls_get_negotiated_alpn(cnx);
+      auto protocol = PicoProtocolDispatcher::getProtocol(alpn);
+
+      XLOG(DBG1) << "Negotiated ALPN: " << (alpn ? alpn : "(null)")
+                 << " -> Protocol: "
+                 << PicoProtocolDispatcher::protocolName(protocol);
+
+      if (protocol == PicoProtocolType::WebTransport) {
+        // Route to h3zero/WebTransport handler
+        MoQPicoServerBaseCallbacks::onNewWebTransportConnection(server, cnx);
+      } else {
+        // Route to raw MoQ handler (existing path)
+        MoQPicoServerBaseCallbacks::onNewConnection(server, cnx);
+      }
     } else {
       XLOG(DBG2) << "Connection event: " << fin_or_event;
     }
@@ -109,18 +151,30 @@ static int picoCallback(picoquic_cnx_t* cnx,
 MoQPicoServerBase::MoQPicoServerBase(std::string cert,
                                      std::string key,
                                      std::string endpoint,
-                                     std::string versions)
+                                     std::string versions,
+                                     PicoWebTransportConfig wtConfig)
     : MoQServerBase(std::move(endpoint)),
       cert_(std::move(cert)),
       key_(std::move(key)),
-      versions_(std::move(versions)) {}
+      versions_(std::move(versions)),
+      wtConfig_(std::move(wtConfig)) {}
 
 MoQPicoServerBase::~MoQPicoServerBase() {
+  destroyH3Zero();
   destroyQuicContext();
 }
 
 bool MoQPicoServerBase::createQuicContext() {
-  auto supportedAlpns = getMoqtProtocols(versions_, true);
+  // Build and log supported ALPNs
+  std::vector<std::string> supportedAlpns;
+  if (wtConfig_.enableWebTransport) {
+    supportedAlpns.push_back("h3");
+  }
+  if (wtConfig_.enableRawMoQ) {
+    auto moqtAlpns = getMoqtProtocols(versions_, true);
+    supportedAlpns.insert(
+        supportedAlpns.end(), moqtAlpns.begin(), moqtAlpns.end());
+  }
   XLOG(INFO) << "Supported ALPNs: " << folly::join(", ", supportedAlpns);
 
   uint64_t current_time = picoquic_current_time();
@@ -150,6 +204,19 @@ bool MoQPicoServerBase::createQuicContext() {
   picoquic_set_alpn_select_fn_v2(quic_, alpnSelectCallback);
   picoquic_set_cookie_mode(quic_, 2);
   picoquic_set_default_congestion_algorithm(quic_, picoquic_bbr_algorithm);
+
+  // Initialize h3zero for WebTransport if enabled
+  if (wtConfig_.enableWebTransport) {
+    if (!initH3Zero()) {
+      XLOG(ERR) << "Failed to initialize h3zero for WebTransport";
+      destroyQuicContext();
+      return false;
+    }
+    // Enable WebTransport transport parameters
+    picowt_set_default_transport_parameters(quic_);
+    XLOG(INFO) << "WebTransport enabled on endpoint: " << wtConfig_.wtEndpoint;
+  }
+
   return true;
 }
 
@@ -204,6 +271,95 @@ void MoQPicoServerBase::onNewConnectionImpl(void* vcnx) {
 
   folly::coro::co_withExecutor(executor_.get(), handleClientSession(moqSession))
       .start();
+}
+
+void MoQPicoServerBase::onNewWebTransportConnectionImpl(void* vcnx) {
+  auto* cnx = static_cast<picoquic_cnx_t*>(vcnx);
+
+  struct sockaddr* peer_addr_ptr = nullptr;
+  picoquic_get_peer_addr(cnx, &peer_addr_ptr);
+
+  folly::SocketAddress peerSockAddr;
+  if (peer_addr_ptr) {
+    peerSockAddr.setFromSockaddr(peer_addr_ptr);
+  }
+
+  XLOG(DBG1) << "New WebTransport connection from " << peerSockAddr.describe();
+
+  if (!h3Ctx_) {
+    XLOG(ERR) << "h3zero context not initialized for WebTransport connection";
+    picoquic_close(cnx, H3ZERO_INTERNAL_ERROR);
+    return;
+  }
+
+  // Initialize HTTP/3 protocol for this connection
+  int ret = h3zero_protocol_init(cnx);
+  if (ret != 0) {
+    XLOG(ERR) << "Failed to initialize h3zero protocol for connection: " << ret;
+    picoquic_close(cnx, H3ZERO_INTERNAL_ERROR);
+    return;
+  }
+
+  // Set h3zero callback for this connection
+  // The h3zero callback will handle HTTP/3 framing and WebTransport
+  picoquic_set_callback(cnx, h3zero_callback, h3Ctx_);
+
+  // Enable WebTransport transport parameters for this connection
+  picowt_set_transport_parameters(cnx);
+
+  XLOG(DBG1) << "WebTransport connection initialized, waiting for CONNECT";
+
+  // Note: MoQSession will be created when WebTransport CONNECT is received
+  // This is handled in the WebTransport path callback (wtPathCallback)
+}
+
+bool MoQPicoServerBase::initH3Zero() {
+  // Create path table for WebTransport endpoint
+  // We need to keep this alive for the lifetime of the server
+  wtPathTable_ = std::make_unique<picohttp_server_path_item_t[]>(2);
+
+  // Configure the WebTransport endpoint path
+  // The callback will be invoked when a CONNECT request is received
+  wtPathTable_[0].path = wtConfig_.wtEndpoint.c_str();
+  wtPathTable_[0].path_length = wtConfig_.wtEndpoint.size();
+  wtPathTable_[0].path_callback = nullptr;  // Will be set in Phase 2
+  wtPathTable_[0].path_app_ctx = this;
+
+  // Null terminator for path table
+  wtPathTable_[1].path = nullptr;
+  wtPathTable_[1].path_length = 0;
+  wtPathTable_[1].path_callback = nullptr;
+  wtPathTable_[1].path_app_ctx = nullptr;
+
+  // Create h3zero server parameters
+  picohttp_server_parameters_t serverParams = {};
+  serverParams.web_folder = nullptr;  // No static file serving
+  serverParams.path_table = wtPathTable_.get();
+  serverParams.path_table_nb = 1;
+
+  // Create h3zero callback context
+  h3Ctx_ = h3zero_callback_create_context(&serverParams);
+  if (!h3Ctx_) {
+    XLOG(ERR) << "Failed to create h3zero callback context";
+    return false;
+  }
+
+  // Configure h3zero settings for WebTransport
+  h3Ctx_->settings.h3_datagram = 1;  // Enable datagrams
+  h3Ctx_->settings.webtransport_max_sessions = wtConfig_.wtMaxSessions;
+
+  XLOG(DBG1) << "h3zero initialized with WebTransport endpoint: "
+             << wtConfig_.wtEndpoint;
+
+  return true;
+}
+
+void MoQPicoServerBase::destroyH3Zero() {
+  if (h3Ctx_) {
+    h3zero_callback_delete_context(nullptr, h3Ctx_);
+    h3Ctx_ = nullptr;
+  }
+  wtPathTable_.reset();
 }
 
 } // namespace moxygen
