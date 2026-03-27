@@ -463,8 +463,7 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
   // Store in wtSessions_ map for lifecycle management
   wtSessions_[streamCtx->stream_id] = {webTransport, moqSession};
 
-  // Notify subclass
-  onNewSession(moqSession);
+  // Note: onNewSession will be called by handleClientSession()
 
   // Send 200 OK response to accept the WebTransport session
   uint8_t response[256];
