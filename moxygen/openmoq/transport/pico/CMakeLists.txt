@@ -84,3 +84,7 @@ moxygen_add_library(openmoq_pico_evb_client_transport
 if(BUILD_SAMPLES)
   add_subdirectory(sample)
 endif()
+
+if(BUILD_TESTS)
+  add_subdirectory(test)
+endif()
