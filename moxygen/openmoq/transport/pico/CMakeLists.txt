@@ -18,6 +18,7 @@ moxygen_add_library(openmoq_pico_base
 moxygen_add_library(openmoq_pico_server_base
   SRCS
     MoQPicoServerBase.cpp
+    PicoH3WebTransport.cpp
   EXPORTED_DEPS
     openmoq_pico_base
     moxygen_moq_server_base

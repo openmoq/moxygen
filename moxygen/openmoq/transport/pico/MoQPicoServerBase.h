@@ -9,18 +9,22 @@
 #include <memory>
 #include <moxygen/MoQServerBase.h>
 #include <string>
+#include <unordered_map>
 
 // Forward declaration — avoids exposing picoquic.h to consumers
 // (C struct typedefs must be at file scope, not inside a namespace)
 typedef struct st_picoquic_quic_t picoquic_quic_t;
 typedef struct st_picoquic_cnx_t picoquic_cnx_t;
 typedef struct st_h3zero_callback_ctx_t h3zero_callback_ctx_t;
+typedef struct st_h3zero_stream_ctx_t h3zero_stream_ctx_t;
 typedef struct st_picohttp_server_path_item_t picohttp_server_path_item_t;
+
 
 namespace moxygen {
 
 class MoQExecutor;
 class PicoQuicWebTransport;
+class PicoH3WebTransport;
 
 /**
  * WebTransport configuration for picoquic server.
@@ -105,6 +109,20 @@ class MoQPicoServerBase : public MoQServerBase {
   // Called for WebTransport connections (h3 ALPN)
   void onNewWebTransportConnectionImpl(void* cnx);
 
+  // Called when a WebTransport CONNECT is received (creates MoQ session)
+  int onWebTransportConnectImpl(
+      picoquic_cnx_t* cnx,
+      h3zero_stream_ctx_t* streamCtx);
+
+  // Called for WebTransport events (forwards to PicoH3WebTransport)
+  // Uses int instead of picohttp_call_back_event_t to avoid exposing h3zero types
+  int onWebTransportEventImpl(
+      picoquic_cnx_t* cnx,
+      uint8_t* bytes,
+      size_t length,
+      int event,
+      h3zero_stream_ctx_t* streamCtx);
+
   // Initialize h3zero context for WebTransport support
   bool initH3Zero();
 
@@ -113,6 +131,13 @@ class MoQPicoServerBase : public MoQServerBase {
 
   // WebTransport path table for h3zero
   std::unique_ptr<picohttp_server_path_item_t[]> wtPathTable_;
+
+  // WebTransport session context (keyed by control stream ID)
+  struct WtSessionContext {
+    std::shared_ptr<PicoH3WebTransport> webTransport;
+    std::shared_ptr<MoQSession> moqSession;
+  };
+  std::unordered_map<uint64_t, WtSessionContext> wtSessions_;
 
   friend struct MoQPicoServerBaseCallbacks;
 };

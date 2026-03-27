@@ -11,6 +11,7 @@
 #include <moxygen/MoQSession.h>
 #include <moxygen/MoQVersions.h>
 #include <moxygen/openmoq/transport/pico/PicoConnectionContext.h>
+#include <moxygen/openmoq/transport/pico/PicoH3WebTransport.h>
 #include <moxygen/openmoq/transport/pico/PicoProtocolDispatcher.h>
 #include <picoquic.h>
 #include <picoquic_bbr.h>
@@ -36,6 +37,24 @@ struct MoQPicoServerBaseCallbacks {
   }
   static h3zero_callback_ctx_t* getH3Ctx(MoQPicoServerBase* server) {
     return server->h3Ctx_;
+  }
+  static int onWebTransportConnect(
+      MoQPicoServerBase* server,
+      picoquic_cnx_t* cnx,
+      h3zero_stream_ctx_t* streamCtx) {
+    return server->onWebTransportConnectImpl(cnx, streamCtx);
+  }
+  static int onWebTransportEvent(
+      MoQPicoServerBase* server,
+      picoquic_cnx_t* cnx,
+      uint8_t* bytes,
+      size_t length,
+      int event,
+      h3zero_stream_ctx_t* streamCtx) {
+    return server->onWebTransportEventImpl(cnx, bytes, length, event, streamCtx);
+  }
+  static std::shared_ptr<MoQExecutor> getExecutor(MoQPicoServerBase* server) {
+    return server->executor_;
   }
 };
 
@@ -142,6 +161,48 @@ static int picoCallback(picoquic_cnx_t* cnx,
   XLOG(DBG6) << "Forwarding event " << fin_or_event << " to PicoQuicWebTransport";
   return dispatchConnectionEvent(
       ctx, cnx, stream_id, bytes, length, fin_or_event, v_stream_ctx);
+}
+
+// WebTransport path callback - invoked by h3zero when a CONNECT request
+// is received on the configured endpoint (e.g., /moq)
+static int wtPathCallback(
+    picoquic_cnx_t* cnx,
+    uint8_t* bytes,
+    size_t length,
+    picohttp_call_back_event_t event,
+    h3zero_stream_ctx_t* streamCtx,
+    void* pathAppCtx) {
+  auto* server = static_cast<MoQPicoServerBase*>(pathAppCtx);
+  if (!server) {
+    XLOG(ERR) << "wtPathCallback: server is null";
+    return -1;
+  }
+
+  XLOG(DBG3) << "wtPathCallback: event=" << static_cast<int>(event)
+             << " stream=" << (streamCtx ? streamCtx->stream_id : 0)
+             << " length=" << length;
+
+  switch (event) {
+    case picohttp_callback_connect:
+      // Browser sent CONNECT request - accept WebTransport session
+      return MoQPicoServerBaseCallbacks::onWebTransportConnect(
+          server, cnx, streamCtx);
+
+    case picohttp_callback_connect_refused:
+      XLOG(WARN) << "WebTransport CONNECT refused";
+      break;
+
+    case picohttp_callback_connect_accepted:
+      XLOG(DBG1) << "WebTransport CONNECT accepted";
+      break;
+
+    default:
+      // Forward other events to the WebTransport adapter
+      return MoQPicoServerBaseCallbacks::onWebTransportEvent(
+          server, cnx, bytes, length, static_cast<int>(event), streamCtx);
+  }
+
+  return 0;
 }
 
 } // namespace
@@ -322,7 +383,7 @@ bool MoQPicoServerBase::initH3Zero() {
   // The callback will be invoked when a CONNECT request is received
   wtPathTable_[0].path = wtConfig_.wtEndpoint.c_str();
   wtPathTable_[0].path_length = wtConfig_.wtEndpoint.size();
-  wtPathTable_[0].path_callback = nullptr;  // Will be set in Phase 2
+  wtPathTable_[0].path_callback = wtPathCallback;
   wtPathTable_[0].path_app_ctx = this;
 
   // Null terminator for path table
@@ -360,6 +421,112 @@ void MoQPicoServerBase::destroyH3Zero() {
     h3Ctx_ = nullptr;
   }
   wtPathTable_.reset();
+}
+
+int MoQPicoServerBase::onWebTransportConnectImpl(
+    picoquic_cnx_t* cnx,
+    h3zero_stream_ctx_t* streamCtx) {
+  XLOG(DBG1) << "WebTransport CONNECT received on stream " << streamCtx->stream_id;
+
+  // Get addresses
+  struct sockaddr* local_addr_ptr = nullptr;
+  struct sockaddr* peer_addr_ptr = nullptr;
+  picoquic_get_peer_addr(cnx, &peer_addr_ptr);
+  picoquic_get_local_addr(cnx, &local_addr_ptr);
+
+  folly::SocketAddress localSockAddr;
+  folly::SocketAddress peerSockAddr;
+  if (local_addr_ptr) {
+    localSockAddr.setFromSockaddr(local_addr_ptr);
+  }
+  if (peer_addr_ptr) {
+    peerSockAddr.setFromSockaddr(peer_addr_ptr);
+  }
+
+  XLOG(DBG1) << "Accepting WebTransport session from " << peerSockAddr.describe();
+
+  // Create PicoH3WebTransport adapter
+  auto webTransport = std::make_shared<PicoH3WebTransport>(
+      cnx, h3Ctx_, streamCtx, localSockAddr, peerSockAddr);
+
+  // Create MoQSession
+  auto moqSession = createSession(webTransport, executor_);
+  webTransport->setHandler(moqSession.get());
+
+  // For WebTransport, MoQ version is always the latest (client indicates via WT)
+  // TODO: Version negotiation via WebTransport headers if needed
+
+  // Store the context for routing future events
+  // Use the control stream's path_callback_ctx to store our WebTransport adapter
+  streamCtx->path_callback_ctx = webTransport.get();
+
+  // Store in wtSessions_ map for lifecycle management
+  wtSessions_[streamCtx->stream_id] = {webTransport, moqSession};
+
+  // Notify subclass
+  onNewSession(moqSession);
+
+  // Send 200 OK response to accept the WebTransport session
+  uint8_t response[256];
+  uint8_t* bytes = response;
+  uint8_t* bytes_max = response + sizeof(response);
+
+  // Create response header with 200 OK status
+  bytes = h3zero_create_response_header_frame_ex(
+      bytes, bytes_max, h3zero_content_type_none, nullptr, nullptr);
+
+  if (bytes == nullptr) {
+    XLOG(ERR) << "Failed to create WebTransport response header";
+    return -1;
+  }
+
+  // Send response
+  int ret = picoquic_add_to_stream_with_ctx(
+      cnx, streamCtx->stream_id, response, bytes - response, 0, streamCtx);
+  if (ret != 0) {
+    XLOG(ERR) << "Failed to send WebTransport response: " << ret;
+    return ret;
+  }
+
+  // Mark stream as upgraded for WebTransport
+  streamCtx->is_upgraded = 1;
+
+  // Start handling the MoQ session
+  folly::coro::co_withExecutor(executor_.get(), handleClientSession(moqSession))
+      .start();
+
+  XLOG(DBG1) << "WebTransport session accepted on stream " << streamCtx->stream_id;
+  return 0;
+}
+
+int MoQPicoServerBase::onWebTransportEventImpl(
+    picoquic_cnx_t* cnx,
+    uint8_t* bytes,
+    size_t length,
+    int event,
+    h3zero_stream_ctx_t* streamCtx) {
+  // Find the WebTransport adapter for this stream
+  PicoH3WebTransport* wt = nullptr;
+
+  // Check if this is the control stream or a data stream
+  if (streamCtx && streamCtx->path_callback_ctx) {
+    wt = static_cast<PicoH3WebTransport*>(streamCtx->path_callback_ctx);
+  } else if (streamCtx) {
+    // For data streams, find the session by control stream ID
+    uint64_t controlStreamId = streamCtx->ps.stream_state.control_stream_id;
+    auto it = wtSessions_.find(controlStreamId);
+    if (it != wtSessions_.end()) {
+      wt = it->second.webTransport.get();
+    }
+  }
+
+  if (!wt) {
+    XLOG(DBG2) << "No WebTransport adapter found for event "
+               << static_cast<int>(event);
+    return 0;
+  }
+
+  return wt->handleWtEvent(cnx, bytes, length, static_cast<int>(event), streamCtx);
 }
 
 } // namespace moxygen
