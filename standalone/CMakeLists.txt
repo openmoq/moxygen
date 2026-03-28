@@ -92,19 +92,21 @@ list(APPEND CMAKE_MODULE_PATH
 )
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
-# glog/gflags/double-conversion: find with .so preference so the tarball's
-# folly-targets.cmake hardcodes .so paths, not .a. Consumers that also
-# find_package(Glog) then get the same .so — no dual-linkage under ASAN.
+# gflags/double-conversion: find with .so preference so the tarball's
+# folly-targets.cmake hardcodes .so paths, not .a.
 if(BUNDLE_DEPS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(_saved_suffixes "${CMAKE_FIND_LIBRARY_SUFFIXES}")
     set(CMAKE_FIND_LIBRARY_SUFFIXES ".so;.a")
 endif()
 find_package(gflags CONFIG REQUIRED)
-find_package(Glog REQUIRED)
 find_package(double-conversion CONFIG REQUIRED)
 if(BUNDLE_DEPS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CMAKE_FIND_LIBRARY_SUFFIXES "${_saved_suffixes}")
 endif()
+# glog: will be built from source via FetchContent (declared below)
+# to guarantee 0.7+ ABI compatibility with folly. System glog on
+# Debian 12 / Ubuntu 22.04 is 0.6 which lacks symbols like
+# kLogSiteUninitialized that newer folly requires.
 find_package(Boost 1.70 REQUIRED COMPONENTS
     context filesystem program_options regex)
 find_package(ZLIB REQUIRED)
@@ -199,6 +201,18 @@ FetchContent_Declare(fmt
     GIT_TAG 10.2.1
 )
 
+# glog 0.7+: system glog on bookworm/jammy is 0.6 which lacks ABI symbols
+# (kLogSiteUninitialized, InitVLOG3__) that newer folly requires.
+set(WITH_GFLAGS ON CACHE BOOL "" FORCE)
+set(WITH_GTEST OFF CACHE BOOL "" FORCE)
+set(WITH_PKGCONFIG OFF CACHE BOOL "" FORCE)
+set(WITH_UNWIND none CACHE STRING "" FORCE)
+set(WITH_SYMBOLIZE OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(glog
+    GIT_REPOSITORY https://github.com/google/glog.git
+    GIT_TAG v0.7.1
+)
+
 # Allow overriding folly repo/rev via -DFOLLY_REPO_OVERRIDE and
 # -DFOLLY_REV_OVERRIDE
 set(FOLLY_REPO_OVERRIDE "" CACHE STRING "Override folly git repository URL")
@@ -285,7 +299,7 @@ endif()
 # Also skip optional compression codecs not needed for moxygen.
 # Skip lzma unless libunwind is available (lzma is used for symbolization).
 set(_FETCHCONTENT_PROVIDED_DEPS folly fizz wangle mvfst proxygen GTest GMock
-    BZip2 LZ4 Snappy glog Glog fmt Fmt)
+    BZip2 LZ4 Snappy glog Glog fmt Fmt Libiberty)
 if(BUILD_PICOQUIC)
     list(APPEND _FETCHCONTENT_PROVIDED_DEPS picoquic)
 endif()
@@ -335,6 +349,12 @@ endif()
 # ALIAS target created by fmt's own CMakeLists.txt).
 set(fmt_FOUND TRUE)
 set(fmt_CONFIG "${fmt_SOURCE_DIR}/CMakeLists.txt")
+
+FetchContent_GetProperties(glog)
+if(NOT glog_POPULATED)
+    FetchContent_Populate(glog)
+    add_subdirectory(${glog_SOURCE_DIR} ${glog_BINARY_DIR} ${_EXCLUDE_FLAG})
+endif()
 
 FetchContent_GetProperties(folly)
 if(NOT folly_POPULATED)
