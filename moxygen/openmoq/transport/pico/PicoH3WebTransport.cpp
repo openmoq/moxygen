@@ -79,6 +79,12 @@ int PicoH3WebTransport::handleWtEvent(
              << " length=" << length;
 
   switch (event) {
+    case picohttp_callback_post:
+      // Initial POST/CONNECT body on control stream - ignore
+      // WebTransport capsule data on control stream is handled by h3zero
+      XLOG(DBG4) << "Ignoring picohttp_callback_post on control stream";
+      break;
+
     case picohttp_callback_post_data:
       // Data received on a WebTransport stream
       if (streamCtx) {
@@ -148,6 +154,13 @@ void PicoH3WebTransport::onStreamData(
 
   XLOG(DBG4) << "onStreamData: stream=" << streamId << " length=" << length
              << " fin=" << fin;
+
+  // Skip the control stream - it carries WebTransport capsule framing,
+  // not application (MoQ) data. Application streams are created separately.
+  if (controlStreamCtx_ && streamId == controlStreamCtx_->stream_id) {
+    XLOG(DBG4) << "Ignoring data on control stream " << streamId;
+    return;
+  }
 
   // Track stream context
   if (streamContexts_.find(streamId) == streamContexts_.end()) {
@@ -245,6 +258,14 @@ void PicoH3WebTransport::IngressCallback::onNewPeerStream(
   // construction, BEFORE the handle is inserted into the map. We must NOT
   // call getOrCreateBidiHandle or getBidiHandle here.
   //
+  // Skip the control stream - it's for WebTransport session control,
+  // not application (MoQ) data.
+  if (parent_->controlStreamCtx_ &&
+      streamId == parent_->controlStreamCtx_->stream_id) {
+    XLOG(DBG4) << "onNewPeerStream: skipping control stream " << streamId;
+    return;
+  }
+
   // Instead, track this stream and notify the handler later in onStreamData.
   XLOG(DBG2) << "onNewPeerStream: " << streamId;
   parent_->pendingStreamNotifications_.insert(streamId);
