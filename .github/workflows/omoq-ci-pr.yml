@@ -31,18 +31,12 @@ jobs:
           - os: macos-15
             name: macos
             cache_prefix: ci-ninja-macos-15
-          - os: [self-hosted, linode]
+          - os: ubuntu-22.04
             name: asan debug
             cache_prefix: ci-asan-ubuntu-22.04
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Fix workspace ownership (self-hosted)
-        if: ${{ contains(toJSON(matrix.os), 'linode') }}
-        run: |
-          sudo rm -rf "$GITHUB_WORKSPACE/_build" "$GITHUB_WORKSPACE/install"
-          sudo chown -R $(id -u):$(id -g) "$GITHUB_WORKSPACE"
-
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
