@@ -627,21 +627,6 @@ StreamPublisherImpl::writeCurrentObject(
   header_.length = length;
   // copy is gratuitous
   header_.extensions = extensions;
-  size_t payloadLen = payload ? payload->computeChainDataLength() : 0;
-  XLOG(DBG1) << "writeCurrentObject objID=" << objectID << " length=" << length
-             << " payloadLen=" << payloadLen;
-  // Log first bytes of payload for debugging
-  if (payload && payloadLen > 0) {
-    auto cursor = folly::io::Cursor(payload.get());
-    std::string hexPreview;
-    for (size_t i = 0; i < std::min<size_t>(20, payloadLen); ++i) {
-      char buf[4];
-      snprintf(buf, sizeof(buf), "%02x ", cursor.read<uint8_t>());
-      hexPreview += buf;
-    }
-    XLOG(DBG1) << "writeCurrentObject objID=" << objectID
-               << " payloadPreview=" << hexPreview;
-  }
   bool entireObjectWritten = (!currentLengthRemaining_.has_value());
   (void)moqFrameWriter_.writeStreamObject(
       writeBuf_,
@@ -2863,12 +2848,6 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       return MoQCodec::ParseResult::ERROR_TERMINATE;
     }
 
-    size_t initialPayloadLen = initialPayload ? initialPayload->computeChainDataLength() : 0;
-    XLOG(DBG1) << "onObjectBegin RECV: alias=" << trackAlias_ << " group=" << group
-               << " subgroup=" << subgroup << " objID=" << objectID
-               << " length=" << length << " initialPayloadLen=" << initialPayloadLen
-               << " objectComplete=" << objectComplete;
-
     if (logger_) {
       ObjectHeader obj = ObjectHeader();
       obj.id = objectID;
@@ -2933,10 +2912,6 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     if (isCancelled()) {
       return MoQCodec::ParseResult::ERROR_TERMINATE;
     }
-
-    size_t payloadLen = payload ? payload->computeChainDataLength() : 0;
-    XLOG(DBG1) << "onObjectPayload RECV: payloadLen=" << payloadLen
-               << " objectComplete=" << objectComplete;
 
     if (logger_ && objectComplete) {
       if (subscribeState_) {
