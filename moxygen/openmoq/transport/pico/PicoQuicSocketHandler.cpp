@@ -442,6 +442,7 @@ void PicoQuicSocketHandler::drainOutgoing() {
   uint8_t sendBuf[kSendBufSize];
 
   uint64_t currentTime = picoquic_current_time();
+  int packetsSent = 0;
 
   for (;;) {
     size_t sendLength = 0;
@@ -466,9 +467,11 @@ void PicoQuicSocketHandler::drainOutgoing() {
         &sendMsgSize);
 
     if (ret != 0 || sendLength == 0) {
+      XLOG(DBG5) << "drainOutgoing: done, sent=" << packetsSent;
       break;
     }
 
+    ++packetsSent;
     sendPacket(sendBuf, sendLength, addrTo, addrFrom, ifIndex, sendMsgSize);
   }
 }

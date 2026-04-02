@@ -37,5 +37,4 @@ DeJitterTests
 .idea/
 
 # Build artifacts
-build/
 *.tmp*

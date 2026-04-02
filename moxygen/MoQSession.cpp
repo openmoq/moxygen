@@ -627,6 +627,7 @@ StreamPublisherImpl::writeCurrentObject(
   header_.length = length;
   // copy is gratuitous
   header_.extensions = extensions;
+  XLOG(DBG6) << "writeCurrentObject sgp=" << this << " objectID=" << objectID;
   bool entireObjectWritten = (!currentLengthRemaining_.has_value());
   (void)moqFrameWriter_.writeStreamObject(
       writeBuf_,
