@@ -167,7 +167,7 @@ static int picoCallback(picoquic_cnx_t* cnx,
                << " -> Protocol: "
                << PicoProtocolDispatcher::protocolName(protocol);
 
-    if (protocol == PicoProtocolType::WebTransport) {
+    if (protocol == PicoProtocolType::WebTransportH3) {
       // Create per-connection h3zero context and switch to h3zero_callback
       auto* h3Ctx = MoQPicoServerBaseCallbacks::getOrCreateH3Ctx(server, cnx);
       if (h3Ctx) {
@@ -198,7 +198,7 @@ static int picoCallback(picoquic_cnx_t* cnx,
                << " -> Protocol: "
                << PicoProtocolDispatcher::protocolName(protocol);
 
-    if (protocol == PicoProtocolType::WebTransport) {
+    if (protocol == PicoProtocolType::WebTransportH3) {
       // WebTransport was switched to h3zero_callback in almost_ready.
       // This shouldn't happen, but forward to h3zero just in case.
       auto* h3Ctx = MoQPicoServerBaseCallbacks::getOrCreateH3Ctx(server, cnx);
@@ -587,7 +587,22 @@ int MoQPicoServerBase::onWebTransportEventImpl(
     return 0;
   }
 
-  return wt->handleWtEvent(cnx, bytes, length, event, streamCtx);
+  int ret = wt->handleWtEvent(cnx, bytes, length, event, streamCtx);
+
+  // Cleanup session from map when session closes
+  auto wtEvent = static_cast<picohttp_call_back_event_t>(event);
+  if (wtEvent == picohttp_callback_deregister ||
+      wtEvent == picohttp_callback_free) {
+    // Find and remove the session by control stream ID
+    auto controlIt = wtSessions_.find({cnx, streamId});
+    if (controlIt != wtSessions_.end()) {
+      XLOG(DBG1) << "Removing WT session for cnx=" << (void*)cnx
+                 << " control_stream=" << streamId;
+      wtSessions_.erase(controlIt);
+    }
+  }
+
+  return ret;
 }
 
 } // namespace moxygen

@@ -6,10 +6,10 @@
 
 #pragma once
 
+#include <folly/container/F14Map.h>
 #include <memory>
 #include <moxygen/MoQServerBase.h>
 #include <string>
-#include <unordered_map>
 
 // Forward declaration — avoids exposing picoquic.h to consumers
 // (C struct typedefs must be at file scope, not inside a namespace)
@@ -94,7 +94,7 @@ class MoQPicoServerBase : public MoQServerBase {
   h3zero_callback_ctx_t* h3CtxTemplate_{nullptr};
 
   // Per-connection h3zero contexts (stream prefixes are per-context, not global)
-  std::unordered_map<picoquic_cnx_t*, h3zero_callback_ctx_t*> h3Contexts_;
+  folly::F14FastMap<picoquic_cnx_t*, h3zero_callback_ctx_t*> h3Contexts_;
 
   /**
    * Called after a PicoQuicWebTransport is created for a new connection.
@@ -161,7 +161,7 @@ class MoQPicoServerBase : public MoQServerBase {
       return std::hash<void*>()(k.cnx) ^ (std::hash<uint64_t>()(k.controlStreamId) << 1);
     }
   };
-  std::unordered_map<WtSessionKey, WtSessionContext, WtSessionKeyHash> wtSessions_;
+  folly::F14FastMap<WtSessionKey, WtSessionContext, WtSessionKeyHash> wtSessions_;
 
   friend struct MoQPicoServerBaseCallbacks;
 };

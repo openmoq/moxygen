@@ -263,8 +263,6 @@ void PicoQuicSocketHandler::onReadClosed() noexcept {
 
 void PicoQuicSocketHandler::timeoutExpired() noexcept {
   XLOG(DBG4) << "timeoutExpired called";
-  // Poll for incoming data since onNotifyDataAvailable may not trigger
-  pollIncoming();
   // Drain pending executor tasks to process coroutine continuations
   if (drainTasksCallback_) {
     drainTasksCallback_();

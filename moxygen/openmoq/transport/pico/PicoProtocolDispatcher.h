@@ -16,8 +16,8 @@ namespace moxygen {
  */
 enum class PicoProtocolType {
   Unknown,
-  RawMoQ,       // Direct MoQ over QUIC (ALPN: moqt-16, moqt-15, moq-00)
-  WebTransport  // MoQ over WebTransport over HTTP/3 (ALPN: h3)
+  Quic,           // Direct MoQ over QUIC (ALPN: moqt-16, moqt-15, moq-00)
+  WebTransportH3  // MoQ over WebTransport over HTTP/3 (ALPN: h3)
 };
 
 /**
@@ -37,10 +37,10 @@ class PicoProtocolDispatcher {
       return PicoProtocolType::Unknown;
     }
     if (isH3(alpn)) {
-      return PicoProtocolType::WebTransport;
+      return PicoProtocolType::WebTransportH3;
     }
     if (isRawMoQ(alpn)) {
-      return PicoProtocolType::RawMoQ;
+      return PicoProtocolType::Quic;
     }
     return PicoProtocolType::Unknown;
   }
@@ -75,10 +75,10 @@ class PicoProtocolDispatcher {
    */
   static const char* protocolName(PicoProtocolType type) {
     switch (type) {
-      case PicoProtocolType::RawMoQ:
-        return "RawMoQ";
-      case PicoProtocolType::WebTransport:
-        return "WebTransport";
+      case PicoProtocolType::Quic:
+        return "Quic";
+      case PicoProtocolType::WebTransportH3:
+        return "WebTransportH3";
       default:
         return "Unknown";
     }

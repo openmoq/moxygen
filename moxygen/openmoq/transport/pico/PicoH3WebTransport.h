@@ -8,13 +8,13 @@
 
 #include <deque>
 #include <folly/SocketAddress.h>
+#include <folly/container/F14Map.h>
+#include <folly/container/F14Set.h>
 #include <functional>
 #include <memory>
 #include <proxygen/lib/http/webtransport/WebTransport.h>
 #include <proxygen/lib/http/webtransport/WtStreamManager.h>
 #include <quic/priority/HTTPPriorityQueue.h>
-#include <unordered_map>
-#include <unordered_set>
 
 // Forward declarations - avoid exposing picoquic/h3zero types
 typedef struct st_picoquic_cnx_t picoquic_cnx_t;
@@ -198,13 +198,13 @@ class PicoH3WebTransport : public proxygen::WebTransport {
   std::unique_ptr<proxygen::detail::WtStreamManager> streamManager_;
 
   // Map from QUIC stream ID to h3zero stream context
-  std::unordered_map<uint64_t, h3zero_stream_ctx_t*> streamContexts_;
+  folly::F14FastMap<uint64_t, h3zero_stream_ctx_t*> streamContexts_;
 
   // Queue for pending datagrams
   std::deque<std::unique_ptr<folly::IOBuf>> datagramQueue_;
 
   // Track streams that need handler notification
-  std::unordered_set<uint64_t> pendingStreamNotifications_;
+  folly::F14FastSet<uint64_t> pendingStreamNotifications_;
 
   // Callback to notify EventBase when wake time may have decreased
   std::function<void()> updateWakeTimeoutCallback_;

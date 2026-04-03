@@ -112,8 +112,14 @@ int PicoH3WebTransport::handleWtEvent(
     case picohttp_callback_provide_datagram:
       // Ready to send datagram
       if (!datagramQueue_.empty()) {
-        // TODO: Send datagram via h3zero API (picowt_prepare_datagram)
-        datagramQueue_.pop_front();
+        auto& dg = datagramQueue_.front();
+        size_t dgLen = dg->computeChainDataLength();
+        dg->coalesce();
+        int ret = picowt_prepare_datagram(
+            cnx_, controlStreamCtx_, dg->data(), dgLen);
+        if (ret == 0) {
+          datagramQueue_.pop_front();
+        }
       }
       break;
 
@@ -225,12 +231,10 @@ void PicoH3WebTransport::onStreamData(
     if (isBidi) {
       // For peer-initiated bidi streams, we need BOTH ingress and egress handles.
       auto bidiHandle = streamManager_->getOrCreateBidiHandle(streamId);
-      if (bidiHandle.readHandle && bidiHandle.writeHandle) {
-        XLOG(DBG2) << "Notifying handler of new peer bidi stream " << streamId;
-        handler_->onNewBidiStream(bidiHandle);
-      } else {
-        XLOG(ERR) << "Failed to create bidi handle for stream " << streamId;
-      }
+      XCHECK(bidiHandle.readHandle && bidiHandle.writeHandle)
+          << "getOrCreateBidiHandle failed for stream " << streamId;
+      XLOG(DBG2) << "Notifying handler of new peer bidi stream " << streamId;
+      handler_->onNewBidiStream(bidiHandle);
     } else {
       XLOG(DBG2) << "Notifying handler of new peer uni stream " << streamId;
       handler_->onNewUniStream(readHandle);
@@ -285,15 +289,12 @@ void PicoH3WebTransport::IngressCallback::onNewPeerStream(
   // construction, BEFORE the handle is inserted into the map. We must NOT
   // call getOrCreateBidiHandle or getBidiHandle here.
   //
-  // Skip the control stream - it's for WebTransport session control,
-  // not application (MoQ) data.
-  if (parent_->controlStreamCtx_ &&
-      streamId == parent_->controlStreamCtx_->stream_id) {
-    XLOG(DBG4) << "onNewPeerStream: skipping control stream " << streamId;
-    return;
-  }
+  // The control stream should never end up in stream manager.
+  XCHECK(!parent_->controlStreamCtx_ ||
+         streamId != parent_->controlStreamCtx_->stream_id)
+      << "Control stream " << streamId << " should not be in stream manager";
 
-  // Instead, track this stream and notify the handler later in onStreamData.
+  // Track this stream and notify the handler later in onStreamData.
   XLOG(DBG2) << "onNewPeerStream: " << streamId;
   parent_->pendingStreamNotifications_.insert(streamId);
 }
@@ -357,17 +358,19 @@ void PicoH3WebTransport::processEgressEvents() {
     // Dequeue ALL available data for this stream
     auto streamData = streamManager_->dequeue(*handle, UINT64_MAX);
     if (streamData.data || streamData.fin) {
-      // Must coalesce IOBuf chain before sending - data() only returns first buffer
+      // Walk IOBuf chain instead of coalescing to save alloc+memcpy+free
       if (streamData.data) {
-        streamData.data->coalesce();
+        const folly::IOBuf* cur = streamData.data.get();
+        do {
+          bool isLastChunk = !cur->next() || cur->next() == streamData.data.get();
+          bool finThisChunk = streamData.fin && isLastChunk;
+          sendStreamData(it->second, cur->data(), cur->length(), finThisChunk);
+          cur = cur->next();
+        } while (cur && cur != streamData.data.get());
+      } else if (streamData.fin) {
+        // Send FIN without data
+        sendStreamData(it->second, nullptr, 0, true);
       }
-      size_t bytesDequeued =
-          streamData.data ? streamData.data->length() : 0;
-      sendStreamData(
-          it->second,
-          streamData.data ? streamData.data->data() : nullptr,
-          bytesDequeued,
-          streamData.fin);
     } else {
       // No data available, break to avoid infinite loop
       break;
@@ -476,45 +479,26 @@ PicoH3WebTransport::writeStreamData(
     std::unique_ptr<folly::IOBuf> data,
     bool fin,
     ByteEventCallback* deliveryCallback) {
-  // Find stream context for this stream ID
-  auto it = streamContexts_.find(id);
-  if (it == streamContexts_.end()) {
-    XLOG(ERR) << "writeStreamData: no stream context for stream " << id;
+  // Route through WtStreamManager to maintain ordering
+  auto* handle = streamManager_->getOrCreateEgressHandle(id);
+  if (!handle) {
     return folly::makeUnexpected(ErrorCode::INVALID_STREAM_ID);
   }
 
-  // Send data directly via picoquic instead of queueing
-  // This ensures complete objects are sent atomically
-  if (data) {
-    data->coalesce();
-    size_t length = data->length();
-    XLOG(DBG4) << "writeStreamData: stream=" << id << " length=" << length
-               << " fin=" << fin;
-    int ret = picoquic_add_to_stream_with_ctx(
-        cnx_, id, data->data(), data->length(), fin ? 1 : 0, it->second);
-    if (ret != 0) {
-      XLOG(ERR) << "picoquic_add_to_stream_with_ctx failed: " << ret;
-      return folly::makeUnexpected(ErrorCode::GENERIC_ERROR);
-    }
+  size_t dataLen = data ? data->computeChainDataLength() : 0;
+  XLOG(DBG4) << "writeStreamData: stream=" << id << " length=" << dataLen
+             << " fin=" << fin;
 
-    // Note: deliveryCallback not used - picoquic handles delivery internally
-    (void)deliveryCallback;
-  } else if (fin) {
-    // Send FIN without data
-    int ret = picoquic_add_to_stream_with_ctx(
-        cnx_, id, nullptr, 0, 1, it->second);
-    if (ret != 0) {
-      XLOG(ERR) << "picoquic_add_to_stream_with_ctx (fin) failed: " << ret;
-      return folly::makeUnexpected(ErrorCode::GENERIC_ERROR);
+  auto result = handle->writeStreamData(std::move(data), fin, deliveryCallback);
+  if (result.hasValue()) {
+    // Trigger egress processing
+    processEgressEvents();
+    // Notify EventBase that wake time may have decreased
+    if (updateWakeTimeoutCallback_) {
+      updateWakeTimeoutCallback_();
     }
   }
-
-  // Notify EventBase that wake time may have decreased (data is ready to send)
-  if (updateWakeTimeoutCallback_) {
-    updateWakeTimeoutCallback_();
-  }
-
-  return FCState::UNBLOCKED;
+  return result;
 }
 
 folly::Expected<folly::Unit, PicoH3WebTransport::ErrorCode>
@@ -544,9 +528,9 @@ PicoH3WebTransport::setPriority(
 
 folly::Expected<folly::Unit, PicoH3WebTransport::ErrorCode>
 PicoH3WebTransport::setPriorityQueue(
-    std::unique_ptr<quic::PriorityQueue> queue) noexcept {
-  // Not supported; using internal priority queue
-  return folly::makeUnexpected(ErrorCode::GENERIC_ERROR);
+    std::unique_ptr<quic::PriorityQueue> /*queue*/) noexcept {
+  // WtStreamManager uses its own priority queue, this is a no-op
+  return folly::unit;
 }
 
 folly::Expected<folly::SemiFuture<uint64_t>, PicoH3WebTransport::ErrorCode>

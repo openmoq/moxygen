@@ -6,8 +6,8 @@
 
 #include "moxygen/openmoq/transport/pico/MoQPicoQuicEventBaseServer.h"
 #include <folly/logging/xlog.h>
+#include <moxygen/events/MoQFollyExecutorImpl.h>
 #include <moxygen/openmoq/transport/pico/PicoH3WebTransport.h>
-#include <moxygen/openmoq/transport/pico/PicoQuicExecutor.h>
 #include <moxygen/openmoq/transport/pico/PicoQuicSocketHandler.h>
 #include <moxygen/openmoq/transport/pico/PicoQuicWebTransport.h>
 #include <picoquic.h>
@@ -16,7 +16,7 @@ namespace moxygen {
 
 struct MoQPicoQuicEventBaseServer::Impl {
   std::unique_ptr<PicoQuicSocketHandler> handler;
-  std::shared_ptr<PicoQuicExecutor> ownedExecutor;
+  std::shared_ptr<MoQFollyExecutorImpl> ownedExecutor;
   std::atomic<bool> running_{false};
 };
 
@@ -46,10 +46,8 @@ void MoQPicoQuicEventBaseServer::start(const folly::SocketAddress& addr) {
     return;
   }
 
-  // Use PicoQuicExecutor to enable synchronous task draining after packet receive.
-  // This matches the threaded server's behavior where drainTasks() is called
-  // after each packet loop iteration.
-  impl_->ownedExecutor = std::make_shared<PicoQuicExecutor>();
+  // Use MoQFollyExecutorImpl - EventBase handles task execution naturally
+  impl_->ownedExecutor = std::make_shared<MoQFollyExecutorImpl>(evb_.get());
   executor_ = impl_->ownedExecutor;
 
   if (!createQuicContext()) {
@@ -64,15 +62,7 @@ void MoQPicoQuicEventBaseServer::start(const folly::SocketAddress& addr) {
   impl_->handler =
       std::make_unique<PicoQuicSocketHandler>(evb_.get(), quic_);
 
-  // Set callback to drain executor tasks after processing packets.
-  // This mimics PicoQuicExecutor's loop callback which calls drainTasks()
-  // after packet receive/send operations.
-  impl_->handler->setDrainTasksCallback([executor = impl_->ownedExecutor.get()] {
-    uint64_t currentTime = picoquic_current_time();
-    executor->drainTasks();
-    executor->processExpiredTimers(currentTime);
-  });
-
+  // No drainTasksCallback needed - EventBase handles task execution
   impl_->handler->start(addr);
 }
 
