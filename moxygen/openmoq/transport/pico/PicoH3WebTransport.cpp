@@ -110,14 +110,16 @@ int PicoH3WebTransport::handleWtEvent(
       break;
 
     case picohttp_callback_provide_datagram:
-      // Ready to send datagram
+      // Ready to send datagram - bytes is the context for h3zero_provide_datagram_buffer
       if (!datagramQueue_.empty()) {
         auto& dg = datagramQueue_.front();
         size_t dgLen = dg->computeChainDataLength();
         dg->coalesce();
-        int ret = picowt_prepare_datagram(
-            cnx_, controlStreamCtx_, dg->data(), dgLen);
-        if (ret == 0) {
+        // Get buffer from h3zero and copy datagram into it
+        int moreToSend = datagramQueue_.size() > 1 ? 1 : 0;
+        uint8_t* buffer = h3zero_provide_datagram_buffer(bytes, dgLen, moreToSend);
+        if (buffer != nullptr) {
+          memcpy(buffer, dg->data(), dgLen);
           datagramQueue_.pop_front();
         }
       }
