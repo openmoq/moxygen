@@ -78,7 +78,7 @@ moxygen_add_library(openmoq_pico_evb_server_transport
   EXPORTED_DEPS
     openmoq_pico_evb_base
     openmoq_pico_server_base
-    openmoq_pico_executor
+    moxygen_events_moq_folly_executor_impl
 )
 
 # EventBase client: outgoing QUIC connection + MoQ session on a folly::EventBase.
