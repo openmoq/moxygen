@@ -358,11 +358,16 @@ void PicoH3WebTransport::processEgressEvents() {
   folly::F14FastSet<uint64_t> streamsToActivate;
   while (auto* handle = streamManager_->nextWritable()) {
     uint64_t streamId = handle->getID();
+    XLOG(DBG4) << "processEgressEvents: nextWritable returned stream " << streamId;
     if (streamsToActivate.count(streamId)) {
       // Already seen this stream, break to avoid infinite loop
+      XLOG(DBG4) << "processEgressEvents: duplicate stream " << streamId << ", breaking";
       break;
     }
     streamsToActivate.insert(streamId);
+  }
+  if (streamsToActivate.empty()) {
+    XLOG(DBG4) << "processEgressEvents: no writable streams";
   }
   for (uint64_t streamId : streamsToActivate) {
     markStreamActive(streamId);
