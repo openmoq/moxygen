@@ -397,10 +397,12 @@ void PicoH3WebTransport::onProvideData(
 
   size_t dataLen = streamData.data ? streamData.data->computeChainDataLength() : 0;
   bool fin = streamData.fin;
-  // Stream is still active if we sent data and have more space,
-  // or if we didn't send fin yet. If we dequeued all available data
-  // (less than maxLength) and fin is set, stream is done.
-  bool isStillActive = (dataLen > 0 && !fin) || (dataLen >= maxLength);
+  // Stream is still active if:
+  // - We sent data and didn't send fin (more data may come)
+  // - We filled the buffer (definitely more data pending)
+  // - We have no data and no fin (stream is waiting for data - keep polling)
+  // Only deactivate when we've sent fin (stream is done)
+  bool isStillActive = !fin || (dataLen >= maxLength);
 
   XLOG(DBG4) << "onProvideData: dequeued=" << dataLen << " fin=" << fin
              << " isStillActive=" << isStillActive;
@@ -479,6 +481,12 @@ PicoH3WebTransport::createUniStream() {
     return folly::makeUnexpected(ErrorCode::STREAM_CREATION_ERROR);
   }
 
+  // Mark stream as active immediately so onProvideData will be called
+  // This is needed because eventsAvailable() only fires when writableStreams_
+  // transitions from empty to non-empty, but MoQSession may write data before
+  // that transition happens.
+  markStreamActive(streamId);
+
   XLOG(DBG2) << "Created WebTransport unidir stream: " << streamId;
   return handle;
 }
@@ -511,6 +519,9 @@ PicoH3WebTransport::createBidiStream() {
               << streamId;
     return folly::makeUnexpected(ErrorCode::STREAM_CREATION_ERROR);
   }
+
+  // Mark stream as active immediately so onProvideData will be called
+  markStreamActive(streamId);
 
   XLOG(DBG2) << "Created WebTransport bidir stream: " << streamId;
   return handle;
