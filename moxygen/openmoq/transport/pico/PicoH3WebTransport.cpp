@@ -403,7 +403,9 @@ void PicoH3WebTransport::onProvideData(
   bool isStillActive = (dataLen > 0 && !fin) || (dataLen >= maxLength);
 
   XLOG(DBG4) << "onProvideData: dequeued=" << dataLen << " fin=" << fin
-             << " isStillActive=" << isStillActive;
+             << " isStillActive=" << isStillActive
+             << " chainLen=" << (streamData.data ? streamData.data->computeChainDataLength() : 0)
+             << " numBufs=" << (streamData.data ? streamData.data->countChainElements() : 0);
 
   // Get buffer from picoquic via JIT API
   uint8_t* buffer = picoquic_provide_stream_data_buffer(
@@ -425,6 +427,10 @@ void PicoH3WebTransport::onProvideData(
       if (toWrite == 0) break;
       memcpy(buffer + written, buf.data(), toWrite);
       written += toWrite;
+    }
+    if (written != dataLen) {
+      XLOG(ERR) << "onProvideData: data copy mismatch! stream=" << streamId
+                << " expected=" << dataLen << " written=" << written;
     }
   }
 
