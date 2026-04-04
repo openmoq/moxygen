@@ -460,6 +460,10 @@ PicoH3WebTransport::createUniStream() {
     return folly::makeUnexpected(ErrorCode::STREAM_CREATION_ERROR);
   }
 
+  // Copy path_callback from control stream so h3zero routes JIT callbacks to us
+  streamCtx->path_callback = controlStreamCtx_->path_callback;
+  streamCtx->path_callback_ctx = controlStreamCtx_->path_callback_ctx;
+
   uint64_t streamId = streamCtx->stream_id;
   streamContexts_[streamId] = streamCtx;
 
@@ -488,6 +492,10 @@ PicoH3WebTransport::createBidiStream() {
     XLOG(ERR) << "Failed to create WebTransport bidir stream";
     return folly::makeUnexpected(ErrorCode::STREAM_CREATION_ERROR);
   }
+
+  // Copy path_callback from control stream so h3zero routes JIT callbacks to us
+  streamCtx->path_callback = controlStreamCtx_->path_callback;
+  streamCtx->path_callback_ctx = controlStreamCtx_->path_callback_ctx;
 
   uint64_t streamId = streamCtx->stream_id;
   streamContexts_[streamId] = streamCtx;
