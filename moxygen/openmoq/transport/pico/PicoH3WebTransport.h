@@ -175,12 +175,14 @@ class PicoH3WebTransport : public proxygen::WebTransport {
   // Process egress events from WtStreamManager
   void processEgressEvents();
 
-  // Send data on a WebTransport stream via h3zero
-  void sendStreamData(
+  // JIT callback for providing stream data to h3zero
+  void onProvideData(
       h3zero_stream_ctx_t* streamCtx,
-      const uint8_t* data,
-      size_t length,
-      bool fin);
+      uint8_t* context,
+      size_t maxLength);
+
+  // Mark a stream as active for JIT sending
+  void markStreamActive(uint64_t streamId);
 
   picoquic_cnx_t* cnx_;
   h3zero_callback_ctx_t* h3Ctx_;

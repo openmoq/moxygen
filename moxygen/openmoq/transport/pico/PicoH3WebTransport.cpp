@@ -105,8 +105,12 @@ int PicoH3WebTransport::handleWtEvent(
       break;
 
     case picohttp_callback_provide_data:
-      // Ready to send data on a stream - process egress queue
-      processEgressEvents();
+      // Ready to send data on a stream - JIT callback
+      // bytes = context for picoquic_provide_stream_data_buffer
+      // length = max space available
+      if (streamCtx) {
+        onProvideData(streamCtx, bytes, length);
+      }
       break;
 
     case picohttp_callback_provide_datagram:
@@ -347,52 +351,85 @@ void PicoH3WebTransport::processEgressEvents() {
     }
   }
 
-  // Process writable streams - send all available data
+  // Mark writable streams as active for JIT sending
+  // The actual data sending happens in onProvideData callback
   while (auto* handle = streamManager_->nextWritable()) {
     uint64_t streamId = handle->getID();
-    auto it = streamContexts_.find(streamId);
-    if (it == streamContexts_.end()) {
-      // Stream context gone, dequeue to clear the buffer
-      streamManager_->dequeue(*handle, UINT64_MAX);
-      continue;
-    }
-
-    // Dequeue ALL available data for this stream
-    auto streamData = streamManager_->dequeue(*handle, UINT64_MAX);
-    if (streamData.data || streamData.fin) {
-      // Walk IOBuf chain instead of coalescing to save alloc+memcpy+free
-      if (streamData.data) {
-        const folly::IOBuf* cur = streamData.data.get();
-        do {
-          bool isLastChunk = !cur->next() || cur->next() == streamData.data.get();
-          bool finThisChunk = streamData.fin && isLastChunk;
-          sendStreamData(it->second, cur->data(), cur->length(), finThisChunk);
-          cur = cur->next();
-        } while (cur && cur != streamData.data.get());
-      } else if (streamData.fin) {
-        // Send FIN without data
-        sendStreamData(it->second, nullptr, 0, true);
-      }
-    } else {
-      // No data available, break to avoid infinite loop
-      break;
-    }
+    markStreamActive(streamId);
   }
 }
 
-void PicoH3WebTransport::sendStreamData(
+void PicoH3WebTransport::onProvideData(
     h3zero_stream_ctx_t* streamCtx,
-    const uint8_t* data,
-    size_t length,
-    bool fin) {
-  XLOG(DBG4) << "sendStreamData: stream=" << streamCtx->stream_id
-             << " length=" << length << " fin=" << fin;
+    uint8_t* context,
+    size_t maxLength) {
+  // JIT callback: h3zero is ready to send data on this stream
+  // We must use picoquic_provide_stream_data_buffer to provide data
+  uint64_t streamId = streamCtx->stream_id;
 
-  int ret = picoquic_add_to_stream_with_ctx(
-      cnx_, streamCtx->stream_id, data, length, fin ? 1 : 0, streamCtx);
+  XLOG(DBG4) << "onProvideData: stream=" << streamId << " maxLength=" << maxLength;
+
+  auto* handle = streamManager_->getOrCreateEgressHandle(streamId);
+  if (!handle) {
+    // Stream doesn't exist, provide empty buffer
+    XLOG(DBG2) << "onProvideData: no handle for stream " << streamId;
+    picoquic_provide_stream_data_buffer(context, 0, 0, 0);
+    return;
+  }
+
+  // Dequeue data from WtStreamManager (respects maxLength)
+  auto streamData = streamManager_->dequeue(*handle, maxLength);
+
+  size_t dataLen = streamData.data ? streamData.data->computeChainDataLength() : 0;
+  bool fin = streamData.fin;
+  // Stream is still active if we sent data and have more space,
+  // or if we didn't send fin yet. If we dequeued all available data
+  // (less than maxLength) and fin is set, stream is done.
+  bool isStillActive = (dataLen > 0 && !fin) || (dataLen >= maxLength);
+
+  XLOG(DBG4) << "onProvideData: dequeued=" << dataLen << " fin=" << fin
+             << " isStillActive=" << isStillActive;
+
+  // Get buffer from picoquic via JIT API
+  uint8_t* buffer = picoquic_provide_stream_data_buffer(
+      context, dataLen, fin ? 1 : 0, isStillActive ? 1 : 0);
+
+  if (buffer == nullptr) {
+    if (dataLen > 0) {
+      XLOG(ERR) << "picoquic_provide_stream_data_buffer returned null for stream "
+                << streamId << " size=" << dataLen;
+    }
+    return;
+  }
+
+  // Copy data into the buffer
+  if (dataLen > 0 && streamData.data) {
+    size_t written = 0;
+    for (const auto& buf : *streamData.data) {
+      size_t toWrite = std::min(buf.size(), dataLen - written);
+      if (toWrite == 0) break;
+      memcpy(buffer + written, buf.data(), toWrite);
+      written += toWrite;
+    }
+  }
+
+  // Fire delivery callback if registered (optimistic, since picoquic lacks ACK callbacks)
+  if (streamData.deliveryCallback) {
+    streamData.deliveryCallback->onByteEvent(streamId, streamData.lastByteStreamOffset);
+  }
+}
+
+void PicoH3WebTransport::markStreamActive(uint64_t streamId) {
+  auto it = streamContexts_.find(streamId);
+  if (it == streamContexts_.end()) {
+    XLOG(DBG2) << "markStreamActive: no context for stream " << streamId;
+    return;
+  }
+
+  XLOG(DBG4) << "markStreamActive: stream=" << streamId;
+  int ret = picoquic_mark_active_stream(cnx_, streamId, 1, it->second);
   if (ret != 0) {
-    XLOG(ERR) << "Failed to send data on stream " << streamCtx->stream_id
-              << ", error=" << ret;
+    XLOG(WARN) << "Failed to mark stream " << streamId << " as active, error=" << ret;
   }
 }
 
