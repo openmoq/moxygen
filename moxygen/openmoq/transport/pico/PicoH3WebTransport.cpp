@@ -552,6 +552,9 @@ PicoH3WebTransport::writeStreamData(
              << " fin=" << fin;
 
   auto result = handle->writeStreamData(std::move(data), fin, deliveryCallback);
+  XLOG(DBG4) << "writeStreamData: stream=" << id
+             << " result=" << (result.hasValue() ? "ok" : "error")
+             << " fcState=" << (result.hasValue() && result.value() == FCState::BLOCKED ? "BLOCKED" : "UNBLOCKED");
   if (result.hasValue()) {
     // Trigger egress processing
     processEgressEvents();
