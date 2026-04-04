@@ -353,8 +353,18 @@ void PicoH3WebTransport::processEgressEvents() {
 
   // Mark writable streams as active for JIT sending
   // The actual data sending happens in onProvideData callback
+  // Collect stream IDs first to avoid infinite loop (nextWritable doesn't
+  // remove streams from writable set until we dequeue in onProvideData)
+  folly::F14FastSet<uint64_t> streamsToActivate;
   while (auto* handle = streamManager_->nextWritable()) {
     uint64_t streamId = handle->getID();
+    if (streamsToActivate.count(streamId)) {
+      // Already seen this stream, break to avoid infinite loop
+      break;
+    }
+    streamsToActivate.insert(streamId);
+  }
+  for (uint64_t streamId : streamsToActivate) {
     markStreamActive(streamId);
   }
 }
