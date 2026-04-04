@@ -397,12 +397,10 @@ void PicoH3WebTransport::onProvideData(
 
   size_t dataLen = streamData.data ? streamData.data->computeChainDataLength() : 0;
   bool fin = streamData.fin;
-  // Stream is still active if:
-  // - We sent data and didn't send fin (more data may come)
-  // - We filled the buffer (definitely more data pending)
-  // - We have no data and no fin (stream is waiting for data - keep polling)
-  // Only deactivate when we've sent fin (stream is done)
-  bool isStillActive = !fin || (dataLen >= maxLength);
+  // Stream is still active if we sent data and have more, or filled the buffer.
+  // Don't keep polling empty streams - rely on markStreamActive() being called
+  // when new data arrives.
+  bool isStillActive = (dataLen > 0 && !fin) || (dataLen >= maxLength);
 
   XLOG(DBG4) << "onProvideData: dequeued=" << dataLen << " fin=" << fin
              << " isStillActive=" << isStillActive;
@@ -434,6 +432,12 @@ void PicoH3WebTransport::onProvideData(
   if (streamData.deliveryCallback) {
     streamData.deliveryCallback->onByteEvent(streamId, streamData.lastByteStreamOffset);
   }
+
+  // Check for other writable streams and mark them active.
+  // This is needed because eventsAvailable() only fires when the writable queue
+  // transitions from empty to non-empty. If new streams become writable while
+  // we're processing, we need to catch them here.
+  processEgressEvents();
 }
 
 void PicoH3WebTransport::markStreamActive(uint64_t streamId) {
