@@ -38,12 +38,14 @@ endif()
 
 # Executor that queues tasks and drains them synchronously.
 # Used by both threaded and EVB servers.
+# Note: No dependency on openmoq_pico_base - executor is transport-agnostic.
 moxygen_add_library(openmoq_pico_executor
   SRCS
     PicoQuicExecutor.cpp
   EXPORTED_DEPS
-    openmoq_pico_base
     moxygen_events_moq_executor
+    Folly::folly_logging_logging
+    picoquic::picoquic-core
 )
 
 # Thread-based server: picoquic runs its own network thread via
