@@ -368,6 +368,9 @@ class MoQFrameParser {
   std::optional<SubscriptionFilter> extractSubscriptionFilter(
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
+  std::optional<TrackFilter> extractTrackFilter(
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
   void handleRequestSpecificParams(
       SubscribeRequest& subscribeRequest,
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
