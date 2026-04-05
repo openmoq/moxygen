@@ -229,10 +229,6 @@ PicoQuicWebTransport::writeStreamData(uint64_t id,
                                       bool fin,
                                       ByteEventCallback *deliveryCallback) {
 
-  size_t dataLen = data ? data->computeChainDataLength() : 0;
-  XLOG(DBG4) << "writeStreamData: stream=" << id << " dataLen=" << dataLen
-             << " fin=" << fin;
-
   auto *handle = streamManager_->getOrCreateEgressHandle(id);
   if (!handle) {
     return folly::makeUnexpected(ErrorCode::INVALID_STREAM_ID);
@@ -546,11 +542,7 @@ void PicoQuicWebTransport::onPrepareToSend(uint64_t streamId, uint8_t *context,
     if (!priorityQueue_.empty()) {
       auto nextId = priorityQueue_.peekNextScheduledID();
       if (nextId.isStreamID()) {
-        uint64_t nextStreamId = nextId.asStreamID();
-        XLOG(DBG4) << "onPrepareToSend: marking next writable stream "
-                   << nextStreamId << " as active after stream " << streamId
-                   << " became inactive";
-        markStreamActive(nextStreamId);
+        markStreamActive(nextId.asStreamID());
       }
     }
   }
@@ -806,10 +798,7 @@ void PicoQuicWebTransport::processEgressEvents() {
   if (!priorityQueue_.empty()) {
     auto nextId = priorityQueue_.peekNextScheduledID();
     if (nextId.isStreamID()) {
-      uint64_t streamId = nextId.asStreamID();
-      XLOG(DBG4) << "processEgressEvents: marking writable stream "
-                 << streamId << " as active";
-      markStreamActive(streamId);
+      markStreamActive(nextId.asStreamID());
     }
   } else {
     XLOG(DBG6) << "processEgressEvents: no writable streams found";

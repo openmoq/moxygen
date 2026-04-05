@@ -358,16 +358,11 @@ void PicoH3WebTransport::processEgressEvents() {
   folly::F14FastSet<uint64_t> streamsToActivate;
   while (auto* handle = streamManager_->nextWritable()) {
     uint64_t streamId = handle->getID();
-    XLOG(DBG4) << "processEgressEvents: nextWritable returned stream " << streamId;
     if (streamsToActivate.count(streamId)) {
       // Already seen this stream, break to avoid infinite loop
-      XLOG(DBG4) << "processEgressEvents: duplicate stream " << streamId << ", breaking";
       break;
     }
     streamsToActivate.insert(streamId);
-  }
-  if (streamsToActivate.empty()) {
-    XLOG(DBG4) << "processEgressEvents: no writable streams";
   }
   for (uint64_t streamId : streamsToActivate) {
     markStreamActive(streamId);
@@ -402,10 +397,8 @@ void PicoH3WebTransport::onProvideData(
   // when new data arrives.
   bool isStillActive = (dataLen > 0 && !fin) || (dataLen >= maxLength);
 
-  XLOG(DBG4) << "onProvideData: dequeued=" << dataLen << " fin=" << fin
-             << " isStillActive=" << isStillActive
-             << " chainLen=" << (streamData.data ? streamData.data->computeChainDataLength() : 0)
-             << " numBufs=" << (streamData.data ? streamData.data->countChainElements() : 0);
+  XLOG(DBG6) << "onProvideData: dequeued=" << dataLen << " fin=" << fin
+             << " isStillActive=" << isStillActive;
 
   // Get buffer from picoquic via JIT API
   uint8_t* buffer = picoquic_provide_stream_data_buffer(
@@ -568,14 +561,7 @@ PicoH3WebTransport::writeStreamData(
     return folly::makeUnexpected(ErrorCode::INVALID_STREAM_ID);
   }
 
-  size_t dataLen = data ? data->computeChainDataLength() : 0;
-  XLOG(DBG4) << "writeStreamData: stream=" << id << " length=" << dataLen
-             << " fin=" << fin;
-
   auto result = handle->writeStreamData(std::move(data), fin, deliveryCallback);
-  XLOG(DBG4) << "writeStreamData: stream=" << id
-             << " result=" << (result.hasValue() ? "ok" : "error")
-             << " fcState=" << (result.hasValue() && result.value() == FCState::BLOCKED ? "BLOCKED" : "UNBLOCKED");
   if (result.hasValue()) {
     // Trigger egress processing
     processEgressEvents();

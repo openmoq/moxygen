@@ -178,7 +178,6 @@ bool PicoQuicSocketHandler::shouldOnlyNotify() {
 
 void PicoQuicSocketHandler::onNotifyDataAvailable(
     folly::AsyncUDPSocket& sock) noexcept {
-  XLOG(DBG4) << "onNotifyDataAvailable called";
   struct mmsghdr msgs[kRecvBatchSize];
   struct iovec iovecs[kRecvBatchSize];
   uint8_t bufs[kRecvBatchSize][kMaxPacketSize];
@@ -262,7 +261,6 @@ void PicoQuicSocketHandler::onReadClosed() noexcept {
 // ---------------------------------------------------------------------------
 
 void PicoQuicSocketHandler::timeoutExpired() noexcept {
-  XLOG(DBG4) << "timeoutExpired called";
   // Drain pending executor tasks to process coroutine continuations
   if (drainTasksCallback_) {
     drainTasksCallback_();
@@ -282,8 +280,6 @@ void PicoQuicSocketHandler::pollIncoming() {
   FD_SET(fd_, &readfds);
   struct timeval tv = {0, 0};
   int ready = select(fd_ + 1, &readfds, nullptr, nullptr, &tv);
-  XLOG(DBG4) << "pollIncoming called, fd=" << fd_ << " select=" << ready
-             << (ready < 0 ? std::string(" errno=") + folly::errnoStr(errno) : "");
 
   struct mmsghdr msgs[kRecvBatchSize];
   struct iovec iovecs[kRecvBatchSize];
@@ -315,7 +311,6 @@ void PicoQuicSocketHandler::pollIncoming() {
       }
       break;
     }
-    XLOG(DBG4) << "recvmmsg returned " << n << " packets";
     totalReceived += n;
 
     for (int i = 0; i < n; i++) {
@@ -327,9 +322,6 @@ void PicoQuicSocketHandler::pollIncoming() {
     }
   }
 
-  if (totalReceived > 0) {
-    XLOG(DBG4) << "pollIncoming: received " << totalReceived << " packets";
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +427,6 @@ void PicoQuicSocketHandler::parseCmsgsAndDeliver(const struct mmsghdr& msg,
 }
 
 void PicoQuicSocketHandler::drainOutgoing() {
-  XLOG(DBG4) << "drainOutgoing called";
   static constexpr size_t kSendBufSize = kMaxPacketSize * 10;
   uint8_t sendBuf[kSendBufSize];
 
@@ -567,9 +558,6 @@ void PicoQuicSocketHandler::rescheduleTimer() {
   int64_t rawDelayUs =
       picoquic_get_next_wake_delay(quic_, now, INT64_MAX);
   int64_t delayUs = std::min(rawDelayUs, kMaxWakeDelayUs);
-  XLOG(DBG4) << "rescheduleTimer: rawDelayUs=" << rawDelayUs
-             << " delayUs=" << delayUs
-             << " evbRunning=" << evb_->isRunning();
   if (delayUs <= 0) {
     evb_->add([this] {
       drainOutgoing();
