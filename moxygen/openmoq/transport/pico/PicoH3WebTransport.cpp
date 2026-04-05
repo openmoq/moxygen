@@ -12,6 +12,33 @@
 
 namespace moxygen {
 
+namespace {
+
+// RAII guard: captures picoquic's next wake time on construction and fires
+// a callback on destruction if the wake time decreased (e.g. after
+// mark_active_stream / mark_datagram_ready).
+struct WakeTimeGuard {
+  WakeTimeGuard(picoquic_cnx_t* cnx, const std::function<void()>& cb)
+      : quic_(picoquic_get_quic_ctx(cnx)), cb_(cb) {
+    if (cb_) {
+      before_ = picoquic_get_next_wake_time(quic_, picoquic_current_time());
+    }
+  }
+  ~WakeTimeGuard() {
+    if (cb_ &&
+        picoquic_get_next_wake_time(quic_, picoquic_current_time()) < before_) {
+      cb_();
+    }
+  }
+
+ private:
+  picoquic_quic_t* quic_;
+  const std::function<void()>& cb_;
+  uint64_t before_{UINT64_MAX};
+};
+
+} // namespace
+
 PicoH3WebTransport::PicoH3WebTransport(
     picoquic_cnx_t* cnx,
     h3zero_callback_ctx_t* h3Ctx,

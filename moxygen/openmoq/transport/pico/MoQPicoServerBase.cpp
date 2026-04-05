@@ -209,7 +209,7 @@ static int picoCallback(picoquic_cnx_t* cnx,
     XCHECK(protocol != PicoProtocolType::WebTransportH3)
         << "WebTransport connection reached picoCallback on ready event";
 
-    if (protocol == PicoProtocolType::RawMoQ) {
+    if (protocol == PicoProtocolType::Quic) {
       // Route to raw MoQ handler (existing path)
       MoQPicoServerBaseCallbacks::onNewConnection(server, cnx);
     }
