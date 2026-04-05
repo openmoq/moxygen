@@ -228,6 +228,9 @@ PicoQuicWebTransport::writeStreamData(uint64_t id,
                                       std::unique_ptr<folly::IOBuf> data,
                                       bool fin,
                                       ByteEventCallback *deliveryCallback) {
+  size_t dataLen = data ? data->computeChainDataLength() : 0;
+  XLOG(DBG5) << "writeStreamData: stream=" << id << " dataLen=" << dataLen
+             << " fin=" << fin;
 
   auto *handle = streamManager_->getOrCreateEgressHandle(id);
   if (!handle) {
@@ -542,7 +545,11 @@ void PicoQuicWebTransport::onPrepareToSend(uint64_t streamId, uint8_t *context,
     if (!priorityQueue_.empty()) {
       auto nextId = priorityQueue_.peekNextScheduledID();
       if (nextId.isStreamID()) {
-        markStreamActive(nextId.asStreamID());
+        uint64_t nextStreamId = nextId.asStreamID();
+        XLOG(DBG5) << "onPrepareToSend: marking next writable stream "
+                   << nextStreamId << " as active after stream " << streamId
+                   << " became inactive";
+        markStreamActive(nextStreamId);
       }
     }
   }
@@ -798,7 +805,10 @@ void PicoQuicWebTransport::processEgressEvents() {
   if (!priorityQueue_.empty()) {
     auto nextId = priorityQueue_.peekNextScheduledID();
     if (nextId.isStreamID()) {
-      markStreamActive(nextId.asStreamID());
+      uint64_t streamId = nextId.asStreamID();
+      XLOG(DBG5) << "processEgressEvents: marking writable stream "
+                 << streamId << " as active";
+      markStreamActive(streamId);
     }
   } else {
     XLOG(DBG6) << "processEgressEvents: no writable streams found";

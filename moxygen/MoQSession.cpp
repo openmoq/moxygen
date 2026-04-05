@@ -3111,7 +3111,7 @@ folly::coro::Task<void> MoQSession::unidirectionalReadLoop(
 
   // Scope guard to unify stopSending on exit if readHandle is still valid
   auto stopSendingGuard = folly::makeGuard([&readHandle, sess = this]() {
-    if (readHandle && !sess->isClosed()) {
+    if (readHandle) {
       XLOG(DBG0) << "Sending STOP_SENDING id=" << readHandle->getID()
                  << " sess=" << sess;
       readHandle->stopSending(0);

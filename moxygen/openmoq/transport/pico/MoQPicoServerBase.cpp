@@ -97,20 +97,22 @@ static size_t alpnSelectCallback(picoquic_quic_t* quic,
       picoquic_get_default_callback_context(quic));
   const auto& wtConfig = MoQPicoServerBaseCallbacks::getWTConfig(server);
 
-  // Build list of supported ALPNs based on configuration
+  // Build list of supported ALPNs based on configuration.
+  // Order matters: server prefers earlier entries. Put raw MoQ first so native
+  // clients get moqt-* preference; h3 last for browser fallback.
   std::vector<std::string> supportedAlpns;
 
-  // Add h3 first if WebTransport is enabled (higher priority for browsers)
-  if (wtConfig.enableWebTransport) {
-    supportedAlpns.push_back("h3");
-  }
-
-  // Add raw MoQ ALPNs if enabled
+  // Add raw MoQ ALPNs first (preferred for native clients)
   if (wtConfig.enableRawMoQ) {
     auto moqtAlpns =
         getMoqtProtocols(MoQPicoServerBaseCallbacks::getVersions(server), true);
     supportedAlpns.insert(
         supportedAlpns.end(), moqtAlpns.begin(), moqtAlpns.end());
+  }
+
+  // Add h3 last if WebTransport is enabled (fallback for browsers)
+  if (wtConfig.enableWebTransport) {
+    supportedAlpns.push_back("h3");
   }
 
   std::vector<std::string> clientAlpns;
@@ -170,13 +172,15 @@ static int picoCallback(picoquic_cnx_t* cnx,
     if (protocol == PicoProtocolType::WebTransportH3) {
       // Create per-connection h3zero context and switch to h3zero_callback
       auto* h3Ctx = MoQPicoServerBaseCallbacks::getOrCreateH3Ctx(server, cnx);
-      if (h3Ctx) {
-        XLOG(DBG1) << "Switching to h3zero_callback for WebTransport, cnx="
-                   << (void*)cnx << " h3Ctx=" << (void*)h3Ctx;
-        picoquic_set_callback(cnx, h3zero_callback, h3Ctx);
-        // Forward almost_ready event to h3zero
-        return h3zero_callback(cnx, stream_id, bytes, length, fin_or_event, h3Ctx, v_stream_ctx);
+      if (!h3Ctx) {
+        XLOG(ERR) << "Failed to create h3Ctx for WebTransport connection";
+        return PICOQUIC_ERROR_UNEXPECTED_ERROR;
       }
+      XLOG(DBG1) << "Switching to h3zero_callback for WebTransport, cnx="
+                 << (void*)cnx << " h3Ctx=" << (void*)h3Ctx;
+      picoquic_set_callback(cnx, h3zero_callback, h3Ctx);
+      // Forward almost_ready event to h3zero
+      return h3zero_callback(cnx, stream_id, bytes, length, fin_or_event, h3Ctx, v_stream_ctx);
     }
     return 0;
   }
@@ -198,14 +202,12 @@ static int picoCallback(picoquic_cnx_t* cnx,
                << " -> Protocol: "
                << PicoProtocolDispatcher::protocolName(protocol);
 
-    if (protocol == PicoProtocolType::WebTransportH3) {
-      // WebTransport was switched to h3zero_callback in almost_ready.
-      // This shouldn't happen, but forward to h3zero just in case.
-      auto* h3Ctx = MoQPicoServerBaseCallbacks::getOrCreateH3Ctx(server, cnx);
-      if (h3Ctx) {
-        return h3zero_callback(cnx, stream_id, bytes, length, fin_or_event, h3Ctx, v_stream_ctx);
-      }
-    } else {
+    // WebTransport connections should have been switched to h3zero_callback
+    // in almost_ready. If we get here with h3 ALPN, something is wrong.
+    XCHECK(protocol != PicoProtocolType::WebTransportH3)
+        << "WebTransport connection reached picoCallback on ready event";
+
+    if (protocol == PicoProtocolType::RawMoQ) {
       // Route to raw MoQ handler (existing path)
       MoQPicoServerBaseCallbacks::onNewConnection(server, cnx);
     }
@@ -253,11 +255,13 @@ static int wtPathCallback(
           server, cnx, streamCtx);
 
     case picohttp_callback_connect_refused:
-      XLOG(WARN) << "WebTransport CONNECT refused";
+      // Client-side callback - shouldn't happen on server
+      XLOG(WARN) << "Unexpected picohttp_callback_connect_refused on server";
       break;
 
     case picohttp_callback_connect_accepted:
-      XLOG(DBG1) << "WebTransport CONNECT accepted";
+      // Client-side callback - shouldn't happen on server
+      XLOG(WARN) << "Unexpected picohttp_callback_connect_accepted on server";
       break;
 
     default:
@@ -290,17 +294,18 @@ MoQPicoServerBase::~MoQPicoServerBase() {
 }
 
 bool MoQPicoServerBase::createQuicContext() {
-  // Build and log supported ALPNs
+  // Build and log supported ALPNs (for logging only - actual selection
+  // happens in alpnSelectCallback with proper preference order)
   std::vector<std::string> supportedAlpns;
-  if (wtConfig_.enableWebTransport) {
-    supportedAlpns.push_back("h3");
-  }
   if (wtConfig_.enableRawMoQ) {
     auto moqtAlpns = getMoqtProtocols(versions_, true);
     supportedAlpns.insert(
         supportedAlpns.end(), moqtAlpns.begin(), moqtAlpns.end());
   }
-  XLOG(INFO) << "Supported ALPNs: " << folly::join(", ", supportedAlpns);
+  if (wtConfig_.enableWebTransport) {
+    supportedAlpns.push_back("h3");
+  }
+  XLOG(DBG1) << "Supported ALPNs: " << folly::join(", ", supportedAlpns);
 
   uint64_t current_time = picoquic_current_time();
   quic_ = picoquic_create(
@@ -339,7 +344,7 @@ bool MoQPicoServerBase::createQuicContext() {
     }
     // Enable WebTransport transport parameters
     picowt_set_default_transport_parameters(quic_);
-    XLOG(INFO) << "WebTransport enabled on endpoint: " << wtConfig_.wtEndpoint;
+    XLOG(DBG1) << "WebTransport enabled on endpoint: " << wtConfig_.wtEndpoint;
   }
 
   return true;
@@ -399,14 +404,10 @@ void MoQPicoServerBase::onNewConnectionImpl(void* vcnx) {
 }
 
 void MoQPicoServerBase::onNewWebTransportConnectionImpl(void* vcnx) {
-  // NOTE: This function is no longer called in the normal flow.
-  // WebTransport connections switch to h3zero_callback during set_alpn,
-  // so h3zero handles almost_ready and ready events directly.
-  // MoQSession creation happens in onWebTransportConnectImpl when
-  // the browser sends CONNECT.
-  auto* cnx = static_cast<picoquic_cnx_t*>(vcnx);
-  XLOG(WARN) << "onNewWebTransportConnectionImpl called unexpectedly";
-  (void)cnx;
+  // TODO: Remove this dead code - WebTransport connections go through
+  // h3zero_callback and onWebTransportConnectImpl instead.
+  (void)vcnx;
+  XLOG(ERR) << "onNewWebTransportConnectionImpl called unexpectedly - this is dead code";
 }
 
 bool MoQPicoServerBase::initH3Zero() {
@@ -450,6 +451,9 @@ void MoQPicoServerBase::destroyH3Zero() {
 int MoQPicoServerBase::onWebTransportConnectImpl(
     picoquic_cnx_t* cnx,
     h3zero_stream_ctx_t* streamCtx) {
+  // TODO: Add dynamic authority/path matching callback for moqx compatibility.
+  // Currently we accept all CONNECT requests to the configured endpoint.
+  // moqx design separates listener (connection) from service (authority/path).
   XLOG(DBG1) << "WebTransport CONNECT received on stream " << streamCtx->stream_id
              << " cnx=" << (void*)cnx;
 
@@ -566,7 +570,10 @@ int MoQPicoServerBase::onWebTransportEventImpl(
     XLOG(DBG3) << "onWebTransportEventImpl: control stream " << streamId
                << " cnx=" << (void*)cnx << " wt=" << (void*)wt;
   } else {
-    // This is a data stream - find the session by control_stream_id
+    // This is a data stream - find the session by control_stream_id.
+    // NOTE: h3zero's path-based callback design requires us to maintain
+    // this mapping since path_callback_ctx is shared across all streams.
+    // Ideally h3zero would let us store per-session context directly.
     uint64_t controlStreamId = streamCtx->ps.stream_state.control_stream_id;
     XLOG(DBG2) << "onWebTransportEventImpl: data stream " << streamId
                << " cnx=" << (void*)cnx << " has control_stream_id=" << controlStreamId;
@@ -583,17 +590,24 @@ int MoQPicoServerBase::onWebTransportEventImpl(
   }
 
   if (!wt) {
-    XLOG(DBG4) << "No WebTransport adapter found for event " << event;
-    return 0;
+    // No session found - this can happen during cleanup or for streams
+    // that arrive after session close. Return -1 to signal error to h3zero.
+    XLOG(WARN) << "No WebTransport adapter found for event " << event
+               << " stream=" << streamId;
+    return -1;
   }
 
   int ret = wt->handleWtEvent(cnx, bytes, length, event, streamCtx);
 
-  // Cleanup session from map when session closes
+  // Cleanup session from map when session closes.
+  // picohttp_callback_deregister: called when stream is being deregistered
+  // picohttp_callback_free: called when resources are being freed
+  // We handle both identically - remove the session from our tracking map.
+  // Note: PicoH3WebTransport::handleWtEvent also handles these for its own
+  // cleanup (via onSessionClose), which is idempotent.
   auto wtEvent = static_cast<picohttp_call_back_event_t>(event);
   if (wtEvent == picohttp_callback_deregister ||
       wtEvent == picohttp_callback_free) {
-    // Find and remove the session by control stream ID
     auto controlIt = wtSessions_.find({cnx, streamId});
     if (controlIt != wtSessions_.end()) {
       XLOG(DBG1) << "Removing WT session for cnx=" << (void*)cnx

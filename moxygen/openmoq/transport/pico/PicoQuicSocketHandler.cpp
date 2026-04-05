@@ -42,9 +42,8 @@ constexpr size_t kMaxPacketSize = 1500;
 // cmsg buffer per message: space for IP_PKTINFO/IPV6_PKTINFO + IP_TOS.
 constexpr size_t kCmsgBufSize =
     CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(uint8_t));
-// Max wake delay passed to picoquic (1 ms in microseconds).
-// Video streaming requires frequent polling to keep congestion window open.
-constexpr int64_t kMaxWakeDelayUs = 1'000;
+// Max wake delay passed to picoquic (200 ms in microseconds).
+constexpr int64_t kMaxWakeDelayUs = 200'000;
 
 } // namespace
 
@@ -220,7 +219,9 @@ void PicoQuicSocketHandler::onNotifyDataAvailable(
   if (anyReceived) {
     XLOG(DBG5) << "onNotifyDataAvailable: received " << totalReceived
                << " packets, draining";
-    // Drain pending executor tasks to process coroutine continuations
+    // Optional callback for executors that need explicit task draining during I/O.
+    // Currently unused in EventBase path (folly::EventBase drains its own tasks),
+    // but could be set by PicoQuicExecutor for the threaded model if needed.
     if (drainTasksCallback_) {
       drainTasksCallback_();
     }
@@ -243,7 +244,7 @@ void PicoQuicSocketHandler::onDataAvailable(
     size_t len,
     bool /*truncated*/,
     OnDataAvailableParams /*params*/) noexcept {
-  XLOG(DBG1) << "onDataAvailable called from " << client.describe()
+  XLOG(DBG4) << "onDataAvailable called from " << client.describe()
              << " len=" << len << " (should not happen with shouldOnlyNotify)";
 }
 

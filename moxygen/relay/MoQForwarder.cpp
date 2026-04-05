@@ -767,9 +767,6 @@ MoQForwarder::SubgroupForwarder::object(
     Payload payload,
     Extensions extensions,
     bool finSubgroup) {
-  XLOG(INFO) << "SubgroupForwarder::object objID=" << objectID
-             << " group=" << identifier_.group << " finSubgroup=" << finSubgroup
-             << " payloadLen=" << (payload ? payload->computeChainDataLength() : 0);
   if (currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
@@ -801,9 +798,6 @@ MoQForwarder::SubgroupForwarder::beginObject(
     uint64_t length,
     Payload initialPayload,
     Extensions extensions) {
-  XLOG(INFO) << "SubgroupForwarder::beginObject objID=" << objectID
-             << " length=" << length << " group=" << identifier_.group
-             << " initialPayloadLen=" << (initialPayload ? initialPayload->computeChainDataLength() : 0);
   // TODO: use a shared class for object publish state validation
   updateLargest(identifier_.group, objectID);
   if (currentObjectLength_) {
@@ -906,15 +900,11 @@ folly::Expected<ObjectPublishStatus, MoQPublishError>
 MoQForwarder::SubgroupForwarder::objectPayload(
     Payload payload,
     bool finSubgroup) {
-  auto payloadLength = (payload) ? payload->computeChainDataLength() : 0;
-  XLOG(INFO) << "SubgroupForwarder::objectPayload len=" << payloadLength
-             << " finSubgroup=" << finSubgroup
-             << " remaining=" << (currentObjectLength_ ? *currentObjectLength_ : 0)
-             << " group=" << identifier_.group;
   if (!currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Haven't started publishing object"));
   }
+  auto payloadLength = (payload) ? payload->computeChainDataLength() : 0;
   if (payloadLength > *currentObjectLength_) {
     return folly::makeUnexpected(
         MoQPublishError(MoQPublishError::API_ERROR, "Payload exceeded length"));

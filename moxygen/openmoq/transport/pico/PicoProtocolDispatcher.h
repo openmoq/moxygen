@@ -39,7 +39,7 @@ class PicoProtocolDispatcher {
     if (isH3(alpn)) {
       return PicoProtocolType::WebTransportH3;
     }
-    if (isRawMoQ(alpn)) {
+    if (isQuic(alpn)) {
       return PicoProtocolType::Quic;
     }
     return PicoProtocolType::Unknown;
@@ -53,9 +53,9 @@ class PicoProtocolDispatcher {
   }
 
   /**
-   * Check if ALPN indicates raw MoQ over QUIC.
+   * Check if ALPN indicates MoQ over raw QUIC (not HTTP/3).
    */
-  static bool isRawMoQ(const char* alpn) {
+  static bool isQuic(const char* alpn) {
     if (!alpn) {
       return false;
     }

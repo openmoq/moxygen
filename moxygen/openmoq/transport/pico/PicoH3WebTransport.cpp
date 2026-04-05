@@ -74,19 +74,22 @@ int PicoH3WebTransport::handleWtEvent(
     h3zero_stream_ctx_t* streamCtx) {
   auto event = static_cast<picohttp_call_back_event_t>(wtEvent);
 
-  XLOG(DBG4) << "handleWtEvent: event=" << wtEvent
+  XLOG(DBG5) << "handleWtEvent: event=" << wtEvent
              << " stream=" << (streamCtx ? streamCtx->stream_id : 0)
              << " length=" << length;
 
   switch (event) {
     case picohttp_callback_post:
-      // Initial POST/CONNECT body on control stream - ignore
-      // WebTransport capsule data on control stream is handled by h3zero
-      XLOG(DBG4) << "Ignoring picohttp_callback_post on control stream";
+      // picohttp_callback_post is for the initial CONNECT request body.
+      // For WebTransport, this contains capsule data that h3zero handles
+      // internally, so we ignore it here. Only the control stream gets this.
+      XLOG(DBG5) << "Ignoring picohttp_callback_post on control stream";
       break;
 
     case picohttp_callback_post_data:
-      // Data received on a WebTransport stream
+      // Data received on a WebTransport stream.
+      // Note: h3zero guarantees this is a data stream, not the control stream.
+      // Control stream data comes via picohttp_callback_post instead.
       if (streamCtx) {
         onStreamData(streamCtx, bytes, length, false);
       }
@@ -145,7 +148,9 @@ int PicoH3WebTransport::handleWtEvent(
 
     case picohttp_callback_deregister:
     case picohttp_callback_free:
-      // Session is being closed
+      // Session is being closed. Note: MoQPicoServerBase also handles these
+      // events for cleanup (removing from wtSessions_ map), so onSessionClose
+      // may be called twice - it's idempotent via sessionClosed_ flag.
       onSessionClose(0, nullptr);
       break;
 
@@ -164,7 +169,7 @@ void PicoH3WebTransport::onStreamData(
     bool fin) {
   uint64_t streamId = streamCtx->stream_id;
 
-  XLOG(DBG4) << "onStreamData: stream=" << streamId << " length=" << length
+  XLOG(DBG5) << "onStreamData: stream=" << streamId << " length=" << length
              << " fin=" << fin;
 
   // Handle control stream capsules (DRAIN_SESSION, CLOSE_SESSION, etc.)
@@ -176,18 +181,21 @@ void PicoH3WebTransport::onStreamData(
       int ret = picowt_receive_capsule(
           cnx_, controlStreamCtx_, bytes, bytes + length, &capsule);
       if (ret != 0) {
-        XLOG(ERR) << "Failed to parse WebTransport capsule: " << ret;
-      } else if (capsule.h3_capsule.is_stored) {
-        XLOG(DBG1) << "Received WT capsule type: 0x" << std::hex
-                   << capsule.h3_capsule.capsule_type;
+        XLOG(ERR) << "Failed to parse WebTransport capsule: " << ret
+                  << ", tearing down session";
+        onSessionClose(static_cast<uint32_t>(ret), nullptr);
+        return;
+      }
+      if (capsule.h3_capsule.is_stored) {
+        uint64_t capsuleType = capsule.h3_capsule.capsule_type;
         // Handle CLOSE/DRAIN capsules
-        if (capsule.h3_capsule.capsule_type ==
-                picowt_capsule_close_webtransport_session ||
-            capsule.h3_capsule.capsule_type ==
-                picowt_capsule_drain_webtransport_session) {
+        if (capsuleType == picowt_capsule_close_webtransport_session ||
+            capsuleType == picowt_capsule_drain_webtransport_session) {
           XLOG(DBG1) << "WebTransport session close/drain requested, error="
                      << capsule.error_code;
           onSessionClose(capsule.error_code, nullptr);
+        } else {
+          XLOG(DBG2) << "Unhandled WT capsule type: 0x" << std::hex << capsuleType;
         }
       }
       picowt_release_capsule(&capsule);
@@ -198,7 +206,7 @@ void PicoH3WebTransport::onStreamData(
   // Track stream context
   if (streamContexts_.find(streamId) == streamContexts_.end()) {
     streamContexts_[streamId] = streamCtx;
-    XLOG(DBG4) << "Tracking new stream context for stream " << streamId;
+    XLOG(DBG5) << "Tracking new stream context for stream " << streamId;
   }
 
   auto* readHandle = streamManager_->getOrCreateIngressHandle(streamId);
@@ -239,10 +247,10 @@ void PicoH3WebTransport::onStreamData(
       auto bidiHandle = streamManager_->getOrCreateBidiHandle(streamId);
       XCHECK(bidiHandle.readHandle && bidiHandle.writeHandle)
           << "getOrCreateBidiHandle failed for stream " << streamId;
-      XLOG(DBG2) << "Notifying handler of new peer bidi stream " << streamId;
+      XLOG(DBG4) << "Notifying handler of new peer bidi stream " << streamId;
       handler_->onNewBidiStream(bidiHandle);
     } else {
-      XLOG(DBG2) << "Notifying handler of new peer uni stream " << streamId;
+      XLOG(DBG4) << "Notifying handler of new peer uni stream " << streamId;
       handler_->onNewUniStream(readHandle);
     }
   }
@@ -310,7 +318,7 @@ void PicoH3WebTransport::processEgressEvents() {
     return;
   }
 
-  XLOG(DBG4) << "processEgressEvents: processing egress events";
+  WakeTimeGuard guard(cnx_, updateWakeTimeoutCallback_);
 
   auto events = streamManager_->moveEvents();
 
@@ -333,39 +341,34 @@ void PicoH3WebTransport::processEgressEvents() {
       XLOG(DBG1) << "DrainSession event received";
     } else if (auto* maxConnData =
                    std::get_if<proxygen::detail::WtStreamManager::MaxConnData>(&event)) {
-      XLOG(DBG2) << "Unhandled MaxConnData event, maxData=" << maxConnData->maxData;
+      XLOG(DBG1) << "Unhandled MaxConnData event, maxData=" << maxConnData->maxData;
     } else if (auto* maxStreamData =
                    std::get_if<proxygen::detail::WtStreamManager::MaxStreamData>(&event)) {
-      XLOG(DBG2) << "Unhandled MaxStreamData event, streamId="
+      XLOG(DBG1) << "Unhandled MaxStreamData event, streamId="
                  << maxStreamData->streamId << " maxData=" << maxStreamData->maxData;
     } else if (auto* maxStreamsBidi =
                    std::get_if<proxygen::detail::WtStreamManager::MaxStreamsBidi>(&event)) {
-      XLOG(DBG2) << "Unhandled MaxStreamsBidi event, maxStreams="
+      XLOG(DBG1) << "Unhandled MaxStreamsBidi event, maxStreams="
                  << maxStreamsBidi->maxStreams;
     } else if (auto* maxStreamsUni =
                    std::get_if<proxygen::detail::WtStreamManager::MaxStreamsUni>(&event)) {
-      XLOG(DBG2) << "Unhandled MaxStreamsUni event, maxStreams="
+      XLOG(DBG1) << "Unhandled MaxStreamsUni event, maxStreams="
                  << maxStreamsUni->maxStreams;
     } else {
-      XLOG(WARN) << "Unknown event type in processEgressEvents";
+      XLOG(ERR) << "Unknown event type in processEgressEvents";
     }
   }
 
-  // Mark writable streams as active for JIT sending
-  // The actual data sending happens in onProvideData callback
-  // Collect stream IDs first to avoid infinite loop (nextWritable doesn't
-  // remove streams from writable set until we dequeue in onProvideData)
-  folly::F14FastSet<uint64_t> streamsToActivate;
-  while (auto* handle = streamManager_->nextWritable()) {
-    uint64_t streamId = handle->getID();
-    if (streamsToActivate.count(streamId)) {
-      // Already seen this stream, break to avoid infinite loop
-      break;
+  // Check for writable streams in the priority queue and mark one active.
+  // JIT model: picoquic will call onProvideData, which chains to the next stream.
+  if (!priorityQueue_.empty()) {
+    auto nextId = priorityQueue_.peekNextScheduledID();
+    if (nextId.isStreamID()) {
+      uint64_t streamId = nextId.asStreamID();
+      XLOG(DBG5) << "processEgressEvents: marking writable stream "
+                 << streamId << " as active";
+      markStreamActive(streamId);
     }
-    streamsToActivate.insert(streamId);
-  }
-  for (uint64_t streamId : streamsToActivate) {
-    markStreamActive(streamId);
   }
 }
 
@@ -377,7 +380,7 @@ void PicoH3WebTransport::onProvideData(
   // We must use picoquic_provide_stream_data_buffer to provide data
   uint64_t streamId = streamCtx->stream_id;
 
-  XLOG(DBG4) << "onProvideData: stream=" << streamId << " maxLength=" << maxLength;
+  XLOG(DBG5) << "onProvideData: stream=" << streamId << " maxLength=" << maxLength;
 
   auto* handle = streamManager_->getOrCreateEgressHandle(streamId);
   if (!handle) {
@@ -388,8 +391,12 @@ void PicoH3WebTransport::onProvideData(
   }
 
   // Dequeue data from WtStreamManager (respects maxLength)
+  // TODO: Could save an allocation by adding enqueue API that takes buf/bytes
+  // and appends to unused tailroom in stream manager's buffer.
   auto streamData = streamManager_->dequeue(*handle, maxLength);
 
+  // Walking the chain twice (once for length, once for copy) is unfortunate
+  // but may be unavoidable given the JIT API requiring length upfront.
   size_t dataLen = streamData.data ? streamData.data->computeChainDataLength() : 0;
   bool fin = streamData.fin;
   // Stream is still active if we sent data and have more, or filled the buffer.
@@ -417,7 +424,9 @@ void PicoH3WebTransport::onProvideData(
     size_t written = 0;
     for (const auto& buf : *streamData.data) {
       size_t toWrite = std::min(buf.size(), dataLen - written);
-      if (toWrite == 0) break;
+      if (toWrite == 0) {
+        break;
+      }
       memcpy(buffer + written, buf.data(), toWrite);
       written += toWrite;
     }
@@ -432,11 +441,18 @@ void PicoH3WebTransport::onProvideData(
     streamData.deliveryCallback->onByteEvent(streamId, streamData.lastByteStreamOffset);
   }
 
-  // Check for other writable streams and mark them active.
-  // This is needed because eventsAvailable() only fires when the writable queue
-  // transitions from empty to non-empty. If new streams become writable while
-  // we're processing, we need to catch them here.
-  processEgressEvents();
+  // If this stream is no longer active, check for the next writable stream
+  // in the priority queue and mark it active - this chains JIT callbacks.
+  if (!isStillActive && !priorityQueue_.empty()) {
+    auto nextId = priorityQueue_.peekNextScheduledID();
+    if (nextId.isStreamID()) {
+      uint64_t nextStreamId = nextId.asStreamID();
+      XLOG(DBG5) << "onProvideData: marking next writable stream "
+                 << nextStreamId << " as active after stream " << streamId
+                 << " became inactive";
+      markStreamActive(nextStreamId);
+    }
+  }
 }
 
 void PicoH3WebTransport::markStreamActive(uint64_t streamId) {
@@ -446,7 +462,7 @@ void PicoH3WebTransport::markStreamActive(uint64_t streamId) {
     return;
   }
 
-  XLOG(DBG4) << "markStreamActive: stream=" << streamId;
+  XLOG(DBG5) << "markStreamActive: stream=" << streamId;
   int ret = picoquic_mark_active_stream(cnx_, streamId, 1, it->second);
   if (ret != 0) {
     XLOG(WARN) << "Failed to mark stream " << streamId << " as active, error=" << ret;
@@ -555,7 +571,10 @@ PicoH3WebTransport::writeStreamData(
     std::unique_ptr<folly::IOBuf> data,
     bool fin,
     ByteEventCallback* deliveryCallback) {
-  // Route through WtStreamManager to maintain ordering
+  size_t dataLen = data ? data->computeChainDataLength() : 0;
+  XLOG(DBG5) << "writeStreamData: stream=" << id << " dataLen=" << dataLen
+             << " fin=" << fin;
+
   auto* handle = streamManager_->getOrCreateEgressHandle(id);
   if (!handle) {
     return folly::makeUnexpected(ErrorCode::INVALID_STREAM_ID);
@@ -563,12 +582,8 @@ PicoH3WebTransport::writeStreamData(
 
   auto result = handle->writeStreamData(std::move(data), fin, deliveryCallback);
   if (result.hasValue()) {
-    // Trigger egress processing
-    processEgressEvents();
-    // Notify EventBase that wake time may have decreased
-    if (updateWakeTimeoutCallback_) {
-      updateWakeTimeoutCallback_();
-    }
+    // Mark stream as active for JIT sending
+    markStreamActive(id);
   }
   return result;
 }
@@ -580,10 +595,8 @@ PicoH3WebTransport::resetStream(uint64_t streamId, uint32_t error) {
     return folly::makeUnexpected(ErrorCode::INVALID_STREAM_ID);
   }
 
-  auto it = streamContexts_.find(streamId);
-  if (it != streamContexts_.end()) {
-    picowt_reset_stream(cnx_, it->second, error);
-  }
+  // Use handle->resetStream which queues a ResetStream event that gets
+  // processed in processEgressEvents, calling picowt_reset_stream there.
   return handle->resetStream(error);
 }
 
