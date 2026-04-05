@@ -548,7 +548,11 @@ void PicoQuicSocketHandler::sendPacket(const uint8_t* data,
 }
 
 void PicoQuicSocketHandler::updateWakeTimeout() {
-  // Drain immediately when new data is queued to avoid latency
+  // Called when new data is queued (via WakeTimeGuard from markStreamActive).
+  // We drain immediately rather than waiting for rescheduleTimer because:
+  // 1. rescheduleTimer only calls drainOutgoing if delayUs <= 0
+  // 2. If delayUs > 0, data would wait until the next timer expiry
+  // 3. Immediate drain reduces latency for freshly queued data
   drainOutgoing();
   cancelTimeout();
   rescheduleTimer();

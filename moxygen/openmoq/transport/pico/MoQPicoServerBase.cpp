@@ -54,6 +54,8 @@ struct MoQPicoServerBaseCallbacks {
     auto* h3Ctx = h3zero_callback_create_context(&serverParams);
     if (h3Ctx) {
       h3Ctx->settings.h3_datagram = 1;
+      // wtMaxSessions limits concurrent WT sessions per QUIC connection.
+      // h3zero enforces this in the WT layer; we use it for flow control.
       h3Ctx->settings.webtransport_max_sessions = server->wtConfig_.wtMaxSessions;
       server->h3Contexts_[cnx] = h3Ctx;
       XLOG(DBG1) << "Created per-connection h3Ctx for cnx=" << (void*)cnx;
@@ -413,10 +415,14 @@ void MoQPicoServerBase::onNewWebTransportConnectionImpl(void* vcnx) {
 bool MoQPicoServerBase::initH3Zero() {
   // Create path table for WebTransport endpoint
   // We need to keep this alive for the lifetime of the server
+  // TODO: Support multiple endpoints by changing wtEndpoint to vector and
+  // sizing this array accordingly. For now, single endpoint suffices.
   wtPathTable_ = std::make_unique<picohttp_server_path_item_t[]>(2);
 
   // Configure the WebTransport endpoint path
   // The callback will be invoked when a CONNECT request is received
+  // Note: This does exact path matching. For compatibility with moqx-style
+  // path-based routing (e.g., /moq/relay-name), consider wildcard support.
   wtPathTable_[0].path = wtConfig_.wtEndpoint.c_str();
   wtPathTable_[0].path_length = wtConfig_.wtEndpoint.size();
   wtPathTable_[0].path_callback = wtPathCallback;

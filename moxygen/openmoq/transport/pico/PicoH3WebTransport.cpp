@@ -72,6 +72,10 @@ int PicoH3WebTransport::handleWtEvent(
     size_t length,
     int wtEvent,
     h3zero_stream_ctx_t* streamCtx) {
+  // Note: No WakeTimeGuard here - this is called from h3zero's callback during
+  // picoquic packet processing, which already handles wake time management.
+  // Data queued during event handling will be sent via drainOutgoing after
+  // packet processing completes.
   auto event = static_cast<picohttp_call_back_event_t>(wtEvent);
 
   XLOG(DBG5) << "handleWtEvent: event=" << wtEvent
@@ -226,6 +230,7 @@ void PicoH3WebTransport::onStreamData(
   auto result = streamManager_->enqueue(*readHandle, std::move(streamData));
 
   if (result == proxygen::detail::WtStreamManager::Result::Fail) {
+    // TODO: Consider resetting the stream on enqueue failure to signal backpressure
     XLOG(ERR) << "Failed to enqueue data for stream " << streamId;
     return;
   }
@@ -664,7 +669,16 @@ const folly::SocketAddress& PicoH3WebTransport::getPeerAddress() const {
 
 quic::TransportInfo PicoH3WebTransport::getTransportInfo() const {
   quic::TransportInfo info;
-  // Basic info - could be expanded with picoquic stats
+
+  if (!cnx_) {
+    return info;
+  }
+
+  // Populate transport info from picoquic connection state
+  info.srtt = std::chrono::microseconds(picoquic_get_rtt(cnx_));
+  info.bytesSent = picoquic_get_data_sent(cnx_);
+  info.bytesRecvd = picoquic_get_data_received(cnx_);
+
   return info;
 }
 

@@ -41,6 +41,9 @@ class MoQPicoServerBase;
  * 2. h3zero invokes wtPathCallback with picohttp_callback_connect
  * 3. Server creates PicoH3WebTransport and sends 200 OK
  * 4. Subsequent events (streams, data, datagrams) route to this adapter
+ *
+ * TODO: Refactor common code with PicoQuicWebTransport (WtStreamManager
+ * integration, egress/ingress callbacks, stream handling) into a shared base.
  */
 class PicoH3WebTransport : public proxygen::WebTransport {
  public:
