@@ -498,18 +498,20 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
   webTransport->setHandler(moqSession.get());
 
   // Negotiate MoQ version via WebTransport protocol negotiation.
-  // The client may send wt-available-protocols; we select from our supported versions.
-  // Note: Browser WebTransport clients typically don't send this header, so we
-  // default to moqt-16 for compatibility when no protocol is negotiated.
-  int wtProtoRet = picowt_select_wt_protocol(streamCtx, versions_.c_str());
+  // The client sends wt-available-protocols, we select from our supported versions.
+  // Note: picowt_select_wt_protocol expects ALPN format (e.g. "moqt-16, moqt-15")
+  // not draft numbers, so we convert versions_ first.
+  auto alpnProtocols = getMoqtProtocols(versions_, /*useStandard=*/true);
+  std::string alpnList = folly::join(", ", alpnProtocols);
+  XLOG(DBG2) << "WT protocol negotiation: server offers [" << alpnList << "]";
+  int wtProtoRet = picowt_select_wt_protocol(streamCtx, alpnList.c_str());
   if (wtProtoRet == 0 && streamCtx->ps.stream_state.wt_protocol) {
     const char* selectedProto = streamCtx->ps.stream_state.wt_protocol;
     XLOG(DBG1) << "WebTransport selected protocol: " << selectedProto;
     moqSession->validateAndSetVersionFromAlpn(selectedProto);
   } else {
-    // Browser clients don't send wt-available-protocols, default for compatibility
-    XLOG(DBG1) << "No WT protocol negotiated, defaulting to moqt-16";
-    moqSession->validateAndSetVersionFromAlpn("moqt-16");
+    XLOG(ERR) << "No compatible WT protocol - client didn't offer matching version";
+    return -1;
   }
 
   // Set path_callback_ctx to the server pointer so h3zero passes it for
