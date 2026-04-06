@@ -72,7 +72,12 @@ PicoWebTransportBase::PicoWebTransportBase(
 PicoWebTransportBase::~PicoWebTransportBase() {
   handler_ = nullptr;
   if (!sessionClosed_) {
-    closeSession(folly::none);
+    // Cannot call closeSession() here: it calls sendCloseImpl() which is pure
+    // virtual and the derived class vtable is already gone by the time the base
+    // destructor runs. Do the minimum safe cleanup directly.
+    sessionClosed_ = true;
+    proxygen::detail::WtStreamManager::CloseSession cs{0, ""};
+    streamManager_->shutdown(cs);
   }
 }
 
