@@ -31,7 +31,7 @@ namespace moxygen {
  * - Priority queue scheduling
  *
  * Subclasses implement transport-specific primitives:
- * - PicoQuicWebTransport: raw QUIC (picoquic callbacks)
+ * - PicoQuicWebTransport: QUIC transport (picoquic callbacks)
  * - PicoH3WebTransport: HTTP/3 WebTransport (h3zero callbacks)
  */
 class PicoWebTransportBase : public proxygen::WebTransport {

@@ -1,51 +1,13 @@
-# PicoQuic Transport for MoQ
+# PicoQuic Transport for MOQT
 
-This directory contains the picoquic-based QUIC transport backend for MoQ,
-supporting both raw QUIC (native clients) and HTTP/3 WebTransport (browsers).
+This directory contains the picoquic-based QUIC transport backend for MOQT,
+supporting both QUIC transport (non-browser clients) and HTTP/3 WebTransport (browsers).
 
 ---
 
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              MoQ Application                                │
-│                         (MoQSession, MoQRelay, etc.)                        │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        proxygen::WebTransport Interface                     │
-│              (streams, datagrams, flow control, session mgmt)               │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          PicoWebTransportBase                               │
-│           (shared: WtStreamManager, JIT send, egress events)                │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-              ┌───────────────────────┴───────────────────────┐
-              │                                               │
-              ▼                                               ▼
-┌─────────────────────────────┐               ┌─────────────────────────────┐
-│   PicoQuicWebTransport      │               │    PicoH3WebTransport       │
-│   (Raw QUIC - moqt-NN)      │               │    (HTTP/3 WebTransport)    │
-│                             │               │                             │
-│ • picoquic_callback_*       │               │ • picohttp_callback_*       │
-│ • Direct stream IDs         │               │ • h3zero stream contexts    │
-│ • Native QUIC clients       │               │ • Browser clients           │
-└─────────────────────────────┘               └─────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                               picoquic                                      │
-│                    (QUIC protocol, congestion control)                      │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-              ┌───────────────────────┴───────────────────────┐
-              │                                               │
-              ▼                                               ▼
 ┌─────────────────────────────┐               ┌─────────────────────────────┐
 │  MoQPicoQuicServer          │               │ MoQPicoQuicEventBaseServer  │
 │  (Threaded Model)           │               │ (EventBase Model)           │
@@ -55,11 +17,50 @@ supporting both raw QUIC (native clients) and HTTP/3 WebTransport (browsers).
 │ • PicoQuicExecutor          │               │ • MoQFollyExecutorImpl      │
 │ • Single dedicated thread   │               │ • Shared event loop         │
 └─────────────────────────────┘               └─────────────────────────────┘
+              │                                               │
+              └───────────────────────┬───────────────────────┘
+                                      │  owns
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                               picoquic                                      │
+│                    (QUIC protocol, congestion control)                      │
+└─────────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
                             ┌─────────────────┐
                             │   UDP Socket    │
                             └─────────────────┘
+
+On each connection, picoquic drives one of two WebTransport adapters:
+
+┌─────────────────────────────┐               ┌─────────────────────────────┐
+│   PicoQuicWebTransport      │               │    PicoH3WebTransport       │
+│   (QUIC - moqt-NN)          │               │    (HTTP/3 WebTransport)    │
+│                             │               │                             │
+│ • picoquic_callback_*       │               │ • picohttp_callback_*       │
+│ • Direct stream IDs         │               │ • h3zero stream contexts    │
+│ • Native QUIC clients       │               │ • Browser clients           │
+└─────────────────────────────┘               └─────────────────────────────┘
+              │                                               │
+              └───────────────────────┬───────────────────────┘
+                                      │  inherits
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          PicoWebTransportBase                               │
+│           (shared: WtStreamManager, JIT send, egress events)                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │  implements
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        proxygen::WebTransport Interface                     │
+│              (streams, datagrams, flow control, session mgmt)               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                             MOQT Application                                │
+│                         (MoQSession, MoQRelay, etc.)                        │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -85,7 +86,7 @@ MoQPicoServerBase                    <- Shared: QUIC context, ALPN, h3zero init
 proxygen::WebTransport (interface)
         │
 PicoWebTransportBase                 <- Shared base: WtStreamManager, JIT, egress
-   ├── PicoQuicWebTransport          <- Raw QUIC (moqt-NN ALPN)
+   ├── PicoQuicWebTransport          <- QUIC transport (moqt-NN ALPN)
    └── PicoH3WebTransport            <- HTTP/3 WebTransport (h3 ALPN)
 ```
 
@@ -123,10 +124,10 @@ provides shared functionality for both transport variants:
 
 | ALPN | Protocol | WebTransport Adapter |
 |------|----------|---------------------|
-| `moqt-16`, `moqt-15`, etc. | Raw MoQ over QUIC | `PicoQuicWebTransport` |
+| `moqt-16`, `moqt-15`, etc. | QUIC transport | `PicoQuicWebTransport` |
 | `h3` | HTTP/3 WebTransport | `PicoH3WebTransport` |
 
-ALPN preference order: raw MoQ ALPNs first (preferred for native clients),
+ALPN preference order: MOQT ALPNs first (preferred for non-browser clients),
 `h3` last (fallback for browsers).
 
 ---
@@ -149,8 +150,8 @@ coroutine execution into the packet loop.
 │  │    • picoquic_prepare_next_packet_ex() for outgoing      │  │
 │  │    • Invokes picoCallback / h3zero_callback              │  │
 │  └──────────────────────────────────────────────────────────┘  │
-│                              │                                  │
-│                              ▼                                  │
+│                              │                                 │
+│                              ▼                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │  PicoQuicExecutor (loopCallbackStatic)                   │  │
 │  │    • Drains pending tasks (folly::Func)                  │  │
@@ -172,7 +173,7 @@ for wake timer scheduling.
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │  EventBase::loopForever()                                │  │
 │  └──────────────────────────────────────────────────────────┘  │
-│              │                               │                  │
+│              │                               │                 │
 │  ┌───────────▼─────────────┐   ┌─────────────▼───────────────┐ │
 │  │ PicoQuicSocketHandler   │   │ MoQFollyExecutorImpl        │ │
 │  │  • onNotifyDataAvailable│   │  • Runs MoQSession coros    │ │
@@ -198,7 +199,7 @@ proactively but provided on demand.
      -> markStreamActiveImpl(id)  // signals picoquic
 
 2. Picoquic calls back when ready:
-   picoquic_callback_prepare_to_send (raw) / picohttp_callback_provide_data (H3)
+   picoquic_callback_prepare_to_send (QUIC) / picohttp_callback_provide_data (H3)
      -> PicoWebTransportBase::onJitProvideData(streamId, context, maxLength)
           -> streamManager_->dequeue(*handle, maxLength)
           -> picoquic_provide_stream_data_buffer(context, dataLen, fin, isActive)
@@ -252,7 +253,7 @@ capsules (`CLOSE_WEBTRANSPORT_SESSION`, `DRAIN_WEBTRANSPORT_SESSION`).
 
 ### Stream Context Tracking
 
-Unlike raw QUIC, H3 requires tracking `h3zero_stream_ctx_t*` per stream for
+Unlike QUIC transport, H3 requires tracking `h3zero_stream_ctx_t*` per stream for
 JIT callbacks. Stored in `streamContexts_` map. New streams must inherit
 `path_callback` from the control stream context.
 
@@ -260,11 +261,17 @@ JIT callbacks. Stored in `streamContexts_` map. New streams must inherit
 
 ## Connection Lifecycle
 
-### New Connection
+### QUIC transport (moqt-NN ALPN)
 
-1. `picoquic_callback_ready` fires
-2. `MoQPicoServerBase::onNewConnectionImpl` creates WebTransport adapter
-3. `MoQSession` is created and configured
+1. `picoquic_callback_almost_ready` — ALPN confirmed as QUIC transport; no callback switch needed
+2. `picoquic_callback_ready` → `onNewConnectionImpl` creates `PicoQuicWebTransport` + `MoQSession`
+3. Session coroutine starts via executor
+
+### HTTP/3 WebTransport (h3 ALPN)
+
+1. `picoquic_callback_almost_ready` — ALPN confirmed as `h3`; picoquic callback switched to `h3zero_callback`, `almost_ready` forwarded to h3zero
+2. `picoquic_callback_ready` forwarded to h3zero; `onNewConnectionImpl` is a no-op for h3 connections
+3. Browser sends HTTP/3 CONNECT → `wtPathCallback(picohttp_callback_connect)` → `onWebTransportConnectImpl` creates `PicoH3WebTransport` + `MoQSession`
 4. Session coroutine starts via executor
 
 ### Close
@@ -280,8 +287,8 @@ JIT callbacks. Stored in `streamContexts_` map. New streams must inherit
 
 | Binary | Class | Description |
 |--------|-------|-------------|
-| `pico_relay_server` | `MoQPicoQuicServer` | Thread-based MoQ relay |
-| `pico_evb_relay_server` | `MoQPicoQuicEventBaseServer` | EventBase MoQ relay |
+| `pico_relay_server` | `MoQPicoQuicServer` | Thread-based MOQT relay |
+| `pico_evb_relay_server` | `MoQPicoQuicEventBaseServer` | EventBase MOQT relay |
 
 ### Running
 
@@ -303,7 +310,7 @@ JIT callbacks. Stored in `streamContexts_` map. New streams must inherit
 | File | Description |
 |------|-------------|
 | `PicoWebTransportBase.h/cpp` | Shared WebTransport base class |
-| `PicoQuicWebTransport.h/cpp` | Raw QUIC WebTransport adapter |
+| `PicoQuicWebTransport.h/cpp` | QUIC transport WebTransport adapter |
 | `PicoH3WebTransport.h/cpp` | HTTP/3 WebTransport adapter |
 | `MoQPicoServerBase.h/cpp` | Shared server base (ALPN, h3zero init) |
 | `MoQPicoQuicServer.h/cpp` | Threaded server |

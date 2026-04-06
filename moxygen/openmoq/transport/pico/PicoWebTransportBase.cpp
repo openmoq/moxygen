@@ -85,7 +85,8 @@ PicoWebTransportBase::~PicoWebTransportBase() {
 
 folly::Expected<PicoWebTransportBase::StreamWriteHandle*, PicoWebTransportBase::ErrorCode>
 PicoWebTransportBase::createUniStream() {
-  if (!cnx_ || sessionClosed_) {
+  XCHECK(cnx_);
+  if (sessionClosed_) {
     return folly::makeUnexpected(ErrorCode::STREAM_CREATION_ERROR);
   }
 
@@ -107,7 +108,8 @@ PicoWebTransportBase::createUniStream() {
 
 folly::Expected<PicoWebTransportBase::BidiStreamHandle, PicoWebTransportBase::ErrorCode>
 PicoWebTransportBase::createBidiStream() {
-  if (!cnx_ || sessionClosed_) {
+  XCHECK(cnx_);
+  if (sessionClosed_) {
     return folly::makeUnexpected(ErrorCode::STREAM_CREATION_ERROR);
   }
 
@@ -218,7 +220,8 @@ PicoWebTransportBase::stopSending(uint64_t streamId, uint32_t error) {
 
 folly::Expected<folly::Unit, PicoWebTransportBase::ErrorCode>
 PicoWebTransportBase::sendDatagram(std::unique_ptr<folly::IOBuf> datagram) {
-  if (!cnx_ || sessionClosed_) {
+  XCHECK(cnx_);
+  if (sessionClosed_) {
     return folly::makeUnexpected(ErrorCode::GENERIC_ERROR);
   }
 
@@ -243,9 +246,7 @@ const folly::SocketAddress& PicoWebTransportBase::getPeerAddress() const {
 
 quic::TransportInfo PicoWebTransportBase::getTransportInfo() const {
   quic::TransportInfo info;
-  if (!cnx_) {
-    return info;
-  }
+  XCHECK(cnx_);
   info.srtt = std::chrono::microseconds(picoquic_get_rtt(cnx_));
   info.bytesSent = picoquic_get_data_sent(cnx_);
   info.bytesRecvd = picoquic_get_data_received(cnx_);
@@ -301,10 +302,7 @@ void PicoWebTransportBase::IngressCallback::onNewPeerStream(
 // Egress event processing
 
 void PicoWebTransportBase::processEgressEvents() {
-  if (!cnx_) {
-    XLOG(WARN) << "processEgressEvents: cnx_ is null, ignoring events";
-    return;
-  }
+  XCHECK(cnx_);
 
   XLOG(DBG4) << "processEgressEvents: processing egress events";
   WakeTimeGuard guard(cnx_, updateWakeTimeoutCallback_);
@@ -510,9 +508,7 @@ void PicoWebTransportBase::onSessionCloseCommon(uint32_t errorCode) {
 }
 
 size_t PicoWebTransportBase::getMaxDatagramPayload() const {
-  if (!cnx_) {
-    return 0;
-  }
+  XCHECK(cnx_);
   auto* tp = picoquic_get_transport_parameters(cnx_, 0 /* peer */);
   return tp ? static_cast<size_t>(tp->max_datagram_frame_size) : 0;
 }

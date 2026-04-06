@@ -67,10 +67,7 @@ PicoQuicWebTransport::createStreamImpl(bool bidi) {
 }
 
 void PicoQuicWebTransport::markStreamActiveImpl(uint64_t streamId) {
-  if (!cnx_) {
-    XLOG(ERR) << "markStreamActiveImpl: cnx_ is null for stream " << streamId;
-    return;
-  }
+  XCHECK(cnx_);
   // Mark stream as active in picoquic
   // Stream context is nullptr - we use callback context instead
   int ret = picoquic_mark_active_stream(cnx_, streamId, 1, nullptr);
@@ -81,10 +78,7 @@ void PicoQuicWebTransport::markStreamActiveImpl(uint64_t streamId) {
 }
 
 void PicoQuicWebTransport::markDatagramActiveImpl() {
-  if (!cnx_) {
-    XLOG(WARN) << "markDatagramActiveImpl: cnx_ is null";
-    return;
-  }
+  XCHECK(cnx_);
   XLOG(DBG4) << "markDatagramActiveImpl: marking datagram as ready";
   int ret = picoquic_mark_datagram_ready(cnx_, 1);
   if (ret != 0) {
@@ -93,9 +87,7 @@ void PicoQuicWebTransport::markDatagramActiveImpl() {
 }
 
 void PicoQuicWebTransport::resetStreamImpl(uint64_t streamId, uint32_t error) {
-  if (!cnx_) {
-    return;
-  }
+  XCHECK(cnx_);
   int ret = picoquic_reset_stream(cnx_, streamId, error);
   if (ret != 0) {
     XLOG(WARN) << "Failed to reset stream " << streamId << " error=" << error
@@ -104,9 +96,7 @@ void PicoQuicWebTransport::resetStreamImpl(uint64_t streamId, uint32_t error) {
 }
 
 void PicoQuicWebTransport::stopSendingImpl(uint64_t streamId, uint32_t error) {
-  if (!cnx_) {
-    return;
-  }
+  XCHECK(cnx_);
   int ret = picoquic_stop_sending(cnx_, streamId, error);
   if (ret != 0) {
     XLOG(WARN) << "Failed to stop sending on stream " << streamId
@@ -115,11 +105,10 @@ void PicoQuicWebTransport::stopSendingImpl(uint64_t streamId, uint32_t error) {
 }
 
 void PicoQuicWebTransport::sendCloseImpl(uint32_t errorCode) {
-  if (cnx_) {
-    int ret = picoquic_close(cnx_, errorCode);
-    if (ret != 0) {
-      XLOG(WARN) << "picoquic_close failed with error=" << ret;
-    }
+  XCHECK(cnx_);
+  int ret = picoquic_close(cnx_, errorCode);
+  if (ret != 0) {
+    XLOG(WARN) << "picoquic_close failed with error=" << ret;
   }
 }
 

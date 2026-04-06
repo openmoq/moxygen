@@ -26,9 +26,6 @@ struct MoQPicoServerBaseCallbacks {
   static void onNewConnection(MoQPicoServerBase* server, void* cnx) {
     server->onNewConnectionImpl(cnx);
   }
-  static void onNewWebTransportConnection(MoQPicoServerBase* server, void* cnx) {
-    server->onNewWebTransportConnectionImpl(cnx);
-  }
   static const std::string& getVersions(MoQPicoServerBase* server) {
     return server->versions_;
   }
@@ -92,30 +89,31 @@ struct MoQPicoServerBaseCallbacks {
 
 namespace {
 
+// Build list of supported ALPNs based on configuration.
+// Order matters: server prefers earlier entries. Put MOQT ALPNs first so non-browser
+// clients get moqt-* preference; h3 last for browser fallback.
+static std::vector<std::string> buildSupportedAlpns(
+    const std::string& versions,
+    const PicoWebTransportConfig& wtConfig) {
+  std::vector<std::string> alpns;
+  if (wtConfig.enableQuicTransport) {
+    auto moqtAlpns = getMoqtProtocols(versions, true);
+    alpns.insert(alpns.end(), moqtAlpns.begin(), moqtAlpns.end());
+  }
+  if (wtConfig.enableWebTransport) {
+    alpns.push_back("h3");
+  }
+  return alpns;
+}
+
 static size_t alpnSelectCallback(picoquic_quic_t* quic,
                                  picoquic_iovec_t* list,
                                  size_t count) {
   auto* server = static_cast<MoQPicoServerBase*>(
       picoquic_get_default_callback_context(quic));
-  const auto& wtConfig = MoQPicoServerBaseCallbacks::getWTConfig(server);
-
-  // Build list of supported ALPNs based on configuration.
-  // Order matters: server prefers earlier entries. Put raw MoQ first so native
-  // clients get moqt-* preference; h3 last for browser fallback.
-  std::vector<std::string> supportedAlpns;
-
-  // Add raw MoQ ALPNs first (preferred for native clients)
-  if (wtConfig.enableRawMoQ) {
-    auto moqtAlpns =
-        getMoqtProtocols(MoQPicoServerBaseCallbacks::getVersions(server), true);
-    supportedAlpns.insert(
-        supportedAlpns.end(), moqtAlpns.begin(), moqtAlpns.end());
-  }
-
-  // Add h3 last if WebTransport is enabled (fallback for browsers)
-  if (wtConfig.enableWebTransport) {
-    supportedAlpns.push_back("h3");
-  }
+  const auto& supportedAlpns = buildSupportedAlpns(
+      MoQPicoServerBaseCallbacks::getVersions(server),
+      MoQPicoServerBaseCallbacks::getWTConfig(server));
 
   std::vector<std::string> clientAlpns;
   for (size_t i = 0; i < count; i++) {
@@ -151,6 +149,10 @@ static int picoCallback(picoquic_cnx_t* cnx,
 
   if (fin_or_event == picoquic_callback_request_alpn_list ||
       fin_or_event == picoquic_callback_set_alpn) {
+    // request_alpn_list is not fired when alpn_select_fn_v2 is registered —
+    // alpnSelectCallback handles selection directly. set_alpn is informational;
+    // we read the negotiated ALPN via picoquic_tls_get_negotiated_alpn in
+    // almost_ready instead. Both are no-ops here.
     XLOG(DBG2) << "Connection event: " << fin_or_event;
     return 0;
   }
@@ -169,9 +171,14 @@ static int picoCallback(picoquic_cnx_t* cnx,
 
     XLOG(DBG1) << "Connection almost_ready, ALPN: " << (alpn ? alpn : "(null)")
                << " -> Protocol: "
-               << PicoProtocolDispatcher::protocolName(protocol);
+               << (protocol ? PicoProtocolDispatcher::protocolName(*protocol) : "none");
 
-    if (protocol == PicoProtocolType::WebTransportH3) {
+    if (!protocol) {
+      XLOG(ERR) << "No recognized ALPN on almost_ready, closing connection";
+      return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+    }
+
+    if (*protocol == PicoProtocolType::WebTransportH3) {
       // Create per-connection h3zero context and switch to h3zero_callback
       auto* h3Ctx = MoQPicoServerBaseCallbacks::getOrCreateH3Ctx(server, cnx);
       if (!h3Ctx) {
@@ -194,23 +201,26 @@ static int picoCallback(picoquic_cnx_t* cnx,
       return PICOQUIC_ERROR_UNEXPECTED_ERROR;
     }
 
-    XLOG(DBG1) << "New connection ready";
-
     // Determine protocol based on negotiated ALPN
     const char* alpn = picoquic_tls_get_negotiated_alpn(cnx);
     auto protocol = PicoProtocolDispatcher::getProtocol(alpn);
 
     XLOG(DBG1) << "Negotiated ALPN: " << (alpn ? alpn : "(null)")
                << " -> Protocol: "
-               << PicoProtocolDispatcher::protocolName(protocol);
+               << (protocol ? PicoProtocolDispatcher::protocolName(*protocol) : "none");
+
+    if (!protocol) {
+      XLOG(ERR) << "No recognized ALPN on ready, closing connection";
+      return PICOQUIC_ERROR_UNEXPECTED_ERROR;
+    }
 
     // WebTransport connections should have been switched to h3zero_callback
     // in almost_ready. If we get here with h3 ALPN, something is wrong.
-    XCHECK(protocol != PicoProtocolType::WebTransportH3)
+    XCHECK(*protocol != PicoProtocolType::WebTransportH3)
         << "WebTransport connection reached picoCallback on ready event";
 
-    if (protocol == PicoProtocolType::Quic) {
-      // Route to raw MoQ handler (existing path)
+    if (*protocol == PicoProtocolType::Quic) {
+      // Route to QUIC transport handler (existing path)
       MoQPicoServerBaseCallbacks::onNewConnection(server, cnx);
     }
     return 0;
@@ -296,18 +306,8 @@ MoQPicoServerBase::~MoQPicoServerBase() {
 }
 
 bool MoQPicoServerBase::createQuicContext() {
-  // Build and log supported ALPNs (for logging only - actual selection
-  // happens in alpnSelectCallback with proper preference order)
-  std::vector<std::string> supportedAlpns;
-  if (wtConfig_.enableRawMoQ) {
-    auto moqtAlpns = getMoqtProtocols(versions_, true);
-    supportedAlpns.insert(
-        supportedAlpns.end(), moqtAlpns.begin(), moqtAlpns.end());
-  }
-  if (wtConfig_.enableWebTransport) {
-    supportedAlpns.push_back("h3");
-  }
-  XLOG(DBG1) << "Supported ALPNs: " << folly::join(", ", supportedAlpns);
+  XLOG(DBG1) << "Supported ALPNs: "
+             << folly::join(", ", buildSupportedAlpns(versions_, wtConfig_));
 
   uint64_t current_time = picoquic_current_time();
   quic_ = picoquic_create(
@@ -389,7 +389,7 @@ void MoQPicoServerBase::onNewConnectionImpl(void* vcnx) {
 
   const char* alpn = picoquic_tls_get_negotiated_alpn(cnx);
   if (alpn) {
-    XLOG(DBG1) << "Setting MoQ version from negotiated ALPN: " << alpn;
+    XLOG(DBG1) << "Setting MOQT version from negotiated ALPN: " << alpn;
     moqSession->validateAndSetVersionFromAlpn(alpn);
   } else {
     XLOG(WARN) << "No ALPN was negotiated for connection";
@@ -405,13 +405,6 @@ void MoQPicoServerBase::onNewConnectionImpl(void* vcnx) {
       .start();
 }
 
-void MoQPicoServerBase::onNewWebTransportConnectionImpl(void* vcnx) {
-  // TODO: Remove this dead code - WebTransport connections go through
-  // h3zero_callback and onWebTransportConnectImpl instead.
-  (void)vcnx;
-  XLOG(ERR) << "onNewWebTransportConnectionImpl called unexpectedly - this is dead code";
-}
-
 bool MoQPicoServerBase::initH3Zero() {
   // Create path table for WebTransport endpoint
   // We need to keep this alive for the lifetime of the server
@@ -421,8 +414,8 @@ bool MoQPicoServerBase::initH3Zero() {
 
   // Configure the WebTransport endpoint path
   // The callback will be invoked when a CONNECT request is received
-  // Note: This does exact path matching. For compatibility with moqx-style
-  // path-based routing (e.g., /moq/relay-name), consider wildcard support.
+  // Note: This does exact path matching; consider wildcard support for
+  // path-based routing (e.g., /moq/relay-name).
   wtPathTable_[0].path = wtConfig_.wtEndpoint.c_str();
   wtPathTable_[0].path_length = wtConfig_.wtEndpoint.size();
   wtPathTable_[0].path_callback = wtPathCallback;
@@ -458,9 +451,8 @@ void MoQPicoServerBase::destroyH3Zero() {
 int MoQPicoServerBase::onWebTransportConnectImpl(
     picoquic_cnx_t* cnx,
     h3zero_stream_ctx_t* streamCtx) {
-  // TODO: Add dynamic authority/path matching callback for moqx compatibility.
-  // Currently we accept all CONNECT requests to the configured endpoint.
-  // moqx design separates listener (connection) from service (authority/path).
+  // TODO: Add dynamic authority/path matching for relay deployments where
+  // multiple services share a single server (e.g., by authority or path prefix).
   XLOG(DBG1) << "WebTransport CONNECT received on stream " << streamCtx->stream_id
              << " cnx=" << (void*)cnx;
 
@@ -498,7 +490,7 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
   auto moqSession = createSession(webTransport, executor_);
   webTransport->setHandler(moqSession.get());
 
-  // Negotiate MoQ version via WebTransport protocol negotiation.
+  // Negotiate MOQT version via WebTransport protocol negotiation.
   // The client sends wt-available-protocols, we select from our supported versions.
   // Note: picowt_select_wt_protocol expects ALPN format (e.g. "moqt-16, moqt-15")
   // not draft numbers, so we convert versions_ first.
@@ -548,7 +540,7 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
   }
   XLOG(DBG2) << "Registered stream prefix for control stream " << streamCtx->stream_id;
 
-  // Start handling the MoQ session
+  // Start handling the MOQT session
   folly::coro::co_withExecutor(executor_.get(), handleClientSession(moqSession))
       .start();
 

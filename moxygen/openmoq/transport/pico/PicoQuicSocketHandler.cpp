@@ -42,7 +42,7 @@ constexpr size_t kMaxPacketSize = 1500;
 constexpr size_t kCmsgBufSize =
     CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(uint8_t));
 // Max wake delay passed to picoquic (200 ms in microseconds).
-constexpr int64_t kMaxWakeDelayUs = 200'000;
+constexpr int64_t kMaxWakeDelayUs = 2'000'000;
 
 } // namespace
 

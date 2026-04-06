@@ -21,7 +21,7 @@ namespace moxygen {
  * This adapter extends PicoWebTransportBase and provides the HTTP/3-specific
  * implementations using h3zero's callback system.
  *
- * Unlike PicoQuicWebTransport (which uses raw QUIC streams), this adapter:
+ * Unlike PicoQuicWebTransport (which uses QUIC transport streams), this adapter:
  * - Receives WebTransport events via h3zero's picohttp_callback_* system
  * - Uses h3zero's WebTransport stream framing (control stream ID prefix)
  * - Handles HTTP/3-level flow control and settings

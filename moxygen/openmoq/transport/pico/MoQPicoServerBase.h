@@ -31,21 +31,21 @@ class PicoH3WebTransport;
  */
 struct PicoWebTransportConfig {
   bool enableWebTransport{false};  // Enable HTTP/3 WebTransport support
-  bool enableRawMoQ{true};         // Enable raw MoQ over QUIC (default)
+  bool enableQuicTransport{true};  // Enable QUIC for non-browser clients (default)
   std::string wtEndpoint{"/moq"};  // WebTransport CONNECT endpoint path
   uint32_t wtMaxSessions{100};     // Max concurrent WebTransport sessions
 };
 
 /**
- * MoQPicoServerBase - shared picoquic machinery for MoQ servers.
+ * MoQPicoServerBase - shared picoquic machinery for MOQT servers.
  *
  * Holds the picoquic_quic_t context plus the picoCallback, ConnectionContext,
  * and onNewConnection logic shared by MoQPicoQuicServer (thread-based) and
  * MoQPicoQuicEventBaseServer (EventBase-based).
  *
  * Supports two connection modes:
- * - Raw MoQ: Direct MoQ over QUIC (ALPN: moqt-16, moqt-15, moq-00)
- * - WebTransport: MoQ over WebTransport over HTTP/3 (ALPN: h3)
+ * - QUIC transport (ALPN: moqt-16, moqt-15, moq-00)
+ * - WebTransport: MOQT over WebTransport over HTTP/3 (ALPN: h3)
  *
  * Subclasses must set executor_ before calling createQuicContext().
  */
@@ -117,10 +117,7 @@ class MoQPicoServerBase : public MoQServerBase {
   // Takes void* to keep picoquic_cnx_t out of this header.
   void onNewConnectionImpl(void* cnx);
 
-  // Called for WebTransport connections (h3 ALPN)
-  void onNewWebTransportConnectionImpl(void* cnx);
-
-  // Called when a WebTransport CONNECT is received (creates MoQ session)
+  // Called when a WebTransport CONNECT is received (creates MOQT session)
   int onWebTransportConnectImpl(
       picoquic_cnx_t* cnx,
       h3zero_stream_ctx_t* streamCtx);

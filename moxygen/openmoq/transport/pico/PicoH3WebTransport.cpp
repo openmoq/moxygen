@@ -78,10 +78,8 @@ void PicoH3WebTransport::markStreamActiveImpl(uint64_t streamId) {
 }
 
 void PicoH3WebTransport::markDatagramActiveImpl() {
-  if (!cnx_ || !controlStreamCtx_) {
-    XLOG(WARN) << "markDatagramActiveImpl: cnx_ or controlStreamCtx_ is null";
-    return;
-  }
+  XCHECK(cnx_);
+  XCHECK(controlStreamCtx_);
   h3zero_set_datagram_ready(cnx_, controlStreamCtx_->stream_id);
 }
 
@@ -93,9 +91,8 @@ void PicoH3WebTransport::resetStreamImpl(uint64_t streamId, uint32_t error) {
 }
 
 void PicoH3WebTransport::stopSendingImpl(uint64_t streamId, uint32_t error) {
-  if (cnx_) {
-    picoquic_stop_sending(cnx_, streamId, error);
-  }
+  XCHECK(cnx_);
+  picoquic_stop_sending(cnx_, streamId, error);
 }
 
 uint8_t* PicoH3WebTransport::getDatagramBuffer(
@@ -123,9 +120,9 @@ size_t PicoH3WebTransport::getMaxDatagramPayload() const {
 }
 
 void PicoH3WebTransport::sendCloseImpl(uint32_t errorCode) {
-  if (cnx_ && controlStreamCtx_) {
-    picowt_send_close_session_message(cnx_, controlStreamCtx_, errorCode, nullptr);
-  }
+  XCHECK(cnx_);
+  XCHECK(controlStreamCtx_);
+  picowt_send_close_session_message(cnx_, controlStreamCtx_, errorCode, nullptr);
 }
 
 // H3zero event handling

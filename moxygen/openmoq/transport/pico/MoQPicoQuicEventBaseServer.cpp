@@ -16,7 +16,6 @@ namespace moxygen {
 
 struct MoQPicoQuicEventBaseServer::Impl {
   std::unique_ptr<PicoQuicSocketHandler> handler;
-  std::shared_ptr<MoQFollyExecutorImpl> ownedExecutor;
   std::atomic<bool> running_{false};
 };
 
@@ -47,11 +46,9 @@ void MoQPicoQuicEventBaseServer::start(const folly::SocketAddress& addr) {
   }
 
   // Use MoQFollyExecutorImpl - EventBase handles task execution naturally
-  impl_->ownedExecutor = std::make_shared<MoQFollyExecutorImpl>(evb_.get());
-  executor_ = impl_->ownedExecutor;
+  executor_ = std::make_shared<MoQFollyExecutorImpl>(evb_.get());
 
   if (!createQuicContext()) {
-    impl_->ownedExecutor.reset();
     executor_.reset();
     impl_->running_ = false;
     return;
@@ -91,7 +88,6 @@ void MoQPicoQuicEventBaseServer::stop() {
   }
 
   destroyQuicContext();
-  impl_->ownedExecutor.reset();
   executor_.reset();
   evb_ = {}; // release KeepAlive so EVB destructor doesn't spin
 

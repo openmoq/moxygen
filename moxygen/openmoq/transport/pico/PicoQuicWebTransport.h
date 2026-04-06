@@ -12,9 +12,9 @@
 namespace moxygen {
 
 /**
- * PicoQuicWebTransport - Raw QUIC WebTransport implementation using picoquic
+ * PicoQuicWebTransport - QUIC WebTransport implementation using picoquic
  *
- * This class extends PicoWebTransportBase and provides the raw QUIC
+ * This class extends PicoWebTransportBase and provides the QUIC
  * transport-specific implementations using picoquic's callback system.
  */
 class PicoQuicWebTransport : public PicoWebTransportBase {

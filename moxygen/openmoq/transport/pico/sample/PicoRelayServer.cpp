@@ -23,7 +23,7 @@ DEFINE_int32(port, 9668, "Relay Server Port");
 DEFINE_string(
     versions,
     "",
-    "Comma-separated MoQ draft versions (e.g. \"14,16\"). Empty = all supported.");
+    "Comma-separated MOQT draft versions (e.g. \"14,16\"). Empty = all supported.");
 DEFINE_int32(
     max_cached_tracks,
     100,
@@ -39,9 +39,9 @@ DEFINE_bool(
     false,
     "Enable HTTP/3 WebTransport support for browser clients");
 DEFINE_bool(
-    enable_raw_moq,
+    enable_quic_transport,
     true,
-    "Enable raw MoQ over QUIC for native clients");
+    "Enable QUIC transport for non-browser clients");
 DEFINE_string(
     wt_endpoint,
     "/moq",
@@ -104,7 +104,7 @@ int main(int argc, char* argv[]) {
   // Configure WebTransport
   PicoWebTransportConfig wtConfig;
   wtConfig.enableWebTransport = FLAGS_enable_webtransport;
-  wtConfig.enableRawMoQ = FLAGS_enable_raw_moq;
+  wtConfig.enableQuicTransport = FLAGS_enable_quic_transport;
   wtConfig.wtEndpoint = FLAGS_wt_endpoint;
   wtConfig.wtMaxSessions = static_cast<uint32_t>(FLAGS_wt_max_sessions);
 

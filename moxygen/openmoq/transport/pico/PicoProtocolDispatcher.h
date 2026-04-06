@@ -7,34 +7,35 @@
 #pragma once
 
 #include <cstring>
-#include <string_view>
+#include <optional>
 
 namespace moxygen {
 
 /**
- * Protocol types supported by the picoquic MoQ server.
+ * Protocol types supported by the picoquic MOQT server.
  */
 enum class PicoProtocolType {
-  Unknown,
-  Quic,           // Direct MoQ over QUIC (ALPN: moqt-16, moqt-15, moq-00)
-  WebTransportH3  // MoQ over WebTransport over HTTP/3 (ALPN: h3)
+  Quic,           // MOQT over QUIC transport (ALPN: moqt-16, moqt-15, moq-00)
+  WebTransportH3  // MOQT over WebTransport over HTTP/3 (ALPN: h3)
 };
 
 /**
  * PicoProtocolDispatcher - Determines protocol type from ALPN.
  *
  * Used to route incoming connections to the appropriate handler:
- * - Raw MoQ connections use the existing PicoQuicWebTransport adapter
+ * - QUIC transport connections use PicoQuicWebTransport
  * - WebTransport connections use h3zero's HTTP/3 + WebTransport stack
  */
 class PicoProtocolDispatcher {
  public:
   /**
    * Determine protocol type from negotiated ALPN string.
+   * alpnSelectCallback guarantees only known ALPNs are negotiated, so
+   * an unrecognized value here indicates a bug.
    */
-  static PicoProtocolType getProtocol(const char* alpn) {
+  static std::optional<PicoProtocolType> getProtocol(const char* alpn) {
     if (!alpn) {
-      return PicoProtocolType::Unknown;
+      return std::nullopt;
     }
     if (isH3(alpn)) {
       return PicoProtocolType::WebTransportH3;
@@ -42,7 +43,7 @@ class PicoProtocolDispatcher {
     if (isQuic(alpn)) {
       return PicoProtocolType::Quic;
     }
-    return PicoProtocolType::Unknown;
+    return std::nullopt;
   }
 
   /**
@@ -53,7 +54,7 @@ class PicoProtocolDispatcher {
   }
 
   /**
-   * Check if ALPN indicates MoQ over raw QUIC (not HTTP/3).
+   * Check if ALPN indicates QUIC transport (not HTTP/3).
    */
   static bool isQuic(const char* alpn) {
     if (!alpn) {
@@ -79,9 +80,8 @@ class PicoProtocolDispatcher {
         return "Quic";
       case PicoProtocolType::WebTransportH3:
         return "WebTransportH3";
-      default:
-        return "Unknown";
     }
+    __builtin_unreachable();
   }
 };
 
