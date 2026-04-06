@@ -109,7 +109,6 @@ class PicoQuicSocketHandler
       const folly::AsyncSocketException& ex) noexcept override;
 
   // I/O helpers
-  void pollIncoming();
   void parseCmsgsAndDeliver(const struct mmsghdr& msg,
                             const uint8_t* pkt,
                             uint64_t currentTime);

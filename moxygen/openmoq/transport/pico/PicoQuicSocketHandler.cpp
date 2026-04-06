@@ -274,57 +274,6 @@ void PicoQuicSocketHandler::timeoutExpired() noexcept {
   }
 }
 
-void PicoQuicSocketHandler::pollIncoming() {
-  // Quick check if fd is readable
-  fd_set readfds;
-  FD_ZERO(&readfds);
-  FD_SET(fd_, &readfds);
-  struct timeval tv = {0, 0};
-  int ready = select(fd_ + 1, &readfds, nullptr, nullptr, &tv);
-
-  struct mmsghdr msgs[kRecvBatchSize];
-  struct iovec iovecs[kRecvBatchSize];
-  uint8_t bufs[kRecvBatchSize][kMaxPacketSize];
-  sockaddr_storage fromAddrs[kRecvBatchSize];
-  char cmsgBufs[kRecvBatchSize][kCmsgBufSize];
-
-  for (int i = 0; i < kRecvBatchSize; i++) {
-    iovecs[i].iov_base = bufs[i];
-    iovecs[i].iov_len = kMaxPacketSize;
-    msgs[i].msg_hdr.msg_name = &fromAddrs[i];
-    msgs[i].msg_hdr.msg_namelen = sizeof(fromAddrs[i]);
-    msgs[i].msg_hdr.msg_iov = &iovecs[i];
-    msgs[i].msg_hdr.msg_iovlen = 1;
-    msgs[i].msg_hdr.msg_control = cmsgBufs[i];
-    msgs[i].msg_hdr.msg_controllen = kCmsgBufSize;
-    msgs[i].msg_hdr.msg_flags = 0;
-    msgs[i].msg_len = 0;
-  }
-
-  int totalReceived = 0;
-  uint64_t currentTime = picoquic_current_time();
-
-  for (;;) {
-    int n = socket_.recvmmsg(msgs, kRecvBatchSize, MSG_DONTWAIT, nullptr);
-    if (n <= 0) {
-      if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        XLOG(ERR) << "recvmmsg failed: " << folly::errnoStr(errno) << " fd=" << fd_;
-      }
-      break;
-    }
-    totalReceived += n;
-
-    for (int i = 0; i < n; i++) {
-      parseCmsgsAndDeliver(msgs[i], bufs[i], currentTime);
-      msgs[i].msg_hdr.msg_namelen = sizeof(fromAddrs[i]);
-      msgs[i].msg_hdr.msg_controllen = kCmsgBufSize;
-      msgs[i].msg_hdr.msg_flags = 0;
-      msgs[i].msg_len = 0;
-    }
-  }
-
-}
-
 // ---------------------------------------------------------------------------
 // AsyncUDPSocket::ErrMessageCallback — ICMP errors
 // ---------------------------------------------------------------------------
