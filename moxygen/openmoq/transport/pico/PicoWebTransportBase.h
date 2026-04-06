@@ -142,6 +142,33 @@ class PicoWebTransportBase : public proxygen::WebTransport {
   virtual void sendCloseImpl(uint32_t errorCode) = 0;
 
   /**
+   * Return the maximum datagram payload size the peer will accept.
+   * Used by onJitProvideDatagram to drop datagrams that can never be sent.
+   * Default uses picoquic_get_transport_parameters; H3 overrides to subtract
+   * the stream ID prefix encoding overhead.
+   */
+  virtual size_t getMaxDatagramPayload() const;
+
+  /**
+   * Provide a datagram buffer for writing, or signal defer/stop.
+   *
+   * Called from onJitProvideDatagram with the transport-specific context pointer
+   * passed by picoquic/h3zero's JIT datagram callback.
+   *
+   * - length > 0: allocate and return a write buffer of exactly `length` bytes;
+   *   `keepPolling` controls whether the transport polls again next packet.
+   * - length == 0, keepPolling == true: defer — don't write, but poll again next packet.
+   * - length == 0, keepPolling == false: stop polling (queue drained).
+   *
+   * Returns a pointer to the write buffer when length > 0 and space is available,
+   * nullptr otherwise.
+   */
+  virtual uint8_t* getDatagramBuffer(
+      uint8_t* context,
+      size_t length,
+      bool keepPolling) = 0;
+
+  /**
    * Called when session is closed (by us or peer).
    * Subclass can override for additional cleanup (e.g., clear picoquic callback).
    */
@@ -157,13 +184,19 @@ class PicoWebTransportBase : public proxygen::WebTransport {
 
   /**
    * JIT send path: dequeue data and provide to picoquic.
-   * Returns true if stream still has data (is_still_active).
    * Subclass JIT callback should call this.
    */
-  bool onJitProvideData(
+  void onJitProvideData(
       uint64_t streamId,
       uint8_t* picoContext,
       size_t maxLength);
+
+  /**
+   * JIT datagram send path: dequeue next datagram and provide to picoquic/h3zero.
+   * Handles defer-on-no-space (fixes stuck-datagram bug) and IOBuf chain copy.
+   * Subclass JIT datagram callback should call this.
+   */
+  void onJitProvideDatagram(uint8_t* context, size_t maxLength);
 
   /**
    * Handle incoming stream data. Enqueues to WtStreamManager and

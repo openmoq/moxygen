@@ -67,6 +67,8 @@ class PicoH3WebTransport : public PicoWebTransportBase {
   void resetStreamImpl(uint64_t streamId, uint32_t error) override;
   void stopSendingImpl(uint64_t streamId, uint32_t error) override;
   void sendCloseImpl(uint32_t errorCode) override;
+  uint8_t* getDatagramBuffer(uint8_t* context, size_t length, bool keepPolling) override;
+  size_t getMaxDatagramPayload() const override;
 
  private:
   // Handle incoming stream data (H3-specific: control stream capsule parsing)
@@ -75,12 +77,6 @@ class PicoH3WebTransport : public PicoWebTransportBase {
       uint8_t* bytes,
       size_t length,
       bool fin);
-
-  // JIT callback for providing stream data to h3zero
-  void onProvideData(
-      h3zero_stream_ctx_t* streamCtx,
-      uint8_t* context,
-      size_t maxLength);
 
   h3zero_callback_ctx_t* h3Ctx_;
   h3zero_stream_ctx_t* controlStreamCtx_;

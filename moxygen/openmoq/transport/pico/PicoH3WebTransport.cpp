@@ -98,6 +98,30 @@ void PicoH3WebTransport::stopSendingImpl(uint64_t streamId, uint32_t error) {
   }
 }
 
+uint8_t* PicoH3WebTransport::getDatagramBuffer(
+    uint8_t* context,
+    size_t length,
+    bool keepPolling) {
+  // h3zero_provide_datagram_buffer maps cleanly onto the three-case contract:
+  //   length > 0              → allocate and return write buffer; keepPolling
+  //                             controls whether h3zero polls this session again
+  //                             after this packet (normal send path).
+  //   length == 0, keepPolling=true  → defer: sets application_ready so h3zero
+  //                             re-polls next packet (datagram didn't fit).
+  //   length == 0, keepPolling=false → stop: application_ready stays 0, h3zero
+  //                             stops polling (queue drained or peer can't recv).
+  return h3zero_provide_datagram_buffer(context, length, keepPolling ? 1 : 0);
+}
+
+size_t PicoH3WebTransport::getMaxDatagramPayload() const {
+  size_t base = PicoWebTransportBase::getMaxDatagramPayload();
+  // h3zero prefixes each WT datagram with the quarter-stream-ID varint.
+  // A stream ID varint is at most 8 bytes; subtract conservatively so we
+  // don't defer a datagram that can never fit in any packet.
+  constexpr size_t kMaxStreamIdPrefixLen = 8;
+  return base > kMaxStreamIdPrefixLen ? base - kMaxStreamIdPrefixLen : 0;
+}
+
 void PicoH3WebTransport::sendCloseImpl(uint32_t errorCode) {
   if (cnx_ && controlStreamCtx_) {
     picowt_send_close_session_message(cnx_, controlStreamCtx_, errorCode, nullptr);
@@ -148,23 +172,13 @@ int PicoH3WebTransport::handleWtEvent(
     case picohttp_callback_provide_data:
       // Ready to send data on a stream - JIT callback
       if (streamCtx) {
-        onProvideData(streamCtx, bytes, length);
+        onJitProvideData(streamCtx->stream_id, bytes, length);
       }
       break;
 
     case picohttp_callback_provide_datagram:
-      // Ready to send datagram
-      if (!datagramQueue_.empty()) {
-        auto& dg = datagramQueue_.front();
-        size_t dgLen = dg->computeChainDataLength();
-        dg->coalesce();
-        int moreToSend = datagramQueue_.size() > 1 ? 1 : 0;
-        uint8_t* buffer = h3zero_provide_datagram_buffer(bytes, dgLen, moreToSend);
-        if (buffer != nullptr) {
-          memcpy(buffer, dg->data(), dgLen);
-          datagramQueue_.pop_front();
-        }
-      }
+      // Ready to send datagram - delegate to shared base implementation
+      onJitProvideDatagram(bytes, length);
       break;
 
     case picohttp_callback_reset:
@@ -243,32 +257,6 @@ void PicoH3WebTransport::onStreamData(
 
   // Delegate to base class common handler
   onStreamDataCommon(streamId, bytes, length, fin);
-}
-
-void PicoH3WebTransport::onProvideData(
-    h3zero_stream_ctx_t* streamCtx,
-    uint8_t* context,
-    size_t maxLength) {
-  // JIT callback: h3zero is ready to send data on this stream
-  uint64_t streamId = streamCtx->stream_id;
-
-  XLOG(DBG5) << "onProvideData: stream=" << streamId << " maxLength=" << maxLength;
-
-  // Delegate to base class JIT handler
-  bool isStillActive = onJitProvideData(streamId, context, maxLength);
-
-  // If this stream is no longer active, check for the next writable stream
-  // in the priority queue and mark it active - this chains JIT callbacks.
-  if (!isStillActive && !priorityQueue_.empty()) {
-    auto nextId = priorityQueue_.peekNextScheduledID();
-    if (nextId.isStreamID()) {
-      uint64_t nextStreamId = nextId.asStreamID();
-      XLOG(DBG5) << "onProvideData: marking next writable stream "
-                 << nextStreamId << " as active after stream " << streamId
-                 << " became inactive";
-      markStreamActiveImpl(nextStreamId);
-    }
-  }
 }
 
 } // namespace moxygen

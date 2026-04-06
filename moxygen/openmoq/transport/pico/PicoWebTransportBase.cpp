@@ -160,6 +160,7 @@ PicoWebTransportBase::writeStreamData(
 
   auto result = handle->writeStreamData(std::move(data), fin, deliveryCallback);
   if (result.hasValue()) {
+    WakeTimeGuard guard(cnx_, updateWakeTimeoutCallback_);
     markStreamActiveImpl(id);
   }
   return result;
@@ -221,6 +222,7 @@ PicoWebTransportBase::sendDatagram(std::unique_ptr<folly::IOBuf> datagram) {
              << "queue_size=" << datagramQueue_.size();
 
   datagramQueue_.push_back(std::move(datagram));
+  WakeTimeGuard guard(cnx_, updateWakeTimeoutCallback_);
   markDatagramActiveImpl();
 
   return folly::unit;
@@ -350,7 +352,7 @@ void PicoWebTransportBase::processEgressEvents() {
 
 // JIT send path
 
-bool PicoWebTransportBase::onJitProvideData(
+void PicoWebTransportBase::onJitProvideData(
     uint64_t streamId,
     uint8_t* picoContext,
     size_t maxLength) {
@@ -358,7 +360,7 @@ bool PicoWebTransportBase::onJitProvideData(
   if (!handle) {
     XLOG(DBG2) << "onJitProvideData: no handle for stream " << streamId;
     picoquic_provide_stream_data_buffer(picoContext, 0, 0, 0);
-    return false;
+    return;
   }
 
   // Dequeue data from WtStreamManager (respects maxLength)
@@ -381,7 +383,7 @@ bool PicoWebTransportBase::onJitProvideData(
       XLOG(ERR) << "picoquic_provide_stream_data_buffer returned null for stream "
                 << streamId << " size=" << dataLen;
     }
-    return false;
+    return;
   }
 
   // Copy data into the buffer
@@ -413,7 +415,6 @@ bool PicoWebTransportBase::onJitProvideData(
     }
   }
 
-  return isStillActive;
 }
 
 // Ingress helpers
@@ -501,6 +502,72 @@ void PicoWebTransportBase::onSessionCloseCommon(uint32_t errorCode) {
   if (auto handler = std::exchange(handler_, nullptr)) {
     handler->onSessionEnd(errorCode);
   }
+}
+
+size_t PicoWebTransportBase::getMaxDatagramPayload() const {
+  if (!cnx_) {
+    return 0;
+  }
+  auto* tp = picoquic_get_transport_parameters(cnx_, 0 /* peer */);
+  return tp ? static_cast<size_t>(tp->max_datagram_frame_size) : 0;
+}
+
+void PicoWebTransportBase::onJitProvideDatagram(
+    uint8_t* context,
+    size_t maxLength) {
+  size_t peerMax = getMaxDatagramPayload();
+  if (peerMax == 0) {
+    // Peer advertised max_datagram_frame_size=0, meaning it does not support
+    // the DATAGRAM extension (RFC 9221). Drop everything and stop polling.
+    XLOG(WARN) << "onJitProvideDatagram: peer does not support datagrams, "
+               << "dropping " << datagramQueue_.size() << " queued datagrams";
+    datagramQueue_.clear();
+    getDatagramBuffer(context, 0, /*keepPolling=*/false);
+    return;
+  }
+
+  while (!datagramQueue_.empty()) {
+    auto& dg = datagramQueue_.front();
+    size_t dgLen = dg->computeChainDataLength();
+
+    if (dgLen > peerMax) {
+      // Datagram exceeds peer's hard limit — will never fit, drop it.
+      XLOG(WARN) << "onJitProvideDatagram: dropping datagram (" << dgLen
+                 << " > peer max " << peerMax << ")";
+      datagramQueue_.pop_front();
+      continue;
+    }
+
+    if (dgLen > maxLength) {
+      // Datagram doesn't fit in this packet — defer to next packet.
+      // This fixes the stuck-datagram bug where passing ready_to_send=0
+      // (because queue.size()==1) would stop polling permanently.
+      XLOG(DBG3) << "onJitProvideDatagram: datagram too large (" << dgLen
+                 << " > " << maxLength << "), deferring";
+      getDatagramBuffer(context, 0, /*keepPolling=*/true);
+      return;
+    }
+
+    bool moreToSend = datagramQueue_.size() > 1;
+    uint8_t* buffer = getDatagramBuffer(context, dgLen, moreToSend);
+    if (!buffer) {
+      XLOG(WARN) << "onJitProvideDatagram: getDatagramBuffer returned null "
+                 << "for length=" << dgLen;
+      return;
+    }
+
+    // Copy IOBuf chain into buffer without coalescing
+    size_t offset = 0;
+    for (const auto& buf : *dg) {
+      memcpy(buffer + offset, buf.data(), buf.size());
+      offset += buf.size();
+    }
+    datagramQueue_.pop_front();
+    return;
+  }
+
+  // Queue empty — stop polling
+  getDatagramBuffer(context, 0, /*keepPolling=*/false);
 }
 
 void PicoWebTransportBase::onReceiveDatagramCommon(uint8_t* bytes, size_t length) {

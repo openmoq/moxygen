@@ -180,14 +180,10 @@ int PicoQuicWebTransport::handlePicoEvent(
       break;
     }
 
-    case picoquic_callback_prepare_datagram: {
+    case picoquic_callback_prepare_datagram:
       // JIT callback - picoquic is ready to send a datagram
-      size_t written = 0;
-      onPrepareDatagram(bytes, length, written);
-      XLOG(DBG4) << "picoCallback: prepare_datagram, max_length=" << length
-                 << " written=" << written;
+      onJitProvideDatagram(bytes, length);
       break;
-    }
 
     case picoquic_callback_stream_gap:
       XLOG(DBG2) << "Stream gap on stream " << stream_id;
@@ -201,71 +197,27 @@ int PicoQuicWebTransport::handlePicoEvent(
   return 0;
 }
 
-void PicoQuicWebTransport::onPrepareDatagram(
+uint8_t* PicoQuicWebTransport::getDatagramBuffer(
     uint8_t* context,
-    size_t maxLength,
-    size_t& written) {
-  written = 0;
-
-  if (!cnx_) {
-    XLOG(WARN) << "onPrepareDatagram: cnx_ is null";
-    return;
+    size_t length,
+    bool keepPolling) {
+  if (length == 0) {
+    // length==0 is the defer/stop path. picoquic_provide_datagram_buffer_ex
+    // with picoquic_datagram_active_any_path defers to the next packet;
+    // picoquic_datagram_not_active cancels the pending datagram-ready signal
+    // set by markDatagramActiveImpl (queue drained or peer can't receive).
+    picoquic_provide_datagram_buffer_ex(
+        context,
+        0,
+        keepPolling ? picoquic_datagram_active_any_path
+                    : picoquic_datagram_not_active);
+    return nullptr;
   }
-
-  if (datagramQueue_.empty()) {
-    // No datagrams to send, mark as not ready
-    int ret = picoquic_mark_datagram_ready(cnx_, 0);
-    if (ret != 0) {
-      XLOG(WARN) << "Failed to mark datagram as not ready, error=" << ret;
-    }
-    return;
-  }
-
-  // Get next datagram from queue
-  auto& datagram = datagramQueue_.front();
-
-  // Check if entire datagram fits - datagrams are atomic
-  size_t datagramLen = datagram->computeChainDataLength();
-
-  XLOG(DBG4) << "onPrepareDatagram: max=" << maxLength
-             << " datagram_len=" << datagramLen
-             << " queue_size=" << datagramQueue_.size();
-
-  if (datagramLen > maxLength) {
-    // Datagram too large, can't send it
-    XLOG(DBG2) << "onPrepareDatagram: datagram too large (" << datagramLen
-               << " > " << maxLength << "), skipping";
-    return;
-  }
-
-  // Get the actual datagram buffer from picoquic
-  uint8_t* buffer = picoquic_provide_datagram_buffer(context, datagramLen);
-  if (buffer == nullptr) {
-    XLOG(WARN) << "picoquic_provide_datagram_buffer returned null "
-               << "for length=" << datagramLen;
-    return;
-  }
-
-  // Copy entire datagram to buffer
-  size_t copied = 0;
-  for (const auto& buf : *datagram) {
-    memcpy(buffer + copied, buf.data(), buf.size());
-    copied += buf.size();
-  }
-
-  written = copied;
-  datagramQueue_.pop_front();
-
-  XLOG(DBG4) << "onPrepareDatagram: sent " << written << " bytes, "
-             << "queue_size=" << datagramQueue_.size();
-
-  // If queue is now empty, mark as not ready
-  if (datagramQueue_.empty()) {
-    int ret = picoquic_mark_datagram_ready(cnx_, 0);
-    if (ret != 0) {
-      XLOG(WARN) << "Failed to mark datagram as not ready, error=" << ret;
-    }
-  }
+  // Normal send path. keepPolling is not passed here — picoquic re-polls as
+  // long as picoquic_mark_datagram_ready is set (done in markDatagramActiveImpl).
+  // The base class issues a length==0 / keepPolling=false call once the queue
+  // drains to cancel the ready signal.
+  return picoquic_provide_datagram_buffer(context, length);
 }
 
 void PicoQuicWebTransport::clearPicoquicCallback() {

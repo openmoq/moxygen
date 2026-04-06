@@ -57,11 +57,9 @@ class PicoQuicWebTransport : public PicoWebTransportBase {
   void stopSendingImpl(uint64_t streamId, uint32_t error) override;
   void sendCloseImpl(uint32_t errorCode) override;
   void onSessionClosedImpl() override;
+  uint8_t* getDatagramBuffer(uint8_t* context, size_t length, bool keepPolling) override;
 
  private:
-  // Handle prepare_datagram callback from picoquic
-  void onPrepareDatagram(uint8_t* context, size_t maxLength, size_t& written);
-
   // Clear picoquic callback to prevent use-after-free
   void clearPicoquicCallback();
 
