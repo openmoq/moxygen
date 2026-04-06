@@ -206,6 +206,11 @@ void writeFullTrackName(
     const FullTrackName& fullTrackName,
     size_t& size,
     bool error);
+void writeTrackFilter(
+    folly::IOBufQueue& writeBuf,
+    const TrackFilter& filter,
+    size_t& size,
+    bool& error) noexcept;
 bool includeSetupParam(uint64_t version, SetupKey key);
 
 folly::Expected<std::string, ErrorCode> parseFixedString(
