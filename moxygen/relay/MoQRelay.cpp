@@ -5,7 +5,6 @@
  */
 
 #include "moxygen/relay/MoQRelay.h"
-#include "moxygen/MoQFilters.h"
 
 namespace {
 constexpr uint8_t kDefaultUpstreamPriority = 128;

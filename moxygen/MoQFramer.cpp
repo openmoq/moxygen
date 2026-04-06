@@ -435,14 +435,14 @@ folly::Expected<TrackFilter, ErrorCode> parseTrackFilter(
     size_t& length) noexcept {
   TrackFilter filter;
 
-  // Parse propType
-  auto propType = quic::follyutils::decodeQuicInteger(cursor, length);
-  if (!propType) {
-    XLOG(DBG4) << "parseTrackFilter: UNDERFLOW on propType";
+  // Parse propertyType
+  auto propertyType = quic::follyutils::decodeQuicInteger(cursor, length);
+  if (!propertyType) {
+    XLOG(DBG4) << "parseTrackFilter: UNDERFLOW on propertyType";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
-  length -= propType->second;
-  filter.propType = propType->first;
+  length -= propertyType->second;
+  filter.propertyType = propertyType->first;
 
   // Parse maxSelected (N)
   auto maxSelected = quic::follyutils::decodeQuicInteger(cursor, length);
@@ -516,6 +516,9 @@ folly::Expected<std::optional<Parameter>, ErrorCode> parseVariableParam(
     p.asSubscriptionFilter = res.value();
   } else if (key == trackFilterKey && getDraftMajorVersion(version) >= 16) {
     // TRACK_FILTER (key=0x29, odd = length-prefixed)
+    // NOTE: TRACK_FILTER is an active proposal, not yet landed
+    // in the core specification. Using draft-16+ check as a placeholder until
+    // the feature is formally specified.
     auto lenRes = quic::follyutils::decodeQuicInteger(cursor, length);
     if (!lenRes) {
       XLOG(DBG4) << "parseVariableParam: UNDERFLOW on trackFilter length";
@@ -4097,8 +4100,8 @@ void writeTrackFilter(
     const TrackFilter& filter,
     size_t& size,
     bool& error) noexcept {
-  // Write propType
-  writeVarint(writeBuf, filter.propType, size, error);
+  // Write propertyType
+  writeVarint(writeBuf, filter.propertyType, size, error);
   // Write maxSelected (N)
   writeVarint(writeBuf, filter.maxSelected, size, error);
 }
