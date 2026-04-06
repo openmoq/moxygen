@@ -498,26 +498,32 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
   webTransport->setHandler(moqSession.get());
 
   // Negotiate MoQ version via WebTransport protocol negotiation.
-  // The client sends wt-available-protocols, we select from our supported versions.
+  // The client may send Sec-WebTransport-Protocol header with available protocols.
   // Note: picowt_select_wt_protocol expects ALPN format (e.g. "moqt-16, moqt-15")
-  // not draft numbers, so we convert versions_ first.
   auto alpnProtocols = getMoqtProtocols(versions_, /*useStandard=*/true);
   std::string alpnList = folly::join(", ", alpnProtocols);
 
-  // Debug: log what the client offered
   const char* clientProtos = reinterpret_cast<const char*>(
       streamCtx->ps.stream_state.header.wt_available_protocols);
   XLOG(DBG1) << "WT protocol negotiation: client offers ["
-             << (clientProtos ? clientProtos : "NULL")
-             << "], server offers [" << alpnList << "]";
+             << (clientProtos ? clientProtos : "none")
+             << "], server supports [" << alpnList << "]";
 
   int wtProtoRet = picowt_select_wt_protocol(streamCtx, alpnList.c_str());
   if (wtProtoRet == 0 && streamCtx->ps.stream_state.wt_protocol) {
+    // Protocol negotiation succeeded
     const char* selectedProto = streamCtx->ps.stream_state.wt_protocol;
     XLOG(DBG1) << "WebTransport selected protocol: " << selectedProto;
     moqSession->validateAndSetVersionFromAlpn(selectedProto);
+  } else if (!clientProtos) {
+    // Client didn't send protocols header - default for browser compatibility
+    // (Chrome doesn't reliably send Sec-WebTransport-Protocol yet)
+    XLOG(DBG1) << "No WT protocol header from client, defaulting to moqt-16";
+    moqSession->validateAndSetVersionFromAlpn("moqt-16");
   } else {
-    XLOG(ERR) << "No compatible WT protocol - client didn't offer matching version";
+    // Client sent protocols but none matched - reject
+    XLOG(ERR) << "No compatible WT protocol - client offered [" << clientProtos
+              << "] but server supports [" << alpnList << "]";
     return -1;
   }
 
