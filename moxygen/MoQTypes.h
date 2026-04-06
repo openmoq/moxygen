@@ -374,17 +374,20 @@ struct SubscriptionFilter {
 // TRACK_FILTER parameter for SUBSCRIBE_NAMESPACE (0x29)
 // Used to filter tracks based on a property value, selecting the top N tracks.
 struct TrackFilter {
-  uint64_t propType{0};    // Property type to filter on (e.g., audio level)
-  uint64_t maxSelected{0}; // Maximum number of tracks to select (N)
+  uint64_t propertyType{0}; // Property type to filter on (e.g., audio level)
+  uint64_t maxSelected{0};  // Maximum number of tracks to select (N)
 
   TrackFilter() = default;
-  TrackFilter(uint64_t pt, uint64_t ms) : propType(pt), maxSelected(ms) {}
+  TrackFilter(uint64_t pt, uint64_t ms) : propertyType(pt), maxSelected(ms) {}
 
   bool operator==(const TrackFilter& other) const {
-    return propType == other.propType && maxSelected == other.maxSelected;
+    return propertyType == other.propertyType && maxSelected == other.maxSelected;
   }
 };
 
+// TODO: Consider refactoring to std::variant<std::string, uint64_t,
+// AuthToken, SubscriptionFilter, TrackFilter, AbsoluteLocation> to
+// reduce memory footprint and clarify semantics.
 struct Parameter {
   uint64_t key = 0;
   std::string asString;
