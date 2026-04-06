@@ -665,9 +665,7 @@ PicoH3WebTransport::stopSending(uint64_t streamId, uint32_t error) {
   if (!handle) {
     return folly::makeUnexpected(ErrorCode::INVALID_STREAM_ID);
   }
-  if (cnx_) {
-    picoquic_stop_sending(cnx_, streamId, error);
-  }
+  // Route through WtStreamManager - processEgressEvents will call picoquic_stop_sending
   return handle->stopSending(error);
 }
 
