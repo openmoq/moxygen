@@ -6,10 +6,8 @@
 
 #pragma once
 
-#include <folly/Function.h>
 #include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/AsyncUDPSocket.h>
-#include <functional>
 
 // Forward declaration — avoids picoquic.h in this header
 typedef struct st_picoquic_quic_t picoquic_quic_t;
@@ -69,14 +67,6 @@ class PicoQuicSocketHandler
   void updateWakeTimeout();
 
   /**
-   * Set a callback to drain pending executor tasks after processing packets.
-   * This mimics PicoQuicExecutor's drainTasks() behavior for EventBase mode.
-   */
-  void setDrainTasksCallback(std::function<void()> cb) {
-    drainTasksCallback_ = std::move(cb);
-  }
-
-  /**
    * Returns the local address the socket is bound to (after start()).
    */
   folly::SocketAddress boundAddress() const {
@@ -127,7 +117,7 @@ class PicoQuicSocketHandler
   int fd_{-1};
   bool gsoSupported_{false};
   uint16_t localPort_{0}; // actual bound port, for addrTo in parseCmsgsAndDeliver
-  std::function<void()> drainTasksCallback_;
+
 };
 
 } // namespace moxygen

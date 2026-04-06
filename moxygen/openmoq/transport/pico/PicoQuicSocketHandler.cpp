@@ -17,7 +17,6 @@
 #ifdef __linux__
 #include <linux/errqueue.h>
 #endif
-#include <sys/select.h>
 
 // IP_PKTINFO (Linux) provides dst addr + ifindex in one cmsg.
 // On macOS/BSD, use IP_RECVDSTADDR for dst addr instead.
@@ -58,49 +57,18 @@ PicoQuicSocketHandler::~PicoQuicSocketHandler() {
 void PicoQuicSocketHandler::start(const folly::SocketAddress& addr) {
   XLOG(INFO) << "PicoQuicSocketHandler::start called, addr=" << addr.describe();
 
-  // For IPv6, we need dual-stack support to receive both IPv4 and IPv6 packets.
-  // This requires setting IPV6_V6ONLY=0 BEFORE bind, which AsyncUDPSocket
-  // doesn't support directly. So we create and configure the socket manually.
   if (addr.getFamily() == AF_INET6) {
-    int fd = ::socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
-    if (fd < 0) {
-      throw std::runtime_error(
-          "Failed to create IPv6 socket: " + folly::errnoStr(errno));
-    }
-
-    // Enable dual-stack: accept both IPv4 and IPv6
-    int zero = 0;
-    if (::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero)) < 0) {
-      ::close(fd);
-      throw std::runtime_error(
-          "Failed to set IPV6_V6ONLY=0: " + folly::errnoStr(errno));
-    }
+    // Enable dual-stack (accept both IPv4 and IPv6) by setting IPV6_V6ONLY=0
+    // before bind. AsyncUDPSocket supports this via init() + applyOptions(PRE_BIND).
+    socket_.init(addr.getFamily());
+    socket_.applyOptions(
+        {{folly::SocketOptionKey{IPPROTO_IPV6, IPV6_V6ONLY}, 0}},
+        folly::SocketOptionKey::ApplyPos::PRE_BIND);
     XLOG(INFO) << "Dual-stack enabled (IPV6_V6ONLY=0)";
-
-    // Set reuse addr for quick restart
-    int one = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-    // Bind manually
-    sockaddr_storage storage;
-    addr.getAddress(&storage);
-    socklen_t len = addr.getActualSize();
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&storage), len) < 0) {
-      ::close(fd);
-      throw std::runtime_error(
-          "Failed to bind dual-stack socket: " + folly::errnoStr(errno));
-    }
-
-    // Transfer ownership to AsyncUDPSocket
-    auto netSock = folly::NetworkSocket::fromFd(fd);
-    socket_.setFD(netSock, folly::AsyncUDPSocket::FDOwnership::OWNS);
-    fd_ = fd;
-    localPort_ = addr.getPort();
-  } else {
-    socket_.bind(addr);
-    fd_ = socket_.getNetworkSocket().toFd();
-    localPort_ = socket_.address().getPort();
   }
+  socket_.bind(addr);
+  fd_ = socket_.getNetworkSocket().toFd();
+  localPort_ = socket_.address().getPort();
   XLOG(INFO) << "Socket bound, fd=" << fd_ << " localPort=" << localPort_;
 
   // Enable IP_PKTINFO / IPV6_RECVPKTINFO so recvmsg delivers the local
@@ -142,8 +110,7 @@ void PicoQuicSocketHandler::start(const folly::SocketAddress& addr) {
   rescheduleTimer();
 
   XLOG(INFO) << "PicoQuicSocketHandler started on "
-             << socket_.address().describe() << " gso=" << gsoSupported_
-             << " evbRunning=" << evb_->isRunning();
+             << socket_.address().describe() << " gso=" << gsoSupported_;
 }
 
 void PicoQuicSocketHandler::stop() {
@@ -219,12 +186,6 @@ void PicoQuicSocketHandler::onNotifyDataAvailable(
   if (anyReceived) {
     XLOG(DBG5) << "onNotifyDataAvailable: received " << totalReceived
                << " packets, draining";
-    // Optional callback for executors that need explicit task draining during I/O.
-    // Currently unused in EventBase path (folly::EventBase drains its own tasks),
-    // but could be set by PicoQuicExecutor for the threaded model if needed.
-    if (drainTasksCallback_) {
-      drainTasksCallback_();
-    }
     drainOutgoing();
     if (pendingClose_) {
       stop();
@@ -236,16 +197,15 @@ void PicoQuicSocketHandler::onNotifyDataAvailable(
 
 void PicoQuicSocketHandler::getReadBuffer(void** /*buf*/,
                                           size_t* /*len*/) noexcept {
-  XLOG(DBG1) << "getReadBuffer called (should not happen with shouldOnlyNotify)";
+  XLOG(WARN) << "getReadBuffer called (should not happen with shouldOnlyNotify)";
 }
 
 void PicoQuicSocketHandler::onDataAvailable(
-    const folly::SocketAddress& client,
-    size_t len,
+    const folly::SocketAddress& /*client*/,
+    size_t /*len*/,
     bool /*truncated*/,
     OnDataAvailableParams /*params*/) noexcept {
-  XLOG(DBG4) << "onDataAvailable called from " << client.describe()
-             << " len=" << len << " (should not happen with shouldOnlyNotify)";
+  XLOG(WARN) << "onDataAvailable called (should not happen with shouldOnlyNotify)";
 }
 
 void PicoQuicSocketHandler::onReadError(
@@ -262,10 +222,6 @@ void PicoQuicSocketHandler::onReadClosed() noexcept {
 // ---------------------------------------------------------------------------
 
 void PicoQuicSocketHandler::timeoutExpired() noexcept {
-  // Drain pending executor tasks to process coroutine continuations
-  if (drainTasksCallback_) {
-    drainTasksCallback_();
-  }
   drainOutgoing();
   if (pendingClose_) {
     stop();
@@ -497,12 +453,10 @@ void PicoQuicSocketHandler::sendPacket(const uint8_t* data,
 }
 
 void PicoQuicSocketHandler::updateWakeTimeout() {
-  // Called when new data is queued (via WakeTimeGuard from markStreamActive).
-  // We drain immediately rather than waiting for rescheduleTimer because:
-  // 1. rescheduleTimer only calls drainOutgoing if delayUs <= 0
-  // 2. If delayUs > 0, data would wait until the next timer expiry
-  // 3. Immediate drain reduces latency for freshly queued data
-  drainOutgoing();
+  // Called via WakeTimeGuard when picoquic's next wake time decreases (e.g.
+  // after marking a stream or datagram active). Cancel the current timer and
+  // reschedule: rescheduleTimer will call evb_->add() for delay<=0, which is
+  // effectively immediate since the EVB passes 0 to epoll when tasks are pending.
   cancelTimeout();
   rescheduleTimer();
 }
