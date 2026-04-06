@@ -503,7 +503,14 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
   // not draft numbers, so we convert versions_ first.
   auto alpnProtocols = getMoqtProtocols(versions_, /*useStandard=*/true);
   std::string alpnList = folly::join(", ", alpnProtocols);
-  XLOG(DBG2) << "WT protocol negotiation: server offers [" << alpnList << "]";
+
+  // Debug: log what the client offered
+  const char* clientProtos = reinterpret_cast<const char*>(
+      streamCtx->ps.stream_state.header.wt_available_protocols);
+  XLOG(DBG1) << "WT protocol negotiation: client offers ["
+             << (clientProtos ? clientProtos : "NULL")
+             << "], server offers [" << alpnList << "]";
+
   int wtProtoRet = picowt_select_wt_protocol(streamCtx, alpnList.c_str());
   if (wtProtoRet == 0 && streamCtx->ps.stream_state.wt_protocol) {
     const char* selectedProto = streamCtx->ps.stream_state.wt_protocol;
