@@ -445,11 +445,12 @@ bool MoQPicoServerBase::initH3Zero() {
 }
 
 void MoQPicoServerBase::destroyH3Zero() {
-  // Clean up all per-connection h3zero contexts
-  for (auto& [cnx, h3Ctx] : h3Contexts_) {
-    XLOG(DBG2) << "Cleaning up h3Ctx for cnx=" << (void*)cnx;
-    h3zero_callback_delete_context(cnx, h3Ctx);
-  }
+  // h3Contexts_ entries have been handed to h3zero via picoquic_set_callback.
+  // h3zero owns each context and frees it when the connection closes
+  // (picoquic_callback_close → h3zero_callback_delete_context). Calling
+  // h3zero_callback_delete_context here would double-free already-closed
+  // connections. Just clear the map and let destroyQuicContext/picoquic_free
+  // drive the remaining close callbacks.
   h3Contexts_.clear();
   wtPathTable_.reset();
 }
