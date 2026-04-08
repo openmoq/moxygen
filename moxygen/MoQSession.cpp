@@ -2808,7 +2808,6 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     }
 
     subscribeState_ = std::move(subscribeState);
-    session_->onSubscriptionStreamOpenedByPeer();
     auto callback = subscribeState_->getSubscribeCallback();
     if (!callback) {
       // This cannot happen in a PUBLISH_DONE flow, because
@@ -2823,6 +2822,7 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     auto res = callback->beginSubgroup(group, subgroup, effectivePriority);
     if (res.hasValue()) {
       subgroupCallback_ = *res;
+      session_->onSubscriptionStreamOpenedByPeer();
     } else {
       return MoQCodec::ParseResult::ERROR_TERMINATE;
     }
