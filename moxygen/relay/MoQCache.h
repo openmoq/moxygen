@@ -59,11 +59,26 @@ class MoQCache {
       std::shared_ptr<FetchConsumer> consumer,
       std::shared_ptr<Publisher> upstream);
 
+  struct PurgeResult {
+    size_t evicted{0};
+    size_t skipped{0};
+  };
+
   void clear() {
     cache_.clear();
     trackLRU_.clear();
     totalCachedBytes_ = 0;
   }
+
+  // Evicts a specific track (if not pinned), or all evictable tracks if ftn is
+  // absent. Tracks that are live or have active fetches are counted in
+  // skipped, never force-removed.
+  PurgeResult safe_purge(
+      const std::optional<FullTrackName>& ftn = std::nullopt);
+
+  // Evicts all tracks belonging to the given namespace (if not pinned).
+  // Tracks that are live or have active fetches are counted in skipped.
+  PurgeResult safe_purge_namespace(const TrackNamespace& ns);
 
   bool hasTrack(const FullTrackName& ftn) const {
     return cache_.contains(ftn);
