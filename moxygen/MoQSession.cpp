@@ -3076,10 +3076,10 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
   }
 
   void endOfSubgroup(bool deliverCallback = false) {
-    if (subgroupCallback_) {
+    if (subscribeState_) {
       CHECK(session_) << "session_ is NULL in ObjectStreamCallback";
       // We only want to call this for SUBSCRIBEs and not FETCHes, which is
-      // why we condition on subgroupCallback_
+      // why we condition on subscribeState_
       session_->onSubscriptionStreamClosedByPeer();
     }
     if (deliverCallback && !isCancelled()) {
@@ -3093,6 +3093,8 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       fetchState_->resetFetchCallback(session_);
     } else {
       subgroupCallback_.reset();
+      // Guard for idempotent reset() call
+      subscribeState_.reset();
     }
   }
   std::shared_ptr<MLogger> logger_ = nullptr;
@@ -3279,7 +3281,8 @@ folly::coro::Task<void> MoQSession::unidirectionalReadLoop(
       if (streamData->fin) {
         XLOG(DBG3) << "End of stream id=" << id << " sess=" << this;
         readHandle = nullptr;
-      } else if (result == MoQCodec::ParseResult::ERROR_TERMINATE) {
+      }
+      if (result == MoQCodec::ParseResult::ERROR_TERMINATE) {
         XLOG(ERR) << "Error parsing/consuming stream id=" << id
                   << " sess=" << this;
         dcb.reset(ResetStreamErrorCode::INTERNAL_ERROR);
