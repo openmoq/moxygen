@@ -2672,16 +2672,16 @@ CO_TEST_F(MoQCacheTest, TestMinEvictionBytesLowWatermark) {
 }
 
 // ============================================================================
-// safe_purge tests
+// PurgeIfIdle tests
 // ============================================================================
 
 // Specific evictable track → evicted=1, skipped=0, track gone from cache.
-CO_TEST_F(MoQCacheTest, SafePurge_SpecificTrack_Evictable) {
+CO_TEST_F(MoQCacheTest, PurgeIfIdleSpecificTrackEvictable) {
   auto wb = cache_.getSubscribeWriteback(kTestTrackName, trackConsumer_);
   wb->datagram(ObjectHeader(0, 0, 0, 0, 5), makeBuf(5));
   wb.reset(); // release → track becomes evictable
 
-  auto result = cache_.safe_purge(kTestTrackName);
+  auto result = cache_.purgeIfIdle(kTestTrackName);
   EXPECT_EQ(result.evicted, 1u);
   EXPECT_EQ(result.skipped, 0u);
   EXPECT_FALSE(cache_.hasTrack(kTestTrackName));
@@ -2689,11 +2689,11 @@ CO_TEST_F(MoQCacheTest, SafePurge_SpecificTrack_Evictable) {
 }
 
 // Specific live track (writeback held) → evicted=0, skipped=1, track stays.
-CO_TEST_F(MoQCacheTest, SafePurge_SpecificTrack_Live) {
+CO_TEST_F(MoQCacheTest, PurgeIfIdleSpecificTrackLive) {
   auto wb = cache_.getSubscribeWriteback(kTestTrackName, trackConsumer_);
   wb->datagram(ObjectHeader(0, 0, 0, 0, 5), makeBuf(5));
 
-  auto result = cache_.safe_purge(kTestTrackName);
+  auto result = cache_.purgeIfIdle(kTestTrackName);
   EXPECT_EQ(result.evicted, 0u);
   EXPECT_EQ(result.skipped, 1u);
   EXPECT_TRUE(cache_.hasTrack(kTestTrackName));
@@ -2701,16 +2701,16 @@ CO_TEST_F(MoQCacheTest, SafePurge_SpecificTrack_Live) {
 }
 
 // Specific track not in cache → no-op, evicted=0, skipped=0.
-CO_TEST_F(MoQCacheTest, SafePurge_SpecificTrack_NotCached) {
+CO_TEST_F(MoQCacheTest, PurgeIfIdleSpecificTrackNotCached) {
   const FullTrackName absent{TrackNamespace{{"ghost"}}, "track"};
-  auto result = cache_.safe_purge(absent);
+  auto result = cache_.purgeIfIdle(absent);
   EXPECT_EQ(result.evicted, 0u);
   EXPECT_EQ(result.skipped, 0u);
   co_return;
 }
 
 // No ftn (purge all): three evictable tracks → all evicted, skipped=0.
-CO_TEST_F(MoQCacheTest, SafePurge_All_AllEvictable) {
+CO_TEST_F(MoQCacheTest, PurgeIfIdleAllEvictable) {
   const FullTrackName ft1{TrackNamespace{{"a"}}, "t1"};
   const FullTrackName ft2{TrackNamespace{{"a"}}, "t2"};
   const FullTrackName ft3{TrackNamespace{{"b"}}, "t3"};
@@ -2718,9 +2718,9 @@ CO_TEST_F(MoQCacheTest, SafePurge_All_AllEvictable) {
     auto wb = cache_.getSubscribeWriteback(ftn, trackConsumer_);
     wb->datagram(ObjectHeader(0, 0, 0, 0, 5), makeBuf(5));
   }
-  ASSERT_EQ(cache_.size(), 3u);
+  EXPECT_EQ(cache_.size(), 3u);
 
-  auto result = cache_.safe_purge();
+  auto result = cache_.purgeIfIdle();
   EXPECT_EQ(result.evicted, 3u);
   EXPECT_EQ(result.skipped, 0u);
   EXPECT_EQ(cache_.size(), 0u);
@@ -2729,7 +2729,7 @@ CO_TEST_F(MoQCacheTest, SafePurge_All_AllEvictable) {
 
 // No ftn (purge all): one live, two evictable → correct split, live track
 // survives.
-CO_TEST_F(MoQCacheTest, SafePurge_All_MixedLiveAndEvictable) {
+CO_TEST_F(MoQCacheTest, PurgeIfIdleMixedLiveAndEvictable) {
   const FullTrackName ftLive{TrackNamespace{{"x"}}, "live"};
   const FullTrackName ftDead1{TrackNamespace{{"x"}}, "dead1"};
   const FullTrackName ftDead2{TrackNamespace{{"x"}}, "dead2"};
@@ -2744,7 +2744,7 @@ CO_TEST_F(MoQCacheTest, SafePurge_All_MixedLiveAndEvictable) {
     wb->datagram(ObjectHeader(0, 0, 0, 0, 5), makeBuf(5));
   }
 
-  auto result = cache_.safe_purge();
+  auto result = cache_.purgeIfIdle();
   EXPECT_EQ(result.evicted, 2u);
   EXPECT_EQ(result.skipped, 1u);
   EXPECT_TRUE(cache_.hasTrack(ftLive));
@@ -2753,13 +2753,9 @@ CO_TEST_F(MoQCacheTest, SafePurge_All_MixedLiveAndEvictable) {
   co_return;
 }
 
-// ============================================================================
-// safe_purge_namespace tests
-// ============================================================================
-
 // Populate two tracks under namespace "foo" and one under "bar", then purge
 // namespace "foo". Both foo tracks are evicted and the bar track survives.
-CO_TEST_F(MoQCacheTest, SafePurgeNamespace_EvictsAllMatchingTracks) {
+CO_TEST_F(MoQCacheTest, PurgeIfIdleNamespaceEvictsAllMatchingTracks) {
   const FullTrackName ftA{TrackNamespace{{"foo"}}, "track-a"};
   const FullTrackName ftB{TrackNamespace{{"foo"}}, "track-b"};
   const FullTrackName ftOther{TrackNamespace{{"bar"}}, "other"};
@@ -2770,9 +2766,9 @@ CO_TEST_F(MoQCacheTest, SafePurgeNamespace_EvictsAllMatchingTracks) {
     // destroy wb → track becomes evictable
   }
 
-  ASSERT_EQ(cache_.size(), 3u);
+  EXPECT_EQ(cache_.size(), 3u);
 
-  auto result = cache_.safe_purge_namespace(TrackNamespace{{"foo"}});
+  auto result = cache_.purgeIfIdle(TrackNamespace{{"foo"}});
   EXPECT_EQ(result.evicted, 2u);
   EXPECT_EQ(result.skipped, 0u);
   EXPECT_EQ(cache_.size(), 1u);
@@ -2784,7 +2780,7 @@ CO_TEST_F(MoQCacheTest, SafePurgeNamespace_EvictsAllMatchingTracks) {
 
 // A live track (writeback still held) must be skipped; a non-live track in the
 // same namespace is evicted.
-CO_TEST_F(MoQCacheTest, SafePurgeNamespace_SkipsLiveTracks) {
+CO_TEST_F(MoQCacheTest, PurgeIfIdleNamespaceSkipsLiveTracks) {
   const FullTrackName ftLive{TrackNamespace{{"ns"}}, "live"};
   const FullTrackName ftDead{TrackNamespace{{"ns"}}, "dead"};
 
@@ -2798,7 +2794,7 @@ CO_TEST_F(MoQCacheTest, SafePurgeNamespace_SkipsLiveTracks) {
     wbDead->datagram(ObjectHeader(0, 0, 0, 0, 5), makeBuf(5));
   }
 
-  auto result = cache_.safe_purge_namespace(TrackNamespace{{"ns"}});
+  auto result = cache_.purgeIfIdle(TrackNamespace{{"ns"}});
   EXPECT_EQ(result.evicted, 1u);
   EXPECT_EQ(result.skipped, 1u);
   EXPECT_TRUE(cache_.hasTrack(ftLive));
@@ -2807,15 +2803,44 @@ CO_TEST_F(MoQCacheTest, SafePurgeNamespace_SkipsLiveTracks) {
 }
 
 // Purging an unknown namespace is a safe no-op.
-CO_TEST_F(MoQCacheTest, SafePurgeNamespace_UnknownNamespaceIsNoop) {
+CO_TEST_F(MoQCacheTest, PurgeIfIdleNamespaceUnknownIsNoop) {
   auto wb = cache_.getSubscribeWriteback(kTestTrackName, trackConsumer_);
   wb->datagram(ObjectHeader(0, 0, 0, 0, 5), makeBuf(5));
   wb.reset();
 
-  auto result = cache_.safe_purge_namespace(TrackNamespace{{"nonexistent"}});
+  auto result = cache_.purgeIfIdle(TrackNamespace{{"nonexistent"}});
   EXPECT_EQ(result.evicted, 0u);
   EXPECT_EQ(result.skipped, 0u);
   EXPECT_TRUE(cache_.hasTrack(kTestTrackName));
+  co_return;
+}
+
+// No ftn (purge all): empty cache → no-op, evicted=0, skipped=0.
+CO_TEST_F(MoQCacheTest, PurgeIfIdleAllEmptyCache) {
+  EXPECT_EQ(cache_.size(), 0u);
+  auto result = cache_.purgeIfIdle();
+  EXPECT_EQ(result.evicted, 0u);
+  EXPECT_EQ(result.skipped, 0u);
+  EXPECT_EQ(cache_.size(), 0u);
+  co_return;
+}
+
+// No ftn (purge all): all tracks are live (writebacks held) → nothing evicted,
+// all skipped.
+CO_TEST_F(MoQCacheTest, PurgeIfIdleAllLive) {
+  const FullTrackName ft1{TrackNamespace{{"live"}}, "t1"};
+  const FullTrackName ft2{TrackNamespace{{"live"}}, "t2"};
+
+  auto wb1 = cache_.getSubscribeWriteback(ft1, trackConsumer_);
+  wb1->datagram(ObjectHeader(0, 0, 0, 0, 5), makeBuf(5));
+  auto wb2 = cache_.getSubscribeWriteback(ft2, trackConsumer_);
+  wb2->datagram(ObjectHeader(0, 0, 0, 0, 5), makeBuf(5));
+
+  auto result = cache_.purgeIfIdle();
+  EXPECT_EQ(result.evicted, 0u);
+  EXPECT_EQ(result.skipped, 2u);
+  EXPECT_TRUE(cache_.hasTrack(ft1));
+  EXPECT_TRUE(cache_.hasTrack(ft2));
   co_return;
 }
 

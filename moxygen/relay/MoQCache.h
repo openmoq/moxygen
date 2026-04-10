@@ -70,15 +70,15 @@ class MoQCache {
     totalCachedBytes_ = 0;
   }
 
-  // Evicts a specific track (if not pinned), or all evictable tracks if ftn is
-  // absent. Tracks that are live or have active fetches are counted in
-  // skipped, never force-removed.
-  PurgeResult safe_purge(
-      const std::optional<FullTrackName>& ftn = std::nullopt);
+  // Evicts a specific track if it has no active subscriptions or fetches.
+  PurgeResult purgeIfIdle(const FullTrackName& ftn);
+
+  // Evicts all tracks that have no active subscriptions or fetches.
+  PurgeResult purgeIfIdle();
 
   // Evicts all tracks belonging to the given namespace (if not pinned).
   // Tracks that are live or have active fetches are counted in skipped.
-  PurgeResult safe_purge_namespace(const TrackNamespace& ns);
+  PurgeResult purgeIfIdle(const TrackNamespace& ns);
 
   bool hasTrack(const FullTrackName& ftn) const {
     return cache_.contains(ftn);

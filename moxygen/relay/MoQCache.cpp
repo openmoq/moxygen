@@ -1867,7 +1867,8 @@ void MoQCache::evictTrack(const FullTrackName& ftn) {
   XLOG(DBG1) << "Evicted track: " << ftn;
 }
 
-MoQCache::PurgeResult MoQCache::safe_purge_namespace(const TrackNamespace& ns) {
+MoQCache::PurgeResult MoQCache::purgeIfIdle(const TrackNamespace& ns) {
+  // Snapshot to avoid iterator invalidation when evictTrack() modifies cache_.
   std::vector<FullTrackName> matching;
   for (auto& [ftn, _] : cache_) {
     if (ftn.trackNamespace == ns) {
@@ -1876,27 +1877,26 @@ MoQCache::PurgeResult MoQCache::safe_purge_namespace(const TrackNamespace& ns) {
   }
   PurgeResult result;
   for (auto& trackName : matching) {
-    auto r = safe_purge(trackName);
+    auto r = purgeIfIdle(trackName);
     result.evicted += r.evicted;
     result.skipped += r.skipped;
   }
   return result;
 }
 
-MoQCache::PurgeResult MoQCache::safe_purge(
-    const std::optional<FullTrackName>& ftn) {
-  if (ftn.has_value()) {
-    auto it = cache_.find(*ftn);
-    if (it == cache_.end()) {
-      return {}; // not cached, nothing to do
-    }
-    if (it->second->canEvict()) {
-      evictTrack(*ftn);
-      return {1, 0};
-    }
-    return {0, 1}; // live or has active fetches — cannot evict
+MoQCache::PurgeResult MoQCache::purgeIfIdle(const FullTrackName& ftn) {
+  auto it = cache_.find(ftn);
+  if (it == cache_.end()) {
+    return {}; // not cached, nothing to do
   }
+  if (it->second->canEvict()) {
+    evictTrack(ftn);
+    return {1, 0};
+  }
+  return {0, 1}; // live or has active fetches — cannot evict
+}
 
+MoQCache::PurgeResult MoQCache::purgeIfIdle() {
   // trackLRU_ holds exactly the evictable tracks, so skipped is the remainder.
   // Snapshot before evicting since evictTrack() mutates trackLRU_.
   size_t skipped = cache_.size() - trackLRU_.size();
