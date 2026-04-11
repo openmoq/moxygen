@@ -1,6 +1,6 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * This source code is licensed under the MIT license found in the
+ * Copyright (c) OpenMOQ contributors.
+ * This source code is licensed under the Apache 2.0 license found in the
  * LICENSE file in the root directory of this source tree.
  */
 
@@ -567,6 +567,14 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
   // Create MoQSession
   auto moqSession = createSession(webTransport, executor_);
   webTransport->setHandler(moqSession.get());
+
+  // Set path from the HTTP/3 CONNECT request. Authority is not set because
+  // h3zero_header_parts_t does not expose the :authority pseudo-header.
+  const auto& hdr = streamCtx->ps.stream_state.header;
+  if (hdr.path && hdr.path_length > 0) {
+    moqSession->setPath(
+        std::string(reinterpret_cast<const char*>(hdr.path), hdr.path_length));
+  }
 
   // Negotiate MOQT version via WebTransport protocol negotiation.
   // The client sends wt-available-protocols, we select from our supported
