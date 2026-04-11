@@ -310,6 +310,9 @@ class MoQFrameParser {
     previousFetchPriority_ = std::nullopt;
   }
 
+  std::optional<TrackFilter> extractTrackFilter(
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
  private:
   // Legacy FETCH object parser (draft <= 14)
   folly::Expected<ObjectHeader, ErrorCode> parseFetchObjectHeaderLegacy(
@@ -366,9 +369,6 @@ class MoQFrameParser {
       bool allowImmutable = true) const noexcept;
 
   std::optional<SubscriptionFilter> extractSubscriptionFilter(
-      const std::vector<Parameter>& requestSpecificParams) const noexcept;
-
-  std::optional<TrackFilter> extractTrackFilter(
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
   void handleRequestSpecificParams(

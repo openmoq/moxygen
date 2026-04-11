@@ -4041,7 +4041,7 @@ TEST_P(MoQFramerV16PlusTest, SubscribeNamespaceWithTrackFilter) {
   auto& parsedParam = parseResult->params.at(0);
   EXPECT_EQ(
       parsedParam.key, folly::to_underlying(TrackRequestParamKey::TRACK_FILTER));
-  EXPECT_EQ(parsedParam.asTrackFilter.propType, 0x10);
+  EXPECT_EQ(parsedParam.asTrackFilter.propertyType, 0x10);
   EXPECT_EQ(parsedParam.asTrackFilter.maxSelected, 5);
 }
 
@@ -4063,7 +4063,7 @@ TEST_P(MoQFramerV16PlusTest, ExtractTrackFilter) {
   // Extract should find the track filter
   auto extracted = parser_.extractTrackFilter(params);
   ASSERT_TRUE(extracted.has_value());
-  EXPECT_EQ(extracted->propType, 0x22);
+  EXPECT_EQ(extracted->propertyType, 0x22);
   EXPECT_EQ(extracted->maxSelected, 10);
 }
 
@@ -4116,7 +4116,7 @@ TEST_P(MoQFramerV16PlusTest, TrackFilterLargeValues) {
   // Check TRACK_FILTER with large propType was parsed correctly
   ASSERT_EQ(parseResult->params.size(), 1);
   auto& parsedParam = parseResult->params.at(0);
-  EXPECT_EQ(parsedParam.asTrackFilter.propType, 0x3FFFFFFFFFFF);
+  EXPECT_EQ(parsedParam.asTrackFilter.propertyType, 0x3FFFFFFFFFFF);
   EXPECT_EQ(parsedParam.asTrackFilter.maxSelected, 15);
 }
 
@@ -4135,7 +4135,7 @@ TEST(TrackFilterTest, Equality) {
 // Test TrackFilter default constructor
 TEST(TrackFilterTest, DefaultConstructor) {
   TrackFilter filter;
-  EXPECT_EQ(filter.propType, 0);
+  EXPECT_EQ(filter.propertyType, 0);
   EXPECT_EQ(filter.maxSelected, 0);
 }
 
