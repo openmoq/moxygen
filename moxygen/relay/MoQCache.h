@@ -60,6 +60,9 @@ class MoQCache {
       std::shared_ptr<Publisher> upstream);
 
   void clear() {
+    for (auto& [ftn, track] : cache_) {
+      track->evicted = true;
+    }
     cache_.clear();
     trackLRU_.clear();
     totalCachedBytes_ = 0;
@@ -247,6 +250,8 @@ class MoQCache {
     Extensions extensions;
     // Time of the most recently cached object in this track
     TimePoint lastWrite{TimePoint::min()};
+    // Set by clear() — writebacks skip caching when true
+    bool evicted{false};
 
     folly::Expected<folly::Unit, MoQPublishError> updateLargest(
         AbsoluteLocation current,
