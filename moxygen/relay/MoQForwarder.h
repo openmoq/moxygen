@@ -142,6 +142,9 @@ class MoQForwarder : public TrackConsumer {
     MoQForwarder& forwarder;
     bool shouldForward;
     bool receivedPublishDone_{false};
+    // If true, this subscriber cannot be removed by PropertyRanking eviction.
+    // Direct subscribers are pinned; TRACK_FILTER subscribers are unpinned.
+    bool pinned{true};
   };
 
   [[nodiscard]] bool empty() const {
@@ -161,6 +164,16 @@ class MoQForwarder : public TrackConsumer {
       std::shared_ptr<MoQSession> session,
       const PublishRequest& pub) {
     return addSubscriber(std::move(session), pub.forward);
+  }
+
+  // Get a subscriber by session pointer (for TRACK_FILTER eviction)
+  std::shared_ptr<MoQForwarder::Subscriber> getSubscriber(
+      MoQSession* session) const {
+    auto it = subscribers_.find(session);
+    if (it != subscribers_.end()) {
+      return it->second;
+    }
+    return nullptr;
   }
 
   folly::Expected<SubscribeRange, FetchError> resolveJoiningFetch(
