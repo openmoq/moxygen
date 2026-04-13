@@ -14,9 +14,16 @@
 #include <moxygen/openmoq/transport/pico/PicoConnectionContext.h>
 #include <moxygen/openmoq/transport/pico/PicoH3WebTransport.h>
 #include <moxygen/openmoq/transport/pico/PicoProtocolDispatcher.h>
-#include <autoqlog.h>
 #include <pico_webtransport.h>
 #include <picoquic.h>
+
+#if __has_include(<autoqlog.h>)
+#include <autoqlog.h>
+#elif __has_include(<picoquic_qlog.h>)
+#include <picoquic_qlog.h>
+#else
+extern "C" int picoquic_set_qlog(picoquic_quic_t* quic, char const* qlog_dir);
+#endif
 
 namespace moxygen {
 
