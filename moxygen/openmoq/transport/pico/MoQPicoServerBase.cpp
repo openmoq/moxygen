@@ -14,6 +14,7 @@
 #include <moxygen/openmoq/transport/pico/PicoConnectionContext.h>
 #include <moxygen/openmoq/transport/pico/PicoH3WebTransport.h>
 #include <moxygen/openmoq/transport/pico/PicoProtocolDispatcher.h>
+#include <autoqlog.h>
 #include <pico_webtransport.h>
 #include <picoquic.h>
 
@@ -354,6 +355,15 @@ bool MoQPicoServerBase::createQuicContext() {
 
   picoquic_set_alpn_select_fn_v2(quic_, alpnSelectCallback);
   picoquic_set_cookie_mode(quic_, 2);
+  if (!transportConfig_.qlogPath.empty()) {
+    int qlogRc = picoquic_set_qlog(quic_, transportConfig_.qlogPath.c_str());
+    XLOG(INFO) << "picoquic_set_qlog(path='" << transportConfig_.qlogPath
+               << "') returned " << qlogRc;
+    if (qlogRc != 0) {
+      XLOG(ERR) << "Failed to enable picoquic qlog path='"
+                << transportConfig_.qlogPath << "' rc=" << qlogRc;
+    }
+  }
   if (picoquic_get_congestion_algorithm(transportConfig_.ccAlgo.c_str()) ==
       nullptr) {
     XLOG(WARN) << "Unknown congestion control algorithm '"

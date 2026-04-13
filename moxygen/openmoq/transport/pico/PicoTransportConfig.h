@@ -50,6 +50,7 @@ struct PicoTransportConfig {
   uint8_t defaultStreamPriority{2};   // default stream priority
   uint8_t defaultDatagramPriority{1}; // default datagram priority
   std::string ccAlgo{"bbr"};          // congestion control algorithm name
+  std::string qlogPath;               // optional picoquic qlog output directory
 };
 
 } // namespace moxygen
