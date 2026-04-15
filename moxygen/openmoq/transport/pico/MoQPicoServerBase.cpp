@@ -179,6 +179,12 @@ static int picoCallback(
       XLOG(DBG1) << "Switching to h3zero_callback for WebTransport, cnx="
                  << (void*)cnx << " h3Ctx=" << (void*)h3Ctx;
       picoquic_set_callback(cnx, h3zero_callback, h3Ctx);
+      // h3zero now owns h3Ctx and will free it via
+      // h3zero_callback_delete_context when the connection closes.
+      // Remove from our map so that if picoquic reuses this cnx address
+      // for a future connection, getOrCreateH3Ctx creates a fresh context
+      // rather than returning the stale freed pointer.
+      server->h3Contexts_.erase(cnx);
       // Forward almost_ready event to h3zero
       return h3zero_callback(
           cnx, stream_id, bytes, length, fin_or_event, h3Ctx, v_stream_ctx);
