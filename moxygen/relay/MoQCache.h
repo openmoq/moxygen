@@ -59,11 +59,6 @@ class MoQCache {
       std::shared_ptr<FetchConsumer> consumer,
       std::shared_ptr<Publisher> upstream);
 
-  struct PurgeResult {
-    size_t evicted{0};
-    size_t skipped{0};
-  };
-
   void clear() {
     for (auto& [ftn, track] : cache_) {
       track->evicted = true;
@@ -73,15 +68,16 @@ class MoQCache {
     totalCachedBytes_ = 0;
   }
 
-  // Evicts a specific track if it has no active subscriptions or fetches.
-  PurgeResult purgeIfIdle(const FullTrackName& ftn);
+  // Force-evicts a specific track unconditionally. Live writebacks will
+  // discover the evicted flag and stop caching, but continue forwarding data.
+  // Returns the number of tracks evicted (0 if not found, 1 otherwise).
+  size_t purge(const FullTrackName& ftn);
 
-  // Evicts all tracks that have no active subscriptions or fetches.
-  PurgeResult purgeIfIdle();
+  // Force-evicts all tracks in the given namespace unconditionally.
+  size_t purge(const TrackNamespace& ns);
 
-  // Evicts all tracks belonging to the given namespace (if not pinned).
-  // Tracks that are live or have active fetches are counted in skipped.
-  PurgeResult purgeIfIdle(const TrackNamespace& ns);
+  // Force-evicts all cached tracks unconditionally.
+  size_t purge();
 
   bool hasTrack(const FullTrackName& ftn) const {
     return cache_.contains(ftn);

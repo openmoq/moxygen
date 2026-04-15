@@ -1939,7 +1939,19 @@ void MoQCache::evictTrack(const FullTrackName& ftn) {
   XLOG(DBG1) << "Evicted track: " << ftn;
 }
 
-MoQCache::PurgeResult MoQCache::purgeIfIdle(const TrackNamespace& ns) {
+size_t MoQCache::purge(const FullTrackName& ftn) {
+  auto it = cache_.find(ftn);
+  if (it == cache_.end()) {
+    return 0;
+  }
+  // Stamp evicted before erasing so in-flight SubscribeWriteback/FetchReadback
+  // objects discover the flag and stop caching while still forwarding data.
+  it->second->evicted = true;
+  evictTrack(ftn);
+  return 1;
+}
+
+size_t MoQCache::purge(const TrackNamespace& ns) {
   // Snapshot to avoid iterator invalidation when evictTrack() modifies cache_.
   std::vector<FullTrackName> matching;
   for (auto& [ftn, _] : cache_) {
@@ -1947,36 +1959,25 @@ MoQCache::PurgeResult MoQCache::purgeIfIdle(const TrackNamespace& ns) {
       matching.push_back(ftn);
     }
   }
-  PurgeResult result;
+  size_t evicted = 0;
   for (auto& trackName : matching) {
-    auto r = purgeIfIdle(trackName);
-    result.evicted += r.evicted;
-    result.skipped += r.skipped;
+    evicted += purge(trackName);
   }
-  return result;
+  return evicted;
 }
 
-MoQCache::PurgeResult MoQCache::purgeIfIdle(const FullTrackName& ftn) {
-  auto it = cache_.find(ftn);
-  if (it == cache_.end()) {
-    return {}; // not cached, nothing to do
+size_t MoQCache::purge() {
+  // Snapshot the full cache before evicting.
+  std::vector<FullTrackName> all;
+  all.reserve(cache_.size());
+  for (auto& [ftn, track] : cache_) {
+    track->evicted = true;
+    all.push_back(ftn);
   }
-  if (it->second->canEvict()) {
-    evictTrack(ftn);
-    return {1, 0};
-  }
-  return {0, 1}; // live or has active fetches — cannot evict
-}
-
-MoQCache::PurgeResult MoQCache::purgeIfIdle() {
-  // trackLRU_ holds exactly the evictable tracks, so skipped is the remainder.
-  // Snapshot before evicting since evictTrack() mutates trackLRU_.
-  size_t skipped = cache_.size() - trackLRU_.size();
-  std::vector<FullTrackName> toEvict(trackLRU_.begin(), trackLRU_.end());
-  for (auto& trackName : toEvict) {
+  for (auto& trackName : all) {
     evictTrack(trackName);
   }
-  return {toEvict.size(), skipped};
+  return all.size();
 }
 
 void MoQCache::evictOldestGroupsIfNeeded(CacheTrack& track) {
