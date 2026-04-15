@@ -1939,6 +1939,47 @@ void MoQCache::evictTrack(const FullTrackName& ftn) {
   XLOG(DBG1) << "Evicted track: " << ftn;
 }
 
+size_t MoQCache::purge(const FullTrackName& ftn) {
+  auto it = cache_.find(ftn);
+  if (it == cache_.end()) {
+    return 0;
+  }
+  // Stamp evicted before erasing so in-flight SubscribeWriteback/FetchReadback
+  // objects discover the flag and stop caching while still forwarding data.
+  it->second->evicted = true;
+  evictTrack(ftn);
+  return 1;
+}
+
+size_t MoQCache::purge(const TrackNamespace& ns) {
+  // Snapshot to avoid iterator invalidation when evictTrack() modifies cache_.
+  std::vector<FullTrackName> matching;
+  for (auto& [ftn, _] : cache_) {
+    if (ftn.trackNamespace == ns) {
+      matching.push_back(ftn);
+    }
+  }
+  size_t evicted = 0;
+  for (auto& trackName : matching) {
+    evicted += purge(trackName);
+  }
+  return evicted;
+}
+
+size_t MoQCache::purge() {
+  // Snapshot the full cache before evicting.
+  std::vector<FullTrackName> all;
+  all.reserve(cache_.size());
+  for (auto& [ftn, track] : cache_) {
+    track->evicted = true;
+    all.push_back(ftn);
+  }
+  for (auto& trackName : all) {
+    evictTrack(trackName);
+  }
+  return all.size();
+}
+
 void MoQCache::evictOldestGroupsIfNeeded(CacheTrack& track) {
   if (maxCachedGroupsPerTrack_ == 0) {
     return; // Unlimited groups

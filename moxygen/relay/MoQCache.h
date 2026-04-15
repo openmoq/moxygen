@@ -68,6 +68,17 @@ class MoQCache {
     totalCachedBytes_ = 0;
   }
 
+  // Force-evicts a specific track unconditionally. Live writebacks will
+  // discover the evicted flag and stop caching, but continue forwarding data.
+  // Returns the number of tracks evicted (0 if not found, 1 otherwise).
+  size_t purge(const FullTrackName& ftn);
+
+  // Force-evicts all tracks in the given namespace unconditionally.
+  size_t purge(const TrackNamespace& ns);
+
+  // Force-evicts all cached tracks unconditionally.
+  size_t purge();
+
   bool hasTrack(const FullTrackName& ftn) const {
     return cache_.contains(ftn);
   }
