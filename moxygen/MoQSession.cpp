@@ -1934,6 +1934,10 @@ class MoQSession::SubscribeTrackReceiveState
             << "deliverPublishDoneAndRemove: Delivering PUBLISH_DONE to app; statusCode="
             << folly::to_underlying(pendingPublishDone_->statusCode)
             << " alias=" << alias_ << " requestID=" << requestID_;
+        MOQ_SUBSCRIBER_STATS(
+            session_->subscriberStatsCallback_,
+            onPublishDone,
+            pendingPublishDone_->statusCode);
         auto token = cancelSource_.getToken();
         auto cb = std::exchange(callback_, nullptr);
         cb->publishDone(std::move(*pendingPublishDone_));
@@ -4015,8 +4019,6 @@ void MoQSession::onPublishDone(PublishDone publishDone) {
   if (logger_) {
     logger_->logPublishDone(publishDone, ControlMessageType::PARSED);
   }
-  MOQ_SUBSCRIBER_STATS(
-      subscriberStatsCallback_, onPublishDone, publishDone.statusCode);
 
   // Handle regular subscription PUBLISH_DONE
   auto trackAliasIt = reqIdToTrackAlias_.find(publishDone.requestID);
