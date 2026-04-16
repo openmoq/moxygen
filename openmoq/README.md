@@ -69,3 +69,4 @@ ctest --test-dir _build --output-on-failure
 # Install
 cmake --install _build --prefix /tmp/moxygen-install
 ```
+
