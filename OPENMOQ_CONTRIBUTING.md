@@ -15,19 +15,32 @@ fork-local patch re-applies to every upstream sync.
 
 ## Pull request scope
 
-**One PR = one cohesive thesis.** A reviewer should be able to read the
-title and predict the diff.
+**One PR = one cohesive thesis.** A reviewer should be able to read
+the title and predict the diff.
 
 - ✅ "fix: MoQForwarder::Subscriber::onPublishOk now updates forwardingSubscribers_"
 - ❌ "various fixes and cleanups" (no thesis)
 - ❌ "feature X + refactor Y" (split it)
 
+## PR state
+
+A PR that looks useful and has all checks green will be merged when a
+maintainer is available. No extra nudge needed. Use PR state to signal
+intent:
+
+- **Draft** — not ready for merge or review. Draft PRs don't
+  auto-request reviewers and don't run CI.
+- **Ready** (non-draft) — ready for merge once review and CI pass.
+- **Prefix title with `WIP:`** — you want review and CI feedback, but
+  are not yet ready for the PR to be merged. Maintainers won't merge
+  `WIP:` PRs regardless of check state.
+
 ## How to contribute
 
-- **Outside contributors**: fork this repo, push a branch, open a PR
+- **Outside contributors**: fork the repo, push a branch, open a PR
   against `main`.
-- **Org members**: push a feature branch to this repo, open a PR
-  against `main`.
+- **Org members**: push a feature branch directly to this repo, open a
+  PR against `main`.
 
 CI runs on every PR with no secrets exposed. Publish, release, and
 deploy only run on `push: main` after merge.
@@ -43,6 +56,13 @@ At least one approving review from a collaborator is required.
 on GitHub or on
 [Reviewable](https://reviewable.io/reviews/openmoq/moxygen); either is
 fine.
+
+**Admin override** (`gh pr merge --admin`) is reserved for:
+- CI/infrastructure repairs where branch protection itself is the block.
+- Release-critical merges under urgency.
+- Documentation-only changes when waiting costs more than reviewing.
+
+Note the override in the PR description: `Admin override: <reason>`.
 
 ## CI
 
@@ -60,6 +80,7 @@ workflow edit in the same PR.
 ## Branches
 
 - `main` — the working branch; all openmoq customizations live here.
+  Releases are tagged from `main`.
 - `upstream` — mirror of `facebookexperimental/moxygen:main`, advanced
   automatically by the daily sync workflow. Do not push to it.
 - `sync/<sha>` — sync PR branches opened by the sync bot when upstream
@@ -74,9 +95,19 @@ mirrors `facebookexperimental/moxygen:main` to `upstream` and opens a
 auto-merges on green CI; conflicts are resolved by pushing fixes to the
 `sync/<sha>` branch.
 
-For files that conflict repeatedly (`cmake/moxygen-config.cmake.in`,
-`moxygen/CMakeLists.txt`), prefer upstreaming a fix to Meta rather than
-carrying a local patch.
+For files that conflict repeatedly
+(`cmake/moxygen-config.cmake.in`, `moxygen/CMakeLists.txt`), prefer
+upstreaming a fix to Meta rather than carrying a local patch.
+
+## Releases
+
+`main` produces rolling `snapshot-latest` artifacts on every push via
+the publish workflow. Versioned releases are cut manually from `main`
+using the `version release` workflow
+([.github/workflows/omoq-version-release.yml](.github/workflows/omoq-version-release.yml)):
+Actions → *version release* → *Run workflow* → enter a version. The
+workflow tags `main` and promotes the current snapshot-latest
+artifacts to a non-prerelease GitHub release.
 
 ## Merge
 
@@ -90,5 +121,6 @@ Maintainers with merge rights: @afrind, @gmarzot, @suhasHere. The
 
 ## Security & License
 
-Report security issues via [SECURITY.md](SECURITY.md). By contributing
-you agree your changes are licensed under [LICENSE](LICENSE).
+Report security issues via [SECURITY.md](SECURITY.md). Do not file
+public issues for security reports. By contributing you agree your
+changes are licensed under [LICENSE](LICENSE).
