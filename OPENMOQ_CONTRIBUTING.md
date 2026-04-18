@@ -1,110 +1,94 @@
 # Contributing to openmoq/moxygen
 
-Contributions to this fork of moxygen are welcome from anyone.
+This is openmoq's fork of
+[facebookexperimental/moxygen](https://github.com/facebookexperimental/moxygen),
+maintained with minimal divergence. Contributions welcome from anyone.
 
-## Quick start
+## Guiding principle
 
-- **Not a collaborator?** Fork this repo, push to your fork, open a PR against
-  `openmoq/moxygen:main`.
-- **Are a collaborator?** Push a feature branch directly to this repo, open
-  a PR against `main`.
+> Producing code in the era of AI is cheap. Reviewer attention is the
+> scarce resource. We optimize our workflow for human review.
 
-Every PR runs the same CI gate regardless of origin. Merge is performed by
-a maintainer once checks are green and at least one review is approving.
+Because this is a fork: **prefer upstreaming over carrying local
+changes.** A patch accepted upstream has zero sync cost forever; a
+fork-local patch re-applies to every upstream sync.
 
-## For outside contributors (fork-based PRs)
+## Pull request scope
 
-1. **Fork** this repository on GitHub.
-2. **Clone** your fork and create a feature branch:
-   ```
-   git clone git@github.com:<you>/moxygen.git
-   cd moxygen
-   git checkout -b my-change
-   ```
-3. **Make your change**, keeping commits small and focused.
-4. **Push** to your fork and **open a PR** targeting `openmoq/moxygen:main`.
-5. The CI pipeline runs on your PR without any secrets available — it can
-   read public artifacts and the public repo, nothing more. If your change
-   passes CI and review, a maintainer will merge it.
+**One PR = one cohesive thesis.** A reviewer should be able to read the
+title and predict the diff.
 
-First-time contributors may see a "Waiting for approval" status on their
-first PR's Actions run — this is a security gate on public repos. A
-maintainer will click "Approve and run" once they've glanced at the PR.
-Subsequent PRs from the same contributor run automatically.
+- ✅ "fix: MoQForwarder::Subscriber::onPublishOk now updates forwardingSubscribers_"
+- ❌ "various fixes and cleanups" (no thesis)
+- ❌ "feature X + refactor Y" (split it)
 
-## For openmoq org members (direct-branch PRs)
+## How to contribute
 
-Org members with write access can push branches directly into this repo
-instead of forking:
+- **Outside contributors**: fork this repo, push a branch, open a PR
+  against `main`.
+- **Org members**: push a feature branch to this repo, open a PR
+  against `main`.
 
-1. Clone this repo, create a branch, push it.
-2. Open a PR against `main`.
-3. CI runs with the same permissions as a fork PR — no org secrets are
-   exposed to the PR's CI context. Publish/release/deploy steps only run
-   on `push: main` after merge.
+CI runs on every PR with no secrets exposed. Publish, release, and
+deploy only run on `push: main` after merge.
 
-Use any descriptive branch name. The repo is configured to automatically
-delete merged branches, so there is no need to clean up.
-
-## What CI checks
-
-All of the following must pass before a PR can be merged:
-
-- `check-format` — clang-format + header/license checks (`scripts/format.sh --check`)
-- `linux` — build + run tests on Ubuntu 22.04
-- `macos` — build + run tests on macOS
-- `asan debug` — build with AddressSanitizer + run tests
-
-See [.github/workflows/omoq-ci-pr.yml](.github/workflows/omoq-ci-pr.yml)
-for the full pipeline. Each job also publishes a test report that appears
-as an annotated check on the PR.
-
-If your change legitimately needs a CI update (new dep, new platform,
-adjusted flags), include the workflow edit in the same PR.
+First-time fork PRs may show "Waiting for approval" on Actions — a
+maintainer will unblock it; subsequent PRs from the same contributor
+run automatically.
 
 ## Reviews
 
-At least **one approving review** is required before merge. Reviews can
-come from any collaborator with write access — they do not have to come
-from a designated code owner.
+At least one approving review from a collaborator is required.
+[CODEOWNERS](CODEOWNERS) auto-requests reviewers. Review is available
+on GitHub or on
+[Reviewable](https://reviewable.io/reviews/openmoq/moxygen); either is
+fine.
 
-[CODEOWNERS](CODEOWNERS) lists the active reviewer pool; those users are
-auto-requested for review when a PR opens. Anyone else in the collaborator
-list can also review on their own initiative.
+## CI
 
-We use [Reviewable](https://reviewable.io/reviews/openmoq/moxygen) for
-multi-round review discussion alongside GitHub's native review interface.
-Either is acceptable.
+Every PR must pass before merge:
 
-## Merge process
+- `check-format` — clang-format + license headers
+- `linux` — build + test on Ubuntu 22.04
+- `macos` — build + test on macOS
+- `asan debug` — build + test with AddressSanitizer
 
-Merging is restricted to a small rotation of maintainers via GitHub branch
-protection. The current maintainers holding the merge button are:
+See [.github/workflows/omoq-ci-pr.yml](.github/workflows/omoq-ci-pr.yml).
+If a change needs a CI update (new dep, platform, flag), include the
+workflow edit in the same PR.
 
-- @afrind
-- @gmarzot
-- @suhasHere
+## Branches
 
-In addition, the `omoq-sync-bot` GitHub App performs automated merges of
-upstream-sync PRs after they pass CI.
+- `main` — the working branch; all openmoq customizations live here.
+- `upstream` — mirror of `facebookexperimental/moxygen:main`, advanced
+  automatically by the daily sync workflow. Do not push to it.
+- `sync/<sha>` — sync PR branches opened by the sync bot when upstream
+  advances. Collaborators may push conflict fixes to these.
 
-**Merge style**: We use **squash merge**. The squashed commit uses the PR
-title verbatim as its message (body is empty). Contributors do **not**
-need to pre-squash commits in their branch — the squash happens server-side
-when the maintainer clicks "Squash and merge".
+## Upstream sync
 
-If you want your commit history on main to read well, make sure your PR
-title accurately summarizes the change. The PR body stays on the PR page
-for future reference, but is not reflected in the commit message.
+A daily workflow
+([.github/workflows/omoq-upstream-sync.yml](.github/workflows/omoq-upstream-sync.yml))
+mirrors `facebookexperimental/moxygen:main` to `upstream` and opens a
+`sync/<sha>` PR against `main` when upstream advances. The PR
+auto-merges on green CI; conflicts are resolved by pushing fixes to the
+`sync/<sha>` branch.
 
-## Security
+For files that conflict repeatedly (`cmake/moxygen-config.cmake.in`,
+`moxygen/CMakeLists.txt`), prefer upstreaming a fix to Meta rather than
+carrying a local patch.
 
-Please report security issues via the process described in
-[SECURITY.md](SECURITY.md). Do not file public issues for security
-reports.
+## Merge
 
-## License
+PRs are squash-merged; the PR title becomes the commit message on
+`main`, so write titles that summarize the change well. Branch commit
+organization (rebase, amend, multiple commits) is up to the author —
+it has no effect on the merged result.
 
-By contributing to this project, you agree that your contributions will be
-licensed under the [LICENSE](LICENSE) file in the root directory of this
-source tree.
+Maintainers with merge rights: @afrind, @gmarzot, @suhasHere. The
+`omoq-sync-bot` GitHub App merges upstream-sync PRs automatically.
+
+## Security & License
+
+Report security issues via [SECURITY.md](SECURITY.md). By contributing
+you agree your changes are licensed under [LICENSE](LICENSE).
