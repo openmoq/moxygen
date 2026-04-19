@@ -5,6 +5,7 @@
  */
 
 #include <moxygen/relay/MoQCache.h>
+#include <moxygen/MoQTrackProperties.h>
 #include <moxygen/util/BidiIterator.h>
 
 #include <folly/logging/xlog.h>
@@ -1606,9 +1607,26 @@ void MoQCache::clearMaxCacheDuration(const FullTrackName& ftn) {
   }
 }
 
+std::optional<std::chrono::milliseconds> MoQCache::getEffectiveCacheDuration(
+    const Extensions& extensions) const {
+  if (auto ms = detail::getIntExtension(extensions, kMaxCacheDurationExtensionType)) {
+    auto dur = std::chrono::milliseconds(*ms);
+    if (maxAllowedCacheDuration_) {
+      dur = std::min(dur, *maxAllowedCacheDuration_);
+    }
+    return dur;
+  }
+  return defaultMaxCacheDuration_;
+}
+
 void MoQCache::setTrackExtensions(
     const FullTrackName& ftn,
     Extensions extensions) {
+  if (auto dur = getEffectiveCacheDuration(extensions)) {
+    setMaxCacheDuration(ftn, *dur);
+  } else {
+    clearMaxCacheDuration(ftn);
+  }
   auto it = cache_.find(ftn);
   if (it == cache_.end()) {
     it = cache_.emplace(ftn, std::make_shared<CacheTrack>()).first;

@@ -127,11 +127,6 @@ class MoQCache {
     }
   }
 
-  void setMaxCacheDuration(
-      const FullTrackName& ftn,
-      std::chrono::milliseconds duration);
-  void clearMaxCacheDuration(const FullTrackName& ftn);
-
   // Sets the default max cache duration applied to all tracks that do not have
   // a per-track duration set via setMaxCacheDuration(). Pass std::nullopt to
   // remove the default (objects never expire by default).
@@ -141,6 +136,17 @@ class MoQCache {
   }
   std::optional<std::chrono::milliseconds> getDefaultMaxCacheDuration() const {
     return defaultMaxCacheDuration_;
+  }
+
+  // Sets a hard upper bound on per-track cache durations. Any value passed to
+  // setMaxCacheDuration() that exceeds this cap is clamped to it. Pass
+  // std::nullopt to remove the cap.
+  void setMaxAllowedCacheDuration(
+      std::optional<std::chrono::milliseconds> duration) {
+    maxAllowedCacheDuration_ = duration;
+  }
+  std::optional<std::chrono::milliseconds> getMaxAllowedCacheDuration() const {
+    return maxAllowedCacheDuration_;
   }
 
   void setTrackExtensions(const FullTrackName& ftn, Extensions extensions);
@@ -339,6 +345,10 @@ class MoQCache {
   // std::nullopt means objects do not expire by default.
   std::optional<std::chrono::milliseconds> defaultMaxCacheDuration_;
 
+  // Hard cap on per-track durations set via setMaxCacheDuration().
+  // std::nullopt means no cap is enforced.
+  std::optional<std::chrono::milliseconds> maxAllowedCacheDuration_;
+
   // Injectable clock for testing
   std::function<TimePoint()> clock_;
 
@@ -365,6 +375,15 @@ class MoQCache {
   folly::coro::Task<folly::Expected<folly::Unit, FetchError>> handleBlocked(
       std::shared_ptr<FetchConsumer> consumer,
       const Fetch& fetch);
+
+  void setMaxCacheDuration(
+      const FullTrackName& ftn,
+      std::chrono::milliseconds duration);
+  void clearMaxCacheDuration(const FullTrackName& ftn);
+  // Returns publisher duration (clamped to maxAllowedCacheDuration_), or
+  // defaultMaxCacheDuration_, or nullopt if neither is set.
+  std::optional<std::chrono::milliseconds> getEffectiveCacheDuration(
+      const Extensions& extensions) const;
 
   // Track LRU management helpers
   void addTrackToLRU(const FullTrackName& ftn, CacheTrack& track);
