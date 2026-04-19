@@ -2426,6 +2426,32 @@ TEST_F(MoQCacheTest, TestPerTrackDurationOverridesDefault) {
   EXPECT_FALSE(cache_.hasCachedObject(kTestTrackName, {0, 0}));
 }
 
+TEST_F(MoQCacheTest, TestZeroDefaultDurationSkipsCaching) {
+  // defaultMaxCacheDuration=0ms + no publisher duration → objects not cached.
+  cache_.setDefaultMaxCacheDuration(std::chrono::milliseconds(0));
+  cache_.setTrackExtensions(kTestTrackName, Extensions{});
+  populateCacheRange({0, 0}, {0, 5});
+
+  EXPECT_FALSE(cache_.hasCachedObject(kTestTrackName, {0, 0}));
+  EXPECT_FALSE(cache_.hasCachedObject(kTestTrackName, {0, 4}));
+}
+
+TEST_F(MoQCacheTest, TestZeroDefaultDurationPublisherOverrides) {
+  // defaultMaxCacheDuration=0ms but publisher sets 1000ms → objects are cached.
+  auto currentTime = MoQCache::SteadyClock::now();
+  cache_.setClockForTesting([&currentTime]() { return currentTime; });
+
+  cache_.setDefaultMaxCacheDuration(std::chrono::milliseconds(0));
+  cache_.setTrackExtensions(kTestTrackName, makeCacheDurationExt(1000));
+  populateCacheRange({0, 0}, {0, 5});
+
+  EXPECT_TRUE(cache_.hasCachedObject(kTestTrackName, {0, 0}));
+
+  // Past publisher TTL
+  currentTime += std::chrono::milliseconds(1001);
+  EXPECT_FALSE(cache_.hasCachedObject(kTestTrackName, {0, 0}));
+}
+
 TEST_F(MoQCacheTest, TestMaxAllowedCacheDurationClampsPublisher) {
   // Publisher requests 2000ms but cap is 500ms — objects expire at 500ms.
   auto currentTime = MoQCache::SteadyClock::now();

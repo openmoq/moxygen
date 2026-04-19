@@ -440,7 +440,7 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
       Payload payload,
       Extensions ext,
       bool finSub) override {
-    if (cacheTrack_.evicted) {
+    if (cacheTrack_.shouldSkipCaching()) {
       return consumer_->object(
           objID, std::move(payload), std::move(ext), finSub);
     }
@@ -482,7 +482,7 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
       uint64_t length,
       Payload initialPayload,
       Extensions extensions) override {
-    if (cacheTrack_.evicted) {
+    if (cacheTrack_.shouldSkipCaching()) {
       return consumer_->beginObject(
           objectID, length, std::move(initialPayload), std::move(extensions));
     }
@@ -526,7 +526,7 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
   folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
       Payload payload,
       bool finSubgroup) override {
-    if (cacheTrack_.evicted) {
+    if (cacheTrack_.shouldSkipCaching()) {
       return consumer_->objectPayload(std::move(payload), finSubgroup);
     }
     auto& object = cacheGroup_.objects[currentObject_];
@@ -550,7 +550,7 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
 
   folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
       uint64_t endOfGroupObjectID) override {
-    if (cacheTrack_.evicted) {
+    if (cacheTrack_.shouldSkipCaching()) {
       return consumer_->endOfGroup(endOfGroupObjectID);
     }
     auto res = cacheTrack_.updateLargest({group_, endOfGroupObjectID});
@@ -578,7 +578,7 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
 
   folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
       uint64_t endOfTrackObjectID) override {
-    if (cacheTrack_.evicted) {
+    if (cacheTrack_.shouldSkipCaching()) {
       return consumer_->endOfTrackAndGroup(endOfTrackObjectID);
     }
     auto res = cacheTrack_.updateLargest({group_, endOfTrackObjectID}, true);
@@ -669,7 +669,7 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
       bool /*containsLastInGroup*/ = false) override {
     // TODO: Handle containsLastInGroup parameter when caching
     auto res = consumer_->beginSubgroup(groupID, subgroupID, priority);
-    if (res.hasValue() && !track_.evicted) {
+    if (res.hasValue() && !track_.shouldSkipCaching()) {
       track_.getOrCreateGroup(groupID, &cache_);
       return std::make_shared<SubgroupWriteback>(
           groupID,
@@ -892,7 +892,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
       Extensions ext,
       bool fin,
       bool forwardingPreferenceIsDatagram = false) override {
-    if (fetchRangeIt_.track->evicted) {
+    if (fetchRangeIt_.track->shouldSkipCaching()) {
       return consumer_->object(
           gID,
           sgID,
@@ -942,7 +942,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
       uint64_t len,
       Payload initPayload,
       Extensions ext) override {
-    if (fetchRangeIt_.track->evicted) {
+    if (fetchRangeIt_.track->shouldSkipCaching()) {
       return consumer_->beginObject(
           gID, sgID, objID, len, std::move(initPayload), std::move(ext));
     }
@@ -970,7 +970,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
   folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
       Payload payload,
       bool finFetch) override {
-    if (fetchRangeIt_.track->evicted) {
+    if (fetchRangeIt_.track->shouldSkipCaching()) {
       return consumer_->objectPayload(
           std::move(payload), finFetch && proxyFin_);
     }
@@ -1000,7 +1000,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
 
   folly::Expected<folly::Unit, MoQPublishError>
   endOfGroup(uint64_t gID, uint64_t sgID, uint64_t objID, bool fin) override {
-    if (fetchRangeIt_.track->evicted) {
+    if (fetchRangeIt_.track->shouldSkipCaching()) {
       return consumer_->endOfGroup(gID, sgID, objID, fin && proxyFin_);
     }
     constexpr auto kEndOfGroup = ObjectStatus::END_OF_GROUP;
@@ -1014,7 +1014,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
 
   folly::Expected<folly::Unit, MoQPublishError>
   endOfTrackAndGroup(uint64_t gID, uint64_t sgID, uint64_t objID) override {
-    if (fetchRangeIt_.track->evicted) {
+    if (fetchRangeIt_.track->shouldSkipCaching()) {
       return consumer_->endOfTrackAndGroup(gID, sgID, objID);
     }
     constexpr auto kEndOfTrack = ObjectStatus::END_OF_TRACK;

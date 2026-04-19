@@ -287,6 +287,12 @@ class MoQCache {
     bool canEvict() const {
       return liveWritebackCount == 0 && activeFetchCount == 0;
     }
+
+    // Returns true if objects should be forwarded without caching.
+    // Optimistic: nullopt maxCacheDuration means "unknown, cache it".
+    bool shouldSkipCaching() const {
+      return evicted || (maxCacheDuration && maxCacheDuration->count() == 0);
+    }
   };
 
   // Group-order-aware iterator for traversing groups (objects within groups
