@@ -95,12 +95,11 @@ jobs:
             "${ASAN_FLAGS[@]}" "${EXTRA_FLAGS[@]}"
 
       - name: Build
-        # asan debug on the 16 GB Linode runner OOMs under -j$(nproc)
-        # during test compilation (cc1plus killed). Match the publish-job
-        # cap of -j6 to leave memory headroom.
+        # asan debug runs on the Linode self-hosted runner; leave 2 cores
+        # of headroom to avoid cc1plus OOM during test compilation.
         run: |
           if [ "${{ matrix.name }}" = "asan debug" ]; then
-            cmake --build _build -j6
+            cmake --build _build -j$(( $(getconf _NPROCESSORS_ONLN) - 2 ))
           else
             cmake --build _build -j$(getconf _NPROCESSORS_ONLN)
           fi
@@ -217,10 +216,10 @@ jobs:
             "${EXTRA_FLAGS[@]}"
 
       - name: Build
-        # Cap parallel jobs to avoid OOM during the link phase (publish
-        # build OOMed at -j8 on the 16 GB Linode runner during MoQTests
-        # link). -j6 keeps most throughput while leaving headroom.
-        run: cmake --build _build -j6
+        # Leave 2 cores of headroom for the Linode bookworm-amd64 publish
+        # job to avoid OOM during MoQTests link (was -j6 pre-resize).
+        # GitHub-hosted matrix entries (ubuntu/macos/arm) are also fine here.
+        run: cmake --build _build -j$(( $(getconf _NPROCESSORS_ONLN) - 2 ))
 
       - name: Install
         run: cmake --install _build
