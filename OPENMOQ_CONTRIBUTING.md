@@ -87,6 +87,8 @@ workflow edit in the same PR.
   automatically by the daily sync workflow. Do not push to it.
 - `sync/<sha>` — sync PR branches opened by the sync bot when upstream
   advances. Collaborators may push conflict fixes to these.
+- `devops/*`, `feature/*`, `fix/*`, `hotfix/*` — working branches for
+  feature work, bug fixes, and infra. Convention only, no enforcement.
 
 ## Upstream sync
 
