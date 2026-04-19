@@ -95,8 +95,7 @@ jobs:
             "${ASAN_FLAGS[@]}" "${EXTRA_FLAGS[@]}"
 
       - name: Build
-        # asan debug runs on the Linode self-hosted runner; leave 2 cores
-        # of headroom to avoid cc1plus OOM during test compilation.
+        # Linode (asan debug): -j(n-2) reserves 2 cores for co-resident workloads.
         run: |
           if [ "${{ matrix.name }}" = "asan debug" ]; then
             cmake --build _build -j$(( $(getconf _NPROCESSORS_ONLN) - 2 ))
@@ -216,9 +215,8 @@ jobs:
             "${EXTRA_FLAGS[@]}"
 
       - name: Build
-        # Leave 2 cores of headroom for the Linode bookworm-amd64 publish
-        # job to avoid OOM during MoQTests link (was -j6 pre-resize).
-        # GitHub-hosted matrix entries (ubuntu/macos/arm) are also fine here.
+        # -j(n-2): on Linode reserves cores for co-resident workloads;
+        # GitHub-hosted entries (ubuntu/macos/arm) tolerate it fine.
         run: cmake --build _build -j$(( $(getconf _NPROCESSORS_ONLN) - 2 ))
 
       - name: Install
