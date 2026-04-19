@@ -41,10 +41,20 @@ jobs:
             name: asan debug
             cache_prefix: ci-asan-ubuntu-22.04
     name: ${{ matrix.name }}
-    runs-on: ${{ (matrix.linode && !github.event.pull_request.head.repo.fork) && fromJSON('["self-hosted","linode"]') || matrix.runner }}
+    runs-on: ${{ fromJSON(matrix.linode && !github.event.pull_request.head.repo.fork && '["self-hosted","linode"]' || format('["{0}"]', matrix.runner)) }}
     env:
       USE_LINODE: ${{ (matrix.linode && !github.event.pull_request.head.repo.fork) && 'true' || 'false' }}
     steps:
+      - name: Debug runner selection
+        run: |
+          echo "matrix.name=${{ matrix.name }}"
+          echo "matrix.runner=${{ matrix.runner }}"
+          echo "matrix.linode=${{ matrix.linode }}"
+          echo "head.repo.fork=${{ github.event.pull_request.head.repo.fork }}"
+          echo "USE_LINODE=$USE_LINODE"
+          echo "runner.name=$RUNNER_NAME"
+          echo "runner.os=$RUNNER_OS"
+
       - name: Fix workspace ownership (self-hosted)
         if: env.USE_LINODE == 'true'
         run: |
