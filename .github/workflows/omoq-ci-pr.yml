@@ -41,20 +41,15 @@ jobs:
             name: asan debug
             cache_prefix: ci-asan-ubuntu-22.04
     name: ${{ matrix.name }}
-    runs-on: ${{ fromJSON(matrix.linode && !github.event.pull_request.head.repo.fork && '["self-hosted","linode"]' || format('["{0}"]', matrix.runner)) }}
+    # Same-repo PRs can use the Linode self-hosted runner; cross-repo (fork)
+    # PRs fall back to matrix.runner since self-hosted on forks requires
+    # per-run admin approval. Note: head.repo.fork is NOT the right check —
+    # openmoq/moxygen is itself a fork of facebookexperimental/moxygen, so
+    # that flag is always true. Compare full_name to github.repository instead.
+    runs-on: ${{ fromJSON(matrix.linode && github.event.pull_request.head.repo.full_name == github.repository && '["self-hosted","linode"]' || format('["{0}"]', matrix.runner)) }}
     env:
-      USE_LINODE: ${{ (matrix.linode && !github.event.pull_request.head.repo.fork) && 'true' || 'false' }}
+      USE_LINODE: ${{ (matrix.linode && github.event.pull_request.head.repo.full_name == github.repository) && 'true' || 'false' }}
     steps:
-      - name: Debug runner selection
-        run: |
-          echo "matrix.name=${{ matrix.name }}"
-          echo "matrix.runner=${{ matrix.runner }}"
-          echo "matrix.linode=${{ matrix.linode }}"
-          echo "head.repo.fork=${{ github.event.pull_request.head.repo.fork }}"
-          echo "USE_LINODE=$USE_LINODE"
-          echo "runner.name=$RUNNER_NAME"
-          echo "runner.os=$RUNNER_OS"
-
       - name: Fix workspace ownership (self-hosted)
         if: env.USE_LINODE == 'true'
         run: |
