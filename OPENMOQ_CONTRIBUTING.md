@@ -1,35 +1,40 @@
 # Contributing to openmoq/moxygen
 
-Fork of
-[facebookexperimental/moxygen](https://github.com/facebookexperimental/moxygen),
-maintained with minimal divergence. Contributions welcome.
+This document describes guidelines for contributing **directly to the
+`openmoq/moxygen` buffer fork repo**. This repo is a community-maintained
+fork of [facebookexperimental/moxygen](https://github.com/facebookexperimental/moxygen),
+for use within OpenMOQ projects and may contain local customizations, or changes that have yet to be absorbed by the upstream parent repo.
 
-## Guiding principle
+> **Note:** Whenever possible, if a contribution applies to core `moxygen` functionality, the PR submission should be made to the upstream parent repo. Contributions to upstream Meta moxygen repo are governed by [CONTRIBUTING.md](CONTRIBUTING.md) and that document does not apply to contributions made directly to this repo.
 
-> Producing code in the era of AI is cheap. Reviewer attention is the
-> scarce resource.
+Openness and community participation are foundational principles of the OpenMOQ Consortium. All are welcome and encouraged to use the software here freely, and contribute to testing, fixing, and enhancing the code when possible.
 
-Because this is a fork: **prefer upstreaming over carrying local
-changes.** Upstreamed patches have zero sync cost; fork-local ones
-re-apply to every sync.
+The following describes the general philosophy and approach for handling contributions. The process remains flexible and subject to review, and may change in the future. The ultimate goal is to facilitate the production of high-quality, high-performance, professional-grade software.
 
-## Pull request scope
+## Pull request scope and content
 
-**One PR = one cohesive thesis.** A reviewer should read the title and
-predict the diff.
+**Each PR should address a single and logically cohesive thesis.**
 
-- ✅ `fix: MoQForwarder::Subscriber::onPublishOk updates forwardingSubscribers_`
-- ❌ `various fixes and cleanups`
-- ❌ `feature X + refactor Y` (split it)
+This makes reviews more approachable and more likely to occur. Avoid bundling various unrelated changes and ad hoc changes.
+
+The following is a list of ideals for PR content — developer
+discretion and sound judgement is expected:
+
+- The title should clearly reflect the functional impact of the PR (in most cases this becomes the commit message on the merge commit).
+- The description should contain additional technical details and solution rationale.
+- If the PR addresses an existing issue, reference it in the description — `Fixes #N` to auto-close on merge, or `Refs #N` for partial or related work.
+- Tests or other evaluation criteria should be included for independent pass/fail evaluation (including unit tests where possible).
+- Relevant logs, developer test output, or other supporting material may be attached to support the review process.
 
 ## PR state
 
-Useful PRs with all checks green are merged when a maintainer is
-available. Signal intent:
+PRs with all checks passing may be merged by maintainers at
+unpredictable times based on availability and relative priority. The
+author can signal merge intent in the following ways:
 
 - **Draft** — not ready for review. No auto-reviewer request; CI still runs.
-- **Ready** (non-draft, no `WIP:` prefix) — merge when green.
-- **`WIP:` prefix** — ready for review and CI, not for merge.
+- **`WIP:` prefix** — ready for review and CI, not ready for merge.
+- **Ready** (non-draft, no `WIP:` prefix) — merge when all checks pass.
 
 ## How to contribute
 
@@ -49,9 +54,10 @@ At least one approving review from a collaborator is required.
 [Reviewable](https://reviewable.io/reviews/openmoq/moxygen).
 
 **Admin override** (`gh pr merge --admin`) is for:
+
 - CI/infrastructure repairs blocked by branch protection itself.
 - Release-critical merges under urgency.
-- Docs-only changes when waiting costs more than reviewing.
+- Docs-only or other low/no-risk changes.
 
 Note the override in the PR description: `Admin override: <reason>`.
 
@@ -59,24 +65,23 @@ Note the override in the PR description: `Admin override: <reason>`.
 
 Every PR must pass:
 
-- `check-format` — clang-format + license headers
-- `linux` — build + test on Ubuntu 22.04
-- `macos` — build + test on macOS
-- `asan debug` — build + test with AddressSanitizer
+- `check-format` — clang-format + license headers.
+- `linux` — build + test on Ubuntu 22.04.
+- `macos` — build + test on macOS.
+- `asan debug` — build + test with AddressSanitizer.
 
 See [.github/workflows/omoq-ci-pr.yml](.github/workflows/omoq-ci-pr.yml).
 CI changes go in the same PR as the code that needs them.
 
 ## Branches
 
-- `main` — working branch; all openmoq customizations live here.
-  Releases are tagged from `main`.
-- `upstream` — mirror of `facebookexperimental/moxygen:main`, advanced
-  by the daily sync workflow. Do not push to it.
-- `sync/<sha>` — sync PR branches from the sync bot. Push conflict
-  fixes as needed.
-- `devops/*`, `feature/*`, `fix/*`, `hotfix/*` — working branches.
-  Convention only.
+- `main` — working branch; all openmoq customizations live here. Releases are tagged from `main`.
+- `upstream` — mirror of `facebookexperimental/moxygen:main`, advanced by the daily sync workflow. Do not push to it.
+- `sync/<sha>` — sync PR branches from the sync bot. Push conflict fixes as needed.
+- `devops/*`, `feature/*`, `fix/*`, `hotfix/*` — convention only, no enforcement.
+
+The specific suffix branch name is up to the developer — something
+informative is often helpful (please clean up stale branches).
 
 ## Upstream sync
 
@@ -86,8 +91,8 @@ opens a `sync/<sha>` PR against `main`. Auto-merges on green CI;
 conflicts are resolved on the `sync/<sha>` branch.
 
 Files that conflict repeatedly — `cmake/moxygen-config.cmake.in`,
-`moxygen/CMakeLists.txt` — prefer upstreaming a fix to Meta over
-a local patch.
+`moxygen/CMakeLists.txt` — prefer upstreaming a fix to Meta over a
+local patch.
 
 ## Releases
 
@@ -100,13 +105,17 @@ artifacts to a non-prerelease.
 
 ## Merge
 
-PRs are squash-merged; the PR title becomes the commit message on `main`.
-Authors are encouraged to maintain a concise, informative commit
-history on the branch — it aids review. Request a merge commit in the
-PR description if preserving history on `main` is warranted.
+PRs are squash-merged; the PR title becomes the commit message on
+`main`. Authors are encouraged to maintain a concise, informative
+commit history on the branch — it aids review. Authors may request a
+merge commit in the PR description if preserving history on `main` is
+warranted.
 
-Maintainers with merge rights: @afrind, @gmarzot, @suhasHere. The
+Merges are conducted by maintainers with merge privileges, in
+accordance with the philosophy described in this document. The
 `omoq-sync-bot` App merges sync PRs automatically.
+
+> **Note:** *Delete branch on merge* is the current default setting.
 
 ## Security & License
 
