@@ -5,7 +5,7 @@ This document describes guidelines for contributing **directly to the
 fork of [facebookexperimental/moxygen](https://github.com/facebookexperimental/moxygen),
 for use within OpenMOQ projects and may contain local customizations, or changes that have yet to be absorbed by the upstream parent repo.
 
-> **Note:** Whenever possible, if a contribution applies to core `moxygen` functionality, the PR submission should be made to the upstream parent repo. Contributions to upstream Meta moxygen repo are governed by [CONTRIBUTING.md](CONTRIBUTING.md) and that document does not apply to contributions made directly to this repo.
+> **Note:** Whenever possible, if a contribution applies to core `moxygen` functionality, the PR submission should be made to the upstream parent repo. Contributions to upstream Meta moxygen repo are governed by [the upstream `CONTRIBUTING.md`](https://github.com/facebookexperimental/moxygen/blob/main/CONTRIBUTING.md) and that document does not apply to contributions made directly to this repo.
 
 Openness and community participation are foundational principles of the OpenMOQ Consortium. All are welcome and encouraged to use the software here freely, and contribute to testing, fixing, and enhancing the code when possible.
 
