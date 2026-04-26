@@ -105,11 +105,8 @@ artifacts to a non-prerelease.
 
 ## Merge
 
-PRs are squash-merged; the PR title becomes the commit message on
-`main`. Authors are encouraged to maintain a concise, informative
-commit history on the branch — it aids review. Authors may request a
-merge commit in the PR description if preserving history on `main` is
-warranted.
+PRs are squash-merged by default; in which case, the PR title becomes the commit message on
+`main`. `Rebase merge` may be used at the authors request, or when preserving history on `main` is warranted. Authors are encouraged to maintain a concise, informative commit history on their branch — it aids in review.
 
 Merges are conducted by maintainers with merge privileges, in
 accordance with the philosophy described in this document. The
