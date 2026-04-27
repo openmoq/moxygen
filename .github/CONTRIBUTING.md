@@ -1,9 +1,10 @@
 # Contributing to openmoq/moxygen
 
 This document describes guidelines for contributing **directly to the
-`openmoq/moxygen` buffer fork repo**. This repo is a community-maintained
-fork of [facebookexperimental/moxygen](https://github.com/facebookexperimental/moxygen),
-for use within OpenMOQ projects and may contain local customizations, or changes that have yet to be absorbed by the upstream parent repo.
+`openmoq/moxygen` fork repo** — a community-maintained fork of
+[facebookexperimental/moxygen](https://github.com/facebookexperimental/moxygen)
+for use within OpenMOQ projects. It maintains local customizations and may
+carry changes not yet merged upstream.
 
 > **Note:** Whenever possible, if a contribution applies to core `moxygen` functionality, the PR submission should be made to the upstream parent repo. Contributions to upstream Meta moxygen repo are governed by [the upstream `CONTRIBUTING.md`](https://github.com/facebookexperimental/moxygen/blob/main/CONTRIBUTING.md) and that document does not apply to contributions made directly to this repo.
 
@@ -105,8 +106,11 @@ artifacts to a non-prerelease.
 
 ## Merge
 
-PRs are squash-merged by default; in which case, the PR title becomes the commit message on
-`main`. `Rebase merge` may be used at the authors request, or when preserving history on `main` is warranted. Authors are encouraged to maintain a concise, informative commit history on their branch — it aids in review.
+By default, PRs are squash-merged on `main` — the PR title becomes the single commit message, so make the title descriptive and self-contained.
+
+`Rebase merge` (commits land verbatim) or `Merge` (creates a merge commit) is available at the author's request, or when preserving history on `main` is warranted. For these modes, authors are expected to groom commits beforehand — squash fixups, rewrite vague messages, drop noise — since each commit lands on `main` as written.
+
+Even for squash-merged PRs, a clean branch history aids review: small, logically-scoped commits make diffs easier to follow and bisect.
 
 Merges are conducted by maintainers with merge privileges, in
 accordance with the philosophy described in this document. The
