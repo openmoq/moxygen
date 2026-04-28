@@ -136,18 +136,21 @@ jobs:
         include:
           - name: ubuntu-22.04-amd64
             runner: ubuntu-22.04
+            build_type: RelWithDebInfo
             artifact: moxygen-ubuntu-22.04-amd64.tar.gz
             debug_artifact: moxygen-ubuntu-22.04-amd64-dbg.tar.gz
             container: ""
 
           - name: macos-15-arm64
             runner: macos-15
+            build_type: RelWithDebInfo
             artifact: moxygen-macos-15-arm64.tar.gz
             debug_artifact: moxygen-macos-15-arm64-dbg.tar.gz
             container: ""
 
           - name: bookworm-amd64
             runner: [self-hosted, linode]
+            build_type: RelWithDebInfo
             artifact: moxygen-bookworm-amd64.tar.gz
             debug_artifact: moxygen-bookworm-amd64-dbg.tar.gz
             container: debian:bookworm
@@ -155,9 +158,25 @@ jobs:
 
           - name: bookworm-arm64
             runner: ubuntu-22.04-arm
+            build_type: RelWithDebInfo
             artifact: moxygen-bookworm-arm64.tar.gz
             debug_artifact: moxygen-bookworm-arm64-dbg.tar.gz
             container: debian:bookworm
+
+          # ── Track A: production tarballs (Release, jammy base, portable) ──
+          - name: linux-amd64
+            runner: ubuntu-22.04
+            build_type: Release
+            artifact: moxygen-linux-amd64.tar.gz
+            debug_artifact: moxygen-linux-amd64-symbols.tar.gz
+            container: ""
+
+          - name: linux-arm64
+            runner: ubuntu-22.04-arm
+            build_type: Release
+            artifact: moxygen-linux-arm64.tar.gz
+            debug_artifact: moxygen-linux-arm64-symbols.tar.gz
+            container: ""
 
     name: publish (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
@@ -211,7 +230,7 @@ jobs:
           cmake -B _build -S standalone -G Ninja \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DBUILD_TESTING=OFF \
             -DBUILD_SHARED_LIBS=OFF \
             -DBUNDLE_DEPS=ON \
