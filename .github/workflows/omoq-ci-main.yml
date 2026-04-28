@@ -249,6 +249,7 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DBUILD_TESTS=OFF \
             -DBUILD_TESTING=OFF \
             -DBUILD_SHARED_LIBS=OFF \
