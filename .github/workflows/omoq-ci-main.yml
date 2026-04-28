@@ -163,10 +163,17 @@ jobs:
             debug_artifact: moxygen-bookworm-arm64-dbg.tar.gz
             container: debian:bookworm
 
-          # ── Track A: production tarballs (Release, jammy base, portable) ──
+          # ── Portable Linux production tarballs ──
+          # Release build on jammy base, statically linked for cross-distro
+          # compatibility. cxx_flags pin the ISA baseline:
+          #   x86-64-v2 = SSE4.2+POPCNT (≈ all cloud x86 since 2015)
+          #   armv8-a   = base ARMv8.0 (covers Graviton 1-4, Ampere, Apple M,
+          #               RPi 3/4/5, Rockchip RK3399 + RK3588 / Orange Pi)
           - name: linux-amd64
             runner: ubuntu-22.04
             build_type: Release
+            cxx_flags: "-march=x86-64-v2"
+            static_syslibs: "ON"
             artifact: moxygen-linux-amd64.tar.gz
             debug_artifact: moxygen-linux-amd64-symbols.tar.gz
             container: ""
@@ -174,6 +181,8 @@ jobs:
           - name: linux-arm64
             runner: ubuntu-22.04-arm
             build_type: Release
+            cxx_flags: "-march=armv8-a"
+            static_syslibs: "ON"
             artifact: moxygen-linux-arm64.tar.gz
             debug_artifact: moxygen-linux-arm64-symbols.tar.gz
             container: ""
@@ -226,6 +235,15 @@ jobs:
           elif echo '${{ toJSON(matrix.runner) }}' | grep -q linode; then
             # Self-hosted without container: use home dir
             EXTRA_FLAGS+=(-DFETCHCONTENT_BASE_DIR="$HOME/.cache/moxygen-publish-${{ matrix.name }}/_deps")
+          fi
+          # ISA baseline pinning for portable production tarballs.
+          if [ -n "${{ matrix.cxx_flags }}" ]; then
+            EXTRA_FLAGS+=(-DCMAKE_C_FLAGS="${{ matrix.cxx_flags }}")
+            EXTRA_FLAGS+=(-DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}")
+          fi
+          # Static-link glog/gflags/double-conversion for cross-distro portability.
+          if [ "${{ matrix.static_syslibs }}" = "ON" ]; then
+            EXTRA_FLAGS+=(-DBUNDLE_DEPS_STATIC_SYSLIBS=ON)
           fi
           cmake -B _build -S standalone -G Ninja \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
