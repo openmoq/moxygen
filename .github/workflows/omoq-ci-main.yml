@@ -134,9 +134,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux RelWithDebInfo entries: keep frame pointers preserved so
+          # signal-handler stack unwinding (folly::symbolizer) and post-mortem
+          # debugging via the -dbg sidecar work reliably under -O2.
           - name: ubuntu-22.04-amd64
             runner: ubuntu-22.04
             build_type: RelWithDebInfo
+            cxx_flags: "-fno-omit-frame-pointer -fasynchronous-unwind-tables"
             artifact: moxygen-ubuntu-22.04-amd64.tar.gz
             debug_artifact: moxygen-ubuntu-22.04-amd64-dbg.tar.gz
             container: ""
@@ -151,6 +155,7 @@ jobs:
           - name: bookworm-amd64
             runner: [self-hosted, linode]
             build_type: RelWithDebInfo
+            cxx_flags: "-fno-omit-frame-pointer -fasynchronous-unwind-tables"
             artifact: moxygen-bookworm-amd64.tar.gz
             debug_artifact: moxygen-bookworm-amd64-dbg.tar.gz
             container: debian:bookworm
@@ -159,6 +164,7 @@ jobs:
           - name: bookworm-arm64
             runner: ubuntu-22.04-arm
             build_type: RelWithDebInfo
+            cxx_flags: "-fno-omit-frame-pointer -fasynchronous-unwind-tables"
             artifact: moxygen-bookworm-arm64.tar.gz
             debug_artifact: moxygen-bookworm-arm64-dbg.tar.gz
             container: debian:bookworm
@@ -236,22 +242,25 @@ jobs:
             # Self-hosted without container: use home dir
             EXTRA_FLAGS+=(-DFETCHCONTENT_BASE_DIR="$HOME/.cache/moxygen-publish-${{ matrix.name }}/_deps")
           fi
-          # ISA baseline pinning for portable production tarballs.
-          # -fno-lto suppresses link-time LTO codegen (Debian/Ubuntu ship system
-          # static libs as fat LTO objects, which clash with -O3 -march + PIE
-          # producing R_AARCH64_ADR_PREL_PG_HI21 against __stack_chk_guard).
-          # Disable libunwind: Ubuntu's libunwind.a is non-PIC, can't link into
-          # PIE binaries. Symbolization is a debug aid, not needed in Release.
-          if [ -n "${{ matrix.cxx_flags }}" ]; then
-            EXTRA_FLAGS+=(-DCMAKE_C_FLAGS="${{ matrix.cxx_flags }} -fno-lto")
-            EXTRA_FLAGS+=(-DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }} -fno-lto")
-            EXTRA_FLAGS+=(-DCMAKE_EXE_LINKER_FLAGS="-fno-lto")
-            EXTRA_FLAGS+=(-DCMAKE_SHARED_LINKER_FLAGS="-fno-lto")
-            EXTRA_FLAGS+=(-DCMAKE_DISABLE_FIND_PACKAGE_LibUnwind=TRUE)
-          fi
-          # Static-link glog/gflags/double-conversion for cross-distro portability.
+          # Build up combined C/CXX flags. matrix.cxx_flags is applied
+          # uniformly (any entry can request flags). matrix.static_syslibs
+          # additionally triggers the portable-tarball treatment: static-link
+          # the SONAME-churning system libs, disable libunwind (Ubuntu's
+          # libunwind.a is non-PIC, blocks PIE link), and disable LTO link-
+          # time codegen (Debian/Ubuntu fat-LTO system .a files would otherwise
+          # clash with -O3 -march + PIE producing R_AARCH64_ADR_PREL_PG_HI21
+          # against __stack_chk_guard).
+          COMBINED_FLAGS="${{ matrix.cxx_flags }}"
           if [ "${{ matrix.static_syslibs }}" = "ON" ]; then
             EXTRA_FLAGS+=(-DBUNDLE_DEPS_STATIC_SYSLIBS=ON)
+            EXTRA_FLAGS+=(-DCMAKE_DISABLE_FIND_PACKAGE_LibUnwind=TRUE)
+            COMBINED_FLAGS="$COMBINED_FLAGS -fno-lto"
+            EXTRA_FLAGS+=(-DCMAKE_EXE_LINKER_FLAGS="-fno-lto")
+            EXTRA_FLAGS+=(-DCMAKE_SHARED_LINKER_FLAGS="-fno-lto")
+          fi
+          if [ -n "$COMBINED_FLAGS" ]; then
+            EXTRA_FLAGS+=(-DCMAKE_C_FLAGS="$COMBINED_FLAGS")
+            EXTRA_FLAGS+=(-DCMAKE_CXX_FLAGS="$COMBINED_FLAGS")
           fi
           cmake -B _build -S standalone -G Ninja \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
