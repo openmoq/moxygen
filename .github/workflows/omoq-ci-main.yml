@@ -240,11 +240,14 @@ jobs:
           # -fno-lto suppresses link-time LTO codegen (Debian/Ubuntu ship system
           # static libs as fat LTO objects, which clash with -O3 -march + PIE
           # producing R_AARCH64_ADR_PREL_PG_HI21 against __stack_chk_guard).
+          # Disable libunwind: Ubuntu's libunwind.a is non-PIC, can't link into
+          # PIE binaries. Symbolization is a debug aid, not needed in Release.
           if [ -n "${{ matrix.cxx_flags }}" ]; then
             EXTRA_FLAGS+=(-DCMAKE_C_FLAGS="${{ matrix.cxx_flags }} -fno-lto")
             EXTRA_FLAGS+=(-DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }} -fno-lto")
             EXTRA_FLAGS+=(-DCMAKE_EXE_LINKER_FLAGS="-fno-lto")
             EXTRA_FLAGS+=(-DCMAKE_SHARED_LINKER_FLAGS="-fno-lto")
+            EXTRA_FLAGS+=(-DCMAKE_DISABLE_FIND_PACKAGE_LibUnwind=TRUE)
           fi
           # Static-link glog/gflags/double-conversion for cross-distro portability.
           if [ "${{ matrix.static_syslibs }}" = "ON" ]; then
