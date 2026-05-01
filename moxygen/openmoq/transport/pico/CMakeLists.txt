@@ -12,6 +12,7 @@ moxygen_add_library(openmoq_pico_base
     Folly::folly_network_address
     Folly::folly_string
     picoquic::picoquic-core
+    picoquic-log
 )
 # PicoConnectionContext.h includes PicoH3WebTransport.h which needs h3zero.
 # Propagate picohttp include path to all consumers via BUILD_INTERFACE
