@@ -17,13 +17,11 @@ moxygen_add_library(openmoq_pico_base
 # loglib/qlog_fns.c (picoquic-log) — which already PUBLIC-links
 # picoquic-core. Cyclic static dep. GNU ld processes the link line
 # left-to-right and won't rescan, so wrap the pair in --start-group/
-# --end-group on Linux. ld64 (macOS) rescans by default.
+# --end-group on Linux via $<LINK_GROUP:RESCAN,...> (cmake 3.24+,
+# dedupe-safe). ld64 (macOS) rescans by default.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(openmoq_pico_base PUBLIC
-    "-Wl,--start-group"
-    picoquic::picoquic-core
-    picoquic-log
-    "-Wl,--end-group"
+    "$<LINK_GROUP:RESCAN,picoquic::picoquic-core,picoquic-log>"
   )
 else()
   target_link_libraries(openmoq_pico_base PUBLIC
