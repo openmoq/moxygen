@@ -105,11 +105,18 @@ jobs:
     needs: [validate]
     runs-on: ubuntu-22.04
     steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.OMOQ_APP_ID }}
+          private-key: ${{ secrets.OMOQ_APP_PRIV_KEY }}
+
       - uses: actions/checkout@v4
 
-      - name: Create draft release
+      - name: Create release (no assets yet)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           VERSION: ${{ needs.validate.outputs.version }}
           TAG: ${{ needs.validate.outputs.tag }}
           SNAPSHOT_TAG: ${{ needs.validate.outputs.snapshot_tag }}
@@ -118,7 +125,6 @@ jobs:
           gh release create "$TAG" \
             --target "$SNAPSHOT_SHA" \
             --title "moxygen $VERSION" \
-            --draft \
             --notes "$(cat <<EOF
           **Version:** \`${VERSION}\`
           **Commit:** \`${SNAPSHOT_SHA}\`
@@ -233,9 +239,16 @@ jobs:
             --debug-output "${{ matrix.debug_artifact }}"
           ls -lh "${{ matrix.artifact }}" "${{ matrix.debug_artifact }}"
 
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.OMOQ_APP_ID }}
+          private-key: ${{ secrets.OMOQ_APP_PRIV_KEY }}
+
       - name: Upload to release (binary + dbg in parallel)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
           # Upload binary and dbg sidecar in parallel from this runner.
@@ -254,9 +267,16 @@ jobs:
     needs: [validate, create-release]
     runs-on: ubuntu-22.04
     steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.OMOQ_APP_ID }}
+          private-key: ${{ secrets.OMOQ_APP_PRIV_KEY }}
+
       - name: Download snapshot tarballs
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SNAPSHOT_TAG: ${{ needs.validate.outputs.snapshot_tag }}
         run: |
           mkdir -p snapshot-assets
@@ -270,7 +290,7 @@ jobs:
 
       - name: Upload to release (parallel)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
           # Fan out asset upload to N concurrent gh release upload calls.
@@ -288,10 +308,20 @@ jobs:
     needs: [validate, portable-build, promote-snapshot]
     runs-on: ubuntu-22.04
     steps:
-      - name: Publish release
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.OMOQ_APP_ID }}
+          private-key: ${{ secrets.OMOQ_APP_PRIV_KEY }}
+
+      - name: Mark release as latest
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
-          gh release edit "$TAG" --draft=false
+          # gh release create without --draft already creates a published
+          # release; this step is here so we can flip latest=true after
+          # all assets are up.
+          gh release edit "$TAG" --latest
           echo "Released: $TAG"
