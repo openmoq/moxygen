@@ -81,13 +81,13 @@ jobs:
             runner: ubuntu-22.04
             cxx_flags: "-march=x86-64-v2 -fno-omit-frame-pointer -fasynchronous-unwind-tables"
             artifact: moxygen-linux-amd64.tar.gz
-            debug_artifact: moxygen-linux-amd64-symbols.tar.gz
+            debug_artifact: moxygen-linux-amd64-dbg.tar.gz
 
           - name: linux-arm64
             runner: ubuntu-22.04-arm
             cxx_flags: "-march=armv8-a -fno-omit-frame-pointer -fasynchronous-unwind-tables"
             artifact: moxygen-linux-arm64.tar.gz
-            debug_artifact: moxygen-linux-arm64-symbols.tar.gz
+            debug_artifact: moxygen-linux-arm64-dbg.tar.gz
 
     name: portable (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
@@ -246,9 +246,9 @@ jobs:
           **Portable Linux tarballs** (Release -O3, ISA-baselined, statically linked):
           - \`moxygen-linux-amd64.tar.gz\` — \`-march=x86-64-v2\` (≈ all cloud x86 since 2015)
           - \`moxygen-linux-arm64.tar.gz\` — \`-march=armv8-a\` (Graviton, Ampere, Apple M, RPi 3+, Rockchip)
-          - \`moxygen-linux-{amd64,arm64}-symbols.tar.gz\` — split debug symbols (.debug sidecar)
+          - \`moxygen-linux-{amd64,arm64}-dbg.tar.gz\` — split debug symbols (.debug sidecar)
 
-          Portable tarballs are compiled with frame pointers preserved (\`-fno-omit-frame-pointer -fasynchronous-unwind-tables\`) so signal-handler stack unwinding (folly::symbolizer) works against the .symbols sidecar even at \`-O3\`.
+          Portable tarballs are compiled with frame pointers preserved (\`-fno-omit-frame-pointer -fasynchronous-unwind-tables\`) so signal-handler stack unwinding (folly::symbolizer) works against the .dbg sidecar even at \`-O3\`.
           EOF
           )"
           echo "Released: $TAG"
