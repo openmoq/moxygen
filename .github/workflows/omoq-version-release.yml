@@ -1,10 +1,29 @@
 name: version release
 
-# Manual workflow to cut a versioned release from the current main.
+# Manual workflow to cut a versioned release from the dispatched ref.
 # Builds portable Linux production tarballs (-O3 + frame pointers + static
-# system libs, ISA-baselined for cross-distro portability) on demand, then
-# combines them with the existing platform tarballs promoted from
-# `snapshot-latest`, and creates a tagged, non-prerelease GitHub release.
+# system libs, ISA-baselined for cross-distro portability) on demand,
+# combines them with the existing platform tarballs promoted from the
+# rolling snapshot pre-release, and creates a tagged, non-prerelease
+# GitHub release.
+#
+# Job graph (parallel):
+#
+#   validate
+#     │
+#     ▼
+#   create-release (--draft)
+#     │
+#     ├──► portable-build (matrix amd64/arm64) ─► uploads directly to release
+#     ├──► promote-snapshot ─► xargs -P parallel uploads to release
+#     │
+#     ▼
+#   finalize (--draft=false)
+#
+# Direct uploads from build runners avoid the actions/upload-artifact +
+# actions/download-artifact round-trip; parallel xargs in promote-snapshot
+# fans out the 8 platform tarballs concurrently. Combined: ~30 min wall
+# clock vs the ~2 hours a serial create+upload would take.
 #
 # Usage: Actions → version release → Run workflow → enter version (e.g. 1.2.3)
 
@@ -21,7 +40,8 @@ permissions:
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
-  # Validate: gate on semver + non-existing tag before doing any expensive work
+  # Validate: gate on semver + tag-doesn't-exist + resolve snapshot tag/sha
+  # before doing any expensive work.
   # ════════════════════════════════════════════════════════════════════════════
 
   validate:
@@ -30,14 +50,17 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
       snapshot_tag: ${{ steps.v.outputs.snapshot_tag }}
+      snapshot_sha: ${{ steps.v.outputs.snapshot_sha }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate version
+      - name: Validate inputs and resolve refs
         id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ inputs.version }}"
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
             echo "Error: version must be semver (e.g. 1.2.3 or 1.2.3-rc1)" >&2
             exit 1
           fi
@@ -46,9 +69,8 @@ jobs:
             echo "Error: tag $TAG already exists" >&2
             exit 1
           fi
-          # Resolve which rolling snapshot to consume based on the dispatched
-          # ref. main → snapshot-latest. release/vM.m → snapshot-vM.m-latest.
-          # Mirrors omoq-ci-main.yml's release-tag computation.
+
+          # Snapshot derived from dispatched ref.
           BRANCH="${{ github.ref_name }}"
           if [ "$BRANCH" = "main" ]; then
             SNAPSHOT_TAG="snapshot-latest"
@@ -56,19 +78,74 @@ jobs:
             LABEL="${BRANCH#release/}"
             SNAPSHOT_TAG="snapshot-${LABEL}-latest"
           fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "snapshot_tag=$SNAPSHOT_TAG" >> "$GITHUB_OUTPUT"
-          echo "Dispatched from: $BRANCH → snapshot tag: $SNAPSHOT_TAG"
+
+          # Resolve snapshot SHA (the commit ci-main built from).
+          SNAPSHOT_SHA=$(gh api repos/{owner}/{repo}/releases \
+            --jq ".[] | select(.tag_name == \"$SNAPSHOT_TAG\") | .target_commitish")
+          if [[ -z "$SNAPSHOT_SHA" ]]; then
+            echo "Error: $SNAPSHOT_TAG release not found. Push to the dispatched branch first to produce a snapshot." >&2
+            exit 1
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "snapshot_tag=$SNAPSHOT_TAG"
+            echo "snapshot_sha=$SNAPSHOT_SHA"
+          } >> "$GITHUB_OUTPUT"
+          echo "Dispatched from $BRANCH → snapshot $SNAPSHOT_TAG @ $SNAPSHOT_SHA"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Create-release: open a draft release that the upload jobs append to.
+  # Asset uploads happen in portable-build and promote-snapshot, both running
+  # in parallel and pushing directly to this release.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  create-release:
+    needs: [validate]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          SNAPSHOT_TAG: ${{ needs.validate.outputs.snapshot_tag }}
+          SNAPSHOT_SHA: ${{ needs.validate.outputs.snapshot_sha }}
+        run: |
+          gh release create "$TAG" \
+            --target "$SNAPSHOT_SHA" \
+            --title "moxygen $VERSION" \
+            --draft \
+            --notes "$(cat <<EOF
+          **Version:** \`${VERSION}\`
+          **Commit:** \`${SNAPSHOT_SHA}\`
+
+          Existing platform tarballs promoted from [\`${SNAPSHOT_TAG}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${SNAPSHOT_TAG}); portable Linux tarballs built fresh from this commit.
+
+          **Existing platform tarballs** (RelWithDebInfo, distro-specific):
+          - \`moxygen-<platform>.tar.gz\` — stripped release build
+          - \`moxygen-<platform>-dbg.tar.gz\` — split debug symbols (.debug sidecar)
+
+          **Portable Linux tarballs** (Release -O3, ISA-baselined, statically linked):
+          - \`moxygen-linux-amd64.tar.gz\` — \`-march=x86-64-v2\` (≈ all cloud x86 since 2015)
+          - \`moxygen-linux-arm64.tar.gz\` — \`-march=armv8-a\` (Graviton, Ampere, Apple M, RPi 3+, Rockchip)
+          - \`moxygen-linux-{amd64,arm64}-dbg.tar.gz\` — split debug symbols (.debug sidecar)
+
+          Portable tarballs are compiled with frame pointers preserved (\`-fno-omit-frame-pointer -fasynchronous-unwind-tables\`) so signal-handler stack unwinding (folly::symbolizer) works against the .dbg sidecar even at \`-O3\`.
+          EOF
+          )"
 
   # ════════════════════════════════════════════════════════════════════════════
   # Portable-build: -O3 + frame-pointer + static-syslibs Linux tarballs.
-  # Built from the workflow's checkout (HEAD of main); produces the artifacts
-  # consumed by moqx release flows for portable production deployment.
+  # Each matrix entry uploads its own outputs directly to the draft release —
+  # avoids the actions/upload-artifact + actions/download-artifact round-trip.
   # ════════════════════════════════════════════════════════════════════════════
 
   portable-build:
-    needs: [validate]
+    needs: [validate, create-release]
     strategy:
       fail-fast: false
       matrix:
@@ -154,101 +231,67 @@ jobs:
             --install-prefix "$GITHUB_WORKSPACE/install" \
             --output "${{ matrix.artifact }}" \
             --debug-output "${{ matrix.debug_artifact }}"
+          ls -lh "${{ matrix.artifact }}" "${{ matrix.debug_artifact }}"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
-          retention-days: 90
-
-      - name: Upload debug artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.debug_artifact }}
-          path: ${{ matrix.debug_artifact }}
-          retention-days: 90
+      - name: Upload to release (binary + dbg in parallel)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          # Upload binary and dbg sidecar in parallel from this runner.
+          # All matrix entries run on different runners so the two arches
+          # also upload concurrently with each other.
+          printf '%s\n' "${{ matrix.artifact }}" "${{ matrix.debug_artifact }}" | \
+            xargs -n1 -P 2 -I{} gh release upload "$TAG" {} --clobber
 
   # ════════════════════════════════════════════════════════════════════════════
-  # Release: combine portable tarballs with promoted snapshot tarballs and
-  # create the tagged, non-prerelease GitHub release.
+  # Promote-snapshot: copy the existing platform tarballs (bookworm/ubuntu/
+  # macos) from the rolling snapshot to the new release. Runs in parallel
+  # with portable-build; uploads via xargs -P for further fan-out.
   # ════════════════════════════════════════════════════════════════════════════
 
-  release:
-    needs: [validate, portable-build]
+  promote-snapshot:
+    needs: [validate, create-release]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download portable artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: portable-assets/
-          merge-multiple: true
-
-      - name: Download snapshot artifacts
+      - name: Download snapshot tarballs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SNAPSHOT_TAG: ${{ needs.validate.outputs.snapshot_tag }}
         run: |
           mkdir -p snapshot-assets
-          echo "Downloading existing platform tarballs from $SNAPSHOT_TAG..."
           gh release download "$SNAPSHOT_TAG" --dir snapshot-assets --pattern '*.tar.gz'
-          # Don't bring portable tarballs over from snapshot — we just built
-          # fresh ones in this workflow.
+          # Drop any portable tarballs from snapshot — those are built fresh
+          # in portable-build and uploaded directly there.
           rm -f snapshot-assets/moxygen-linux-amd64*.tar.gz \
                 snapshot-assets/moxygen-linux-arm64*.tar.gz
-          echo "Snapshot platform tarballs:"
+          echo "Snapshot tarballs to promote:"
           ls -lh snapshot-assets/
 
-      - name: Get snapshot commit
+      - name: Upload to release (parallel)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SNAPSHOT_TAG: ${{ needs.validate.outputs.snapshot_tag }}
-        run: |
-          SNAPSHOT_SHA=$(gh api repos/{owner}/{repo}/releases \
-            --jq ".[] | select(.tag_name == \"$SNAPSHOT_TAG\") | .target_commitish")
-          if [[ -z "$SNAPSHOT_SHA" ]]; then
-            echo "Error: $SNAPSHOT_TAG release not found. Push to the dispatched branch first to produce a snapshot." >&2
-            exit 1
-          fi
-          echo "Snapshot built from commit: $SNAPSHOT_SHA"
-          echo "SNAPSHOT_SHA=$SNAPSHOT_SHA" >> "$GITHUB_ENV"
-
-      - name: Stage release assets
-        run: |
-          mkdir -p release-assets
-          cp snapshot-assets/*.tar.gz release-assets/
-          cp portable-assets/*.tar.gz release-assets/
-          echo "Release assets:"
-          ls -lh release-assets/
-
-      - name: Create versioned release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.validate.outputs.version }}
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
-          echo "Creating release $TAG from snapshot commit $SNAPSHOT_SHA..."
-          gh release create "$TAG" release-assets/*.tar.gz \
-            --target "$SNAPSHOT_SHA" \
-            --title "moxygen $VERSION" \
-            --notes "$(cat <<EOF
-          **Version:** \`${VERSION}\`
-          **Commit:** \`${SNAPSHOT_SHA}\`
+          # Fan out asset upload to N concurrent gh release upload calls.
+          # 6 is a safe upper bound — GitHub releases handle concurrent
+          # uploads to the same release fine.
+          find snapshot-assets -name '*.tar.gz' -print0 | \
+            xargs -0 -n1 -P 6 -I{} gh release upload "$TAG" {} --clobber
 
-          Existing platform tarballs promoted from [\`${{ needs.validate.outputs.snapshot_tag }}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.validate.outputs.snapshot_tag }}); portable Linux tarballs built fresh from this commit.
+  # ════════════════════════════════════════════════════════════════════════════
+  # Finalize: flip draft → published once all assets are up. Runs only if
+  # both upload jobs succeeded.
+  # ════════════════════════════════════════════════════════════════════════════
 
-          **Existing platform tarballs** (RelWithDebInfo, distro-specific):
-          - \`moxygen-<platform>.tar.gz\` — stripped release build
-          - \`moxygen-<platform>-dbg.tar.gz\` — split debug symbols (.debug sidecar)
-
-          **Portable Linux tarballs** (Release -O3, ISA-baselined, statically linked):
-          - \`moxygen-linux-amd64.tar.gz\` — \`-march=x86-64-v2\` (≈ all cloud x86 since 2015)
-          - \`moxygen-linux-arm64.tar.gz\` — \`-march=armv8-a\` (Graviton, Ampere, Apple M, RPi 3+, Rockchip)
-          - \`moxygen-linux-{amd64,arm64}-dbg.tar.gz\` — split debug symbols (.debug sidecar)
-
-          Portable tarballs are compiled with frame pointers preserved (\`-fno-omit-frame-pointer -fasynchronous-unwind-tables\`) so signal-handler stack unwinding (folly::symbolizer) works against the .dbg sidecar even at \`-O3\`.
-          EOF
-          )"
+  finalize:
+    needs: [validate, portable-build, promote-snapshot]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          gh release edit "$TAG" --draft=false
           echo "Released: $TAG"
