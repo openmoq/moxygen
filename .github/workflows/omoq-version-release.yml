@@ -29,6 +29,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
+      snapshot_tag: ${{ steps.v.outputs.snapshot_tag }}
     steps:
       - uses: actions/checkout@v4
 
@@ -45,8 +46,20 @@ jobs:
             echo "Error: tag $TAG already exists" >&2
             exit 1
           fi
+          # Resolve which rolling snapshot to consume based on the dispatched
+          # ref. main → snapshot-latest. release/vM.m → snapshot-vM.m-latest.
+          # Mirrors omoq-ci-main.yml's release-tag computation.
+          BRANCH="${{ github.ref_name }}"
+          if [ "$BRANCH" = "main" ]; then
+            SNAPSHOT_TAG="snapshot-latest"
+          else
+            LABEL="${BRANCH#release/}"
+            SNAPSHOT_TAG="snapshot-${LABEL}-latest"
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "snapshot_tag=$SNAPSHOT_TAG" >> "$GITHUB_OUTPUT"
+          echo "Dispatched from: $BRANCH → snapshot tag: $SNAPSHOT_TAG"
 
   # ════════════════════════════════════════════════════════════════════════════
   # Portable-build: -O3 + frame-pointer + static-syslibs Linux tarballs.
@@ -176,10 +189,11 @@ jobs:
       - name: Download snapshot artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SNAPSHOT_TAG: ${{ needs.validate.outputs.snapshot_tag }}
         run: |
           mkdir -p snapshot-assets
-          echo "Downloading existing platform tarballs from snapshot-latest..."
-          gh release download snapshot-latest --dir snapshot-assets --pattern '*.tar.gz'
+          echo "Downloading existing platform tarballs from $SNAPSHOT_TAG..."
+          gh release download "$SNAPSHOT_TAG" --dir snapshot-assets --pattern '*.tar.gz'
           # Don't bring portable tarballs over from snapshot — we just built
           # fresh ones in this workflow.
           rm -f snapshot-assets/moxygen-linux-amd64*.tar.gz \
@@ -190,11 +204,12 @@ jobs:
       - name: Get snapshot commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SNAPSHOT_TAG: ${{ needs.validate.outputs.snapshot_tag }}
         run: |
           SNAPSHOT_SHA=$(gh api repos/{owner}/{repo}/releases \
-            --jq '.[] | select(.tag_name == "snapshot-latest") | .target_commitish')
+            --jq ".[] | select(.tag_name == \"$SNAPSHOT_TAG\") | .target_commitish")
           if [[ -z "$SNAPSHOT_SHA" ]]; then
-            echo "Error: snapshot-latest release not found. Run the main pipeline first." >&2
+            echo "Error: $SNAPSHOT_TAG release not found. Push to the dispatched branch first to produce a snapshot." >&2
             exit 1
           fi
           echo "Snapshot built from commit: $SNAPSHOT_SHA"
@@ -222,7 +237,7 @@ jobs:
           **Version:** \`${VERSION}\`
           **Commit:** \`${SNAPSHOT_SHA}\`
 
-          Existing platform tarballs promoted from [\`snapshot-latest\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/snapshot-latest); portable Linux tarballs built fresh from this commit.
+          Existing platform tarballs promoted from [\`${{ needs.validate.outputs.snapshot_tag }}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.validate.outputs.snapshot_tag }}); portable Linux tarballs built fresh from this commit.
 
           **Existing platform tarballs** (RelWithDebInfo, distro-specific):
           - \`moxygen-<platform>.tar.gz\` — stripped release build
