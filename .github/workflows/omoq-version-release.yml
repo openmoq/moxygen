@@ -35,6 +35,13 @@ on:
         required: true
         type: string
 
+# Serialize per-version dispatches: prevents two runs with the same
+# version from both passing validate's tag-doesn't-exist check and
+# then racing on create-release.
+concurrency:
+  group: version-release-${{ inputs.version }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -273,6 +280,23 @@ jobs:
         with:
           app-id: ${{ secrets.OMOQ_APP_ID }}
           private-key: ${{ secrets.OMOQ_APP_PRIV_KEY }}
+
+      - name: Verify snapshot hasn't been replaced mid-flight
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          SNAPSHOT_TAG: ${{ needs.validate.outputs.snapshot_tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.snapshot_sha }}
+        run: |
+          CURRENT_SHA=$(gh api "repos/$REPO/releases" \
+            --jq ".[] | select(.tag_name == \"$SNAPSHOT_TAG\") | .target_commitish")
+          if [ "$CURRENT_SHA" != "$EXPECTED_SHA" ]; then
+            echo "Error: $SNAPSHOT_TAG was replaced mid-release." >&2
+            echo "  expected: $EXPECTED_SHA" >&2
+            echo "  current:  $CURRENT_SHA" >&2
+            echo "Retry the dispatch — ci-main published a new snapshot during this run." >&2
+            exit 1
+          fi
 
       - name: Download snapshot tarballs
         env:
