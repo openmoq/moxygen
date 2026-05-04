@@ -91,6 +91,10 @@ enum class PublishDoneStatusCode : uint32_t {
   EXPIRED = 0x5,
   TOO_FAR_BEHIND = 0x6,
   UPDATE_FAILED = 0x8,
+  DOES_NOT_EXIST = 0x9,  // SWITCH: target track not available
+  TIMEOUT = 0xA,         // SWITCH: G_switch not found within T_switch
+  NOT_SUPPORTED = 0xB,   // SWITCH: relay does not support SWITCH
+  EXCESSIVE_LOAD = 0xC,  // SWITCH: concurrent SWITCH on same subscription
   //
   SESSION_CLOSED = std::numeric_limits<uint32_t>::max()
 };
@@ -181,6 +185,7 @@ enum class FrameType : uint64_t {
   CLIENT_SETUP = 0x20,
   SERVER_SETUP = 0x21,
   SETUP = 0x2F00,
+  SWITCH = 0x75, // SWITCH proposal (PR #1378); 0x12 conflicts with SUBSCRIBE_NAMESPACE_OK
 };
 
 enum class DatagramType : uint64_t {
@@ -1151,6 +1156,13 @@ struct PublishRequest {
   std::optional<AbsoluteLocation> largest;
   bool forward{false};
   Extensions extensions; // Draft 16+
+  TrackRequestParameters params{FrameType::PUBLISH};
+};
+
+struct Switch {
+  RequestID currentSubscribeRequestID;
+  FullTrackName targetTrackName;
+  uint64_t minimumSwitchingGroupID{0};
   TrackRequestParameters params{FrameType::PUBLISH};
 };
 

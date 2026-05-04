@@ -814,6 +814,17 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       }
       break;
     }
+    case FrameType::SWITCH: {
+      auto res = moqFrameParser_.parseSwitch(cursor, curFrameLength_);
+      if (res) {
+        if (callback_) {
+          callback_->onSwitch(std::move(res.value()));
+        }
+      } else {
+        return folly::makeUnexpected(res.error());
+      }
+      break;
+    }
   }
   return folly::unit;
 }

@@ -98,6 +98,7 @@ class MoQControlCodec : public MoQCodec {
     virtual void onNamespaceDone(NamespaceDone) {}
     virtual void onTrackStatusError(TrackStatusError) {}
     virtual void onGoaway(Goaway) {}
+    virtual void onSwitch(Switch) {} // SWITCH proposal (PR #1378)
   };
 
   enum class Direction { CLIENT, SERVER };
@@ -145,6 +146,7 @@ class MoQControlCodec : public MoQCodec {
       case FrameType::FETCH_CANCEL:
       case FrameType::FETCH_OK:
       case FrameType::FETCH_ERROR:
+      case FrameType::SWITCH:
         return true;
       case FrameType::SUBSCRIBE_NAMESPACE:
       case FrameType::SUBSCRIBE_NAMESPACE_OK:

@@ -190,6 +190,10 @@ class MoQFrameParser {
       folly::io::Cursor& cursor,
       size_t length) const noexcept;
 
+  folly::Expected<Switch, ErrorCode> parseSwitch(
+      folly::io::Cursor& cursor,
+      size_t length);
+
   folly::Expected<PublishOk, ErrorCode> parsePublishOk(
       folly::io::Cursor& cursor,
       size_t length) const noexcept;

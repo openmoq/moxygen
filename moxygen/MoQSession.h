@@ -453,7 +453,8 @@ class MoQSession : public Subscriber,
     std::vector<FrameType> allowedFrames;
     folly::Function<void(RequestID)> onStreamClosed;
   };
-  std::optional<BidiStreamConfig> getBidiStreamConfig(FrameType frameType);
+  virtual std::optional<BidiStreamConfig> getBidiStreamConfig(
+      FrameType frameType);
   void onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept override;
   void onSessionEnd(folly::Optional<uint32_t> err) noexcept override {
     XLOG(DBG1) << __func__ << "err="
@@ -528,6 +529,14 @@ class MoQSession : public Subscriber,
       uint64_t minBidiDraftVersion = 17,
       std::unique_ptr<MoQControlCodec::ControlCallback> senderCallback =
           nullptr);
+
+  // Creates and registers a TrackPublisherImpl for the given PublishRequest
+  // without writing a PUBLISH frame to the wire. Use when PUBLISH was already
+  // sent via sendRequest() (e.g. SWITCH response bidi stream). Sets
+  // forward=true so beginSubgroup() creates QUIC unidirectional streams.
+  std::shared_ptr<TrackConsumer> registerPublishConsumerForSwitch(
+      const PublishRequest& pub,
+      std::shared_ptr<Publisher::SubscriptionHandle> handle);
 
  private:
   static const folly::RequestToken& sessionRequestToken();

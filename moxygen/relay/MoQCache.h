@@ -95,6 +95,17 @@ class MoQCache {
     return getCachedObjectMaybe(*it->second, obj, now()) != nullptr;
   }
 
+  // Returns the cached CacheEntry for (ftn, obj), or nullptr if not in cache.
+  // nullptr may mean either "not cached" or "gap" — callers must not assume
+  // nullptr implies end-of-group.
+  CacheEntry* getObject(const FullTrackName& ftn, AbsoluteLocation obj) {
+    auto it = cache_.find(ftn);
+    if (it == cache_.end()) {
+      return nullptr;
+    }
+    return getCachedObjectMaybe(*it->second, obj, now());
+  }
+
   // Setters for testing - update cache limits and evict if necessary
   void setMaxCachedTracks(size_t maxTracks) {
     maxCachedTracks_ = maxTracks;

@@ -2152,6 +2152,52 @@ void MoQFrameParser::handleRequestSpecificParams(
   }
 }
 
+folly::Expected<Switch, ErrorCode> MoQFrameParser::parseSwitch(
+    folly::io::Cursor& cursor,
+    size_t length) {
+  Switch sw;
+
+  auto reqID = quic::follyutils::decodeQuicInteger(cursor, length);
+  if (!reqID) {
+    XLOG(DBG4) << "parseSwitch: UNDERFLOW on currentSubscribeRequestID";
+    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  }
+  length -= reqID->second;
+  sw.currentSubscribeRequestID = RequestID(reqID->first);
+
+  auto ftn = parseFullTrackName(cursor, length);
+  if (!ftn) {
+    XLOG(DBG4) << "parseSwitch: error in parseFullTrackName";
+    return folly::makeUnexpected(ftn.error());
+  }
+  sw.targetTrackName = std::move(ftn.value());
+
+  auto minGroup = quic::follyutils::decodeQuicInteger(cursor, length);
+  if (!minGroup) {
+    XLOG(DBG4) << "parseSwitch: UNDERFLOW on minimumSwitchingGroupID";
+    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  }
+  length -= minGroup->second;
+  sw.minimumSwitchingGroupID = minGroup->first;
+
+  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+  if (!numParams) {
+    XLOG(DBG4) << "parseSwitch: UNDERFLOW on numParams";
+    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  }
+  length -= numParams->second;
+
+  std::vector<Parameter> requestSpecificParams;
+  auto paramRes = parseTrackRequestParams(
+      cursor, length, numParams->first, sw.params, requestSpecificParams);
+  if (!paramRes) {
+    XLOG(DBG4) << "parseSwitch: error in parseTrackRequestParams";
+    return folly::makeUnexpected(paramRes.error());
+  }
+
+  return sw;
+}
+
 folly::Expected<PublishOk, ErrorCode> MoQFrameParser::parsePublishOk(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {

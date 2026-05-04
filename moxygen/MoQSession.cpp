@@ -4762,6 +4762,38 @@ Subscriber::PublishResult MoQSession::publish(
       std::move(replyTask)};
 }
 
+std::shared_ptr<TrackConsumer> MoQSession::registerPublishConsumerForSwitch(
+    const PublishRequest& pub,
+    std::shared_ptr<Publisher::SubscriptionHandle> handle) {
+  auto deliveryTimeout = getPublisherDeliveryTimeout(pub);
+  auto trackPublisher = std::make_shared<TrackPublisherImpl>(
+      this,
+      pub.fullTrackName,
+      pub.requestID,
+      pub.trackAlias,
+      0, // priority
+      pub.groupOrder,
+      *negotiatedVersion_,
+      moqSettings_.bufferingThresholds.perSubscription,
+      /*forward=*/true, // must be true: beginSubgroup() checks forward_ before creating streams
+      deliveryTimeout);
+  if (handle) {
+    trackPublisher->setSubscriptionHandle(handle);
+  }
+  setPublisherPriorityFromParams(pub.params, trackPublisher);
+  pubTracks_.emplace(pub.requestID, trackPublisher);
+  pendingPublishTracks_.insert(pub.fullTrackName);
+  auto contract = folly::coro::makePromiseContract<
+      folly::Expected<PublishOk, PublishError>>();
+  pendingRequests_.emplace(
+      pub.requestID,
+      PendingRequestState::makePublish(std::move(contract.first)));
+  // replyTask dropped: the bidi read loop started by sendRequest() handles
+  // PUBLISH_OK dispatch. PUBLISH_OK side-effects (groupOrder, subPriority
+  // updates) are not critical for the POC.
+  return std::static_pointer_cast<TrackConsumer>(trackPublisher);
+}
+
 void MoQSession::publishOk(const PublishOk& pubOk, ReplyContext& replyContext) {
   XLOG(DBG1) << __func__ << " reqID=" << pubOk.requestID << " sess=" << this;
   MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onPublishOk);
@@ -5417,6 +5449,12 @@ std::optional<MoQSession::BidiStreamConfig> MoQSession::getBidiStreamConfig(
           {FrameType::SUBSCRIBE_NAMESPACE, FrameType::REQUEST_UPDATE},
           [this](RequestID id) {
             onUnsubscribeNamespace(UnsubscribeNamespace{id, std::nullopt});
+          }};
+    case FrameType::PUBLISH:
+      return BidiStreamConfig{
+          {FrameType::PUBLISH_OK, FrameType::PUBLISH_ERROR},
+          [](RequestID) {
+            // PUBLISH bidi stream closed — no teardown needed for POC
           }};
     default:
       return std::nullopt;
