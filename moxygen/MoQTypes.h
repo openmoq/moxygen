@@ -179,13 +179,16 @@ enum class FrameType : uint64_t {
   FETCH_OK = 0x18,
   FETCH_ERROR = 0x19,
   REQUESTS_BLOCKED = 0x1A,
+  // NOTE: PUBLISH_ERROR (was 0x1F) removed from moq-transport spec; kept in
+  // moxygen for backward compat on this POC branch; reassigned to avoid
+  // conflict with SWITCH = 0x1F (moq-transport PR #1378).
+  PUBLISH_ERROR = 0x1B,
   PUBLISH = 0x1D,
   PUBLISH_OK = 0x1E,
-  PUBLISH_ERROR = 0x1F,
+  SWITCH = 0x1F, // moq-transport PR #1378
   CLIENT_SETUP = 0x20,
   SERVER_SETUP = 0x21,
   SETUP = 0x2F00,
-  SWITCH = 0x75, // SWITCH proposal (PR #1378); 0x12 conflicts with SUBSCRIBE_NAMESPACE_OK
 };
 
 enum class DatagramType : uint64_t {
