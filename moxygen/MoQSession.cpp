@@ -5003,6 +5003,16 @@ void MoQSession::unsubscribe(const Unsubscribe& unsubscribe) {
   checkForCloseOnDrain();
 }
 
+void MoQSession::sendSwitch(Switch sw) {
+  XLOG(DBG1) << __func__ << " sess=" << this;
+  auto res = moqFrameWriter_.writeSwitch(controlWriteBuf_, sw);
+  if (!res) {
+    XLOG(ERR) << "writeSwitch failed sess=" << this;
+    return;
+  }
+  controlWriteEvent_.signal();
+}
+
 void MoQSession::sendPublishDone(const PublishDone& pubDone) {
   XLOG(DBG1) << __func__ << " sess=" << this;
   MOQ_PUBLISHER_STATS(

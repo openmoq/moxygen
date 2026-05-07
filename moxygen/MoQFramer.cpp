@@ -5394,6 +5394,25 @@ WriteResult MoQFrameWriter::writeFetch(
   return size;
 }
 
+WriteResult MoQFrameWriter::writeSwitch(
+    folly::IOBufQueue& writeBuf,
+    const Switch& sw) const noexcept {
+  CHECK(version_.has_value()) << "Version must be set before writeSwitch";
+  size_t size = 0;
+  bool error = false;
+  auto sizePtr = writeFrameHeader(writeBuf, FrameType::SWITCH, error);
+  writeVarint(writeBuf, sw.currentSubscribeRequestID.value, size, error);
+  writeFullTrackName(writeBuf, sw.targetTrackName, size, error);
+  writeVarint(writeBuf, sw.minimumSwitchingGroupID, size, error);
+  std::vector<Parameter> empty;
+  writeTrackRequestParams(writeBuf, sw.params, empty, size, error);
+  writeSize(sizePtr, size, error, *version_);
+  if (error) {
+    return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
+  }
+  return size;
+}
+
 WriteResult MoQFrameWriter::writeFetchCancel(
     folly::IOBufQueue& writeBuf,
     const FetchCancel& fetchCancel) const noexcept {

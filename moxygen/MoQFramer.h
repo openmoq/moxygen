@@ -523,6 +523,10 @@ class MoQFrameWriter {
       folly::IOBufQueue& writeBuf,
       const Unsubscribe& unsubscribe) const noexcept;
 
+  WriteResult writeSwitch(
+      folly::IOBufQueue& writeBuf,
+      const Switch& sw) const noexcept;
+
   WriteResult writePublish(
       folly::IOBufQueue& writeBuf,
       const PublishRequest& publish) const noexcept;
