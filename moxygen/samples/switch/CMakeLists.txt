@@ -60,3 +60,10 @@ target_link_libraries(
   Folly::folly_json_dynamic
   Folly::folly_futures_core
 )
+
+install(
+    TARGETS moqswitchpub moqswitchsub
+    EXPORT moxygen-exports
+    ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
+    LIBRARY DESTINATION ${LIB_INSTALL_DIR}
+)
