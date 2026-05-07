@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <atomic>
 #include <folly/coro/BlockingWait.h>
 #include <folly/coro/Sleep.h>
 #include <folly/coro/UnboundedQueue.h>
@@ -102,7 +103,7 @@ class CollectingConsumer : public TrackConsumer {
       : track_(std::move(track)), catchup_(catchup) {}
 
   void setCatchup(bool c) {
-    catchup_ = c;
+    catchup_.store(c, std::memory_order_relaxed);
   }
 
   folly::Expected<folly::Unit, MoQPublishError> setTrackAlias(
@@ -112,7 +113,7 @@ class CollectingConsumer : public TrackConsumer {
   folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
   beginSubgroup(uint64_t groupID, uint64_t, Priority, bool) override {
     return std::make_shared<CollectingSubgroup>(
-        track_, groupID, catchup_, queue_);
+        track_, groupID, catchup_.load(std::memory_order_relaxed), queue_);
   }
   folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
   awaitStreamCredit() override {
@@ -146,7 +147,7 @@ class CollectingConsumer : public TrackConsumer {
 
  private:
   std::string track_;
-  bool catchup_;
+  std::atomic<bool> catchup_;
 };
 
 std::pair<uint64_t, uint64_t> decodeSwitchTransition(const std::string& s) {
@@ -320,7 +321,10 @@ class SwitchSubscriber : public Subscriber,
     uint64_t catchupGroups = (liveEdgeGroupID_ > switchingGroupID_)
         ? liveEdgeGroupID_ - switchingGroupID_
         : 0;
-    bool pass = hasSwitchTransition && !gap && !duplicate;
+    // When lag was requested, require a non-trivial catch-up range.
+    bool insufficientCatchup =
+        (FLAGS_lag_seconds > 0 && catchupGroups == 0);
+    bool pass = hasSwitchTransition && !gap && !duplicate && !insufficientCatchup;
     printEvent(folly::dynamic::object("event", "result")("pass", pass)(
         "g_switch", switchingGroupID_)("live_edge", liveEdgeGroupID_)(
         "catchup_groups", catchupGroups)("gap", gap)("duplicate", duplicate));
