@@ -143,11 +143,10 @@ class CollectingConsumer : public TrackConsumer {
     co_return co_await queue_.dequeue();
   }
 
-  ObjQueue queue_;
-
  private:
   std::string track_;
   std::atomic<bool> catchup_;
+  ObjQueue queue_;
 };
 
 std::pair<uint64_t, uint64_t> decodeSwitchTransition(const std::string& s) {
@@ -155,6 +154,10 @@ std::pair<uint64_t, uint64_t> decodeSwitchTransition(const std::string& s) {
   folly::io::Cursor cursor(buf.get());
   auto g = quic::follyutils::decodeQuicInteger(cursor);
   auto l = quic::follyutils::decodeQuicInteger(cursor);
+  if (!g || !l) {
+    XLOG(ERR) << "decodeSwitchTransition: truncated VARINT in SWITCH_TRANSITION param";
+    return {UINT64_MAX, 0};
+  }
   return {g->first, l->first};
 }
 
@@ -178,7 +181,11 @@ class SwitchSubscriber : public Subscriber,
         "g_switch", switchingGroupID_)("live_edge", liveEdgeGroupID_));
 
     lowConsumer_ = std::make_shared<CollectingConsumer>("low", true);
-    publishPromise_.setValue(folly::unit);
+    if (!publishPromise_.isFulfilled()) {
+      publishPromise_.setValue(folly::unit);
+    } else {
+      XLOG(ERR) << "publish() called more than once — ignoring duplicate relay PUBLISH";
+    }
 
     auto consumer = lowConsumer_;
     auto requestID = pub.requestID;
