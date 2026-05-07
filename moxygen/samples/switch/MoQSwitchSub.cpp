@@ -8,6 +8,7 @@
 #include <folly/coro/Sleep.h>
 #include <folly/coro/UnboundedQueue.h>
 #include <folly/init/Init.h>
+#include <folly/io/async/EventBaseManager.h>
 #include <folly/json.h>
 #include <folly/portability/GFlags.h>
 #include <moxygen/MoQConsumers.h>

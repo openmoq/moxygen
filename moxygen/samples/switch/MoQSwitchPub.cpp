@@ -4,8 +4,10 @@
  */
 
 #include <folly/coro/BlockingWait.h>
+#include <folly/coro/Collect.h>
 #include <folly/coro/Sleep.h>
 #include <folly/init/Init.h>
+#include <folly/io/async/EventBaseManager.h>
 #include <folly/portability/GFlags.h>
 #include <moxygen/MoQWebTransportClient.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
