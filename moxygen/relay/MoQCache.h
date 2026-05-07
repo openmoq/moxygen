@@ -28,6 +28,7 @@ class MoQCache {
  public:
   using SteadyClock = std::chrono::steady_clock;
   using TimePoint = SteadyClock::time_point;
+  struct CacheEntry; // forward declaration — defined in private section below
 
   explicit MoQCache(
       size_t maxCachedTracks = kDefaultMaxCachedTracks,
