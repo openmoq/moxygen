@@ -5404,8 +5404,7 @@ WriteResult MoQFrameWriter::writeSwitch(
   writeVarint(writeBuf, sw.currentSubscribeRequestID.value, size, error);
   writeFullTrackName(writeBuf, sw.targetTrackName, size, error);
   writeVarint(writeBuf, sw.minimumSwitchingGroupID, size, error);
-  std::vector<Parameter> empty;
-  writeTrackRequestParams(writeBuf, sw.params, empty, size, error);
+  writeTrackRequestParams(writeBuf, sw.params, {}, size, error);
   writeSize(sizePtr, size, error, *version_);
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);

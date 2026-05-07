@@ -568,7 +568,7 @@ class MoQSession : public Subscriber,
   void sendSubscribeOk(const SubscribeOk& subOk, ReplyContext& replyContext);
   void subscribeError(const SubscribeError& subErr, ReplyContext& replyContext);
   void unsubscribe(const Unsubscribe& unsubscribe);
-  void sendSwitch(Switch sw);
+  void sendSwitch(const Switch& sw);
   // Backward compatibility forwarders
   void subscribeUpdate(const SubscribeUpdate& subUpdate) {
     requestUpdate(subUpdate);

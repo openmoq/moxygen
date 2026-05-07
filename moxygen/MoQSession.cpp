@@ -5003,7 +5003,7 @@ void MoQSession::unsubscribe(const Unsubscribe& unsubscribe) {
   checkForCloseOnDrain();
 }
 
-void MoQSession::sendSwitch(Switch sw) {
+void MoQSession::sendSwitch(const Switch& sw) {
   XLOG(DBG1) << __func__ << " sess=" << this;
   auto res = moqFrameWriter_.writeSwitch(controlWriteBuf_, sw);
   if (!res) {
