@@ -26,6 +26,7 @@ target_link_libraries(
   moxygen_moq_webtransport_client
   moxygen_relay_moq_forwarder
   moxygen_relay_moq_relay_client
+  Folly::folly_init_init
   Folly::folly_futures_core
 )
 
@@ -57,6 +58,7 @@ target_link_libraries(
   moxygen_moq_webtransport_client
   moxygen_relay_moq_relay_client
   mvfst::mvfst_folly_utils
+  Folly::folly_init_init
   Folly::folly_json_dynamic
   Folly::folly_futures_core
 )
