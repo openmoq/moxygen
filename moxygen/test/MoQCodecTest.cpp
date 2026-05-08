@@ -1031,4 +1031,31 @@ INSTANTIATE_TEST_SUITE_P(
     MoQCodecTest,
     MoQCodecTest,
     ::testing::ValuesIn(kSupportedVersions));
+
+TEST_P(MoQCodecTest, SwitchDispatch) {
+  // SERVER codec receives CLIENT_SETUP first, then SWITCH.
+  // Write both into one buffer so the codec transitions past setup state.
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  moxygen::Setup clientSetup;
+  clientSetup.params.insertParam(
+      Parameter(folly::to_underlying(SetupKey::PATH), "/test"));
+  writeClientSetup(buf, clientSetup, GetParam());
+
+  Switch sw;
+  sw.currentSubscribeRequestID = RequestID{1};
+  sw.targetTrackName =
+      FullTrackName{TrackNamespace(std::vector<std::string>{"ns"}), "track"};
+  sw.minimumSwitchingGroupID = 3;
+  auto writeRes = moqFrameWriter_.writeSwitch(buf, sw);
+  ASSERT_FALSE(writeRes.hasError());
+
+  // NiceMock: onClientSetup fires from the setup frame; only assert onSwitch.
+  testing::NiceMock<MockMoQCodecCallback> callback;
+  EXPECT_CALL(callback, onSwitch(testing::_)).Times(1);
+
+  MoQControlCodec codec(MoQControlCodec::Direction::SERVER, &callback);
+  codec.initializeVersion(GetParam());
+  codec.onIngress(buf.move(), /*eom=*/false);
+}
+
 } // namespace moxygen::test

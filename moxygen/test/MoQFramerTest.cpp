@@ -4601,3 +4601,35 @@ TEST_P(MoQFramerTest, SubgroupObjectUnderflowDoesNotCorruptDeltaState) {
   ASSERT_TRUE(r1.hasValue());
   EXPECT_EQ(r1->value.id, 1);
 }
+
+TEST(MoQFramerTest, SwitchRoundTrip) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft16);
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft16);
+
+  Switch sw;
+  sw.currentSubscribeRequestID = RequestID{42};
+  sw.targetTrackName =
+      FullTrackName{TrackNamespace(std::vector<std::string>{"test", "ns"}), "low-bitrate"};
+  sw.minimumSwitchingGroupID = 7;
+  // sw.params defaults to TrackRequestParameters{FrameType::PUBLISH}
+
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  auto writeRes = writer.writeSwitch(buf, sw);
+  ASSERT_FALSE(writeRes.hasError()) << "writeSwitch failed";
+
+  auto chain = buf.move();
+  folly::io::Cursor cursor(chain.get());
+
+  // Frame header: type is QUIC varint (SWITCH=0x1B fits in 1 byte), then 16-bit BE length
+  quic::follyutils::decodeQuicInteger(cursor); // skip frame type
+  size_t len = cursor.readBE<uint16_t>();      // 16-bit BE frame length
+
+  auto res = parser.parseSwitch(cursor, len);
+  ASSERT_TRUE(res.hasValue()) << "parseSwitch failed";
+  EXPECT_EQ(res->currentSubscribeRequestID, RequestID{42});
+  EXPECT_EQ(res->targetTrackName.trackNamespace, TrackNamespace(std::vector<std::string>{"test", "ns"}));
+  EXPECT_EQ(res->targetTrackName.trackName, "low-bitrate");
+  EXPECT_EQ(res->minimumSwitchingGroupID, 7u);
+}
