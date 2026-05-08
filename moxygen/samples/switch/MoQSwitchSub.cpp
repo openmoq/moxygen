@@ -256,10 +256,16 @@ class SwitchSubscriber : public Subscriber,
             FullTrackName{TrackNamespace({FLAGS_ns}), "low"},
         .minimumSwitchingGroupID = lastHighGroup + 1});
 
-    // Phase 4: wait for relay-initiated PUBLISH
+    // Phase 4: wait for relay-initiated PUBLISH, then drain + collect.
+    // Extracted into a separate coroutine to split the frame and work around
+    // a GCC 11/12 ICE (morph_fn_to_coro / build_special_member_call) that
+    // triggers when the coroutine frame holds too many non-trivial types.
     auto exec = co_await folly::coro::co_current_executor;
     co_await publishPromise_.getSemiFuture().via(exec);
+    co_return co_await collectPhase();
+  }
 
+  folly::coro::Task<bool> collectPhase() {
     std::vector<ReceivedObject> received;
     bool drainedCatchup = false;
     while (!drainedCatchup) {
