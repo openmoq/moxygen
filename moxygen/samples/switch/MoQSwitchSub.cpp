@@ -35,8 +35,12 @@ DEFINE_bool(insecure, false, "Skip TLS certificate validation");
 namespace {
 using namespace moxygen;
 
+// POD struct — no std::string — so std::optional<ReceivedObject> and
+// std::vector<ReceivedObject> are trivially moveable, avoiding the GCC 11/12
+// ICE in morph_fn_to_coro / build_special_member_call that fires when a
+// coroutine frame holds non-trivially-moveable types.
 struct ReceivedObject {
-  std::string track;
+  bool isLow{false}; // false = "high" track, true = "low" track
   uint64_t group{0};
   uint64_t objectID{0};
   bool catchup{false};
@@ -45,25 +49,17 @@ struct ReceivedObject {
 using ObjQueue =
     folly::coro::UnboundedQueue<std::optional<ReceivedObject>, true, true>;
 
-// SubgroupConsumer that enqueues objects into a shared queue.
 class CollectingSubgroup : public SubgroupConsumer {
  public:
-  CollectingSubgroup(
-      std::string track,
-      uint64_t groupID,
-      bool catchup,
-      ObjQueue& q)
-      : track_(std::move(track)),
-        groupID_(groupID),
-        catchup_(catchup),
-        queue_(q) {}
+  CollectingSubgroup(bool isLow, uint64_t groupID, bool catchup, ObjQueue& q)
+      : isLow_(isLow), groupID_(groupID), catchup_(catchup), queue_(q) {}
 
   folly::Expected<folly::Unit, MoQPublishError> object(
       uint64_t objectID,
       Payload,
       Extensions,
       bool) override {
-    queue_.enqueue(ReceivedObject{track_, groupID_, objectID, catchup_});
+    queue_.enqueue(ReceivedObject{isLow_, groupID_, objectID, catchup_});
     return folly::unit;
   }
   folly::Expected<folly::Unit, MoQPublishError> beginObject(
@@ -91,17 +87,16 @@ class CollectingSubgroup : public SubgroupConsumer {
   void reset(ResetStreamErrorCode) override {}
 
  private:
-  std::string track_;
+  bool isLow_;
   uint64_t groupID_;
   bool catchup_;
   ObjQueue& queue_;
 };
 
-// TrackConsumer that creates CollectingSubgroup instances.
 class CollectingConsumer : public TrackConsumer {
  public:
-  explicit CollectingConsumer(std::string track, bool catchup = false)
-      : track_(std::move(track)), catchup_(catchup) {}
+  explicit CollectingConsumer(bool isLow, bool catchup = false)
+      : isLow_(isLow), catchup_(catchup) {}
 
   void setCatchup(bool c) {
     catchup_.store(c, std::memory_order_relaxed);
@@ -114,7 +109,7 @@ class CollectingConsumer : public TrackConsumer {
   folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
   beginSubgroup(uint64_t groupID, uint64_t, Priority, bool) override {
     return std::make_shared<CollectingSubgroup>(
-        track_, groupID, catchup_.load(std::memory_order_relaxed), queue_);
+        isLow_, groupID, catchup_.load(std::memory_order_relaxed), queue_);
   }
   folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
   awaitStreamCredit() override {
@@ -124,14 +119,14 @@ class CollectingConsumer : public TrackConsumer {
       const ObjectHeader& h,
       Payload,
       bool) override {
-    queue_.enqueue(ReceivedObject{track_, h.group, h.id, catchup_});
+    queue_.enqueue(ReceivedObject{isLow_, h.group, h.id, catchup_});
     return folly::unit;
   }
   folly::Expected<folly::Unit, MoQPublishError> datagram(
       const ObjectHeader& h,
       Payload,
       bool) override {
-    queue_.enqueue(ReceivedObject{track_, h.group, h.id, catchup_});
+    queue_.enqueue(ReceivedObject{isLow_, h.group, h.id, catchup_});
     return folly::unit;
   }
   folly::Expected<folly::Unit, MoQPublishError> publishDone(
@@ -145,7 +140,7 @@ class CollectingConsumer : public TrackConsumer {
   }
 
  private:
-  std::string track_;
+  bool isLow_;
   std::atomic<bool> catchup_;
   ObjQueue queue_;
 };
@@ -181,7 +176,7 @@ class SwitchSubscriber : public Subscriber,
     printEvent(folly::dynamic::object("event", "switch")(
         "g_switch", switchingGroupID_)("live_edge", liveEdgeGroupID_));
 
-    lowConsumer_ = std::make_shared<CollectingConsumer>("low", true);
+    lowConsumer_ = std::make_shared<CollectingConsumer>(/*isLow=*/true, /*catchup=*/true);
     if (!publishPromise_.isFulfilled()) {
       publishPromise_.setValue(folly::unit);
     } else {
@@ -198,7 +193,8 @@ class SwitchSubscriber : public Subscriber,
         }()};
   }
 
-  folly::coro::Task<bool> run() noexcept {
+  // Non-coroutine: keeps proxygen::URL off every coroutine frame.
+  void setupRelayClient() {
     proxygen::URL url(FLAGS_relay_url);
     auto executor = std::make_shared<MoQFollyExecutorImpl>(
         folly::EventBaseManager::get()->getEventBase());
@@ -209,6 +205,62 @@ class SwitchSubscriber : public Subscriber,
     }
     relayClient_ = std::make_shared<MoQRelayClient>(
         std::make_unique<MoQWebTransportClient>(executor, url, verifier));
+  }
+
+  folly::coro::Task<bool> warmup() {
+    highConsumer_ = std::make_shared<CollectingConsumer>(/*isLow=*/false);
+    auto* evb = folly::EventBaseManager::get()->getEventBase();
+    // GCC 12 ICEs whenever SubscribeResult = Expected<shared_ptr<SubscriptionHandle>,
+    // RequestError> (which contains std::string) appears in any awaitable stored in a
+    // coroutine frame, even via Future<T> wrappers. Bridge via Promise<bool> so the
+    // coroutine frame only ever sees Future<bool> — which compiles fine.
+    folly::Promise<bool> subscribePromise;
+    auto subscribeDone = subscribePromise.getFuture();
+    relayClient_->getSession()
+        ->subscribe(
+            SubscribeRequest::make(
+                FullTrackName{TrackNamespace({FLAGS_ns}), "high"}),
+            highConsumer_)
+        .semi()
+        .via(evb)
+        .thenValue(
+            [this, p = std::move(subscribePromise)](auto res) mutable {
+              if (res.hasError()) {
+                XLOG(ERR) << "subscribe(high) failed";
+                p.setValue(false);
+                return;
+              }
+              highRequestID_ = res.value()->subscribeOk().requestID;
+              p.setValue(true);
+            });
+    if (!co_await std::move(subscribeDone).via(evb)) {
+      co_return false;
+    }
+
+    for (int i = 0; i < FLAGS_warm_up_groups; ++i) {
+      auto obj = co_await highConsumer_->dequeue();
+      if (!obj) {
+        XLOG(ERR) << "high track ended during warm-up";
+        co_return false;
+      }
+      lastHighGroup_ = obj->group;
+      printEvent(folly::dynamic::object("event", "object")("track", "high")(
+          "group", obj->group)("object", obj->objectID));
+    }
+
+    if (FLAGS_lag_seconds > 0) {
+      printEvent(folly::dynamic::object("event", "lag_start")(
+          "after_group", lastHighGroup_));
+      co_await folly::coro::sleep(std::chrono::seconds(FLAGS_lag_seconds));
+      printEvent(folly::dynamic::object("event", "lag_end")(
+          "elapsed_ms", FLAGS_lag_seconds * 1000));
+    }
+
+    co_return true;
+  }
+
+  folly::coro::Task<bool> run() noexcept {
+    setupRelayClient();
 
     co_await relayClient_->setup(
         /*publisher=*/nullptr,
@@ -216,50 +268,16 @@ class SwitchSubscriber : public Subscriber,
         std::chrono::milliseconds(2000),
         std::chrono::seconds(120));
 
-    auto highConsumer = std::make_shared<CollectingConsumer>("high");
-    auto subResult = co_await relayClient_->getSession()->subscribe(
-        SubscribeRequest::make(
-            FullTrackName{TrackNamespace({FLAGS_ns}), "high"}),
-        highConsumer);
-    if (!subResult.hasValue()) {
-      XLOG(ERR) << "subscribe(high) failed";
+    if (!co_await warmup()) {
       co_return false;
     }
-    auto highRequestID = subResult.value()->subscribeOk().requestID;
 
-    // Phase 1: warm-up
-    uint64_t lastHighGroup = 0;
-    for (int i = 0; i < FLAGS_warm_up_groups; ++i) {
-      auto obj = co_await highConsumer->dequeue();
-      if (!obj) {
-        XLOG(ERR) << "high track ended during warm-up";
-        co_return false;
-      }
-      lastHighGroup = obj->group;
-      printEvent(folly::dynamic::object("event", "object")("track", obj->track)(
-          "group", obj->group)("object", obj->objectID));
-    }
-
-    // Phase 2: artificial lag
-    if (FLAGS_lag_seconds > 0) {
-      printEvent(folly::dynamic::object("event", "lag_start")(
-          "after_group", lastHighGroup));
-      co_await folly::coro::sleep(std::chrono::seconds(FLAGS_lag_seconds));
-      printEvent(folly::dynamic::object("event", "lag_end")(
-          "elapsed_ms", FLAGS_lag_seconds * 1000));
-    }
-
-    // Phase 3: send SWITCH
     relayClient_->getSession()->sendSwitch(Switch{
-        .currentSubscribeRequestID = highRequestID,
+        .currentSubscribeRequestID = highRequestID_,
         .targetTrackName =
             FullTrackName{TrackNamespace({FLAGS_ns}), "low"},
-        .minimumSwitchingGroupID = lastHighGroup + 1});
+        .minimumSwitchingGroupID = lastHighGroup_ + 1});
 
-    // Phase 4: wait for relay-initiated PUBLISH, then drain + collect.
-    // Extracted into a separate coroutine to split the frame and work around
-    // a GCC 11/12 ICE (morph_fn_to_coro / build_special_member_call) that
-    // triggers when the coroutine frame holds too many non-trivial types.
     auto exec = co_await folly::coro::co_current_executor;
     co_await publishPromise_.getSemiFuture().via(exec);
     co_return co_await collectPhase();
@@ -278,12 +296,12 @@ class SwitchSubscriber : public Subscriber,
         lowConsumer_->setCatchup(false);
         received.push_back(*obj);
         printEvent(folly::dynamic::object("event", "object")(
-            "track", obj->track)("group", obj->group)("object", obj->objectID));
+            "track", "low")("group", obj->group)("object", obj->objectID));
         drainedCatchup = true;
       } else {
         received.push_back(*obj);
         printEvent(folly::dynamic::object("event", "catchup")(
-            "track", obj->track)("group", obj->group)("object", obj->objectID));
+            "track", "low")("group", obj->group)("object", obj->objectID));
       }
     }
 
@@ -295,7 +313,7 @@ class SwitchSubscriber : public Subscriber,
       }
       received.push_back(*obj);
       printEvent(folly::dynamic::object("event", "object")(
-          "track", obj->track)("group", obj->group)("object", obj->objectID));
+          "track", "low")("group", obj->group)("object", obj->objectID));
       ++liveCollected;
     }
 
@@ -322,10 +340,10 @@ class SwitchSubscriber : public Subscriber,
       if (!first && o.group > lastGroup + 1) {
         gap = true;
       }
-      if (o.track == "high" && o.group >= switchingGroupID_) {
+      if (!o.isLow && o.group >= switchingGroupID_) {
         gap = true;
       }
-      if (o.track == "low" && o.group < switchingGroupID_) {
+      if (o.isLow && o.group < switchingGroupID_) {
         duplicate = true;
       }
       seen.insert(o.group);
@@ -335,7 +353,6 @@ class SwitchSubscriber : public Subscriber,
     uint64_t catchupGroups = (liveEdgeGroupID_ > switchingGroupID_)
         ? liveEdgeGroupID_ - switchingGroupID_
         : 0;
-    // When lag was requested, require a non-trivial catch-up range.
     bool insufficientCatchup =
         (FLAGS_lag_seconds > 0 && catchupGroups == 0);
     bool pass = hasSwitchTransition && !gap && !duplicate && !insufficientCatchup;
@@ -346,7 +363,10 @@ class SwitchSubscriber : public Subscriber,
   }
 
   std::shared_ptr<MoQRelayClient> relayClient_;
+  std::shared_ptr<CollectingConsumer> highConsumer_;
   std::shared_ptr<CollectingConsumer> lowConsumer_;
+  RequestID highRequestID_{};
+  uint64_t lastHighGroup_{0};
   folly::Promise<folly::Unit> publishPromise_;
   uint64_t switchingGroupID_{UINT64_MAX};
   uint64_t liveEdgeGroupID_{0};

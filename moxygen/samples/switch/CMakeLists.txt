@@ -50,6 +50,10 @@ target_include_directories(
 target_compile_options(
   moqswitchsub PRIVATE
   ${_MOXYGEN_COMMON_COMPILE_OPTIONS}
+  # GCC 12 ICEs in morph_fn_to_coro on coroutines that co_await types
+  # containing std::string (e.g. folly::Expected<T, RequestError>).
+  # -O0 disables the tree-sink / SSA passes that trigger the bug.
+  -O0
 )
 target_link_libraries(
   moqswitchsub PUBLIC
