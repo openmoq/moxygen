@@ -8,6 +8,7 @@
 #include <folly/coro/Sleep.h>
 #include <folly/init/Init.h>
 #include <folly/io/async/EventBaseManager.h>
+#include <folly/io/async/ScopedEventBaseThread.h>
 #include <folly/portability/GFlags.h>
 #include <moxygen/MoQWebTransportClient.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
@@ -147,6 +148,11 @@ folly::coro::Task<void> run(std::shared_ptr<SwitchPublisher> pub) {
 int main(int argc, char* argv[]) {
   folly::Init init(&argc, &argv);
   auto pub = std::make_shared<SwitchPublisher>(FLAGS_ns);
-  folly::coro::blockingWait(run(pub));
+  // ScopedEventBaseThread provides a running EventBase on a dedicated thread.
+  // EventBaseManager::get()->getEventBase() in run() returns this EventBase,
+  // making QUIC callbacks fire correctly (undriven EventBase = silent hang).
+  folly::ScopedEventBaseThread ioThread;
+  folly::coro::blockingWait(
+      run(pub).scheduleOn(ioThread.getEventBase()).start());
   return 0;
 }

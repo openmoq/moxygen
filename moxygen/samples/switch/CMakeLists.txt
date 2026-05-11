@@ -28,6 +28,7 @@ target_link_libraries(
   moxygen_relay_moq_relay_client
   Folly::folly_init_init
   Folly::folly_futures_core
+  Folly::folly_io_async_scoped_event_base_thread
 )
 
 # moqswitchsub — subscriber that sends SWITCH and validates relay response
@@ -65,6 +66,7 @@ target_link_libraries(
   Folly::folly_init_init
   Folly::folly_json_dynamic
   Folly::folly_futures_core
+  Folly::folly_io_async_scoped_event_base_thread
 )
 
 install(

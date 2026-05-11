@@ -3604,11 +3604,11 @@ void MoQSession::onRequestUpdate(RequestUpdate requestUpdate) {
 void MoQSession::handleSubscribeRequestUpdate(
     RequestUpdate requestUpdate,
     std::shared_ptr<TrackPublisherImpl> trackPublisher) {
-  if (!publishHandler_) {
-    XLOG(DBG1) << __func__ << " No publisher callback set";
-    return;
-  }
-
+  // Do NOT gate on publishHandler_: the forward-state update goes through
+  // subscriptionHandle_->requestUpdate() (a MoQForwarder::Subscriber) and
+  // requires no application-level publisher callback.  Clients that call
+  // session->publish() directly without a Publisher handler still need the
+  // REQUEST_UPDATE forward=true to start sending objects.
   trackPublisher->setSubPriority(requestUpdate.priority);
   trackPublisher->onRequestUpdate(std::move(requestUpdate));
 }

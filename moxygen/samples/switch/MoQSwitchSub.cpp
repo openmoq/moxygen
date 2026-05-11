@@ -9,6 +9,7 @@
 #include <folly/coro/UnboundedQueue.h>
 #include <folly/init/Init.h>
 #include <folly/io/async/EventBaseManager.h>
+#include <folly/io/async/ScopedEventBaseThread.h>
 #include <folly/json.h>
 #include <folly/portability/GFlags.h>
 #include <moxygen/MoQConsumers.h>
@@ -237,6 +238,33 @@ class SwitchSubscriber : public Subscriber,
       co_return false;
     }
 
+    // When testing with lag, subscribe to the target "low" track immediately so
+    // the relay will REQUEST_UPDATE the publisher and cache "low" groups during
+    // the entire warm-up + lag period.  The handle is stored as a member to
+    // keep it alive across co_awaits without landing in the coroutine frame
+    // (GCC 12 ICE guard).  We unsubscribe before sending SWITCH so the relay
+    // PUBLISH from the SWITCH mechanism is the sole delivery path.
+    if (FLAGS_lag_seconds > 0) {
+      folly::Promise<bool> primePromise;
+      auto primeDone = primePromise.getFuture();
+      relayClient_->getSession()
+          ->subscribe(
+              SubscribeRequest::make(
+                  FullTrackName{TrackNamespace({FLAGS_ns}), "low"}),
+              std::make_shared<CollectingConsumer>(/*isLow=*/true))
+          .semi()
+          .via(evb)
+          .thenValue(
+              [this, p = std::move(primePromise)](auto res) mutable {
+                if (!res.hasError()) {
+                  lowPrimeHandle_ = res.value();
+                }
+                p.setValue(!res.hasError());
+              });
+      co_await std::move(primeDone).via(evb);
+      // Continue even if prime fails — catch-up simply won't be available.
+    }
+
     for (int i = 0; i < FLAGS_warm_up_groups; ++i) {
       auto obj = co_await highConsumer_->dequeue();
       if (!obj) {
@@ -252,6 +280,11 @@ class SwitchSubscriber : public Subscriber,
       printEvent(folly::dynamic::object("event", "lag_start")(
           "after_group", lastHighGroup_));
       co_await folly::coro::sleep(std::chrono::seconds(FLAGS_lag_seconds));
+      // Unsubscribe "low" before SWITCH so the relay PUBLISH is the sole path.
+      if (lowPrimeHandle_) {
+        lowPrimeHandle_->unsubscribe();
+        lowPrimeHandle_.reset();
+      }
       printEvent(folly::dynamic::object("event", "lag_end")(
           "elapsed_ms", FLAGS_lag_seconds * 1000));
     }
@@ -365,6 +398,10 @@ class SwitchSubscriber : public Subscriber,
   std::shared_ptr<MoQRelayClient> relayClient_;
   std::shared_ptr<CollectingConsumer> highConsumer_;
   std::shared_ptr<CollectingConsumer> lowConsumer_;
+  // Held on the heap (not in coroutine frame) to keep it alive across co_awaits
+  // and avoid GCC 12 ICE; used to unsubscribe the cache-priming subscription
+  // for "low" before SWITCH is sent.
+  std::shared_ptr<SubscriptionHandle> lowPrimeHandle_;
   RequestID highRequestID_{};
   uint64_t lastHighGroup_{0};
   folly::Promise<folly::Unit> publishPromise_;
@@ -377,6 +414,11 @@ class SwitchSubscriber : public Subscriber,
 int main(int argc, char* argv[]) {
   folly::Init init(&argc, &argv);
   auto sub = std::make_shared<SwitchSubscriber>();
-  bool pass = folly::coro::blockingWait(sub->run());
+  // ScopedEventBaseThread provides a running EventBase on a dedicated thread.
+  // EventBaseManager::get()->getEventBase() in run() returns this EventBase,
+  // making QUIC callbacks fire correctly (undriven EventBase = silent hang).
+  folly::ScopedEventBaseThread ioThread;
+  bool pass = folly::coro::blockingWait(
+      sub->run().scheduleOn(ioThread.getEventBase()).start());
   return pass ? 0 : 1;
 }
