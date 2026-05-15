@@ -178,6 +178,8 @@ class SwitchSubscriber : public Subscriber,
         "g_switch", switchingGroupID_)("live_edge", liveEdgeGroupID_));
 
     lowConsumer_ = std::make_shared<CollectingConsumer>(/*isLow=*/true, /*catchup=*/true);
+    relayClient_->getSession()->registerSwitchFetchConsumer(
+        highRequestID_, lowConsumer_);
     if (!publishPromise_.isFulfilled()) {
       publishPromise_.setValue(folly::unit);
     } else {

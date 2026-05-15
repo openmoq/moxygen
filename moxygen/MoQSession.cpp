@@ -2768,16 +2768,88 @@ MoQSession::getSubscribeTrackReceiveState(TrackAlias trackAlias) {
   return trackIt->second;
 }
 
+// Adapts a TrackConsumer as a FetchConsumer so that relay-initiated FETCH
+// streams for SWITCH catch-up can be routed through the existing
+// ObjectStreamCallback FETCH path.
+class SwitchFetchConsumerAdapter : public FetchConsumer {
+ public:
+  explicit SwitchFetchConsumerAdapter(std::shared_ptr<TrackConsumer> consumer)
+      : consumer_(std::move(consumer)) {}
+
+  folly::Expected<folly::Unit, MoQPublishError> object(
+      uint64_t groupID,
+      uint64_t subgroupID,
+      uint64_t objectID,
+      Payload payload,
+      Extensions extensions,
+      bool finFetch,
+      bool /*datagram*/) override {
+    auto len = payload ? payload->computeChainDataLength() : 0;
+    ObjectHeader hdr(
+        groupID,
+        subgroupID,
+        objectID,
+        std::nullopt,
+        ObjectStatus::NORMAL,
+        extensions,
+        len > 0 ? std::optional<uint64_t>(len) : std::nullopt);
+    return consumer_->objectStream(hdr, std::move(payload), finFetch);
+  }
+
+  folly::Expected<folly::Unit, MoQPublishError> beginObject(
+      uint64_t, uint64_t, uint64_t, uint64_t, Payload, Extensions) override {
+    return folly::unit; // not used for SWITCH catch-up (whole-object delivery only)
+  }
+  folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
+      Payload, bool) override {
+    return ObjectPublishStatus::DONE;
+  }
+  folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+      uint64_t, uint64_t, uint64_t, bool) override {
+    return folly::unit;
+  }
+  folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+      uint64_t, uint64_t, uint64_t) override {
+    return folly::unit;
+  }
+  folly::Expected<folly::Unit, MoQPublishError> endOfFetch() override {
+    return folly::unit;
+  }
+  void reset(ResetStreamErrorCode) override {}
+  folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>
+  awaitReadyToConsume() override {
+    return folly::makeSemiFuture<uint64_t>(0u);
+  }
+
+ private:
+  std::shared_ptr<TrackConsumer> consumer_;
+};
+
 std::shared_ptr<MoQSession::FetchTrackReceiveState>
 MoQSession::getFetchTrackReceiveState(RequestID requestID) {
   XLOG(DBG3) << "getTrack reqID=" << requestID;
   auto trackIt = fetches_.find(requestID);
-  if (trackIt == fetches_.end()) {
-    // received an object for unknown subscribe ID
-    XLOG(ERR) << "unknown subscribe ID=" << requestID << " sess=" << this;
-    return nullptr;
+  if (trackIt != fetches_.end()) {
+    return trackIt->second;
   }
-  return trackIt->second;
+  // Check for relay-initiated FETCH streams from SWITCH catch-up delivery.
+  auto switchIt = switchFetchConsumers_.find(requestID);
+  if (switchIt != switchFetchConsumers_.end()) {
+    auto adapter =
+        std::make_shared<SwitchFetchConsumerAdapter>(switchIt->second);
+    switchFetchConsumers_.erase(switchIt);
+    auto state = std::make_shared<FetchTrackReceiveState>(
+        FullTrackName{}, requestID, std::move(adapter));
+    // Pre-fulfill the fetch promise so fetchOkAndAllDataReceived() triggers
+    // cleanup in fetches_ correctly when the stream closes.
+    (void)state->fetchFuture();
+    state->fetchOK(FetchOk{requestID});
+    fetches_.emplace(requestID, state);
+    return state;
+  }
+  // received an object for unknown subscribe ID
+  XLOG(ERR) << "unknown fetch ID=" << requestID << " sess=" << this;
+  return nullptr;
 }
 
 namespace detail {
@@ -6056,6 +6128,13 @@ std::shared_ptr<ReplyContext> MoQSession::controlStreamReplyContext() {
         controlWriteBuf_, controlWriteEvent_, cancellationSource_.getToken());
   }
   return controlStreamReplyContext_;
+}
+
+void MoQSession::registerSwitchFetchConsumer(
+    RequestID currentSubscribeRequestID,
+    std::shared_ptr<TrackConsumer> consumer) {
+  switchFetchConsumers_.emplace(
+      currentSubscribeRequestID, std::move(consumer));
 }
 
 void MoQSession::validateAndSetVersionFromAlpn(const std::string& alpn) {

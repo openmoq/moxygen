@@ -540,6 +540,16 @@ class MoQSession : public Subscriber,
 
   void sendSwitch(const Switch& sw);
 
+  // Register a TrackConsumer to receive objects from a relay-initiated FETCH
+  // stream opened for SWITCH catch-up delivery. The key is the
+  // currentSubscribeRequestID carried in the FETCH_HEADER. Once the FETCH
+  // stream header is parsed, the consumer is looked up here before the normal
+  // fetches_ map so that SWITCH catch-up can be routed without a prior FETCH
+  // request from this side.
+  void registerSwitchFetchConsumer(
+      RequestID currentSubscribeRequestID,
+      std::shared_ptr<TrackConsumer> consumer);
+
  private:
   static const folly::RequestToken& sessionRequestToken();
 
@@ -1001,6 +1011,10 @@ class MoQSession : public Subscriber,
   // Private session state
   folly::F14FastMap<RequestID, std::shared_ptr<PublisherImpl>, RequestID::hash>
       pubTracks_;
+  // Pending TrackConsumers for relay-initiated FETCH streams from SWITCH
+  // catch-up. Keyed by currentSubscribeRequestID written in FETCH_HEADER.
+  folly::F14FastMap<RequestID, std::shared_ptr<TrackConsumer>, RequestID::hash>
+      switchFetchConsumers_;
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingPublishTracks_;
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingSubscribeTracks_;
   folly::F14FastMap<TrackAlias, std::list<Payload>, TrackAlias::hash>
