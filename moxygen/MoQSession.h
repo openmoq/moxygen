@@ -997,6 +997,10 @@ class MoQSession : public Subscriber,
  protected:
   std::optional<uint64_t> negotiatedVersion_;
 
+  proxygen::WebTransport* getWebTransport() const {
+    return wt_;
+  }
+
   // Shared receive-side auth token cache. All codecs that parse auth tokens
   // (control stream, draft16+ SUBSCRIBE_NAMESPACE bidi streams, etc.) point to
   // this cache so that aliases registered on one stream are visible on all
