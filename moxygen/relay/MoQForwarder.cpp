@@ -589,13 +589,13 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::publishDone(
 
 void MoQForwarder::addForwardingSubscriber() {
   if (forwardingSubscribers_++ == 0 && callback_) {
-    callback_->forwardChanged(this);
+    callback_->forwardChanged(this, true);
   }
 }
 
 void MoQForwarder::removeForwardingSubscriber() {
   if (--forwardingSubscribers_ == 0 && callback_) {
-    callback_->forwardChanged(this);
+    callback_->forwardChanged(this, false);
   }
 }
 
