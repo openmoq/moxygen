@@ -90,6 +90,9 @@ folly::coro::Task<void> SubscriberState::connect() {
         [] {
           quic::TransportSettings ts;
           ts.orderedReadCallbacks = true;
+          ts.rxPacketsBeforeAckAfterInit = 2;
+          ts.shouldUseRecvmmsgForBatchRecv = true;
+          ts.maxRecvBatchSize = 32;
           return ts;
         }(),
         alpns_);
