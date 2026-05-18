@@ -1015,10 +1015,6 @@ class MoQSession : public Subscriber,
   // Private session state
   folly::F14FastMap<RequestID, std::shared_ptr<PublisherImpl>, RequestID::hash>
       pubTracks_;
-  // Pending TrackConsumers for relay-initiated FETCH streams from SWITCH
-  // catch-up. Keyed by currentSubscribeRequestID written in FETCH_HEADER.
-  folly::F14FastMap<RequestID, std::shared_ptr<TrackConsumer>, RequestID::hash>
-      switchFetchConsumers_;
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingPublishTracks_;
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingSubscribeTracks_;
   folly::F14FastMap<TrackAlias, std::list<Payload>, TrackAlias::hash>
@@ -1054,5 +1050,11 @@ class MoQSession : public Subscriber,
   bool closed_{false};
   std::string authority_;
   std::string path_;
+  // Pending TrackConsumers for relay-initiated FETCH streams from SWITCH
+  // catch-up. Keyed by currentSubscribeRequestID written in FETCH_HEADER.
+  // MUST be at the end of the private section to avoid shifting proxygen's
+  // inlined offsets for fields like authority_ / path_.
+  folly::F14FastMap<RequestID, std::shared_ptr<TrackConsumer>, RequestID::hash>
+      switchFetchConsumers_;
 };
 } // namespace moxygen
