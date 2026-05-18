@@ -110,7 +110,10 @@ MoQForwarder::SubgroupForwarder::forEachSubscriberSubgroup(
         XLOG(DBG2) << "skipping creating subgroup for sub=" << sub.get();
         return;
       }
-      XCHECK(sub->trackConsumer);
+      // TODO: buffer objects until trackConsumer is set (currently dropped)
+      if (!sub->trackConsumer) {
+        return;
+      }
       XLOG(DBG2) << "Making new subgroup for consumer=" << sub->trackConsumer
                  << " " << callsite;
       auto res = sub->trackConsumer->beginSubgroup(
@@ -515,6 +518,10 @@ MoQForwarder::beginSubgroup(
     if (sub->subgroups.count(subgroupIdentifier)) {
       return;
     }
+    // TODO: buffer objects until trackConsumer is set (currently dropped)
+    if (!sub->trackConsumer) {
+      return;
+    }
     auto sgRes = sub->trackConsumer->beginSubgroup(
         groupID, subgroupID, priority, containsLastInGroup);
     if (sgRes.hasError()) {
@@ -545,6 +552,10 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::objectStream(
     if (!checkRange(*sub) || !sub->checkShouldForward()) {
       return;
     }
+    // TODO: buffer objects until trackConsumer is set (currently dropped)
+    if (!sub->trackConsumer) {
+      return;
+    }
     sub->trackConsumer->objectStream(header, maybeClone(payload), lastInGroup)
         .onError([this, sub](const auto& err) {
           removeSubscriberOnError(*sub, err, "objectStream");
@@ -560,6 +571,10 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::datagram(
   countReceivedObject(header.group);
   return forEachSubscriber([&](const std::shared_ptr<Subscriber>& sub) {
     if (!checkRange(*sub) || !sub->checkShouldForward()) {
+      return;
+    }
+    // TODO: buffer objects until trackConsumer is set (currently dropped)
+    if (!sub->trackConsumer) {
       return;
     }
     sub->trackConsumer->datagram(header, maybeClone(payload), lastInGroup)
