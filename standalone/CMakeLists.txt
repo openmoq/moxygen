@@ -120,41 +120,39 @@ endif()
 # /opt/homebrew/Cellar/libsodium/<version>/... into fizz-targets.cmake
 # INTERFACE_INCLUDE_DIRECTORIES, so the install tree breaks after
 # `brew upgrade libsodium`. Steer through brew's stable opt-symlink.
-if(APPLE AND (NOT DEFINED Sodium_INCLUDE_DIR OR NOT DEFINED Sodium_LIBRARY_RELEASE))
+# Note: FindSodium.cmake (in build/fbcode_builder/CMake/) uses lowercase
+# `sodium_*` cache variables (sodium_INCLUDE_DIR, sodium_LIBRARY_RELEASE),
+# not the FindOpenSSL-style uppercase convention.
+if(APPLE AND (NOT DEFINED sodium_INCLUDE_DIR OR NOT DEFINED sodium_LIBRARY_RELEASE))
     if(NOT DEFINED _brew_prefix)
         execute_process(COMMAND brew --prefix
             OUTPUT_VARIABLE _brew_prefix
             OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
     endif()
     if(_brew_prefix AND EXISTS "${_brew_prefix}/opt/libsodium")
-        if(NOT DEFINED Sodium_INCLUDE_DIR)
-            set(Sodium_INCLUDE_DIR
+        if(NOT DEFINED sodium_INCLUDE_DIR)
+            set(sodium_INCLUDE_DIR
                 "${_brew_prefix}/opt/libsodium/include" CACHE PATH "")
         endif()
-        if(NOT DEFINED Sodium_LIBRARY_RELEASE)
-            set(Sodium_LIBRARY_RELEASE
+        if(NOT DEFINED sodium_LIBRARY_RELEASE)
+            set(sodium_LIBRARY_RELEASE
                 "${_brew_prefix}/opt/libsodium/lib/libsodium.dylib"
                 CACHE FILEPATH "")
         endif()
     endif()
 endif()
 
-# find_package(ZLIB) defaults to whichever SDK xcrun resolves at configure
-# time, which on a host with Xcode installed produces a versioned
-# /Applications/Xcode_X.Y.app/.../libz.tbd path. That path gets baked into
-# IMPORTED_LOCATION of dependent target configs and breaks on consumer
-# hosts with a different Xcode version (or CLT-only). The CommandLineTools
-# SDK lives at a stable path that's present on every dev mac and CI
-# runner; pin find_package(ZLIB) to it.
-if(APPLE)
+# Pin CMAKE_OSX_SYSROOT to the CommandLineTools SDK so all SDK-relative
+# paths baked into exported target configs (libz, system frameworks, etc.)
+# reference a stable path present on every dev mac and CI runner — not
+# whatever versioned /Applications/Xcode_X.Y.app/.../SDKs/MacOSX.sdk path
+# xcrun happened to resolve at build time. find_library(ZLIB ...) etc.
+# search relative to CMAKE_OSX_SYSROOT, so this pin propagates through all
+# subprojects (folly, fizz, etc.) without per-library pre-population.
+if(APPLE AND NOT DEFINED CMAKE_OSX_SYSROOT)
     set(_clt_sdk "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk")
-    if(EXISTS "${_clt_sdk}/usr/lib/libz.tbd")
-        if(NOT DEFINED ZLIB_INCLUDE_DIR)
-            set(ZLIB_INCLUDE_DIR "${_clt_sdk}/usr/include" CACHE PATH "")
-        endif()
-        if(NOT DEFINED ZLIB_LIBRARY)
-            set(ZLIB_LIBRARY "${_clt_sdk}/usr/lib/libz.tbd" CACHE FILEPATH "")
-        endif()
+    if(EXISTS "${_clt_sdk}/usr/include")
+        set(CMAKE_OSX_SYSROOT "${_clt_sdk}" CACHE PATH "")
     endif()
 endif()
 
