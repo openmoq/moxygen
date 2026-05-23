@@ -3,6 +3,23 @@
 # LICENSE file in the root directory of this source tree.
 
 cmake_minimum_required(VERSION 3.16)
+
+# Pin CMAKE_OSX_SYSROOT to the CommandLineTools SDK BEFORE project() so the
+# compiler probe records this sysroot. Setting it after project()/enable_
+# language() doesn't reach the compiler's baked sysroot — which folly et al.
+# pick up via xcrun-style discovery and bake into IMPORTED_LOCATION of
+# exported target configs. The CommandLineTools SDK lives at a stable path
+# present on every dev mac and CI runner, unlike the versioned
+# /Applications/Xcode_X.Y.app/.../SDKs/MacOSX.sdk that xcrun resolves to on
+# hosts with Xcode installed. Plain EXISTS check works on any host — the
+# path is macOS-only.
+if(EXISTS "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk")
+    if(NOT DEFINED CMAKE_OSX_SYSROOT)
+        set(CMAKE_OSX_SYSROOT
+            "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk" CACHE PATH "")
+    endif()
+endif()
+
 project(moxygen-standalone VERSION 1.0.0 LANGUAGES CXX C)
 
 # Disable CMake user package registry to prevent picking up stale getdeps builds
@@ -139,20 +156,6 @@ if(APPLE AND (NOT DEFINED sodium_INCLUDE_DIR OR NOT DEFINED sodium_LIBRARY_RELEA
                 "${_brew_prefix}/opt/libsodium/lib/libsodium.dylib"
                 CACHE FILEPATH "")
         endif()
-    endif()
-endif()
-
-# Pin CMAKE_OSX_SYSROOT to the CommandLineTools SDK so all SDK-relative
-# paths baked into exported target configs (libz, system frameworks, etc.)
-# reference a stable path present on every dev mac and CI runner — not
-# whatever versioned /Applications/Xcode_X.Y.app/.../SDKs/MacOSX.sdk path
-# xcrun happened to resolve at build time. find_library(ZLIB ...) etc.
-# search relative to CMAKE_OSX_SYSROOT, so this pin propagates through all
-# subprojects (folly, fizz, etc.) without per-library pre-population.
-if(APPLE AND NOT DEFINED CMAKE_OSX_SYSROOT)
-    set(_clt_sdk "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk")
-    if(EXISTS "${_clt_sdk}/usr/include")
-        set(CMAKE_OSX_SYSROOT "${_clt_sdk}" CACHE PATH "")
     endif()
 endif()
 
