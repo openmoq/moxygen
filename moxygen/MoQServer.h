@@ -8,6 +8,7 @@
 
 #include <proxygen/httpserver/samples/hq/HQServer.h>
 #include <moxygen/MoQServerBase.h>
+#include <quic/logging/QLogger.h>
 
 #include <folly/init/Init.h>
 #include <folly/io/async/EventBaseLocal.h>
@@ -107,6 +108,16 @@ class MoQServer : public MoQServerBase {
   // Register ALPN handlers for direct QUIC connections (internal use)
   void registerAlpnHandler(const std::vector<std::string>& alpns);
 
+  // Hook called once per new QUIC connection (both WebTransport/H3 and direct
+  // QUIC ALPN paths). Override to return a FileQLogger or similar for this
+  // connection; return nullptr to skip qlog. Default returns nullptr.
+  // FileQLogger(streaming=true) is recommended: it uses its own
+  // folly::AsyncFileWriter background thread — no executor needed.
+  virtual std::shared_ptr<quic::QLogger> makeQLogger(
+      quic::VantagePoint /*vantagePoint*/) {
+    return nullptr;
+  }
+
  private:
   void createMoQQuicSession(std::shared_ptr<quic::QuicSocket> quicSocket);
 
@@ -178,7 +189,10 @@ class MoQServer : public MoQServerBase {
   quic::samples::HQServerParams params_;
   std::shared_ptr<const fizz::server::FizzServerContext> fizzContext_;
   std::vector<std::string> wtMoqtProtocols_;
-  std::unique_ptr<quic::samples::HQServerTransportFactory> factory_;
+  // inner_ is owned by factory_ (MoQQLogFactory); kept as a raw ptr for
+  // addAlpnHandler() access in registerAlpnHandler().
+  quic::samples::HQServerTransportFactory* innerFactory_{nullptr};
+  std::unique_ptr<quic::QuicServerTransportFactory> factory_;
   std::unique_ptr<quic::samples::HQServer> hqServer_;
   folly::EventBaseLocal<std::shared_ptr<MoQExecutor>> executorLocal_;
   std::function<bool()> useQuicWtSession_;

@@ -12,11 +12,62 @@
 #include <proxygen/lib/http/webtransport/QuicWebTransport.h>
 #include <proxygen/lib/http/webtransport/QuicWtSession.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
+#include <quic/api/QuicTransportBaseLite.h>
 
 #include <utility>
 
 using namespace quic::samples;
 using namespace proxygen;
+
+namespace {
+
+// Wraps HQServerTransportFactory to attach a QLogger to every new transport
+// via a subclass-supplied makeQLogger() hook.  This covers both paths:
+//   - WebTransport (H3): HQServerTransportFactory::make() is called by mvfst
+//     for every incoming QUIC connection, regardless of ALPN.
+//   - Direct QUIC ALPN (moqt-*): same make() call, before the ALPN handler
+//     fires and hands the socket to createMoQQuicSession().
+// Using FileQLogger(streaming=true) each logger writes via its own
+// folly::AsyncFileWriter background thread — no separate executor needed.
+class MoQQLogFactory : public quic::QuicServerTransportFactory {
+ public:
+  MoQQLogFactory(
+      std::unique_ptr<HQServerTransportFactory> inner,
+      std::function<std::shared_ptr<quic::QLogger>(quic::VantagePoint)>
+          makeQLoggerFn)
+      : inner_(std::move(inner)),
+        makeQLoggerFn_(std::move(makeQLoggerFn)) {}
+
+  quic::QuicServerTransport::Ptr make(
+      folly::EventBase* evb,
+      std::unique_ptr<quic::FollyAsyncUDPSocketAlias> socket,
+      const folly::SocketAddress& addr,
+      quic::QuicVersion quicVersion,
+      std::shared_ptr<const fizz::server::FizzServerContext>
+          ctx) noexcept override {
+    auto transport =
+        inner_->make(evb, std::move(socket), addr, quicVersion, std::move(ctx));
+    if (transport && makeQLoggerFn_) {
+      if (auto logger = makeQLoggerFn_(quic::VantagePoint::Server)) {
+        auto* base =
+            dynamic_cast<quic::QuicTransportBaseLite*>(transport.get());
+        if (base) {
+          base->setQLogger(std::move(logger));
+        }
+      }
+    }
+    return transport;
+  }
+
+  HQServerTransportFactory* inner() const noexcept { return inner_.get(); }
+
+ private:
+  std::unique_ptr<HQServerTransportFactory> inner_;
+  std::function<std::shared_ptr<quic::QLogger>(quic::VantagePoint)>
+      makeQLoggerFn_;
+};
+
+} // namespace
 
 namespace moxygen {
 
@@ -91,8 +142,14 @@ MoQServer::MoQServer(
     }
   }
 
-  factory_ = std::make_unique<HQServerTransportFactory>(
+  // Build the factory chain: inner handles H3/ALPN dispatch; outer attaches a
+  // QLogger (from makeQLogger()) to every transport before any session starts.
+  auto inner = std::make_unique<HQServerTransportFactory>(
       params_, [this](HTTPMessage*) { return new Handler(*this); }, nullptr);
+  innerFactory_ = inner.get();
+  factory_ = std::make_unique<MoQQLogFactory>(
+      std::move(inner),
+      [this](quic::VantagePoint vp) { return makeQLogger(vp); });
 
   // Register ALPN handlers for direct QUIC MoQT connections
   XLOG(DBG1) << "MoQServer: Registering ALPN handlers: "
@@ -104,7 +161,7 @@ MoQServer::MoQServer(
 }
 
 void MoQServer::registerAlpnHandler(const std::vector<std::string>& alpns) {
-  if (!factory_) {
+  if (!innerFactory_) {
     XLOG(INFO) << "Cannot register ALPN handler: factory not initialized";
     return;
   }
@@ -114,7 +171,7 @@ void MoQServer::registerAlpnHandler(const std::vector<std::string>& alpns) {
     return;
   }
 
-  factory_->addAlpnHandler(
+  innerFactory_->addAlpnHandler(
       alpns,
       [this](
           std::shared_ptr<quic::QuicSocket> quicSocket,
