@@ -501,6 +501,7 @@ StreamPublisherImpl::StreamPublisherImpl(
   }
 
   moqFrameWriter_.initializeVersion(publisher->getVersion());
+  moqFrameWriter_.setFetchGroupOrder(publisher->getGroupOrder());
   (void)moqFrameWriter_.writeFetchHeader(writeBuf_, publisher->requestID());
 }
 
@@ -1316,7 +1317,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       uint64_t groupID,
       uint64_t subgroupID,
       Priority priority,
-      bool containsLastInGroup = false) override;
+      BeginSubgroupOptions options = {}) override;
 
   folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
   beginSubgroup(
@@ -1325,7 +1326,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       Priority priority,
       SubgroupIDFormat format,
       bool includeExtensions,
-      bool containsLastInGroup);
+      BeginSubgroupOptions options);
 
   folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
   awaitStreamCredit() override;
@@ -1505,14 +1506,14 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
     uint64_t groupID,
     uint64_t subgroupID,
     Priority pubPriority,
-    bool containsLastInGroup) {
+    BeginSubgroupOptions options) {
   return beginSubgroup(
       groupID,
       subgroupID,
       pubPriority,
       SubgroupIDFormat::Present,
       true,
-      containsLastInGroup);
+      options);
 }
 
 folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
@@ -1522,7 +1523,7 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
     Priority pubPriority,
     SubgroupIDFormat format,
     bool includeExtensions,
-    bool containsLastInGroup) {
+    TrackConsumer::BeginSubgroupOptions options) {
   if (!trackAlias_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Must set track alias first"));
@@ -1571,7 +1572,7 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
       elidedPriority,
       format,
       includeExtensions,
-      containsLastInGroup,
+      options.containsLastInGroup,
       logger_,
       deliveryCallback_,
       effectiveTimeout);
@@ -1639,6 +1640,8 @@ MoQSession::TrackPublisherImpl::objectStream(
   }
   XCHECK(objHeader.status == ObjectStatus::NORMAL || !payload);
   Extensions extensions = objHeader.extensions;
+  TrackConsumer::BeginSubgroupOptions options;
+  options.containsLastInGroup = lastInGroup;
   auto subgroup = beginSubgroup(
       objHeader.group,
       objHeader.subgroup,
@@ -1646,7 +1649,7 @@ MoQSession::TrackPublisherImpl::objectStream(
       objHeader.subgroup == objHeader.id ? SubgroupIDFormat::FirstObject
                                          : SubgroupIDFormat::Present,
       !extensions.empty(),
-      lastInGroup);
+      options);
   if (subgroup.hasError()) {
     return folly::makeUnexpected(std::move(subgroup.error()));
   }
@@ -2035,9 +2038,13 @@ class MoQSession::FetchTrackReceiveState
       FullTrackName fullTrackName,
       RequestID requestID,
       std::shared_ptr<FetchConsumer> fetchCallback,
+      GroupOrder fetchGroupOrder = GroupOrder::OldestFirst,
       std::shared_ptr<MLogger> logger = nullptr)
       : TrackReceiveStateBase(std::move(fullTrackName), requestID),
-        callback_(std::move(fetchCallback)) {
+        callback_(std::move(fetchCallback)),
+        fetchGroupOrder_(
+            fetchGroupOrder == GroupOrder::Default ? GroupOrder::OldestFirst
+                                                   : fetchGroupOrder) {
     logger_ = std::move(logger);
   }
 
@@ -2049,6 +2056,10 @@ class MoQSession::FetchTrackReceiveState
 
   std::shared_ptr<FetchConsumer> getFetchCallback() const {
     return callback_;
+  }
+
+  GroupOrder getFetchGroupOrder() const {
+    return fetchGroupOrder_;
   }
 
   void resetFetchCallback(MoQSession* session) {
@@ -2096,6 +2107,7 @@ class MoQSession::FetchTrackReceiveState
  private:
   std::shared_ptr<MLogger> logger_ = nullptr;
   std::shared_ptr<FetchConsumer> callback_;
+  GroupOrder fetchGroupOrder_;
   folly::coro::Promise<FetchResult> promise_;
   uint64_t currentStreamId_{0};
 };
@@ -2975,7 +2987,10 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     // Use object priority if present, else fall back to publisher priority
     uint8_t effectivePriority =
         priority.value_or(subscribeState_->getPublisherPriority());
-    auto res = callback->beginSubgroup(group, subgroup, effectivePriority);
+    TrackConsumer::BeginSubgroupOptions beginOptions;
+    beginOptions.containsLastInGroup = options.hasEndOfGroup;
+    auto res = callback->beginSubgroup(
+        group, subgroup, effectivePriority, beginOptions);
     if (res.hasValue()) {
       subgroupCallback_ = *res;
     } else {
@@ -3351,11 +3366,12 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
   };
 
   // Lambda for onFetch
-  auto onFetchFunc = [this, &token](RequestID requestID) {
+  auto onFetchFunc = [this, &token, &codec](RequestID requestID) {
     auto state = getFetchTrackReceiveState(requestID);
     if (state) {
       // FetchTrackReceiveState lifecycle now controls read loop
       token = state->getCancelToken();
+      codec.setFetchGroupOrder(state->getFetchGroupOrder());
     }
     return state;
   };
@@ -5450,7 +5466,7 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
   }
   controlWriteEvent_.signal();
   auto trackReceiveState = std::make_shared<FetchTrackReceiveState>(
-      fullTrackName, reqID, std::move(consumer), logger_);
+      fullTrackName, reqID, std::move(consumer), fetch.groupOrder, logger_);
   auto fetchTrack = fetches_.try_emplace(reqID, trackReceiveState);
   XCHECK(fetchTrack.second)
       << "RequestID already in use id=" << reqID << " sess=" << this;
@@ -6357,6 +6373,10 @@ void MoQSession::subscribeTracksError(
     std::shared_ptr<MessageReply>&& messageReply) {
   XLOG(DBG1) << __func__ << " reqID=" << subscribeTracksError.requestID.value
              << " sess=" << this;
+  MOQ_PUBLISHER_STATS(
+      publisherStatsCallback_,
+      onSubscribeTracksError,
+      subscribeTracksError.errorCode);
   auto res = messageReply->error(subscribeTracksError);
   if (!res) {
     XLOG(ERR) << "writeSubscribeTracksError failed sess=" << this;
