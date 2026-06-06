@@ -44,7 +44,8 @@ inline StreamType getSubgroupStreamType(
     SubgroupIDFormat format,
     bool includeExtensions,
     bool endOfGroup,
-    bool priorityPresent = true) {
+    bool priorityPresent = true,
+    bool beginsWithFirstObject = false) {
   auto majorVersion = getDraftMajorVersion(version);
   return StreamType(
       folly::to_underlying(StreamType::SUBGROUP_HEADER_MASK) |
@@ -52,7 +53,8 @@ inline StreamType getSubgroupStreamType(
       (format == SubgroupIDFormat::FirstObject ? SG_SUBGROUP_VALUE : 0) |
       (includeExtensions ? SG_HAS_EXTENSIONS : 0) |
       (endOfGroup ? SG_HAS_END_OF_GROUP : 0) |
-      (majorVersion >= 15 && !priorityPresent ? SG_PRIORITY_NOT_PRESENT : 0));
+      (majorVersion >= 15 && !priorityPresent ? SG_PRIORITY_NOT_PRESENT : 0) |
+      (majorVersion >= 18 && beginsWithFirstObject ? SG_FIRST_OBJECT : 0));
 }
 
 bool isValidSubgroupType(uint64_t version, uint64_t streamType);
@@ -75,6 +77,8 @@ inline SubgroupOptions getSubgroupOptions(
   if (majorVersion >= 15) {
     options.priorityPresent = !(streamTypeInt & SG_PRIORITY_NOT_PRESENT);
   }
+  options.beginsWithFirstObject =
+      majorVersion >= 18 && (streamTypeInt & SG_FIRST_OBJECT);
   return options;
 }
 
@@ -323,6 +327,8 @@ class MoQFrameParser {
     return quic::follyutils::decodeQuicInteger(cursor, atMost);
   }
 
+  void setFetchGroupOrder(GroupOrder groupOrder) noexcept;
+
   void setTokenCacheMaxSize(size_t size) {
     tokenCache_->setMaxSize(size, /*evict=*/true);
   }
@@ -339,6 +345,7 @@ class MoQFrameParser {
     previousFetchGroup_ = std::nullopt;
     previousFetchSubgroup_ = std::nullopt;
     previousFetchPriority_ = std::nullopt;
+    fetchGroupOrder_ = GroupOrder::OldestFirst;
   }
 
   std::optional<TrackFilter> extractTrackFilter(
@@ -500,6 +507,7 @@ class MoQFrameParser {
   mutable std::optional<uint64_t> previousFetchGroup_;
   mutable std::optional<uint64_t> previousFetchSubgroup_;
   mutable std::optional<uint8_t> previousFetchPriority_;
+  mutable GroupOrder fetchGroupOrder_{GroupOrder::OldestFirst};
   // Context for extension delta decoding (draft-16+)
   mutable uint64_t previousExtensionType_ = 0;
 };
@@ -536,7 +544,8 @@ class MoQFrameWriter {
       TrackAlias trackAlias,
       const ObjectHeader& objectHeader,
       SubgroupIDFormat format = SubgroupIDFormat::Present,
-      bool includeExtensions = true) const noexcept;
+      bool includeExtensions = true,
+      bool beginsWithFirstObject = false) const noexcept;
 
   WriteResult writeFetchHeader(folly::IOBufQueue& writeBuf, RequestID requestID)
       const noexcept;
@@ -758,6 +767,8 @@ class MoQFrameWriter {
     }
   }
 
+  void setFetchGroupOrder(GroupOrder groupOrder) noexcept;
+
   void writeExtensions(
       folly::IOBufQueue& writeBuf,
       const Extensions& extensions,
@@ -862,6 +873,7 @@ class MoQFrameWriter {
   mutable std::optional<uint64_t> previousFetchGroup_;
   mutable std::optional<uint64_t> previousFetchSubgroup_;
   mutable std::optional<uint8_t> previousFetchPriority_;
+  mutable GroupOrder fetchGroupOrder_{GroupOrder::OldestFirst};
 
   // writeSetup is a free function but needs access to writer member helpers
   // to dispatch on the negotiated version.

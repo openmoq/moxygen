@@ -133,6 +133,12 @@ enum class RequestErrorCode : uint32_t {
 
   DUPLICATE_SUBSCRIPTION = 0x19,
 
+  // Draft 18+: returned by SUBSCRIBE_TRACKS when the requesting session
+  // already has an established SUBSCRIBE_TRACKS at an overlapping prefix
+  // (ancestor, descendant, or exact). See draft-ietf-moq-transport §10.19
+  // for the semantics and §15.10.2 for the on-wire value.
+  PREFIX_OVERLAP = 0x30,
+
   // Special values
   CANCELLED = std::numeric_limits<uint32_t>::max(),
 };
@@ -253,6 +259,7 @@ constexpr uint8_t SG_SUBGROUP_VALUE = 0x2;
 constexpr uint8_t SG_HAS_SUBGROUP_ID = 0x4;
 constexpr uint8_t SG_HAS_END_OF_GROUP = 0x8;
 constexpr uint8_t SG_PRIORITY_NOT_PRESENT = 0x20;
+constexpr uint8_t SG_FIRST_OBJECT = 0x40;
 
 // Datagram Type Bit Fields
 constexpr uint8_t DG_HAS_EXTENSIONS = 0x1;
@@ -269,6 +276,7 @@ struct SubgroupOptions {
   SubgroupIDFormat subgroupIDFormat{SubgroupIDFormat::Present};
   bool hasEndOfGroup{false};
   bool priorityPresent{true};
+  bool beginsWithFirstObject{false};
 };
 
 std::ostream& operator<<(std::ostream& os, FrameType type);
@@ -555,7 +563,10 @@ using TrackRequestParameter = Parameter;
 enum class TrackRequestParamKey : uint64_t {
   AUTHORIZATION_TOKEN = 3,
   DELIVERY_TIMEOUT = 2,
+  // Key 0x04: MAX_CACHE_DURATION for drafts < 18
+  // RENDEZVOUS_TIMEOUT for drafts >= 18.
   MAX_CACHE_DURATION = 4,
+  RENDEZVOUS_TIMEOUT = 4,
   PUBLISHER_PRIORITY = 0x0E,
   SUBSCRIBER_PRIORITY = 0x20,
   SUBSCRIPTION_FILTER = 0x21,
@@ -566,6 +577,12 @@ enum class TrackRequestParamKey : uint64_t {
   TRACK_FILTER = 0x29,
   NEW_GROUP_REQUEST = 0x32,
 };
+
+inline bool isRendezvousTimeoutParam(uint64_t key, uint64_t majorVersion) {
+  return key ==
+      static_cast<uint64_t>(TrackRequestParamKey::RENDEZVOUS_TIMEOUT) &&
+      majorVersion >= 18;
+}
 
 class Parameters {
  public:

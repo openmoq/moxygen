@@ -6,6 +6,8 @@
 
 #include "moxygen/test/MoQSessionTestCommon.h"
 
+#include <quic/api/test/MockQuicSocket.h>
+
 using namespace moxygen;
 using namespace moxygen::test;
 using testing::_;
@@ -536,6 +538,110 @@ CO_TEST_P_X(
       });
 }
 
+class RecordingSessionCloseCallback
+    : public MoQSession::MoQSessionCloseCallback {
+ public:
+  void onMoQSessionClosed(
+      SessionCloseErrorCode error,
+      folly::Optional<uint32_t> /* wtError */) override {
+    errorCode = error;
+    closed.post();
+  }
+
+  std::optional<SessionCloseErrorCode> errorCode;
+  folly::coro::Baton closed;
+};
+
+class Draft18GoawayTimeoutTest : public MoQSessionTest {
+ protected:
+  folly::coro::Task<std::shared_ptr<Publisher::SubscriptionHandle>>
+  openPeerSubscription() {
+    co_await setupMoQSession();
+    expectSubscribe([](auto sub, auto /* pub */) -> TaskSubscribeResult {
+      co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+    });
+
+    auto result = co_await clientSession_->subscribe(
+        getSubscribe(kTestTrackName), subscribeCallback_);
+    EXPECT_FALSE(result.hasError());
+    if (result.hasError()) {
+      co_return nullptr;
+    }
+    co_return result.value();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    Draft18GoawayTimeoutTest,
+    Draft18GoawayTimeoutTest,
+    testing::Values(VersionParams{{kVersionDraft18}, kVersionDraft18}));
+
+CO_TEST_P_X(Draft18GoawayTimeoutTest, TimeoutClosesOpenPeerSubscription) {
+  auto subscription = co_await openPeerSubscription();
+  if (!subscription) {
+    co_return;
+  }
+
+  RecordingSessionCloseCallback closeCallback;
+  serverSession_->setSessionCloseCallback(&closeCallback);
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
+      .WillOnce([](const PublishDone& done) {
+        EXPECT_EQ(done.statusCode, PublishDoneStatusCode::SESSION_CLOSED);
+        return folly::Expected<folly::Unit, MoQPublishError>(folly::unit);
+      });
+
+  Goaway goaway;
+  goaway.timeout = 1;
+  serverSession_->goaway(goaway);
+
+  co_await closeCallback.closed;
+  EXPECT_EQ(closeCallback.errorCode, SessionCloseErrorCode::GOAWAY_TIMEOUT);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(Draft18GoawayTimeoutTest, ClosingPeerSubscriptionCancelsTimeout) {
+  auto subscription = co_await openPeerSubscription();
+  if (!subscription) {
+    co_return;
+  }
+
+  RecordingSessionCloseCallback closeCallback;
+  serverSession_->setSessionCloseCallback(&closeCallback);
+
+  Goaway goaway;
+  goaway.timeout = 1000;
+  serverSession_->goaway(goaway);
+  EXPECT_FALSE(closeCallback.errorCode.has_value());
+
+  subscription->unsubscribe();
+  co_await closeCallback.closed;
+  EXPECT_EQ(closeCallback.errorCode, SessionCloseErrorCode::NO_ERROR);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    Draft18GoawayTimeoutTest,
+    ZeroTimeoutDoesNotCloseOpenPeerSubscription) {
+  auto subscription = co_await openPeerSubscription();
+  if (!subscription) {
+    co_return;
+  }
+
+  RecordingSessionCloseCallback closeCallback;
+  serverSession_->setSessionCloseCallback(&closeCallback);
+
+  Goaway goaway;
+  goaway.timeout = 0;
+  serverSession_->goaway(goaway);
+  co_await rescheduleN(4);
+  EXPECT_FALSE(closeCallback.errorCode.has_value());
+
+  subscription->unsubscribe();
+  co_await closeCallback.closed;
+  EXPECT_EQ(closeCallback.errorCode, SessionCloseErrorCode::NO_ERROR);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, Goaway) {
   co_await setupMoQSession();
   expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
@@ -820,13 +926,19 @@ class DummyMoQClientBase : public MoQClientBase {
   using MoQClientBase::MoQClientBase;
 
   void test_onNewBidiStream(proxygen::WebTransport::BidiStreamHandle bidi) {
-    MoQClientBase::onNewBidiStream(std::move(bidi));
+    if (moqSession_) {
+      moqSession_->onNewBidiStream(std::move(bidi));
+    }
   }
   void test_onNewUniStream(proxygen::WebTransport::StreamReadHandle* handle) {
-    MoQClientBase::onNewUniStream(handle);
+    if (moqSession_) {
+      moqSession_->onNewUniStream(handle);
+    }
   }
   void test_onDatagram(std::unique_ptr<folly::IOBuf> datagram) {
-    MoQClientBase::onDatagram(std::move(datagram));
+    if (moqSession_) {
+      moqSession_->onDatagram(std::move(datagram));
+    }
   }
   void test_goaway(const Goaway& goaway) {
     MoQClientBase::goaway(goaway);
@@ -842,6 +954,24 @@ class DummyMoQClientBase : public MoQClientBase {
     co_return nullptr;
   }
 };
+
+class TestMoQClient : public MoQClient {
+ public:
+  using MoQClient::MoQClient;
+
+  void setQuicWebTransport(std::shared_ptr<proxygen::QuicWebTransport> wt) {
+    quicWebTransport_ = std::move(wt);
+  }
+};
+
+std::shared_ptr<proxygen::QuicWebTransport> makeTestQuicWebTransport() {
+  auto quicSocket = std::make_shared<testing::NiceMock<quic::MockQuicSocket>>();
+  ON_CALL(*quicSocket, setDatagramCallback(_))
+      .WillByDefault(
+          [](quic::QuicSocket::DatagramCallback*)
+              -> quic::Expected<void, quic::LocalErrorCode> { return {}; });
+  return std::make_shared<proxygen::QuicWebTransport>(std::move(quicSocket));
+}
 
 TEST(MoQClientBaseTest, CallbacksIgnoredWhenSessionNull) {
   folly::EventBase evb;
@@ -864,6 +994,63 @@ TEST(MoQClientBaseTest, CallbacksIgnoredWhenSessionNull) {
   client.test_onDatagram(folly::IOBuf::copyBuffer("hi"));
   client.test_goaway(Goaway{"/newSession"});
 }
+
+TEST(MoQClientTest, TransportStatsUnavailableAfterSessionClose) {
+  folly::EventBase evb;
+  auto exec = std::make_shared<MoQFollyExecutorImpl>(&evb);
+
+  auto [clientWt, serverWt] =
+      proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
+  (void)serverWt;
+  auto session = std::make_shared<MoQSession>(
+      folly::MaybeManagedPtr<proxygen::WebTransport>(clientWt.get()), exec);
+
+  auto quicWebTransport = makeTestQuicWebTransport();
+  auto retainedQuicWebTransport = quicWebTransport;
+
+  TestMoQClient client(exec, proxygen::URL("https://example.com:443/"));
+  client.moqSession_ = session;
+  client.setQuicWebTransport(std::move(quicWebTransport));
+
+  session->close(SessionCloseErrorCode::NO_ERROR);
+  static_cast<proxygen::WebTransport*>(retainedQuicWebTransport.get())
+      ->closeSession();
+
+  EXPECT_FALSE(client.getTransportInfo().has_value());
+
+  auto flowControl = client.getConnectionFlowControl();
+  ASSERT_FALSE(flowControl.has_value());
+  EXPECT_EQ(flowControl.error(), quic::LocalErrorCode::CONNECTION_CLOSED);
+}
+
+TEST(MoQClientTest, TransportStatsUnavailableAfterSocketClose) {
+  folly::EventBase evb;
+  auto exec = std::make_shared<MoQFollyExecutorImpl>(&evb);
+
+  auto [clientWt, serverWt] =
+      proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
+  (void)serverWt;
+  auto session = std::make_shared<MoQSession>(
+      folly::MaybeManagedPtr<proxygen::WebTransport>(clientWt.get()), exec);
+
+  auto quicWebTransport = makeTestQuicWebTransport();
+  auto retainedQuicWebTransport = quicWebTransport;
+
+  TestMoQClient client(exec, proxygen::URL("https://example.com:443/"));
+  client.moqSession_ = session;
+  client.setQuicWebTransport(std::move(quicWebTransport));
+
+  static_cast<proxygen::WebTransport*>(retainedQuicWebTransport.get())
+      ->closeSession();
+
+  EXPECT_FALSE(session->isClosed());
+  EXPECT_FALSE(client.getTransportInfo().has_value());
+
+  auto flowControl = client.getConnectionFlowControl();
+  ASSERT_FALSE(flowControl.has_value());
+  EXPECT_EQ(flowControl.error(), quic::LocalErrorCode::CONNECTION_CLOSED);
+}
+
 TEST(MoQRelayClientTest, ShutdownClearsHandlersAndResetsSession) {
   folly::EventBase evb;
   auto exec = std::make_shared<MoQFollyExecutorImpl>(&evb);

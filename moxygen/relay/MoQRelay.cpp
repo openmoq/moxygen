@@ -90,6 +90,43 @@ std::shared_ptr<MoQRelay::NamespaceNode> MoQRelay::findInTree(
   return nodePtr;
 }
 
+bool MoQRelay::hasTracksSubscriptionInSubtree(
+    const NamespaceNode& root,
+    std::shared_ptr<MoQSession> session) const {
+  std::vector<const NamespaceNode*> nodesToVisit{&root};
+  while (!nodesToVisit.empty()) {
+    const auto* node = nodesToVisit.back();
+    nodesToVisit.pop_back();
+    if (node->sessions.find(session) != node->sessions.end()) {
+      return true;
+    }
+    for (const auto& [_, child] : node->children) {
+      nodesToVisit.push_back(child.get());
+    }
+  }
+  return false;
+}
+
+bool MoQRelay::hasOverlappingTracksSubscription(
+    const TrackNamespace& trackNamespacePrefix,
+    std::shared_ptr<MoQSession> session) const {
+  const NamespaceNode* node = &tracksSubscriberRoot_;
+  for (size_t i = 0; i < trackNamespacePrefix.size(); i++) {
+    // Nodes visited before the target prefix are strict ancestors.
+    if (node->sessions.find(session) != node->sessions.end()) {
+      return true;
+    }
+    auto it = node->children.find(trackNamespacePrefix[i]);
+    if (it == node->children.end()) {
+      return false;
+    }
+    node = it->second.get();
+  }
+
+  // The target subtree covers exact-prefix and descendant registrations.
+  return hasTracksSubscriptionInSubtree(*node, std::move(session));
+}
+
 folly::coro::Task<Subscriber::PublishNamespaceResult>
 MoQRelay::publishNamespace(
     PublishNamespace ann,
@@ -822,6 +859,15 @@ folly::coro::Task<Publisher::SubscribeTracksResult> MoQRelay::subscribeTracks(
             "SUBSCRIBE_TRACKS requires draft 18+"});
   }
 
+  if (hasOverlappingTracksSubscription(
+          subTracks.trackNamespacePrefix, session)) {
+    co_return folly::makeUnexpected(
+        SubscribeTracksError{
+            subTracks.requestID,
+            SubscribeTracksErrorCode::PREFIX_OVERLAP,
+            "Overlapping SUBSCRIBE_TRACKS exists in this session"});
+  }
+
   // Register in the parallel tracks tree (independent overlap space).
   auto tracksNode = findTracksSubscriberNode(
       subTracks.trackNamespacePrefix, /*createMissingNodes=*/true);
@@ -837,6 +883,43 @@ folly::coro::Task<Publisher::SubscribeTracksResult> MoQRelay::subscribeTracks(
           subTracks.trackNamespacePrefix});
   if (wasEmpty && tracksNode->parent_) {
     tracksNode->parent_->incrementActiveChildren();
+  }
+
+  // Walk the existing publish tree and emit PUBLISH for each matching
+  // already-published track.
+  auto exec = session->getExecutor();
+  std::deque<std::tuple<TrackNamespace, std::shared_ptr<NamespaceNode>>> nodes;
+  if (auto pubNode = findNamespaceNode(
+          subTracks.trackNamespacePrefix,
+          /*createMissingNodes=*/false,
+          MatchType::Exact)) {
+    nodes.emplace_back(subTracks.trackNamespacePrefix, pubNode);
+  }
+  while (!nodes.empty()) {
+    auto [prefix, pubNode] = std::move(*nodes.begin());
+    nodes.pop_front();
+    for (auto& publishEntry : pubNode->publishes) {
+      auto& publishSession = publishEntry.second;
+      FullTrackName ftn{prefix, publishEntry.first};
+      auto subscriptionIt = subscriptions_.find(ftn);
+      if (subscriptionIt == subscriptions_.end()) {
+        continue;
+      }
+      if (publishSession == session) {
+        // Don't echo the subscriber's own published tracks back to them.
+        continue;
+      }
+      co_withExecutor(
+          exec,
+          publishToSession(
+              session, subscriptionIt->second.forwarder, subTracks.forward))
+          .start();
+    }
+    for (auto& nextNodeIt : pubNode->children) {
+      TrackNamespace nodePrefix(prefix);
+      nodePrefix.append(nextNodeIt.first);
+      nodes.emplace_back(std::forward_as_tuple(nodePrefix, nextNodeIt.second));
+    }
   }
 
   RequestOk subTracksOk{subTracks.requestID};

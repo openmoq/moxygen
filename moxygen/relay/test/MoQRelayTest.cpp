@@ -410,6 +410,93 @@ class MoQRelayTest : public ::testing::Test {
   std::shared_ptr<MoQRelay> relay_;
 };
 
+class NoopSubgroupConsumer : public SubgroupConsumer {
+ public:
+  folly::Expected<folly::Unit, MoQPublishError>
+  object(uint64_t, Payload, Extensions, bool) override {
+    return folly::makeExpected<MoQPublishError>(folly::unit);
+  }
+
+  folly::Expected<folly::Unit, MoQPublishError>
+  beginObject(uint64_t, uint64_t, Payload, Extensions) override {
+    return folly::makeExpected<MoQPublishError>(folly::unit);
+  }
+
+  folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
+      Payload,
+      bool) override {
+    return folly::makeExpected<MoQPublishError, ObjectPublishStatus>(
+        ObjectPublishStatus::DONE);
+  }
+
+  folly::Expected<folly::Unit, MoQPublishError> endOfGroup(uint64_t) override {
+    return folly::makeExpected<MoQPublishError>(folly::unit);
+  }
+
+  folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+      uint64_t) override {
+    return folly::makeExpected<MoQPublishError>(folly::unit);
+  }
+
+  folly::Expected<folly::Unit, MoQPublishError> endOfSubgroup() override {
+    return folly::makeExpected<MoQPublishError>(folly::unit);
+  }
+
+  void reset(ResetStreamErrorCode) override {}
+};
+
+class RecordingTrackConsumer : public TrackConsumer {
+ public:
+  folly::Expected<folly::Unit, MoQPublishError> setTrackAlias(
+      TrackAlias) override {
+    return folly::makeExpected<MoQPublishError>(folly::unit);
+  }
+
+  folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
+  beginSubgroup(
+      uint64_t /*groupID*/,
+      uint64_t /*subgroupID*/,
+      Priority /*priority*/,
+      TrackConsumer::BeginSubgroupOptions options) override {
+    beginSubgroupOptions.push_back(options);
+    std::shared_ptr<SubgroupConsumer> subgroup =
+        std::make_shared<NoopSubgroupConsumer>();
+    return folly::makeExpected<MoQPublishError>(std::move(subgroup));
+  }
+
+  folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
+  awaitStreamCredit() override {
+    return folly::makeExpected<MoQPublishError>(
+        folly::makeSemiFuture(folly::unit));
+  }
+
+  folly::Expected<folly::Unit, MoQPublishError>
+  objectStream(const ObjectHeader&, Payload, bool) override {
+    return folly::makeExpected<MoQPublishError>(folly::unit);
+  }
+
+  folly::Expected<folly::Unit, MoQPublishError>
+  datagram(const ObjectHeader&, Payload, bool) override {
+    return folly::makeExpected<MoQPublishError>(folly::unit);
+  }
+
+  folly::Expected<folly::Unit, MoQPublishError> publishDone(
+      PublishDone) override {
+    return folly::makeExpected<MoQPublishError>(folly::unit);
+  }
+
+  std::vector<TrackConsumer::BeginSubgroupOptions> beginSubgroupOptions;
+};
+
+auto matchesBeginSubgroupOptions(
+    bool containsLastInGroup,
+    bool beginsWithFirstObject) {
+  return Truly([=](const TrackConsumer::BeginSubgroupOptions& options) {
+    return options.containsLastInGroup == containsLastInGroup &&
+        options.beginsWithFirstObject == beginsWithFirstObject;
+  });
+}
+
 // Test: Basic relay construction
 TEST_F(MoQRelayTest, Construction) {
   EXPECT_NE(relay_, nullptr);
@@ -911,7 +998,10 @@ TEST_F(MoQRelayTest, SubscribeNamespaceDoesntAddDrainingPublish) {
       });
 
   EXPECT_CALL(*mockConsumer1, beginSubgroup(_, _, _, _))
-      .WillOnce([&](uint64_t, uint64_t, uint8_t, bool) {
+      .WillOnce([&](uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
         auto sg = std::make_shared<NiceMock<MockSubgroupConsumer>>();
         EXPECT_CALL(*sg, endOfSubgroup())
             .WillOnce(testing::Return(folly::unit));
@@ -1655,23 +1745,35 @@ TEST_F(MoQRelayTest, DuplicateSubgroupReplacesActiveConsumers) {
 
   // First beginSubgroup gives v1 consumers; second call gives v2 consumers
   EXPECT_CALL(*mockConsumer1, beginSubgroup(0, 0, _, _))
-      .WillOnce([&](uint64_t, uint64_t, uint8_t, bool) {
+      .WillOnce([&](uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
         return folly::
             makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
                 sg1v1);
       })
-      .WillOnce([&](uint64_t, uint64_t, uint8_t, bool) {
+      .WillOnce([&](uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
         return folly::
             makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
                 sg1v2);
       });
   EXPECT_CALL(*mockConsumer2, beginSubgroup(0, 0, _, _))
-      .WillOnce([&](uint64_t, uint64_t, uint8_t, bool) {
+      .WillOnce([&](uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
         return folly::
             makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
                 sg2v1);
       })
-      .WillOnce([&](uint64_t, uint64_t, uint8_t, bool) {
+      .WillOnce([&](uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
         return folly::
             makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
                 sg2v2);
@@ -1717,7 +1819,10 @@ TEST_F(MoQRelayTest, DuplicateSubgroupCancelledWhenNoActiveConsumers) {
   auto mockSg = std::make_shared<NiceMock<MockSubgroupConsumer>>();
 
   EXPECT_CALL(*mockConsumer, beginSubgroup(0, 0, _, _))
-      .WillOnce([&](uint64_t, uint64_t, uint8_t, bool) {
+      .WillOnce([&](uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
         return folly::
             makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
                 mockSg);
@@ -1764,18 +1869,27 @@ TEST_F(MoQRelayTest, DuplicateSubgroupSkipsTombstonedSubscriber) {
 
   // First beginSubgroup: both A and B get consumers
   EXPECT_CALL(*consumerA, beginSubgroup(0, 0, _, _))
-      .WillOnce([&](uint64_t, uint64_t, uint8_t, bool) {
+      .WillOnce([&](uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
         return folly::
             makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
                 sgAv1);
       })
-      .WillOnce([&](uint64_t, uint64_t, uint8_t, bool) {
+      .WillOnce([&](uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
         return folly::
             makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
                 sgAv2);
       });
   EXPECT_CALL(*consumerB, beginSubgroup(0, 0, _, _))
-      .WillOnce([&](uint64_t, uint64_t, uint8_t, bool) {
+      .WillOnce([&](uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
         return folly::
             makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
                 sgBv1);
@@ -1840,7 +1954,11 @@ TEST_F(MoQRelayTest, ForwardChangedAfterPublisherTermination) {
   // Begin a subgroup so the subscriber has open subgroups and survives drain
   auto sg = createMockSubgroupConsumer();
   EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
-      .WillOnce([&sg](uint64_t, uint64_t, uint8_t, bool) {
+      .WillOnce([&sg](
+                    uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
         return folly::
             makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
                 sg);
@@ -1896,7 +2014,11 @@ TEST_F(MoQRelayTest, FetchAfterPublisherTermination) {
   auto consumer = createMockConsumer();
   auto sg = createMockSubgroupConsumer();
   EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
-      .WillOnce([&sg](uint64_t, uint64_t, uint8_t, bool) {
+      .WillOnce([&sg](
+                    uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
         return folly::
             makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
                 sg);
@@ -2003,7 +2125,11 @@ TEST_F(MoQRelayTest, PublishReplacesSubscribeDrainsOldAndServesNew) {
   auto newConsumer = createMockConsumer();
   auto sg = createMockSubgroupConsumer();
   EXPECT_CALL(*newConsumer, beginSubgroup(0, 0, _, _))
-      .WillOnce([&sg](uint64_t, uint64_t, uint8_t, bool) {
+      .WillOnce([&sg](
+                    uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
         return folly::
             makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
                 sg);
@@ -2117,7 +2243,14 @@ TEST_F(MoQRelayTest, ForwarderLateJoiner_ContainsLastInGroupPropagated) {
   // containsLastInGroup=true
   auto earlySubgroupConsumer = createMockSubgroupConsumer();
   EXPECT_CALL(
-      *earlyConsumer, beginSubgroup(0, 0, _, /*containsLastInGroup=*/true))
+      *earlyConsumer,
+      beginSubgroup(
+          0,
+          0,
+          _,
+          matchesBeginSubgroupOptions(
+              /*containsLastInGroup=*/true,
+              /*beginsWithFirstObject=*/true)))
       .WillOnce(Return(
           folly::
               makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
@@ -2127,7 +2260,14 @@ TEST_F(MoQRelayTest, ForwarderLateJoiner_ContainsLastInGroupPropagated) {
   // default)
   auto lateSubgroupConsumer = createMockSubgroupConsumer();
   EXPECT_CALL(
-      *lateConsumer, beginSubgroup(0, 0, _, /*containsLastInGroup=*/true))
+      *lateConsumer,
+      beginSubgroup(
+          0,
+          0,
+          _,
+          matchesBeginSubgroupOptions(
+              /*containsLastInGroup=*/true,
+              /*beginsWithFirstObject=*/false)))
       .WillOnce(Return(
           folly::
               makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
@@ -2138,8 +2278,9 @@ TEST_F(MoQRelayTest, ForwarderLateJoiner_ContainsLastInGroupPropagated) {
       earlySubscriber, kTestTrackName, earlyConsumer, RequestID(1));
 
   // Publisher opens subgroup with containsLastInGroup=true
-  auto sgRes =
-      publishConsumer->beginSubgroup(0, 0, 0, /*containsLastInGroup=*/true);
+  TrackConsumer::BeginSubgroupOptions beginOptions;
+  beginOptions.containsLastInGroup = true;
+  auto sgRes = publishConsumer->beginSubgroup(0, 0, 0, beginOptions);
   ASSERT_TRUE(sgRes.hasValue());
   auto sg = *sgRes;
 
@@ -2160,6 +2301,78 @@ TEST_F(MoQRelayTest, ForwarderLateJoiner_ContainsLastInGroupPropagated) {
       .WillOnce(Return(folly::makeExpected<MoQPublishError>(folly::unit)));
   EXPECT_TRUE(
       sg->object(1, folly::IOBuf::copyBuffer("world"), {}, false).hasValue());
+
+  EXPECT_TRUE(sg->endOfSubgroup().hasValue());
+  removeSession(publisherSession);
+  removeSession(earlySubscriber);
+  removeSession(lateSubscriber);
+}
+
+TEST_F(MoQRelayTest, ForwarderLateJoiner_FirstObjectOnlyAtOriginalStart) {
+  auto publisherSession = createMockSession();
+  auto earlySubscriber = createMockSession();
+  auto lateSubscriber = createMockSession();
+
+  auto earlyConsumer = std::make_shared<RecordingTrackConsumer>();
+  auto lateConsumer = std::make_shared<RecordingTrackConsumer>();
+
+  auto publishConsumer = doPublish(publisherSession, kTestTrackName);
+  subscribeToTrack(
+      earlySubscriber, kTestTrackName, earlyConsumer, RequestID(1));
+
+  TrackConsumer::BeginSubgroupOptions beginOptions;
+  beginOptions.beginsWithFirstObject = true;
+  auto sgRes = publishConsumer->beginSubgroup(0, 0, 0, beginOptions);
+  ASSERT_TRUE(sgRes.hasValue());
+  ASSERT_EQ(earlyConsumer->beginSubgroupOptions.size(), 1);
+  EXPECT_TRUE(earlyConsumer->beginSubgroupOptions[0].beginsWithFirstObject);
+  auto sg = *sgRes;
+
+  EXPECT_TRUE(
+      sg->object(0, folly::IOBuf::copyBuffer("hi"), {}, false).hasValue());
+
+  subscribeToTrack(lateSubscriber, kTestTrackName, lateConsumer, RequestID(2));
+
+  EXPECT_TRUE(
+      sg->object(1, folly::IOBuf::copyBuffer("world"), {}, false).hasValue());
+  ASSERT_EQ(lateConsumer->beginSubgroupOptions.size(), 1);
+  EXPECT_FALSE(lateConsumer->beginSubgroupOptions[0].beginsWithFirstObject);
+
+  EXPECT_TRUE(sg->endOfSubgroup().hasValue());
+  removeSession(publisherSession);
+  removeSession(earlySubscriber);
+  removeSession(lateSubscriber);
+}
+
+TEST_F(MoQRelayTest, ForwarderFirstObjectNotSetWhenUpstreamDidNotSetIt) {
+  auto publisherSession = createMockSession();
+  auto earlySubscriber = createMockSession();
+  auto lateSubscriber = createMockSession();
+
+  auto earlyConsumer = std::make_shared<RecordingTrackConsumer>();
+  auto lateConsumer = std::make_shared<RecordingTrackConsumer>();
+
+  auto publishConsumer = doPublish(publisherSession, kTestTrackName);
+  subscribeToTrack(
+      earlySubscriber, kTestTrackName, earlyConsumer, RequestID(1));
+
+  TrackConsumer::BeginSubgroupOptions beginOptions;
+  beginOptions.beginsWithFirstObject = false;
+  auto sgRes = publishConsumer->beginSubgroup(0, 0, 0, beginOptions);
+  ASSERT_TRUE(sgRes.hasValue());
+  ASSERT_EQ(earlyConsumer->beginSubgroupOptions.size(), 1);
+  EXPECT_FALSE(earlyConsumer->beginSubgroupOptions[0].beginsWithFirstObject);
+  auto sg = *sgRes;
+
+  EXPECT_TRUE(
+      sg->object(0, folly::IOBuf::copyBuffer("hi"), {}, false).hasValue());
+
+  subscribeToTrack(lateSubscriber, kTestTrackName, lateConsumer, RequestID(2));
+
+  EXPECT_TRUE(
+      sg->object(1, folly::IOBuf::copyBuffer("world"), {}, false).hasValue());
+  ASSERT_EQ(lateConsumer->beginSubgroupOptions.size(), 1);
+  EXPECT_FALSE(lateConsumer->beginSubgroupOptions[0].beginsWithFirstObject);
 
   EXPECT_TRUE(sg->endOfSubgroup().hasValue());
   removeSession(publisherSession);
@@ -2380,25 +2593,31 @@ class MoQRelayTracksTest : public MoQRelayTest {
     return session;
   }
 
-  // Helper that mirrors doSubscribeNamespace but for the new SUBSCRIBE_TRACKS
-  // path. The handle is tracked for cleanup in the per-session state.
-  std::shared_ptr<Publisher::SubscribeTracksHandle> doSubscribeTracks(
+  Publisher::SubscribeTracksResult subscribeTracks(
       std::shared_ptr<MoQSession> session,
       const TrackNamespace& nsPrefix) {
     SubscribeTracks subTracks;
     subTracks.trackNamespacePrefix = nsPrefix;
     return withSessionContext(session, [&]() {
       auto task = relay_->subscribeTracks(std::move(subTracks));
-      auto res = folly::coro::blockingWait(std::move(task), exec_.get());
-      EXPECT_TRUE(res.hasValue());
-      if (!res.hasValue()) {
-        return std::shared_ptr<Publisher::SubscribeTracksHandle>(nullptr);
-      }
-      // Stash for cleanup so the destructor doesn't fire on a stale relay.
-      auto handle = *res;
-      cleanupHandles_.push_back(handle);
-      return handle;
+      return folly::coro::blockingWait(std::move(task), exec_.get());
     });
+  }
+
+  // Helper that mirrors doSubscribeNamespace but for the new SUBSCRIBE_TRACKS
+  // path. The handle is tracked for cleanup in the per-session state.
+  std::shared_ptr<Publisher::SubscribeTracksHandle> doSubscribeTracks(
+      std::shared_ptr<MoQSession> session,
+      const TrackNamespace& nsPrefix) {
+    auto res = subscribeTracks(session, nsPrefix);
+    EXPECT_TRUE(res.hasValue());
+    if (!res.hasValue()) {
+      return nullptr;
+    }
+    // Stash for cleanup so the destructor doesn't fire on a stale relay.
+    auto handle = *res;
+    cleanupHandles_.push_back(handle);
+    return handle;
   }
 
   void TearDown() override {
@@ -2420,14 +2639,9 @@ class MoQRelayTracksTest : public MoQRelayTest {
 // Pre-draft-18 sessions can't issue SUBSCRIBE_TRACKS at all.
 TEST_F(MoQRelayTracksTest, SubscribeTracksRejectsPreV18) {
   auto session = createMockSession(); // defaults to kVersionDraftCurrent (v14)
-  SubscribeTracks subTracks;
-  subTracks.trackNamespacePrefix = TrackNamespace{{"test"}};
-  withSessionContext(session, [&]() {
-    auto res = folly::coro::blockingWait(
-        relay_->subscribeTracks(std::move(subTracks)), exec_.get());
-    ASSERT_FALSE(res.hasValue());
-    EXPECT_EQ(res.error().errorCode, SubscribeTracksErrorCode::NOT_SUPPORTED);
-  });
+  auto res = subscribeTracks(session, TrackNamespace{{"test"}});
+  ASSERT_FALSE(res.hasValue());
+  EXPECT_EQ(res.error().errorCode, SubscribeTracksErrorCode::NOT_SUPPORTED);
   removeSession(session);
 }
 
@@ -2457,6 +2671,63 @@ TEST_F(MoQRelayTracksTest, NewPublishFanoutToTracksSubscriber) {
   EXPECT_CALL(*subscriber, publish(_, _)).Times(1);
 
   doPublish(publisher, kTestTrackName);
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
+// Draft 18 section 10.19: a SUBSCRIBE_TRACKS from a session that already has a
+// registration at an exact / ancestor / descendant prefix is rejected with
+// PREFIX_OVERLAP. The first SUBSCRIBE_TRACKS for any of those prefixes
+// succeeds; the second one (in any order) fails.
+TEST_F(MoQRelayTracksTest, OverlappingSubscribeTracksRejected) {
+  auto session = createV18Session();
+  const TrackNamespace base{{"a", "b"}};
+  const TrackNamespace ancestor{{"a"}};
+  const TrackNamespace descendant{{"a", "b", "c"}};
+  const std::vector<std::pair<std::string, TrackNamespace>> overlaps{
+      {"exact", base},
+      {"ancestor", ancestor},
+      {"descendant", descendant},
+  };
+
+  // First call establishes the registration.
+  auto baseHandle = doSubscribeTracks(session, base);
+  ASSERT_NE(baseHandle, nullptr);
+
+  // Exact duplicate, ancestor, and descendant prefixes must all fail.
+  for (const auto& [label, prefix] : overlaps) {
+    SCOPED_TRACE(label);
+    auto res = subscribeTracks(session, prefix);
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().errorCode, SubscribeTracksErrorCode::PREFIX_OVERLAP);
+  }
+
+  // A different session subscribing to an overlapping prefix is fine; the
+  // check is per-session.
+  auto otherSession = createV18Session();
+  auto otherHandle = doSubscribeTracks(otherSession, base);
+  EXPECT_NE(otherHandle, nullptr);
+
+  removeSession(session);
+  removeSession(otherSession);
+}
+
+// A SUBSCRIBE_TRACKS that arrives after a track is already published gets
+// the existing track via PUBLISH on registration.
+TEST_F(MoQRelayTracksTest, ExistingPublishEchoedToNewTracksSubscriber) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  setupPublishSucceeds(subscriber);
+
+  doPublish(publisher, kTestTrackName);
+
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(1);
+  doSubscribeTracks(subscriber, kTestNamespace);
   for (int i = 0; i < 5; i++) {
     exec_->drive();
   }

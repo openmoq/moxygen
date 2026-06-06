@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <fizz/server/FizzServerContext.h>
 #include <folly/CancellationToken.h>
+#include <folly/Function.h>
 #include <folly/SocketAddress.h>
 #include <folly/io/async/AsyncServerSocket.h>
 #include <folly/io/async/AsyncTransport.h>
@@ -43,10 +45,15 @@ class MoQQmuxServer : public MoQServerBase {
     size_t serverThreads{folly::available_concurrency()};
   };
 
-  explicit MoQQmuxServer(std::string endpoint)
-      : MoQQmuxServer(std::move(endpoint), Config{}) {}
+  MoQQmuxServer(
+      std::string endpoint,
+      std::shared_ptr<const fizz::server::FizzServerContext> fizzContext)
+      : MoQQmuxServer(std::move(endpoint), std::move(fizzContext), Config{}) {}
 
-  MoQQmuxServer(std::string endpoint, Config config);
+  MoQQmuxServer(
+      std::string endpoint,
+      std::shared_ptr<const fizz::server::FizzServerContext> fizzContext,
+      Config config);
 
   ~MoQQmuxServer() override;
 
@@ -62,6 +69,18 @@ class MoQQmuxServer : public MoQServerBase {
   void start(
       const folly::SocketAddress& addr,
       std::vector<folly::EventBase*> evbs);
+
+  // Initialise the worker pool without binding any listening sockets.
+  // Use when this server is fed externally-accepted post-Fizz transports
+  void initExternallyFed(std::vector<folly::EventBase*> workerEvbs);
+
+  // Run a MoQ session over an already-Fizz-completed transport.
+  // postCreateHook, if non-empty, is invoked once on the worker evb after
+  // the MoQSession is created.
+  bool dispatchExternallyFedSession(
+      folly::AsyncTransport::UniquePtr fizzCompletedTransport,
+      std::string negotiatedAlpn,
+      folly::Function<void(MoQSession*)> postCreateHook = nullptr);
 
   void stop() override;
 
@@ -88,9 +107,40 @@ class MoQQmuxServer : public MoQServerBase {
 
   folly::coro::Task<void> handleAccept(
       folly::EventBase* workerEvb,
-      std::shared_ptr<MoQExecutor> executor,
       folly::AsyncTransport::UniquePtr asyncSocket,
       WorkerShutdownState* state);
+
+  // Called by dispatchExternallyFedSession after doing some synchronous work.
+  folly::coro::Task<void> handleExternallyFedSession(
+      WorkerShutdownState* state,
+      folly::AsyncTransport::UniquePtr fizzCompletedTransport,
+      std::string negotiatedAlpn,
+      folly::Function<void(MoQSession*)> postCreateHook);
+
+  // Post-Fizz portion of the per-connection flow: wraps the already-
+  // authenticated transport in a coro::Transport, runs the QMUX handshake,
+  // creates the MoQSession, registers it in state->liveSessions, and drives
+  // handleClientSession. Caller owns the inflight-count + cancellation
+  // wrapping. qmuxTimeout is the remaining handshake budget for QMUX
+  // specifically (caller computes it; must be > 0ms).
+  folly::coro::Task<void> runQmuxAndSession(
+      folly::EventBase* workerEvb,
+      folly::AsyncTransport::UniquePtr fizzCompletedTransport,
+      std::string negotiatedAlpn,
+      std::chrono::milliseconds qmuxTimeout,
+      WorkerShutdownState* state,
+      folly::Function<void(MoQSession*)> postCreateHook = nullptr);
+
+  // Must not be called from a worker event base thread (it joins on those event
+  // bases).
+  void teardown();
+
+  // Lookup the per-worker shutdown-state for a worker EB. Returns nullptr
+  // if the EB is not in this server's pool.
+  WorkerShutdownState* findStateFor(folly::EventBase* workerEvb) noexcept;
+
+  std::shared_ptr<MoQExecutor> findExecutorFor(
+      folly::EventBase* workerEvb) noexcept;
 
   bool isInWorkerPool() const noexcept {
     for (auto* evb : workerEvbs_) {
@@ -102,14 +152,17 @@ class MoQQmuxServer : public MoQServerBase {
   }
 
   const Config config_;
+  const std::shared_ptr<const fizz::server::FizzServerContext> fizzContext_;
 
   folly::CancellationSource cancelSource_;
   std::vector<std::unique_ptr<WorkerShutdownState>> workerShutdownState_;
+  std::vector<std::shared_ptr<MoQExecutor>> workerExecutors_;
   std::vector<folly::EventBase*> workerEvbs_;
   std::vector<std::unique_ptr<folly::ScopedEventBaseThread>> ownedWorkers_;
   std::vector<std::shared_ptr<folly::AsyncServerSocket>> serverSockets_;
   std::vector<std::unique_ptr<WorkerAcceptCallback>> workerCallbacks_;
   folly::SocketAddress boundAddr_;
+  bool started_{false};
   bool stopped_{false};
 };
 
