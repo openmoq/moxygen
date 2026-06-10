@@ -5,13 +5,13 @@
  */
 
 #include <moxygen/MoQTypes.h>
+#include <moxygen/MoQVersions.h>
 
 #include <folly/Conv.h>
 #include <folly/String.h>
 #include <folly/container/F14Map.h>
 #include <folly/container/F14Set.h>
 #include <folly/logging/xlog.h>
-#include <moxygen/MoQVersions.h>
 
 namespace {
 
@@ -196,6 +196,15 @@ const folly::F14FastSet<FrameType> kAllowedFramesForDeliveryTimeout = {
     FrameType::SUBSCRIBE,
     FrameType::SUBSCRIBE_UPDATE};
 
+// In v18+, key 0x02 is OBJECT_DELIVERY_TIMEOUT. REQUEST_OK is accepted at
+// parse time because PUBLISH_OK is encoded on the wire as REQUEST_OK; the
+// PUBLISH_OK conversion validates once the pending request resolves.
+const folly::F14FastSet<FrameType> kAllowedFramesForObjectDeliveryTimeoutV18 = {
+    FrameType::PUBLISH_OK,
+    FrameType::REQUEST_OK,
+    FrameType::SUBSCRIBE,
+    FrameType::REQUEST_UPDATE};
+
 const folly::F14FastSet<FrameType> kAllowedFramesForSubscriberPriority = {
     FrameType::SUBSCRIBE,
     FrameType::FETCH,
@@ -240,6 +249,7 @@ const folly::F14FastSet<FrameType> kAllowedFramesForNewGroupRequest = {
 // SUBSCRIBE, or REQUEST_UPDATE.
 const folly::F14FastSet<FrameType> kAllowedFramesForSubgroupDeliveryTimeout = {
     FrameType::PUBLISH_OK,
+    FrameType::REQUEST_OK,
     FrameType::SUBSCRIBE,
     FrameType::REQUEST_UPDATE};
 
@@ -288,15 +298,37 @@ const folly::F14FastSet<FrameType> kAllowAllParamsFrameTypes = {
     FrameType::SETUP,
 };
 
-bool Parameters::isKnownParamKey(uint64_t key) {
-  return kParamAllowlist.find(static_cast<TrackRequestParamKey>(key)) !=
-      kParamAllowlist.end();
+// Parameter keys introduced in draft 18 that reuse no earlier key value. They
+// must be treated as unknown (and therefore rejected) when the negotiated draft
+// is below 18.
+static bool isV18OnlyParamKey(TrackRequestParamKey key) {
+  switch (key) {
+    case TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT:
+    case TrackRequestParamKey::FILL_TIMEOUT:
+    case TrackRequestParamKey::TRACK_NAMESPACE_PREFIX:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool Parameters::isKnownParamKey(uint64_t key, uint64_t majorVersion) {
+  auto typedKey = static_cast<TrackRequestParamKey>(key);
+  if (majorVersion < 18 && isV18OnlyParamKey(typedKey)) {
+    return false;
+  }
+  return kParamAllowlist.find(typedKey) != kParamAllowlist.end();
 }
 
 bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
   // Setup frame types allow all parameters
   if (kAllowAllParamsFrameTypes.contains(frameType_)) {
     return true;
+  }
+
+  if (key == TrackRequestParamKey::OBJECT_DELIVERY_TIMEOUT &&
+      majorVersion_.has_value() && *majorVersion_ >= 18) {
+    return kAllowedFramesForObjectDeliveryTimeoutV18.contains(frameType_);
   }
 
   // v16+ version-specific restrictions for track property params
@@ -327,12 +359,9 @@ bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
   }
 
   // v18-only parameter keys.
-  if (key == TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT ||
-      key == TrackRequestParamKey::FILL_TIMEOUT ||
-      key == TrackRequestParamKey::TRACK_NAMESPACE_PREFIX) {
-    if (!majorVersion_.has_value() || *majorVersion_ < 18) {
-      return false;
-    }
+  if (isV18OnlyParamKey(key) &&
+      (!majorVersion_.has_value() || *majorVersion_ < 18)) {
+    return false;
   }
 
   auto it = kParamAllowlist.find(key);

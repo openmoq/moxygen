@@ -1021,6 +1021,7 @@ class MoQSession : public Subscriber,
       RequestID::hash>::iterator;
 
   void handleTrackStatusOkFromRequestOk(const RequestOk& requestOk);
+  void handlePublishOkFromRequestOk(const RequestOk& requestOk);
   void handleSubscribeUpdateOkFromRequestOk(
       const RequestOk& requestOk,
       PendingRequestIterator reqIt);
@@ -1030,6 +1031,15 @@ class MoQSession : public Subscriber,
   // PROTOCOL_VIOLATION (spec section 10.5). Returns true if the frame is
   // valid; if it returns false the session has already been closed.
   bool validateRequestOkTrackProperties(
+      const RequestOk& requestOk,
+      FrameType resolvedFrameType);
+
+  // Draft 18+: the delivery-timeout params accept REQUEST_OK at parse time (so
+  // PUBLISH_OK, sent as REQUEST_OK, is accepted), but among REQUEST_OK
+  // responses they are valid only for PUBLISH_OK. Once the shorthand resolves,
+  // reject them for any other response. Returns true if valid; if it returns
+  // false the session has already been closed.
+  bool validateRequestOkParams(
       const RequestOk& requestOk,
       FrameType resolvedFrameType);
 

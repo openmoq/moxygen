@@ -4627,6 +4627,27 @@ void MoQSession::handleTrackStatusOkFromRequestOk(const RequestOk& requestOk) {
   onTrackStatusOk(std::move(trackStatusOk));
 }
 
+void MoQSession::handlePublishOkFromRequestOk(const RequestOk& requestOk) {
+  XLOG(DBG1) << __func__ << " reqID=" << requestOk.requestID
+             << " sess=" << this;
+  auto majorVersion = getDraftMajorVersion(*getNegotiatedVersion());
+  if (majorVersion < 18) {
+    XLOG(ERR) << "PUBLISH_OK received as REQUEST_OK before draft 18 reqID="
+              << requestOk.requestID << " sess=" << this;
+    close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+    return;
+  }
+
+  auto publishOk = requestOk.toPublishOk(majorVersion);
+  if (publishOk.hasError()) {
+    XLOG(ERR) << "Invalid PUBLISH_OK params in REQUEST_OK reqID="
+              << requestOk.requestID << " sess=" << this;
+    close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+    return;
+  }
+  onPublishOk(std::move(publishOk.value()));
+}
+
 bool MoQSession::validateRequestOkTrackProperties(
     const RequestOk& requestOk,
     FrameType resolvedFrameType) {
@@ -4643,6 +4664,35 @@ bool MoQSession::validateRequestOkTrackProperties(
             << folly::to_underlying(resolvedFrameType) << ", sess=" << this;
   close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
   return false;
+}
+
+bool MoQSession::validateRequestOkParams(
+    const RequestOk& requestOk,
+    FrameType resolvedFrameType) {
+  if (getDraftMajorVersion(*getNegotiatedVersion()) < 18) {
+    return true;
+  }
+  // OBJECT_DELIVERY_TIMEOUT and SUBGROUP_DELIVERY_TIMEOUT list REQUEST_OK in
+  // their parse-time allowlist so a PUBLISH_OK (encoded on the wire as
+  // REQUEST_OK) is accepted. Among REQUEST_OK responses they are valid only for
+  // PUBLISH_OK, so once the shorthand resolves reject them for anything else.
+  // This is keyed on the param (not isParamAllowed) because shorthands that
+  // share the REQUEST_OK wire type -- e.g. PUBLISH_NAMESPACE_OK (also 0x7) --
+  // are indistinguishable by frame type and would otherwise pass the superset.
+  for (const auto& param : requestOk.params) {
+    auto key = static_cast<TrackRequestParamKey>(param.key);
+    if ((key == TrackRequestParamKey::OBJECT_DELIVERY_TIMEOUT ||
+         key == TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT) &&
+        resolvedFrameType != FrameType::PUBLISH_OK) {
+      XLOG(ERR) << "Delivery timeout param key=" << param.key
+                << " only valid for PUBLISH_OK among REQUEST_OK responses, got "
+                << "resolved frameType="
+                << folly::to_underlying(resolvedFrameType) << ", sess=" << this;
+      close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+      return false;
+    }
+  }
+  return true;
 }
 
 void MoQSession::handleSubscribeUpdateOkFromRequestOk(
@@ -6198,9 +6248,17 @@ void MoQSession::onRequestOk(RequestOk requestOk, FrameType frameType) {
     return;
   }
 
+  if (!validateRequestOkParams(requestOk, frameType)) {
+    return;
+  }
+
   switch (frameType) {
     case FrameType::TRACK_STATUS_OK: {
       handleTrackStatusOkFromRequestOk(requestOk);
+      break;
+    }
+    case FrameType::PUBLISH_OK: {
+      handlePublishOkFromRequestOk(requestOk);
       break;
     }
     case FrameType::REQUEST_OK: {

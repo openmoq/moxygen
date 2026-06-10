@@ -145,11 +145,12 @@ class MoQFramerTest : public ::testing::TestWithParam<uint64_t> {
 
   // Consume a varint-encoded frame type using the version-aware parser so
   // tests work across QUIC-varint (drafts <17) and MoQ-varint (drafts >=17).
-  void skipFrameType(folly::io::Cursor& cursor) {
+  FrameType skipFrameType(folly::io::Cursor& cursor) {
     auto frameType = parser_.decodeVarint(cursor);
     if (!frameType) {
       throw TestUnderflow();
     }
+    return FrameType(frameType->first);
   }
 
   template <class T>
@@ -218,9 +219,16 @@ class MoQFramerTest : public ::testing::TestWithParam<uint64_t> {
     testUnderflowResult(r8a);
     EXPECT_TRUE(getPublisherPriority(*r8a).has_value());
 
-    skipFrameType(cursor);
-    auto r8b = parser_.parsePublishOk(cursor, frameLength(cursor));
-    testUnderflowResult(r8b);
+    auto publishOkFrameType = skipFrameType(cursor);
+    if (getDraftMajorVersion(GetParam()) >= 18) {
+      EXPECT_EQ(publishOkFrameType, FrameType::REQUEST_OK);
+      auto r8b = parser_.parseRequestOk(
+          cursor, frameLength(cursor), FrameType::REQUEST_OK);
+      testUnderflowResult(r8b);
+    } else {
+      auto r8b = parser_.parsePublishOk(cursor, frameLength(cursor));
+      testUnderflowResult(r8b);
+    }
 
     skipFrameType(cursor);
     auto r8c = parser_.parseRequestError(
@@ -4541,6 +4549,154 @@ class MoQFramerV18Test : public ::testing::Test {
   }
 };
 
+TEST_F(MoQFramerV18Test, PublishOkUsesRequestOkWireType) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  PublishOk publishOk;
+  auto majorVersion = getDraftMajorVersion(kVersionDraft18);
+  publishOk.requestID = RequestID(55);
+  publishOk.forward = false;
+  publishOk.subscriberPriority = 42;
+  publishOk.groupOrder = GroupOrder::NewestFirst;
+  publishOk.locType = LocationType::AbsoluteRange;
+  publishOk.start = AbsoluteLocation{3, 4};
+  publishOk.endGroup = 9;
+  publishOk.params.setMajorVersion(majorVersion);
+  ASSERT_TRUE(
+      publishOk.params
+          .insertParam(Parameter(
+              folly::to_underlying(TrackRequestParamKey::NEW_GROUP_REQUEST),
+              uint64_t(11)))
+          .hasValue());
+  ASSERT_TRUE(publishOk.params
+                  .insertParam(Parameter(
+                      folly::to_underlying(TrackRequestParamKey::EXPIRES),
+                      uint64_t(1234)))
+                  .hasValue());
+  ASSERT_TRUE(publishOk.params
+                  .insertParam(Parameter(
+                      folly::to_underlying(
+                          TrackRequestParamKey::OBJECT_DELIVERY_TIMEOUT),
+                      uint64_t(1000)))
+                  .hasValue());
+  ASSERT_TRUE(publishOk.params
+                  .insertParam(Parameter(
+                      folly::to_underlying(
+                          TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT),
+                      uint64_t(2000)))
+                  .hasValue());
+
+  auto writeResult = writer_.writePublishOk(writeBuf, publishOk);
+  ASSERT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::REQUEST_OK));
+
+  auto requestOk = parser_.parseRequestOk(
+      cursor, frameLength(cursor), FrameType::REQUEST_OK);
+  ASSERT_TRUE(requestOk.hasValue());
+  EXPECT_EQ(
+      getFirstIntParam(
+          requestOk->params, TrackRequestParamKey::NEW_GROUP_REQUEST),
+      std::nullopt);
+  EXPECT_EQ(
+      getFirstIntParam(requestOk->params, TrackRequestParamKey::EXPIRES),
+      std::nullopt);
+  EXPECT_EQ(
+      getFirstIntParam(
+          requestOk->params, TrackRequestParamKey::OBJECT_DELIVERY_TIMEOUT),
+      uint64_t(1000));
+  EXPECT_EQ(
+      getFirstIntParam(
+          requestOk->params, TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT),
+      uint64_t(2000));
+
+  auto countRequestSpecificParam = [](const std::vector<Parameter>& params,
+                                      TrackRequestParamKey key) {
+    size_t count = 0;
+    auto keyValue = folly::to_underlying(key);
+    for (const auto& param : params) {
+      if (param.key == keyValue) {
+        ++count;
+      }
+    }
+    return count;
+  };
+  EXPECT_EQ(
+      countRequestSpecificParam(
+          requestOk->requestSpecificParams,
+          TrackRequestParamKey::NEW_GROUP_REQUEST),
+      1);
+  EXPECT_EQ(
+      countRequestSpecificParam(
+          requestOk->requestSpecificParams, TrackRequestParamKey::EXPIRES),
+      1);
+
+  auto parsed = requestOk->toPublishOk(majorVersion);
+  ASSERT_TRUE(parsed.hasValue());
+  const auto& parsedPublishOk = parsed.value();
+  EXPECT_EQ(parsedPublishOk.requestID, publishOk.requestID);
+  EXPECT_EQ(parsedPublishOk.forward, publishOk.forward);
+  EXPECT_EQ(parsedPublishOk.subscriberPriority, publishOk.subscriberPriority);
+  EXPECT_EQ(parsedPublishOk.groupOrder, publishOk.groupOrder);
+  EXPECT_EQ(parsedPublishOk.locType, publishOk.locType);
+  EXPECT_EQ(parsedPublishOk.start, publishOk.start);
+  EXPECT_EQ(parsedPublishOk.endGroup, publishOk.endGroup);
+  EXPECT_EQ(
+      getFirstIntParam(
+          parsedPublishOk.params, TrackRequestParamKey::NEW_GROUP_REQUEST),
+      uint64_t(11));
+  EXPECT_EQ(
+      getFirstIntParam(parsedPublishOk.params, TrackRequestParamKey::EXPIRES),
+      uint64_t(1234));
+  EXPECT_EQ(
+      getFirstIntParam(
+          parsedPublishOk.params,
+          TrackRequestParamKey::OBJECT_DELIVERY_TIMEOUT),
+      uint64_t(1000));
+  EXPECT_EQ(
+      getFirstIntParam(
+          parsedPublishOk.params,
+          TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT),
+      uint64_t(2000));
+}
+
+TEST_F(MoQFramerV18Test, RequestOkToPublishOkRejectsNonPublishOkParams) {
+  RequestOk requestOk;
+  requestOk.requestID = RequestID(55);
+  requestOk.requestSpecificParams.emplace_back(
+      folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT),
+      std::optional<AbsoluteLocation>(AbsoluteLocation{3, 4}));
+
+  auto parsed = requestOk.toPublishOk(getDraftMajorVersion(kVersionDraft18));
+  EXPECT_TRUE(parsed.hasError());
+  EXPECT_EQ(parsed.error(), ErrorCode::PROTOCOL_VIOLATION);
+}
+
+TEST_F(MoQFramerV18Test, PublishOkWireTypeRejected) {
+  MoQFrameWriter draft17Writer;
+  draft17Writer.initializeVersion(kVersionDraft17);
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  PublishOk publishOk;
+  publishOk.requestID = RequestID(55);
+  auto writeResult = draft17Writer.writePublishOk(writeBuf, publishOk);
+  ASSERT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::PUBLISH_OK));
+
+  auto parsed = parser_.parsePublishOk(cursor, frameLength(cursor));
+  ASSERT_TRUE(parsed.hasError());
+  EXPECT_EQ(parsed.error(), ErrorCode::PROTOCOL_VIOLATION);
+}
+
 // Draft 18 renumbers SUBSCRIBE_NAMESPACE on the wire from 0x11 to 0x50 and
 // drops the Subscribe Options + Forward fields from the message body.
 TEST_F(MoQFramerV18Test, SubscribeNamespaceUsesNewWireTypeAndOmitsOptions) {
@@ -5334,6 +5490,35 @@ TEST_F(ParametersIsParamAllowedTest, ForwardForbiddenOnSubscribeNamespaceV18) {
   Parameters paramsV17(FrameType::SUBSCRIBE_NAMESPACE);
   paramsV17.setMajorVersion(17);
   EXPECT_TRUE(paramsV17.isParamAllowed(TrackRequestParamKey::FORWARD));
+}
+
+// Draft-18-only parameter keys (SUBGROUP_DELIVERY_TIMEOUT 0x06, FILL_TIMEOUT
+// 0x0A, TRACK_NAMESPACE_PREFIX 0x34) reuse no earlier key value, so below
+// draft 18 they must be unknown -- which makes parseParams hard-reject them
+// with PROTOCOL_VIOLATION, preserving pre-18 behavior. At v18 they are known.
+TEST_F(ParametersIsParamAllowedTest, V18OnlyParamKeysUnknownBeforeV18) {
+  for (auto key :
+       {TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT,
+        TrackRequestParamKey::FILL_TIMEOUT,
+        TrackRequestParamKey::TRACK_NAMESPACE_PREFIX}) {
+    auto rawKey = folly::to_underlying(key);
+    EXPECT_FALSE(Parameters::isKnownParamKey(rawKey, 17));
+    EXPECT_TRUE(Parameters::isKnownParamKey(rawKey, 18));
+  }
+}
+
+// Keys present in every supported draft -- including the key values that are
+// reinterpreted in v18 (0x02 DELIVERY_TIMEOUT/OBJECT_DELIVERY_TIMEOUT, 0x04
+// MAX_CACHE_DURATION/RENDEZVOUS_TIMEOUT) -- stay known across versions.
+TEST_F(ParametersIsParamAllowedTest, StableParamKeysKnownAcrossVersions) {
+  for (auto key :
+       {TrackRequestParamKey::DELIVERY_TIMEOUT,
+        TrackRequestParamKey::MAX_CACHE_DURATION,
+        TrackRequestParamKey::SUBSCRIBER_PRIORITY}) {
+    auto rawKey = folly::to_underlying(key);
+    EXPECT_TRUE(Parameters::isKnownParamKey(rawKey, 17));
+    EXPECT_TRUE(Parameters::isKnownParamKey(rawKey, 18));
+  }
 }
 
 class ParameterValidationFlowTest : public ::testing::Test {

@@ -580,18 +580,18 @@ enum class TrackRequestParamKey : uint64_t {
   // OBJECT_DELIVERY_TIMEOUT for drafts >= 18.
   DELIVERY_TIMEOUT = 2,
   OBJECT_DELIVERY_TIMEOUT = 2,
+  SUBGROUP_DELIVERY_TIMEOUT = 6,
   // Key 0x04: MAX_CACHE_DURATION for drafts < 18
   // RENDEZVOUS_TIMEOUT for drafts >= 18.
   MAX_CACHE_DURATION = 4,
   RENDEZVOUS_TIMEOUT = 4,
-  SUBGROUP_DELIVERY_TIMEOUT = 0x06,
   PUBLISHER_PRIORITY = 0x0E,
-  FILL_TIMEOUT = 0x0A,
   SUBSCRIBER_PRIORITY = 0x20,
   SUBSCRIPTION_FILTER = 0x21,
   EXPIRES = 8,
   GROUP_ORDER = 0x22,
   LARGEST_OBJECT = 0x9,
+  FILL_TIMEOUT = 0x0A,
   FORWARD = 0x10,
   TRACK_FILTER = 0x29,
   NEW_GROUP_REQUEST = 0x32,
@@ -621,8 +621,9 @@ class Parameters {
   // Validates if a parameter is allowed for frameType_
   bool isParamAllowed(TrackRequestParamKey key) const;
 
-  // Returns true if key is a known parameter key in kParamAllowlist
-  static bool isKnownParamKey(uint64_t key);
+  // Returns true if key is a known parameter key for the negotiated draft
+  // version. Keys introduced in draft 18 are treated as unknown below v18.
+  static bool isKnownParamKey(uint64_t key, uint64_t majorVersion);
 
   const Parameter& getParam(size_t position) const {
     return params_.at(position);
@@ -1392,6 +1393,11 @@ struct RequestOk {
 
   TrackStatusOk toTrackStatusOk() const;
   static RequestOk fromTrackStatusOk(const TrackStatusOk& trackStatusOk);
+  folly::Expected<PublishOk, ErrorCode> toPublishOk(
+      uint64_t majorVersion) const;
+  static RequestOk fromPublishOk(
+      const PublishOk& publishOk,
+      uint64_t majorVersion);
 };
 
 using SubscribeNamespaceOk = RequestOk;

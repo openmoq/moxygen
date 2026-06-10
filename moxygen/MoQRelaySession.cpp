@@ -680,10 +680,19 @@ void MoQRelaySession::onRequestOk(RequestOk requestOk, FrameType frameType) {
     // Session was closed; do not erase pending state - close() will tear down.
     return;
   }
+  if (!validateRequestOkParams(requestOk, frameType)) {
+    // Session was closed; do not erase pending state - close() will tear down.
+    return;
+  }
   switch (frameType) {
     case moxygen::FrameType::TRACK_STATUS_OK: {
       // Use base class helper
       handleTrackStatusOkFromRequestOk(requestOk);
+      shouldErasePendingRequest = false;
+      break;
+    }
+    case moxygen::FrameType::PUBLISH_OK: {
+      handlePublishOkFromRequestOk(requestOk);
       shouldErasePendingRequest = false;
       break;
     }
