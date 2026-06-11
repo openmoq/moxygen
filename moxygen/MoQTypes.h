@@ -1405,6 +1405,11 @@ using SubscribeTracksOk = RequestOk;
 using PublishNamespaceOk = RequestOk;
 using SubscribeUpdateOk = RequestOk;
 
+struct Redirect {
+  std::string connectUri;
+  FullTrackName fullTrackName;
+};
+
 // Consolidated request error structure
 struct RequestError {
   RequestID requestID;
@@ -1415,6 +1420,8 @@ struct RequestError {
   // If the value is 0, the request SHOULD NOT be retried.
   // A value of 1 indicates the request can be retried immediately.
   std::optional<std::chrono::milliseconds> retryInterval = std::nullopt;
+  // Draft 18+: present only when errorCode == REDIRECT.
+  std::optional<Redirect> redirect = std::nullopt;
 };
 
 // Type aliases for backward compatibility
