@@ -4422,15 +4422,19 @@ TEST_P(MoQFramerV16PlusTest, SubscribeNamespaceWithTrackFilter) {
   auto serialized = writeBuf.move();
   folly::io::Cursor cursor(serialized.get());
 
-  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
-  // Draft 16 uses the legacy SUBSCRIBE_NAMESPACE wire type 0x11
+  auto majorVersion = getDraftMajorVersion(GetParam());
+  // Draft 16/17 use the legacy SUBSCRIBE_NAMESPACE wire type 0x11
   // (draft-ietf-moq-transport-16 section 9.25); draft 18 renumbers it to
   // 0x50 via the LEGACY_SUBSCRIBE_NAMESPACE / SUBSCRIBE_NAMESPACE split.
-  // This test class is instantiated for kVersionDraft16 only (the body
-  // asserts pre-v18 options/forward fields), so the wire type is 0x11.
+  // This test runs for both draft 16 and draft 18. Use decodeMoQVarint so the
+  // 0x50 type (which has a 2-byte QUIC varint prefix) decodes correctly.
+  auto frameType = decodeMoQVarint(cursor);
+  ASSERT_TRUE(frameType.has_value());
   EXPECT_EQ(
       frameType->first,
-      folly::to_underlying(FrameType::LEGACY_SUBSCRIBE_NAMESPACE));
+      folly::to_underlying(
+          majorVersion >= 18 ? FrameType::SUBSCRIBE_NAMESPACE
+                             : FrameType::LEGACY_SUBSCRIBE_NAMESPACE));
 
   auto parseResult =
       parser_.parseSubscribeNamespace(cursor, frameLength(cursor));
@@ -4441,7 +4445,12 @@ TEST_P(MoQFramerV16PlusTest, SubscribeNamespaceWithTrackFilter) {
       parseResult->trackNamespacePrefix,
       subscribeNamespace.trackNamespacePrefix);
   EXPECT_EQ(parseResult->forward, subscribeNamespace.forward);
-  EXPECT_EQ(parseResult->options, SubscribeNamespaceOptions::PUBLISH);
+  // Draft 18 dropped the Subscribe Options field from the wire; the parser
+  // restores the NAMESPACE default. Pre-18 carries the PUBLISH option set above.
+  EXPECT_EQ(
+      parseResult->options,
+      majorVersion >= 18 ? SubscribeNamespaceOptions::NAMESPACE
+                         : SubscribeNamespaceOptions::PUBLISH);
 
   // Check TRACK_FILTER was parsed correctly
   ASSERT_EQ(parseResult->params.size(), 1);
@@ -4512,15 +4521,15 @@ TEST_P(MoQFramerV16PlusTest, TrackFilterLargeValues) {
   auto serialized = writeBuf.move();
   folly::io::Cursor cursor(serialized.get());
 
-  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
-  // Draft 16 uses the legacy SUBSCRIBE_NAMESPACE wire type 0x11
-  // (draft-ietf-moq-transport-16 section 9.25); draft 18 renumbers it to
-  // 0x50 via the LEGACY_SUBSCRIBE_NAMESPACE / SUBSCRIBE_NAMESPACE split.
-  // This test class is instantiated for kVersionDraft16 only (the body
-  // asserts pre-v18 options/forward fields), so the wire type is 0x11.
+  auto majorVersion = getDraftMajorVersion(GetParam());
+  // 0x11 pre-18, 0x50 in draft 18 — see SubscribeNamespaceWithTrackFilter.
+  auto frameType = decodeMoQVarint(cursor);
+  ASSERT_TRUE(frameType.has_value());
   EXPECT_EQ(
       frameType->first,
-      folly::to_underlying(FrameType::LEGACY_SUBSCRIBE_NAMESPACE));
+      folly::to_underlying(
+          majorVersion >= 18 ? FrameType::SUBSCRIBE_NAMESPACE
+                             : FrameType::LEGACY_SUBSCRIBE_NAMESPACE));
 
   auto parseResult =
       parser_.parseSubscribeNamespace(cursor, frameLength(cursor));
