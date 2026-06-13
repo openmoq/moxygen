@@ -466,6 +466,16 @@ void MoQPicoServerBase::onNewConnectionImpl(void* vcnx) {
   onWebTransportCreated(*webTransport);
 
   auto moqSession = createSession(webTransport, executor_);
+  if (mLoggerFactory_) {
+    auto logger = createLogger();
+    auto picoCid = picoquic_get_local_cnxid(cnx);
+    if (picoCid.id_len > 0) {
+      logger->setDcid(
+          quic::ConnectionId::createAndMaybeCrash(
+              std::vector<uint8_t>(picoCid.id, picoCid.id + picoCid.id_len)));
+    }
+    moqSession->setLogger(logger);
+  }
   webTransport->setHandler(moqSession.get());
 
   const char* alpn = picoquic_tls_get_negotiated_alpn(cnx);
@@ -564,6 +574,16 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
 
   // Create MoQSession
   auto moqSession = createSession(webTransport, executor_);
+  if (mLoggerFactory_) {
+    auto logger = createLogger();
+    auto picoCid = picoquic_get_local_cnxid(cnx);
+    if (picoCid.id_len > 0) {
+      logger->setDcid(
+          quic::ConnectionId::createAndMaybeCrash(
+              std::vector<uint8_t>(picoCid.id, picoCid.id + picoCid.id_len)));
+    }
+    moqSession->setLogger(logger);
+  }
   webTransport->setHandler(moqSession.get());
 
   // Set path from the HTTP/3 CONNECT request. Authority is not set because
