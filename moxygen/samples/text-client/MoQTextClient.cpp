@@ -8,13 +8,14 @@
 #include <folly/coro/Sleep.h>
 #include <folly/init/Init.h>
 #include <folly/io/async/AsyncSignalHandler.h>
+#include <folly/logging/xlog.h>
 #include <folly/portability/GFlags.h>
 #include <signal.h>
-#include <moxygen/MoQWebTransportClient.h>
 #include <moxygen/ObjectReceiver.h>
 #include <moxygen/mlog/FileMLogger.h>
 #include <moxygen/mlog/MLogger.h>
 #include <moxygen/relay/MoQRelayClient.h>
+#include <moxygen/samples/util/Utils.h>
 #include <moxygen/util/InsecureVerifierDangerousDoNotUseInProduction.h>
 
 DEFINE_string(connect_url, "", "URL for webtransport server");
@@ -60,6 +61,11 @@ DEFINE_string(
     mlog_path,
     "",
     "If non-empty, write MoQ logs to the specified file path");
+DEFINE_bool(
+    qmux,
+    false,
+    "Connect over QMUX-on-TCP (TLS via Fizz is mandatory) instead of "
+    "QUIC/WebTransport. Mutually exclusive with --quic_transport.");
 
 namespace {
 using namespace moxygen;
@@ -145,7 +151,7 @@ class TextHandler : public ObjectReceiverCallback {
   }
 
   void onPublishDone(PublishDone) override {
-    CHECK(!fetch_);
+    XCHECK(!fetch_);
     std::cout << __func__ << std::endl;
     baton.post();
   }
@@ -166,17 +172,14 @@ class MoQTextClient : public Subscriber,
       std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr,
       std::shared_ptr<MLogger> logger = nullptr)
       : moqClient_(
-            FLAGS_quic_transport
-                ? std::make_unique<MoQClient>(
-                      evb,
-                      std::move(url),
-                      MoQRelaySession::createRelaySessionFactory(),
-                      verifier)
-                : std::make_unique<MoQWebTransportClient>(
-                      evb,
-                      std::move(url),
-                      MoQRelaySession::createRelaySessionFactory(),
-                      verifier)),
+            samples::makeRelayClientTransport(
+                evb,
+                std::move(url),
+                std::move(verifier),
+                FLAGS_qmux ? samples::TransportType::QMUX
+                    : FLAGS_quic_transport
+                    ? samples::TransportType::QUIC
+                    : samples::TransportType::WEB_TRANSPORT)),
         fullTrackName_(std::move(ftn)),
         logger_(logger) {
     if (logger) {
@@ -434,6 +437,8 @@ using namespace moxygen;
 
 int main(int argc, char* argv[]) {
   folly::Init init(&argc, &argv, false);
+  XLOG_IF(FATAL, FLAGS_qmux && FLAGS_quic_transport)
+      << "--qmux and --quic_transport are mutually exclusive";
   folly::EventBase eventBase;
   proxygen::URL url(FLAGS_connect_url);
   std::shared_ptr<MLogger> logger;
@@ -446,7 +451,7 @@ int main(int argc, char* argv[]) {
   }
   int sumFetchCount =
       int(FLAGS_jafetch) + int(FLAGS_jrfetch) + int(FLAGS_fetch);
-  CHECK(sumFetchCount <= 1)
+  XCHECK(sumFetchCount <= 1)
       << "Can specify at most one of jafetch or jrfetch or fetch";
   TrackNamespace ns =
       TrackNamespace(FLAGS_track_namespace, FLAGS_track_namespace_delimiter);

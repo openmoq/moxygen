@@ -8,6 +8,7 @@
 #include <folly/lang/Bits.h>
 #include <folly/logging/xlog.h>
 
+#include <cstdint>
 #include <utility>
 
 namespace {
@@ -37,6 +38,46 @@ uint64_t getLocationTypeValue(
   }
 
   return folly::to_underlying(locationType);
+}
+
+// Per-key value encoding for draft-18 Message Parameters (§10.2).
+enum class ParamValueEncoding {
+  Uint8,
+  Varint,
+  Location,
+  LengthPrefixed,
+};
+
+// Caller must reject unknown keys (Parameters::isKnownParamKey) before calling.
+ParamValueEncoding paramEncodingV18(uint64_t key) {
+  using K = moxygen::TrackRequestParamKey;
+  switch (static_cast<K>(key)) {
+    case K::SUBSCRIBER_PRIORITY:
+    case K::GROUP_ORDER:
+    case K::FORWARD:
+      return ParamValueEncoding::Uint8;
+    case K::OBJECT_DELIVERY_TIMEOUT:
+    case K::RENDEZVOUS_TIMEOUT:
+    case K::SUBGROUP_DELIVERY_TIMEOUT:
+    case K::FILL_TIMEOUT:
+    case K::EXPIRES:
+    case K::NEW_GROUP_REQUEST:
+    // PUBLISHER_PRIORITY is extensions-only in v16+; parsed as varint so the
+    // caller's allowlist check can reject it cleanly.
+    case K::PUBLISHER_PRIORITY:
+      return ParamValueEncoding::Varint;
+    case K::LARGEST_OBJECT:
+      return ParamValueEncoding::Location;
+    case K::AUTHORIZATION_TOKEN:
+    case K::SUBSCRIPTION_FILTER:
+    case K::TRACK_NAMESPACE_PREFIX:
+    // TRACK_FILTER (0x29) is a fork-local active proposal; length-prefixed
+    // value decoded via parseVariableParam (see parseTrackFilter).
+    case K::TRACK_FILTER:
+      return ParamValueEncoding::LengthPrefixed;
+  }
+  XLOG(DFATAL) << "paramEncodingV18: unknown key " << key;
+  return ParamValueEncoding::Varint;
 }
 
 bool isRequestSpecificParam(moxygen::TrackRequestParamKey key) {
@@ -119,6 +160,102 @@ std::vector<moxygen::Parameter> mergeAndSortParams(
   return sortParamsByKey(std::move(allParams));
 }
 
+bool isPublishOkRequestSpecificParam(moxygen::TrackRequestParamKey key) {
+  switch (key) {
+    case moxygen::TrackRequestParamKey::SUBSCRIPTION_FILTER:
+    case moxygen::TrackRequestParamKey::EXPIRES:
+    case moxygen::TrackRequestParamKey::GROUP_ORDER:
+    case moxygen::TrackRequestParamKey::SUBSCRIBER_PRIORITY:
+    case moxygen::TrackRequestParamKey::FORWARD:
+    case moxygen::TrackRequestParamKey::NEW_GROUP_REQUEST:
+      return true;
+    default:
+      return false;
+  }
+}
+
+void appendIntRequestSpecificParam(
+    std::vector<moxygen::Parameter>& requestSpecificParams,
+    moxygen::TrackRequestParamKey key,
+    std::optional<uint64_t> value) {
+  if (!value.has_value()) {
+    return;
+  }
+  requestSpecificParams.emplace_back(folly::to_underlying(key), *value);
+}
+
+void insertPublishOkIntParamIfMissing(
+    moxygen::TrackRequestParameters& params,
+    moxygen::TrackRequestParamKey key,
+    uint64_t value,
+    const char* context) {
+  if (moxygen::getFirstIntParam(params, key).has_value()) {
+    return;
+  }
+  auto insertResult =
+      params.insertParam(moxygen::Parameter(folly::to_underlying(key), value));
+  if (insertResult.hasError()) {
+    XLOG(WARN) << context
+               << ": ignoring param key=" << folly::to_underlying(key);
+  }
+}
+
+std::vector<moxygen::Parameter> getPublishOkRequestSpecificParams(
+    const moxygen::PublishOk& publishOk,
+    bool includeRequestOkOnlyParams = false) {
+  std::vector<moxygen::Parameter> requestSpecificParams;
+
+  moxygen::Parameter subscriptionFilterParam;
+  subscriptionFilterParam.key =
+      folly::to_underlying(moxygen::TrackRequestParamKey::SUBSCRIPTION_FILTER);
+  subscriptionFilterParam.asSubscriptionFilter = moxygen::SubscriptionFilter(
+      publishOk.locType,
+      publishOk.start,
+      publishOk.locType == moxygen::LocationType::AbsoluteRange
+          ? publishOk.endGroup
+          : std::nullopt);
+  requestSpecificParams.push_back(subscriptionFilterParam);
+
+  if (publishOk.subscriberPriority != moxygen::kDefaultPriority) {
+    moxygen::Parameter priorityParam;
+    priorityParam.key = folly::to_underlying(
+        moxygen::TrackRequestParamKey::SUBSCRIBER_PRIORITY);
+    priorityParam.asUint64 = publishOk.subscriberPriority;
+    requestSpecificParams.push_back(priorityParam);
+  }
+
+  if (publishOk.groupOrder != moxygen::GroupOrder::Default) {
+    moxygen::Parameter groupOrderParam;
+    groupOrderParam.key =
+        folly::to_underlying(moxygen::TrackRequestParamKey::GROUP_ORDER);
+    groupOrderParam.asUint64 = folly::to_underlying(publishOk.groupOrder);
+    requestSpecificParams.push_back(groupOrderParam);
+  }
+
+  if (!publishOk.forward) {
+    moxygen::Parameter forwardParam;
+    forwardParam.key =
+        folly::to_underlying(moxygen::TrackRequestParamKey::FORWARD);
+    forwardParam.asUint64 = 0;
+    requestSpecificParams.push_back(forwardParam);
+  }
+
+  if (includeRequestOkOnlyParams) {
+    appendIntRequestSpecificParam(
+        requestSpecificParams,
+        moxygen::TrackRequestParamKey::EXPIRES,
+        moxygen::getFirstIntParam(
+            publishOk.params, moxygen::TrackRequestParamKey::EXPIRES));
+  }
+  appendIntRequestSpecificParam(
+      requestSpecificParams,
+      moxygen::TrackRequestParamKey::NEW_GROUP_REQUEST,
+      moxygen::getFirstIntParam(
+          publishOk.params, moxygen::TrackRequestParamKey::NEW_GROUP_REQUEST));
+
+  return requestSpecificParams;
+}
+
 std::vector<moxygen::Extension> sortExtensionsByType(
     std::vector<moxygen::Extension> extensions) {
   std::sort(
@@ -140,83 +277,168 @@ folly::Expected<uint64_t, moxygen::ErrorCode> decodeDelta(
   return previous + delta;
 }
 
+folly::Expected<uint64_t, moxygen::ErrorCode> resolveFetchGroupID(
+    const std::optional<uint64_t>& groupIDField,
+    bool useFetchObjectDeltas,
+    const std::optional<uint64_t>& previousFetchGroup,
+    moxygen::GroupOrder fetchGroupOrder) {
+  if (!groupIDField.has_value()) {
+    if (!previousFetchGroup.has_value()) {
+      XLOG(ERR) << "resolveFetchGroupID: First object must have explicit "
+                   "group ID";
+      return folly::makeUnexpected(moxygen::ErrorCode::PROTOCOL_VIOLATION);
+    }
+    return previousFetchGroup.value();
+  }
+
+  if (!useFetchObjectDeltas) {
+    return groupIDField.value();
+  }
+
+  auto groupIDDelta = groupIDField.value();
+  if (!previousFetchGroup.has_value()) {
+    return groupIDDelta;
+  }
+
+  if (fetchGroupOrder == moxygen::GroupOrder::NewestFirst) {
+    if (groupIDDelta == std::numeric_limits<uint64_t>::max() ||
+        previousFetchGroup.value() < groupIDDelta + 1) {
+      return folly::makeUnexpected(moxygen::ErrorCode::PROTOCOL_VIOLATION);
+    }
+    return previousFetchGroup.value() - (groupIDDelta + 1);
+  }
+
+  if (groupIDDelta == std::numeric_limits<uint64_t>::max() ||
+      previousFetchGroup.value() >
+          std::numeric_limits<uint64_t>::max() - groupIDDelta - 1) {
+    return folly::makeUnexpected(moxygen::ErrorCode::PROTOCOL_VIOLATION);
+  }
+  return previousFetchGroup.value() + groupIDDelta + 1;
+}
+
+folly::Expected<uint64_t, moxygen::ErrorCode> resolveFetchObjectID(
+    const std::optional<uint64_t>& objectIDField,
+    bool draft18GroupIDDeltaPresent,
+    bool useFetchObjectDeltas,
+    const std::optional<uint64_t>& previousObjectID) {
+  DCHECK(useFetchObjectDeltas || !draft18GroupIDDeltaPresent);
+  if (objectIDField.has_value()) {
+    if (!useFetchObjectDeltas || draft18GroupIDDeltaPresent) {
+      return objectIDField.value();
+    }
+
+    if (!previousObjectID.has_value()) {
+      XLOG(ERR) << "resolveFetchObjectID: First object cannot reference "
+                   "prior object ID";
+      return folly::makeUnexpected(moxygen::ErrorCode::PROTOCOL_VIOLATION);
+    }
+    return decodeDelta(previousObjectID.value(), objectIDField.value());
+  }
+
+  if (!previousObjectID.has_value()) {
+    XLOG(ERR) << "resolveFetchObjectID: First object must have explicit "
+                 "object ID";
+    return folly::makeUnexpected(moxygen::ErrorCode::PROTOCOL_VIOLATION);
+  }
+  if (useFetchObjectDeltas &&
+      previousObjectID.value() == std::numeric_limits<uint64_t>::max()) {
+    return folly::makeUnexpected(moxygen::ErrorCode::PROTOCOL_VIOLATION);
+  }
+  return previousObjectID.value() + 1;
+}
+
+struct FetchObjectDeltaFields {
+  std::optional<uint64_t> groupIDDelta;
+  std::optional<uint64_t> objectIDDelta;
+};
+
+std::optional<FetchObjectDeltaFields> computeFetchObjectDeltaFieldsForWrite(
+    const moxygen::ObjectHeader& objectHeader,
+    const std::optional<uint64_t>& previousFetchGroup,
+    const std::optional<uint64_t>& previousObjectID,
+    moxygen::GroupOrder fetchGroupOrder) {
+  FetchObjectDeltaFields fields;
+
+  if (!previousFetchGroup.has_value()) {
+    fields.groupIDDelta = objectHeader.group;
+  } else if (objectHeader.group != previousFetchGroup.value()) {
+    if (fetchGroupOrder == moxygen::GroupOrder::NewestFirst) {
+      if (objectHeader.group >= previousFetchGroup.value()) {
+        return std::nullopt;
+      }
+      fields.groupIDDelta = previousFetchGroup.value() - objectHeader.group - 1;
+    } else {
+      if (objectHeader.group <= previousFetchGroup.value()) {
+        return std::nullopt;
+      }
+      fields.groupIDDelta = objectHeader.group - previousFetchGroup.value() - 1;
+    }
+  }
+  const bool groupIDDeltaPresent = fields.groupIDDelta.has_value();
+
+  bool objectIDIsNext = false;
+  if (previousObjectID.has_value() &&
+      previousObjectID.value() != std::numeric_limits<uint64_t>::max()) {
+    objectIDIsNext = objectHeader.id == previousObjectID.value() + 1;
+  }
+  if (!previousObjectID.has_value()) {
+    fields.objectIDDelta = objectHeader.id;
+  } else if (groupIDDeltaPresent) {
+    if (!objectIDIsNext) {
+      fields.objectIDDelta = objectHeader.id;
+    }
+  } else if (!objectIDIsNext) {
+    if (objectHeader.id < previousObjectID.value()) {
+      return std::nullopt;
+    }
+    fields.objectIDDelta = objectHeader.id - previousObjectID.value();
+  }
+
+  return fields;
+}
+
 } // namespace
 
 namespace moxygen {
 
 // Forward declarations for iOS.
-enum class ParamsType { ClientSetup, ServerSetup, Request };
-folly::Expected<folly::Unit, ErrorCode> parseParams(
-    folly::io::Cursor& cursor,
-    size_t& length,
-    uint64_t version,
-    size_t numParams,
-    Parameters& params,
-    std::vector<Parameter>& requestSpecificParams,
-    MoQTokenCache& tokenCache,
-    ParamsType paramsType);
-folly::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
-    folly::io::Cursor& cursor,
-    size_t length,
-    MoQTokenCache& tokenCache,
-    ParamsType paramsType) noexcept;
-folly::Expected<std::optional<Parameter>, ErrorCode> parseVariableParam(
-    folly::io::Cursor& cursor,
-    size_t& length,
-    uint64_t version,
-    uint64_t key,
-    MoQTokenCache& tokenCache,
-    ParamsType paramsType);
-folly::Expected<AbsoluteLocation, ErrorCode> parseAbsoluteLocation(
-    folly::io::Cursor& cursor,
-    size_t& length) noexcept;
-folly::Expected<SubscriptionFilter, ErrorCode> parseSubscriptionFilter(
-    folly::io::Cursor& cursor,
-    size_t& length) noexcept;
-folly::Expected<std::optional<Parameter>, ErrorCode> parseIntParam(
-    folly::io::Cursor& cursor,
-    size_t& length,
-    uint64_t version,
-    uint64_t key);
 bool datagramTypeHasExtensions(uint64_t version, DatagramType streamType);
 bool datagramTypeIsStatus(uint64_t version, DatagramType streamType);
 bool datagramObjectIdZero(uint64_t version, DatagramType datagramType);
 
-void writeFixedString(
-    folly::IOBufQueue& writeBuf,
-    const std::string& str,
-    size_t& size,
-    bool& error);
-void writeFixedTuple(
-    folly::IOBufQueue& writeBuf,
-    const std::vector<std::string>& tup,
-    size_t& size,
-    bool& error);
-void writeTrackNamespace(
-    folly::IOBufQueue& writeBuf,
-    const TrackNamespace& tn,
-    size_t& size,
-    bool& error);
-uint16_t*
-writeFrameHeader(folly::IOBufQueue& writeBuf, FrameType frameType, bool& error);
 void writeSize(uint16_t* sizePtr, size_t size, bool& error, uint64_t versionIn);
 
-void writeFullTrackName(
-    folly::IOBufQueue& writeBuf,
-    const FullTrackName& fullTrackName,
-    size_t& size,
-    bool error);
 void writeTrackFilter(
     folly::IOBufQueue& writeBuf,
     const TrackFilter& filter,
     size_t& size,
     bool& error) noexcept;
+
 bool includeSetupParam(uint64_t version, SetupKey key);
 
+// Test-only helper: QUIC varint length prefix + fixed string. Production code
+// should call MoQFrameParser::parseFixedString to dispatch on negotiated
+// version.
 folly::Expected<std::string, ErrorCode> parseFixedString(
     folly::io::Cursor& cursor,
     size_t& length) {
   auto strLength = quic::follyutils::decodeQuicInteger(cursor, length);
+  if (!strLength) {
+    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  }
+  length -= strLength->second;
+  if (strLength->first > length) {
+    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  }
+  auto res = cursor.readFixedString(strLength->first);
+  length -= strLength->first;
+  return res;
+}
+
+folly::Expected<std::string, ErrorCode> MoQFrameParser::parseFixedString(
+    folly::io::Cursor& cursor,
+    size_t& length) const noexcept {
+  auto strLength = decodeVarint(cursor, length);
   if (!strLength) {
     XLOG(DBG4) << "parseFixedString: UNDERFLOW on strLength";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -231,14 +453,15 @@ folly::Expected<std::string, ErrorCode> parseFixedString(
   return res;
 }
 
-folly::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
+folly::Expected<std::optional<AuthToken>, ErrorCode>
+MoQFrameParser::parseAuthToken(
     folly::io::Cursor& cursor,
     size_t length,
-    MoQTokenCache& tokenCache,
-    ParamsType paramsType) noexcept {
+    ParamsType paramsType) const noexcept {
+  auto& tokenCache = *tokenCache_;
   std::optional<AuthToken> token;
   token.emplace(); // plan for success
-  auto aliasType = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto aliasType = decodeVarint(cursor, length);
   if (!aliasType) {
     XLOG(DBG4) << "parseToken: UNDERFLOW on aliasType";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -257,7 +480,7 @@ folly::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
         XLOG(ERR) << "Can't delete/use-alias in client setup";
         return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
       }
-      auto tokenAlias = quic::follyutils::decodeQuicInteger(cursor, length);
+      auto tokenAlias = decodeVarint(cursor, length);
       if (!tokenAlias) {
         XLOG(DBG4) << "parseToken: UNDERFLOW on tokenAlias (DELETE/USE_ALIAS)";
         return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -287,7 +510,7 @@ folly::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
       }
     } break;
     case AliasType::REGISTER: {
-      auto tokenAlias = quic::follyutils::decodeQuicInteger(cursor, length);
+      auto tokenAlias = decodeVarint(cursor, length);
       if (!tokenAlias) {
         XLOG(DBG4) << "parseToken: UNDERFLOW on tokenAlias (REGISTER)";
         return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -295,7 +518,7 @@ folly::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
       length -= tokenAlias->second;
       token->alias = tokenAlias->first;
 
-      auto tokenType = quic::follyutils::decodeQuicInteger(cursor, length);
+      auto tokenType = decodeVarint(cursor, length);
       if (!tokenType) {
         XLOG(DBG4) << "parseToken: UNDERFLOW on tokenType (REGISTER)";
         return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -334,7 +557,7 @@ folly::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
       }
     } break;
     case AliasType::USE_VALUE: {
-      auto tokenType = quic::follyutils::decodeQuicInteger(cursor, length);
+      auto tokenType = decodeVarint(cursor, length);
       if (!tokenType) {
         XLOG(DBG4) << "parseToken: UNDERFLOW on tokenType (USE_VALUE)";
         return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -357,11 +580,11 @@ folly::Expected<std::optional<AuthToken>, ErrorCode> parseToken(
   return token;
 }
 
-folly::Expected<AbsoluteLocation, ErrorCode> parseAbsoluteLocation(
-    folly::io::Cursor& cursor,
-    size_t& length) noexcept {
+folly::Expected<AbsoluteLocation, ErrorCode>
+MoQFrameParser::parseAbsoluteLocation(folly::io::Cursor& cursor, size_t& length)
+    const noexcept {
   AbsoluteLocation location;
-  auto group = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto group = decodeVarint(cursor, length);
   if (!group) {
     XLOG(DBG4) << "parseAbsoluteLocation: UNDERFLOW on group";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -369,7 +592,7 @@ folly::Expected<AbsoluteLocation, ErrorCode> parseAbsoluteLocation(
   location.group = group->first;
   length -= group->second;
 
-  auto object = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto object = decodeVarint(cursor, length);
   if (!object) {
     XLOG(DBG4) << "parseAbsoluteLocation: UNDERFLOW on object";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -380,13 +603,14 @@ folly::Expected<AbsoluteLocation, ErrorCode> parseAbsoluteLocation(
   return location;
 }
 
-folly::Expected<SubscriptionFilter, ErrorCode> parseSubscriptionFilter(
+folly::Expected<SubscriptionFilter, ErrorCode>
+MoQFrameParser::parseSubscriptionFilter(
     folly::io::Cursor& cursor,
-    size_t& length) noexcept {
+    size_t& length) const noexcept {
   SubscriptionFilter filter;
 
   // Parse filter type
-  auto filterType = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto filterType = decodeVarint(cursor, length);
   if (!filterType) {
     XLOG(DBG4) << "parseSubscriptionFilter: UNDERFLOW on filterType";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -423,12 +647,24 @@ folly::Expected<SubscriptionFilter, ErrorCode> parseSubscriptionFilter(
 
   // Parse end group if present (only for AbsoluteRange)
   if (filter.filterType == LocationType::AbsoluteRange) {
-    auto endGroup = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto endGroup = decodeVarint(cursor, length);
     if (!endGroup) {
       XLOG(DBG4) << "parseSubscriptionFilter: UNDERFLOW on endGroup";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
-    filter.endGroup = endGroup->first;
+    // In draft-18+, EndGroup is encoded as a delta from StartLocation.group.
+    // In draft-17 and earlier, EndGroup is an absolute group number.
+    if (getDraftMajorVersion(*version_) >= 18) {
+      if (endGroup->first > kEightByteLimit - filter.location->group) {
+        XLOG(ERR) << "parseSubscriptionFilter: EndGroup delta wraps "
+                  << "(start.group=" << filter.location->group
+                  << " + delta=" << endGroup->first << " > kEightByteLimit)";
+        return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+      }
+      filter.endGroup = endGroup->first + filter.location->group;
+    } else {
+      filter.endGroup = endGroup->first;
+    }
     length -= endGroup->second;
   }
 
@@ -461,13 +697,13 @@ folly::Expected<TrackFilter, ErrorCode> parseTrackFilter(
   return filter;
 }
 
-folly::Expected<std::optional<Parameter>, ErrorCode> parseVariableParam(
+folly::Expected<std::optional<Parameter>, ErrorCode>
+MoQFrameParser::parseVariableParam(
     folly::io::Cursor& cursor,
     size_t& length,
     uint64_t version,
     uint64_t key,
-    MoQTokenCache& tokenCache,
-    ParamsType paramsType) {
+    ParamsType paramsType) const noexcept {
   Parameter p;
   p.key = key;
   const auto authKey =
@@ -477,7 +713,7 @@ folly::Expected<std::optional<Parameter>, ErrorCode> parseVariableParam(
   const auto trackFilterKey =
       folly::to_underlying(TrackRequestParamKey::TRACK_FILTER);
   if (key == authKey) {
-    auto res = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto res = decodeVarint(cursor, length);
     if (!res) {
       XLOG(DBG4) << "parseVariableParam: UNDERFLOW on authKey length";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -487,7 +723,7 @@ folly::Expected<std::optional<Parameter>, ErrorCode> parseVariableParam(
       XLOG(DBG4) << "parseVariableParam: UNDERFLOW on authKey data";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
-    auto tokenRes = parseToken(cursor, res->first, tokenCache, paramsType);
+    auto tokenRes = parseAuthToken(cursor, res->first, paramsType);
     if (!tokenRes) {
       return folly::makeUnexpected(tokenRes.error());
     }
@@ -500,7 +736,7 @@ folly::Expected<std::optional<Parameter>, ErrorCode> parseVariableParam(
   } else if (
       key == subscriptionFilterKey && getDraftMajorVersion(version) >= 15) {
     // Read length prefix (odd key = length-prefixed)
-    auto lenRes = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto lenRes = decodeVarint(cursor, length);
     if (!lenRes) {
       XLOG(DBG4)
           << "parseVariableParam: UNDERFLOW on subscriptionFilter length";
@@ -560,14 +796,15 @@ folly::Expected<std::optional<Parameter>, ErrorCode> parseVariableParam(
   return p;
 }
 
-folly::Expected<std::optional<Parameter>, ErrorCode> parseIntParam(
+folly::Expected<std::optional<Parameter>, ErrorCode>
+MoQFrameParser::parseIntParam(
     folly::io::Cursor& cursor,
     size_t& length,
     uint64_t version,
-    uint64_t key) {
+    uint64_t key) const noexcept {
   Parameter p;
   p.key = key;
-  auto res = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto res = decodeVarint(cursor, length);
   if (!res) {
     XLOG(DBG4) << "parseIntParam: UNDERFLOW on integer decode";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -581,19 +818,57 @@ folly::Expected<std::optional<Parameter>, ErrorCode> parseIntParam(
   return p;
 }
 
-folly::Expected<folly::Unit, ErrorCode> parseParams(
+folly::Expected<std::optional<Parameter>, ErrorCode>
+MoQFrameParser::parseV18ParamValue(
     folly::io::Cursor& cursor,
     size_t& length,
     uint64_t version,
-    size_t numParams,
+    uint64_t key,
+    ParamsType paramsType) const noexcept {
+  switch (paramEncodingV18(key)) {
+    case ParamValueEncoding::Uint8: {
+      if (length < 1 || !cursor.canAdvance(1)) {
+        XLOG(DBG4) << "parseV18ParamValue: UNDERFLOW on uint8, key=" << key;
+        return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+      }
+      uint8_t value = cursor.read<uint8_t>();
+      length -= 1;
+      if (!isIntParamValid(version, key, value)) {
+        return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+      }
+      return Parameter(key, static_cast<uint64_t>(value));
+    }
+    case ParamValueEncoding::Varint:
+      return parseIntParam(cursor, length, version, key);
+    case ParamValueEncoding::Location: {
+      auto loc = parseAbsoluteLocation(cursor, length);
+      if (!loc) {
+        return folly::makeUnexpected(loc.error());
+      }
+      return Parameter(key, std::optional<AbsoluteLocation>(loc.value()));
+    }
+    case ParamValueEncoding::LengthPrefixed:
+      return parseVariableParam(cursor, length, version, key, paramsType);
+  }
+  XLOG(DFATAL) << "parseV18ParamValue: unreachable, key=" << key;
+  return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+}
+
+folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseParams(
+    folly::io::Cursor& cursor,
+    size_t& length,
+    uint64_t version,
+    std::optional<size_t> numParams,
     Parameters& params,
     std::vector<Parameter>& requestSpecificParams,
-    MoQTokenCache& tokenCache,
-    ParamsType paramsType) {
+    ParamsType paramsType) const noexcept {
   uint64_t previousKey = 0;
 
-  for (auto i = 0u; i < numParams; i++) {
-    auto keyOrDelta = quic::follyutils::decodeQuicInteger(cursor, length);
+  // numParams == std::nullopt means "consume options until the declared
+  // message length is exhausted" (draft-17+ SETUP has no Number-of-Options
+  // field on the wire).
+  for (auto i = 0u; numParams ? i < *numParams : length > 0; i++) {
+    auto keyOrDelta = decodeVarint(cursor, length);
     if (!keyOrDelta) {
       XLOG(DBG4) << "parseParams: UNDERFLOW on key";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -616,14 +891,18 @@ folly::Expected<folly::Unit, ErrorCode> parseParams(
 
     if (getDraftMajorVersion(version) >= 16 &&
         paramsType == ParamsType::Request &&
-        !Parameters::isKnownParamKey(key)) {
+        !Parameters::isKnownParamKey(key, getDraftMajorVersion(version))) {
       XLOG(ERR) << "Unknown parameter key " << key << " in v16+";
       return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
 
     folly::Expected<std::optional<Parameter>, ErrorCode> res;
 
-    if ((paramsType == ParamsType::Request &&
+    if (getDraftMajorVersion(version) >= 18 &&
+        paramsType == ParamsType::Request) {
+      res = parseV18ParamValue(cursor, length, version, key, paramsType);
+    } else if (
+        (paramsType == ParamsType::Request &&
          key == folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT)) ||
         ((key & 0x01) == 0 &&
          (paramsType != ParamsType::Request ||
@@ -639,7 +918,7 @@ folly::Expected<folly::Unit, ErrorCode> parseParams(
       }
 
       // Read length prefix (odd key = length-prefixed)
-      auto lenRes = quic::follyutils::decodeQuicInteger(cursor, length);
+      auto lenRes = decodeVarint(cursor, length);
       if (!lenRes) {
         XLOG(DBG4) << "parseParams: UNDERFLOW on LARGEST_OBJECT length";
         return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -664,8 +943,7 @@ folly::Expected<folly::Unit, ErrorCode> parseParams(
       length -= lenRes->first;
       res = Parameter(key, largestLocation.value());
     } else {
-      res = parseVariableParam(
-          cursor, length, version, key, tokenCache, paramsType);
+      res = parseVariableParam(cursor, length, version, key, paramsType);
     }
     if (!res) {
       XLOG(DBG4)
@@ -682,7 +960,13 @@ folly::Expected<folly::Unit, ErrorCode> parseParams(
       } else {
         auto insertResult = params.insertParam(std::move(*res.value()));
         if (insertResult.hasError()) {
-          // Per spec: invalid params in received messages should be ignored
+          // In draft 18+, receiving parameters in a message in which it isn't
+          // allowed is a protocol violation.
+          if (getDraftMajorVersion(version) >= 18) {
+            XLOG(ERR) << "parseParams: param not allowed for frame type in "
+                      << "v18+ at param index=" << i << ", key=" << key;
+            return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+          }
           XLOG(WARN) << "parseParams: ignoring param not allowed for frame type"
                      << " at param index=" << i << ", key=" << key;
         }
@@ -702,7 +986,7 @@ folly::Expected<Setup, ErrorCode> MoQFrameParser::parseClientSetup(
   // Only parse version array when version is not initialized, i.e. alpn did not
   // happen, or when version is initialized but is < 15 (in tests)
   if (!version_ || getDraftMajorVersion(*version_) < 15) {
-    auto numVersions = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto numVersions = decodeVarint(cursor, length);
     if (!numVersions) {
       XLOG(DBG4) << "parseClientSetup: UNDERFLOW on numVersions";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -710,7 +994,7 @@ folly::Expected<Setup, ErrorCode> MoQFrameParser::parseClientSetup(
     length -= numVersions->second;
     bool foundDraft14 = false;
     for (auto i = 0ul; i < numVersions->first; i++) {
-      auto version = quic::follyutils::decodeQuicInteger(cursor, length);
+      auto version = decodeVarint(cursor, length);
       if (!version) {
         XLOG(DBG4) << "parseClientSetup: UNDERFLOW on version";
         return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -731,21 +1015,26 @@ folly::Expected<Setup, ErrorCode> MoQFrameParser::parseClientSetup(
     serializationVersion = *version_;
   }
 
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
-  if (!numParams) {
-    XLOG(DBG4) << "parseClientSetup: UNDERFLOW on numParams";
-    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  // Draft-17 removed the Number-of-Options field; options span the rest of
+  // the message length. Older drafts still carry an explicit count.
+  std::optional<size_t> numParams;
+  if (getDraftMajorVersion(serializationVersion) < 17) {
+    auto decoded = decodeVarint(cursor, length);
+    if (!decoded) {
+      XLOG(DBG4) << "parseClientSetup: UNDERFLOW on numParams";
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    length -= decoded->second;
+    numParams = decoded->first;
   }
-  length -= numParams->second;
   std::vector<Parameter> requestSpecificParams;
   auto res = parseParams(
       cursor,
       length,
       serializationVersion,
-      numParams->first,
+      numParams,
       clientSetup.params,
       requestSpecificParams,
-      *tokenCache_,
       ParamsType::ClientSetup);
   if (res.hasError()) {
     return folly::makeUnexpected(res.error());
@@ -765,7 +1054,7 @@ folly::Expected<Setup, ErrorCode> MoQFrameParser::parseServerSetup(
   // Only parse version when version is not initialized, i.e. alpn did not
   // happen, or when version is initialized but is < 15 (in tests)
   if (!version_ || getDraftMajorVersion(*version_) < 15) {
-    auto version = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto version = decodeVarint(cursor, length);
     if (!version) {
       XLOG(DBG4) << "parseServerSetup: UNDERFLOW on version";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -784,21 +1073,26 @@ folly::Expected<Setup, ErrorCode> MoQFrameParser::parseServerSetup(
     serializationVersion = *version_;
   }
 
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
-  if (!numParams) {
-    XLOG(DBG4) << "parseServerSetup: UNDERFLOW on numParams";
-    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  // Draft-17 removed the Number-of-Options field; options span the rest of
+  // the message length. Older drafts still carry an explicit count.
+  std::optional<size_t> numParams;
+  if (getDraftMajorVersion(serializationVersion) < 17) {
+    auto decoded = decodeVarint(cursor, length);
+    if (!decoded) {
+      XLOG(DBG4) << "parseServerSetup: UNDERFLOW on numParams";
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    length -= decoded->second;
+    numParams = decoded->first;
   }
-  length -= numParams->second;
   std::vector<Parameter> requestSpecificParams;
   auto res = parseParams(
       cursor,
       length,
       serializationVersion,
-      numParams->first,
+      numParams,
       serverSetup.params,
       requestSpecificParams,
-      *tokenCache_,
       ParamsType::ServerSetup);
   if (res.hasError()) {
     return folly::makeUnexpected(res.error());
@@ -812,7 +1106,7 @@ folly::Expected<Setup, ErrorCode> MoQFrameParser::parseServerSetup(
 folly::Expected<MoQFrameParser::ParseResultAndLength<RequestID>, ErrorCode>
 MoQFrameParser::parseFetchHeader(folly::io::Cursor& cursor, size_t length)
     const noexcept {
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parseFetchHeader: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -827,11 +1121,17 @@ MoQFrameParser::parseFetchHeader(folly::io::Cursor& cursor, size_t length)
       RequestID(requestID->first), requestID->second};
 }
 
+void MoQFrameParser::setFetchGroupOrder(GroupOrder groupOrder) noexcept {
+  fetchGroupOrder_ =
+      groupOrder == GroupOrder::Default ? GroupOrder::OldestFirst : groupOrder;
+}
+
 void MoQFrameParser::resetFetchContext() const noexcept {
   previousFetchGroup_.reset();
   previousFetchSubgroup_.reset();
   previousObjectID_.reset();
   previousFetchPriority_.reset();
+  fetchGroupOrder_ = GroupOrder::OldestFirst;
 }
 
 bool datagramTypeHasExtensions(uint64_t version, DatagramType datagramType) {
@@ -864,14 +1164,14 @@ MoQFrameParser::parseDatagramObjectHeader(
     DatagramType datagramType,
     size_t& length) const noexcept {
   ObjectHeader objectHeader;
-  auto trackAlias = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto trackAlias = decodeVarint(cursor, length);
   if (!trackAlias) {
     XLOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on trackAlias";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= trackAlias->second;
 
-  auto group = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto group = decodeVarint(cursor, length);
   if (!group) {
     XLOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on group";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -880,7 +1180,7 @@ MoQFrameParser::parseDatagramObjectHeader(
   objectHeader.group = group->first;
 
   if (!datagramObjectIdZero(*version_, datagramType)) {
-    auto id = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto id = decodeVarint(cursor, length);
     if (!id) {
       XLOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on id";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -913,7 +1213,7 @@ MoQFrameParser::parseDatagramObjectHeader(
   }
 
   if (datagramTypeIsStatus(*version_, datagramType)) {
-    auto status = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto status = decodeVarint(cursor, length);
     if (!status) {
       XLOG(DBG4) << "parseDatagramObjectHeader: UNDERFLOW on status";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -948,7 +1248,7 @@ MoQFrameParser::parseSubgroupHeader(
     folly::io::Cursor& cursor,
     size_t length,
     const SubgroupOptions& options) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "The version must be set before parsing subgroup header";
   auto startLength = length;
   SubgroupHeaderResult result;
@@ -956,7 +1256,7 @@ MoQFrameParser::parseSubgroupHeader(
   objectHeader.group = std::numeric_limits<uint64_t>::max(); // unset
   objectHeader.id = std::numeric_limits<uint64_t>::max();    // unset
 
-  auto parsedTrackAlias = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto parsedTrackAlias = decodeVarint(cursor, length);
   if (!parsedTrackAlias) {
     XLOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on trackAlias";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -964,7 +1264,7 @@ MoQFrameParser::parseSubgroupHeader(
   length -= parsedTrackAlias->second;
   result.trackAlias = TrackAlias(parsedTrackAlias->first);
 
-  auto group = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto group = decodeVarint(cursor, length);
   if (!group) {
     XLOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on group";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -974,7 +1274,7 @@ MoQFrameParser::parseSubgroupHeader(
 
   bool parseObjectID = false;
   if (options.subgroupIDFormat == SubgroupIDFormat::Present) {
-    auto subgroup = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto subgroup = decodeVarint(cursor, length);
     if (!subgroup) {
       XLOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on subgroup";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1001,7 +1301,7 @@ MoQFrameParser::parseSubgroupHeader(
   }
   if (parseObjectID) {
     auto tmpCursor = cursor; // we reparse the object ID later
-    auto id = quic::follyutils::decodeQuicInteger(tmpCursor, length);
+    auto id = decodeVarint(tmpCursor, length);
     if (!id) {
       XLOG(DBG4) << "parseSubgroupHeader: UNDERFLOW on id";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1021,7 +1321,7 @@ MoQFrameParser::parseFetchObjectHeaderLegacy(
   ObjectHeader objectHeader = headerTemplate;
 
   // Group ID (varint)
-  auto group = quic::follyutils::decodeQuicInteger(cursor, remainingLength);
+  auto group = decodeVarint(cursor, remainingLength);
   if (!group) {
     XLOG(DBG4) << "parseFetchObjectHeaderLegacy: UNDERFLOW on group";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1030,7 +1330,7 @@ MoQFrameParser::parseFetchObjectHeaderLegacy(
   objectHeader.group = group->first;
 
   // Subgroup ID (varint)
-  auto subgroup = quic::follyutils::decodeQuicInteger(cursor, remainingLength);
+  auto subgroup = decodeVarint(cursor, remainingLength);
   if (!subgroup) {
     XLOG(DBG4) << "parseFetchObjectHeaderLegacy: UNDERFLOW on subgroup";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1039,7 +1339,7 @@ MoQFrameParser::parseFetchObjectHeaderLegacy(
   objectHeader.subgroup = subgroup->first;
 
   // Object ID (varint)
-  auto id = quic::follyutils::decodeQuicInteger(cursor, remainingLength);
+  auto id = decodeVarint(cursor, remainingLength);
   if (!id) {
     XLOG(DBG4) << "parseFetchObjectHeaderLegacy: UNDERFLOW on id";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1092,8 +1392,7 @@ MoQFrameParser::parseFetchObjectDraft15(
   // Read Serialization Flags - varint for v16+, single byte for v15
   uint64_t flags;
   if (getDraftMajorVersion(*version_) >= 16) {
-    auto flagsResult =
-        quic::follyutils::decodeQuicInteger(cursor, remainingLength);
+    auto flagsResult = decodeVarint(cursor, remainingLength);
     if (!flagsResult) {
       XLOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on flags";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1116,26 +1415,34 @@ MoQFrameParser::parseFetchObjectDraft15(
       (flags == kSerializationFlagEndOfNonExistentRange ||
        flags == kSerializationFlagEndOfUnknownRange)) {
     // End of Range: parse only Group ID and Object ID
-    auto groupId = quic::follyutils::decodeQuicInteger(cursor, remainingLength);
+    auto groupId = decodeVarint(cursor, remainingLength);
     if (!groupId) {
       XLOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on End of Range group";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     remainingLength -= groupId->second;
 
-    auto objectId =
-        quic::follyutils::decodeQuicInteger(cursor, remainingLength);
+    auto objectId = decodeVarint(cursor, remainingLength);
     if (!objectId) {
       XLOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on End of Range object";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     remainingLength -= objectId->second;
 
+    previousFetchGroup_ = groupId->first;
+    previousObjectID_ = objectId->first;
+
     length = remainingLength;
     return EndOfRangeMarker{
         groupId->first,
         objectId->first,
         flags == kSerializationFlagEndOfUnknownRange};
+  }
+
+  if (flags >= 128) {
+    XLOG(ERR) << "parseFetchObjectDraft15: Invalid serialization flags: 0x"
+              << std::hex << flags;
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
 
   // Check reserved bits - version dependent
@@ -1166,27 +1473,50 @@ MoQFrameParser::parseFetchObjectDraft15(
 
   // flags < 128: interpret as bit flags for normal object
   uint8_t bitFlags = static_cast<uint8_t>(flags);
+  const bool useFetchObjectDeltas = getDraftMajorVersion(*version_) >= 18;
+  const bool groupIDFieldPresent = bitFlags &
+      folly::to_underlying(FetchHeaderSerializationBits::GROUP_ID_BITMASK);
+  const bool objectIDFieldPresent = bitFlags &
+      folly::to_underlying(FetchHeaderSerializationBits::OBJECT_ID_BITMASK);
+  const bool groupIDDeltaPresent = useFetchObjectDeltas && groupIDFieldPresent;
+  const bool objectIDDeltaPresent =
+      useFetchObjectDeltas && objectIDFieldPresent;
+  const bool hasPreviousFetchGroup = previousFetchGroup_.has_value();
+  const bool hasPreviousObjectID = previousObjectID_.has_value();
+  if (hasPreviousFetchGroup != hasPreviousObjectID) {
+    XLOG(ERR) << "parseFetchObjectDraft15: Inconsistent prior FETCH object "
+                 "state";
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+  const bool firstFetchObject = !hasPreviousFetchGroup;
 
-  // Decode Group ID (flags & 0x08)
-  if (bitFlags &
-      folly::to_underlying(FetchHeaderSerializationBits::GROUP_ID_BITMASK)) {
-    // Group ID field is present
-    auto group = quic::follyutils::decodeQuicInteger(cursor, remainingLength);
-    if (!group) {
+  if (useFetchObjectDeltas && firstFetchObject &&
+      (!groupIDDeltaPresent || !objectIDDeltaPresent)) {
+    XLOG(ERR) << "parseFetchObjectDraft15: First draft-18 FETCH object must "
+                 "include group and object deltas";
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+
+  // Decode Group ID (flags & 0x08). In draft 18+, this is Group ID Delta.
+  std::optional<uint64_t> groupIDField;
+  if (groupIDFieldPresent) {
+    auto parsedGroupIDField = decodeVarint(cursor, remainingLength);
+    if (!parsedGroupIDField) {
       XLOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on group";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
-    remainingLength -= group->second;
-    objectHeader.group = group->first;
-  } else {
-    // Group ID is same as previous
-    if (!previousFetchGroup_.has_value()) {
-      XLOG(ERR) << "parseFetchObjectDraft15: First object must have explicit "
-                   "group ID";
-      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-    }
-    objectHeader.group = previousFetchGroup_.value();
+    remainingLength -= parsedGroupIDField->second;
+    groupIDField = parsedGroupIDField->first;
   }
+  auto groupID = resolveFetchGroupID(
+      groupIDField,
+      useFetchObjectDeltas,
+      previousFetchGroup_,
+      fetchGroupOrder_);
+  if (groupID.hasError()) {
+    return folly::makeUnexpected(groupID.error());
+  }
+  objectHeader.group = groupID.value();
 
   // Decode Subgroup ID (flags & 0x03)
   // Ignore if datagram
@@ -1226,8 +1556,7 @@ MoQFrameParser::parseFetchObjectDraft15(
       case folly::to_underlying(
           FetchHeaderSerializationBits::SUBGROUP_MODE_BITMASK):
         // Subgroup ID field is present
-        auto subgroup =
-            quic::follyutils::decodeQuicInteger(cursor, remainingLength);
+        auto subgroup = decodeVarint(cursor, remainingLength);
         if (!subgroup) {
           XLOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on subgroup";
           return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1238,26 +1567,26 @@ MoQFrameParser::parseFetchObjectDraft15(
     }
   }
 
-  // Decode Object ID (flags & 0x04)
-  if (bitFlags &
-      folly::to_underlying(FetchHeaderSerializationBits::OBJECT_ID_BITMASK)) {
-    // Object ID field is present
-    auto id = quic::follyutils::decodeQuicInteger(cursor, remainingLength);
-    if (!id) {
+  // Decode Object ID (flags & 0x04). In draft 18+, this is Object ID Delta.
+  std::optional<uint64_t> objectIDField;
+  if (objectIDFieldPresent) {
+    auto parsedObjectIDField = decodeVarint(cursor, remainingLength);
+    if (!parsedObjectIDField) {
       XLOG(DBG4) << "parseFetchObjectDraft15: UNDERFLOW on id";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
-    remainingLength -= id->second;
-    objectHeader.id = id->first;
-  } else {
-    // Object ID is the prior Object's ID plus one
-    if (!previousObjectID_.has_value()) {
-      XLOG(ERR) << "parseFetchObjectDraft15: First object must have explicit "
-                   "object ID";
-      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-    }
-    objectHeader.id = previousObjectID_.value() + 1;
+    remainingLength -= parsedObjectIDField->second;
+    objectIDField = parsedObjectIDField->first;
   }
+  auto objectID = resolveFetchObjectID(
+      objectIDField,
+      groupIDDeltaPresent,
+      useFetchObjectDeltas,
+      previousObjectID_);
+  if (objectID.hasError()) {
+    return folly::makeUnexpected(objectID.error());
+  }
+  objectHeader.id = objectID.value();
 
   // Decode Priority (flags & 0x10)
   if (bitFlags &
@@ -1323,7 +1652,7 @@ MoQFrameParser::parseObjectStatusAndLength(
     folly::io::Cursor& cursor,
     size_t& length,
     ObjectHeader& objectHeader) const noexcept {
-  auto payloadLength = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto payloadLength = decodeVarint(cursor, length);
   if (!payloadLength) {
     XLOG(DBG4) << "parseObjectStatusAndLength: UNDERFLOW on payloadLength";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1332,7 +1661,7 @@ MoQFrameParser::parseObjectStatusAndLength(
   objectHeader.length = payloadLength->first;
 
   if (objectHeader.length == 0) {
-    auto objectStatus = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto objectStatus = decodeVarint(cursor, length);
     if (!objectStatus) {
       XLOG(DBG4) << "parseObjectStatusAndLength: UNDERFLOW on objectStatus";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1408,7 +1737,7 @@ MoQFrameParser::parseSubgroupObjectHeader(
     const SubgroupOptions& options) const noexcept {
   auto startLength = length;
   ObjectHeader objectHeader = headerTemplate;
-  auto id = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto id = decodeVarint(cursor, length);
   if (!id) {
     XLOG(DBG4) << "parseSubgroupObjectHeader: UNDERFLOW on id";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1462,7 +1791,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseTrackRequestParams(
     size_t numParams,
     TrackRequestParameters& params,
     std::vector<Parameter>& requestSpecificParams) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "The version must be set before parsing track request params";
   params.setMajorVersion(getDraftMajorVersion(*version_));
   return parseParams(
@@ -1472,7 +1801,6 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseTrackRequestParams(
       numParams,
       params,
       requestSpecificParams,
-      *tokenCache_,
       ParamsType::Request);
 }
 
@@ -1501,10 +1829,10 @@ std::optional<TrackFilter> MoQFrameParser::extractTrackFilter(
 folly::Expected<SubscribeRequest, ErrorCode>
 MoQFrameParser::parseSubscribeRequest(folly::io::Cursor& cursor, size_t length)
     const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "The version must be set before parsing a subscribe request";
   SubscribeRequest subscribeRequest;
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1563,7 +1891,7 @@ MoQFrameParser::parseSubscribeRequest(folly::io::Cursor& cursor, size_t length)
   }
 
   if (getDraftMajorVersion(*version_) < 15) {
-    auto locType = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto locType = decodeVarint(cursor, length);
     if (!locType) {
       XLOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on locType";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1592,7 +1920,7 @@ MoQFrameParser::parseSubscribeRequest(folly::io::Cursor& cursor, size_t length)
       subscribeRequest.start = *location;
     }
     if (subscribeRequest.locType == LocationType::AbsoluteRange) {
-      auto endGroup = quic::follyutils::decodeQuicInteger(cursor, length);
+      auto endGroup = decodeVarint(cursor, length);
       if (!endGroup) {
         XLOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on endGroup";
         return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1601,7 +1929,7 @@ MoQFrameParser::parseSubscribeRequest(folly::io::Cursor& cursor, size_t length)
       length -= endGroup->second;
     }
   }
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto numParams = decodeVarint(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parseSubscribeRequest: UNDERFLOW on numParams";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1665,11 +1993,11 @@ void MoQFrameParser::handleRequestSpecificParams(
 folly::Expected<RequestUpdate, ErrorCode> MoQFrameParser::parseRequestUpdate(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "The version must be set before parsing a request update";
 
   RequestUpdate requestUpdate;
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parseRequestUpdate: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1678,8 +2006,7 @@ folly::Expected<RequestUpdate, ErrorCode> MoQFrameParser::parseRequestUpdate(
   length -= requestID->second;
 
   if (getDraftMajorVersion(*version_) >= 14) {
-    auto existingRequestID =
-        quic::follyutils::decodeQuicInteger(cursor, length);
+    auto existingRequestID = decodeVarint(cursor, length);
     if (!existingRequestID) {
       XLOG(DBG4) << "parseRequestUpdate: UNDERFLOW on existingRequestID";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1695,7 +2022,7 @@ folly::Expected<RequestUpdate, ErrorCode> MoQFrameParser::parseRequestUpdate(
     }
     requestUpdate.start = start.value();
 
-    auto endGroup = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto endGroup = decodeVarint(cursor, length);
     if (!endGroup) {
       XLOG(DBG4) << "parseRequestUpdate: UNDERFLOW on endGroup";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1732,7 +2059,7 @@ folly::Expected<RequestUpdate, ErrorCode> MoQFrameParser::parseRequestUpdate(
     // absent
   }
 
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto numParams = decodeVarint(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parseRequestUpdate: UNDERFLOW on numParams";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1785,14 +2112,14 @@ folly::Expected<SubscribeOk, ErrorCode> MoQFrameParser::parseSubscribeOk(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
   SubscribeOk subscribeOk;
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
   subscribeOk.requestID = requestID->first;
-  auto trackAlias = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto trackAlias = decodeVarint(cursor, length);
   if (!trackAlias) {
     XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on trackAlias";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1802,7 +2129,7 @@ folly::Expected<SubscribeOk, ErrorCode> MoQFrameParser::parseSubscribeOk(
 
   // For < v15: parse expires and groupOrder from fixed fields
   if (getDraftMajorVersion(*version_) < 15) {
-    auto expires = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto expires = decodeVarint(cursor, length);
     if (!expires) {
       XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on expires";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1840,7 +2167,7 @@ folly::Expected<SubscribeOk, ErrorCode> MoQFrameParser::parseSubscribeOk(
     }
   }
 
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto numParams = decodeVarint(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on numParams";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1926,7 +2253,7 @@ folly::Expected<Unsubscribe, ErrorCode> MoQFrameParser::parseUnsubscribe(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
   Unsubscribe unsubscribe;
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parseUnsubscribe: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1943,7 +2270,7 @@ folly::Expected<PublishDone, ErrorCode> MoQFrameParser::parsePublishDone(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
   PublishDone publishDone;
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parsePublishDone: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1951,7 +2278,7 @@ folly::Expected<PublishDone, ErrorCode> MoQFrameParser::parsePublishDone(
   length -= requestID->second;
   publishDone.requestID = requestID->first;
 
-  auto statusCode = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto statusCode = decodeVarint(cursor, length);
   if (!statusCode) {
     XLOG(DBG4) << "parsePublishDone: UNDERFLOW on statusCode";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1959,7 +2286,7 @@ folly::Expected<PublishDone, ErrorCode> MoQFrameParser::parsePublishDone(
   length -= statusCode->second;
   publishDone.statusCode = PublishDoneStatusCode(statusCode->first);
 
-  auto streamCount = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto streamCount = decodeVarint(cursor, length);
   if (!streamCount) {
     XLOG(DBG4) << "parsePublishDone: UNDERFLOW on streamCount";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1973,7 +2300,7 @@ folly::Expected<PublishDone, ErrorCode> MoQFrameParser::parsePublishDone(
   }
   publishDone.reasonPhrase = std::move(reas.value());
 
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "The version must be set before parsing PUBLISH_DONE";
   if (getDraftMajorVersion(*version_) <= 9) {
     if (length == 0) {
@@ -1998,10 +2325,10 @@ folly::Expected<PublishDone, ErrorCode> MoQFrameParser::parsePublishDone(
 folly::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "The version must be set before parsing a publish request";
   PublishRequest publish;
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parsePublish: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2015,7 +2342,7 @@ folly::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
   }
   publish.fullTrackName = res.value();
 
-  auto trackAlias = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto trackAlias = decodeVarint(cursor, length);
   if (!trackAlias) {
     XLOG(DBG4) << "parsePublish: UNDERFLOW on trackAlias";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2078,7 +2405,7 @@ folly::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
     publish.forward = true;
   }
 
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto numParams = decodeVarint(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parsePublish: UNDERFLOW on numParams";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2155,10 +2482,13 @@ void MoQFrameParser::handleRequestSpecificParams(
 folly::Expected<PublishOk, ErrorCode> MoQFrameParser::parsePublishOk(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "The version must be set before parsing a publish ok";
+  if (getDraftMajorVersion(*version_) >= 18) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
   PublishOk publishOk;
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parsePublishOk: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2207,7 +2537,7 @@ folly::Expected<PublishOk, ErrorCode> MoQFrameParser::parsePublishOk(
   }
 
   if (getDraftMajorVersion(*version_) < 15) {
-    auto locType = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto locType = decodeVarint(cursor, length);
     if (!locType) {
       XLOG(DBG4) << "parsePublishOk: UNDERFLOW on locType";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2235,7 +2565,7 @@ folly::Expected<PublishOk, ErrorCode> MoQFrameParser::parsePublishOk(
       publishOk.start = *location;
     }
     if (publishOk.locType == LocationType::AbsoluteRange) {
-      auto endGroup = quic::follyutils::decodeQuicInteger(cursor, length);
+      auto endGroup = decodeVarint(cursor, length);
       if (!endGroup) {
         XLOG(DBG4) << "parsePublishOk: UNDERFLOW on endGroup";
         return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2247,7 +2577,7 @@ folly::Expected<PublishOk, ErrorCode> MoQFrameParser::parsePublishOk(
     }
   }
 
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto numParams = decodeVarint(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parsePublishOk: UNDERFLOW on numParams";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2353,7 +2683,7 @@ folly::Expected<PublishNamespace, ErrorCode>
 MoQFrameParser::parsePublishNamespace(folly::io::Cursor& cursor, size_t length)
     const noexcept {
   PublishNamespace publishNamespace;
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parsePublishNamespace: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2366,7 +2696,7 @@ MoQFrameParser::parsePublishNamespace(folly::io::Cursor& cursor, size_t length)
     return folly::makeUnexpected(res.error());
   }
   publishNamespace.trackNamespace = TrackNamespace(std::move(res.value()));
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto numParams = decodeVarint(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parsePublishNamespace: UNDERFLOW on numParams";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2400,7 +2730,7 @@ folly::Expected<PublishNamespaceOk, ErrorCode> MoQFrameParser::parseRequestOk(
     size_t length,
     FrameType frameType) const noexcept {
   RequestOk requestOk;
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parseRequestOk: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2409,7 +2739,7 @@ folly::Expected<PublishNamespaceOk, ErrorCode> MoQFrameParser::parseRequestOk(
   requestOk.requestID = requestID->first;
   if (getDraftMajorVersion(*version_) > 14) {
     // Parse track request params into requestOk.params
-    auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto numParams = decodeVarint(cursor, length);
     if (!numParams) {
       XLOG(DBG4) << "parseRequestOk: UNDERFLOW on numParams";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2431,6 +2761,18 @@ folly::Expected<PublishNamespaceOk, ErrorCode> MoQFrameParser::parseRequestOk(
       }
     }
   }
+
+  if (getDraftMajorVersion(*version_) >= 18 && length > 0) {
+    ObjectHeader tempHeader;
+    auto ext = parseExtensionKvPairs(cursor, tempHeader, length, true);
+    if (!ext) {
+      XLOG(DBG4) << "parseRequestOk: error in parseExtensionKvPairs: "
+                 << folly::to_underlying(ext.error());
+      return folly::makeUnexpected(ext.error());
+    }
+    requestOk.trackProperties = std::move(tempHeader.extensions);
+    length = 0;
+  }
   if (length > 0) {
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
@@ -2445,7 +2787,7 @@ MoQFrameParser::parsePublishNamespaceDone(
 
   if (getDraftMajorVersion(*version_) >= 16) {
     // v16+: Parse Request ID
-    auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto requestID = decodeVarint(cursor, length);
     if (!requestID) {
       XLOG(DBG4) << "parsePublishNamespaceDone: UNDERFLOW on requestID";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2476,7 +2818,7 @@ MoQFrameParser::parsePublishNamespaceCancel(
 
   if (getDraftMajorVersion(*version_) >= 16) {
     // v16+: Parse Request ID
-    auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto requestID = decodeVarint(cursor, length);
     if (!requestID) {
       XLOG(DBG4) << "parsePublishNamespaceCancel: UNDERFLOW on requestID";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2493,7 +2835,7 @@ MoQFrameParser::parsePublishNamespaceCancel(
         TrackNamespace(std::move(res.value()));
   }
 
-  auto errorCode = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto errorCode = decodeVarint(cursor, length);
   if (!errorCode) {
     XLOG(DBG4) << "parsePublishNamespaceCancel: UNDERFLOW on errorCode";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2516,7 +2858,7 @@ MoQFrameParser::parsePublishNamespaceCancel(
 folly::Expected<TrackStatus, ErrorCode> MoQFrameParser::parseTrackStatus(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "version_ needs to be set to parse TrackStatus";
 
   if (getDraftMajorVersion(*version_) >= 14) {
@@ -2532,7 +2874,7 @@ folly::Expected<TrackStatus, ErrorCode> MoQFrameParser::parseTrackStatus(
   trackStatus.start = std::nullopt;
   trackStatus.endGroup = 0;
 
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parseTrackStatus: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2545,7 +2887,7 @@ folly::Expected<TrackStatus, ErrorCode> MoQFrameParser::parseTrackStatus(
   }
   trackStatus.fullTrackName = std::move(res.value());
 
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto numParams = decodeVarint(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parseTrackStatus: UNDERFLOW on numParams";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2570,7 +2912,7 @@ folly::Expected<TrackStatus, ErrorCode> MoQFrameParser::parseTrackStatus(
 folly::Expected<TrackStatusOk, ErrorCode> MoQFrameParser::parseTrackStatusOk(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "version_ needs to be set to parse TrackStatusOk";
 
   if (getDraftMajorVersion(*version_) >= 14) {
@@ -2592,14 +2934,14 @@ folly::Expected<TrackStatusOk, ErrorCode> MoQFrameParser::parseTrackStatusOk(
   trackStatusOk.trackAlias = TrackAlias{0};
   trackStatusOk.expires = std::chrono::milliseconds(0);
   trackStatusOk.groupOrder = GroupOrder::OldestFirst;
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parseTrackStatusOk: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= requestID->second;
   trackStatusOk.requestID = requestID->first;
-  auto statusCode = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto statusCode = decodeVarint(cursor, length);
   if (!statusCode) {
     XLOG(DBG4) << "parseTrackStatusOk: UNDERFLOW on statusCode";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2616,7 +2958,7 @@ folly::Expected<TrackStatusOk, ErrorCode> MoQFrameParser::parseTrackStatusOk(
   }
   trackStatusOk.largest = *location;
 
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto numParams = decodeVarint(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parseTrackStatusOk: UNDERFLOW on numParams";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2654,6 +2996,23 @@ folly::Expected<Goaway, ErrorCode> MoQFrameParser::parseGoaway(
     return folly::makeUnexpected(res.error());
   }
   goaway.newSessionUri = std::move(res.value());
+  if (getDraftMajorVersion(*version_) >= 18) {
+    auto timeout = decodeVarint(cursor, length);
+    if (!timeout) {
+      XLOG(DBG4) << "parseGoaway: UNDERFLOW on timeout";
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    length -= timeout->second;
+    goaway.timeout = timeout->first;
+
+    auto requestID = decodeVarint(cursor, length);
+    if (!requestID) {
+      XLOG(DBG4) << "parseGoaway: UNDERFLOW on requestID";
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    length -= requestID->second;
+    goaway.requestID = RequestID(requestID->first);
+  }
   if (length > 0) {
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
@@ -2664,7 +3023,7 @@ folly::Expected<MaxRequestID, ErrorCode> MoQFrameParser::parseMaxRequestID(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
   MaxRequestID maxRequestID;
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parseMaxRequestID: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2681,7 +3040,7 @@ folly::Expected<RequestsBlocked, ErrorCode>
 MoQFrameParser::parseRequestsBlocked(folly::io::Cursor& cursor, size_t length)
     const noexcept {
   RequestsBlocked subscribesBlocked;
-  auto res = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto res = decodeVarint(cursor, length);
   if (!res) {
     XLOG(DBG4) << "parseRequestsBlocked: UNDERFLOW on maxRequestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2698,7 +3057,7 @@ folly::Expected<Fetch, ErrorCode> MoQFrameParser::parseFetch(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
   Fetch fetch;
-  auto res = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto res = decodeVarint(cursor, length);
   if (!res) {
     XLOG(DBG4) << "parseFetch: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2738,7 +3097,7 @@ folly::Expected<Fetch, ErrorCode> MoQFrameParser::parseFetch(
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
 
-  auto fetchType = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto fetchType = decodeVarint(cursor, length);
   if (!fetchType) {
     XLOG(DBG4) << "parseFetch: UNDERFLOW on fetchType";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2770,14 +3129,14 @@ folly::Expected<Fetch, ErrorCode> MoQFrameParser::parseFetch(
     fetch.args = StandaloneFetch(start.value(), end.value());
   } else {
     // Relative or absolute join
-    auto jsid = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto jsid = decodeVarint(cursor, length);
     if (!jsid) {
       XLOG(DBG4) << "parseFetch: UNDERFLOW on jsid";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= jsid->second;
 
-    auto joiningStart = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto joiningStart = decodeVarint(cursor, length);
     if (!joiningStart) {
       XLOG(DBG4) << "parseFetch: UNDERFLOW on joiningStart";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2788,7 +3147,7 @@ folly::Expected<Fetch, ErrorCode> MoQFrameParser::parseFetch(
     fetch.args = JoiningFetch(
         RequestID(jsid->first), joiningStart->first, fetchTypeEnum);
   }
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto numParams = decodeVarint(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parseFetch: UNDERFLOW on numParams";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2827,7 +3186,7 @@ folly::Expected<FetchCancel, ErrorCode> MoQFrameParser::parseFetchCancel(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
   FetchCancel fetchCancel;
-  auto res = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto res = decodeVarint(cursor, length);
   if (!res) {
     XLOG(DBG4) << "parseFetchCancel: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2844,7 +3203,7 @@ folly::Expected<FetchOk, ErrorCode> MoQFrameParser::parseFetchOk(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
   FetchOk fetchOk;
-  auto res = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto res = decodeVarint(cursor, length);
   if (!res) {
     XLOG(DBG4) << "parseFetchOk: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2881,7 +3240,7 @@ folly::Expected<FetchOk, ErrorCode> MoQFrameParser::parseFetchOk(
   }
   fetchOk.endLocation = std::move(res2.value());
 
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto numParams = decodeVarint(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parseFetchOk: UNDERFLOW on numParams";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2939,7 +3298,7 @@ MoQFrameParser::parseSubscribeNamespace(
   SubscribeNamespace subscribeNamespace;
 
   // Parse Request ID
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parseSubscribeNamespace: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2958,9 +3317,11 @@ MoQFrameParser::parseSubscribeNamespace(
   auto majorVersion = getDraftMajorVersion(*version_);
 
   // The SUBSCRIBE_NAMESPACE message has an "options" field only in drafts
-  // 16 and 17.
+  // 16 and 17. In draft 18+, SUBSCRIBE_NAMESPACE is NAMESPACE-only — peers
+  // wanting PUBLISH fan-out use the new SUBSCRIBE_TRACKS message. Prior to
+  // draft 16 the field doesn't exist either, but the legacy behavior is BOTH.
   if (majorVersion >= 16 && majorVersion < 18) {
-    auto options = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto options = decodeVarint(cursor, length);
     if (!options) {
       XLOG(DBG4) << "parseSubscribeNamespace: UNDERFLOW on options";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -2968,12 +3329,14 @@ MoQFrameParser::parseSubscribeNamespace(
     length -= options->second;
     subscribeNamespace.options =
         static_cast<SubscribeNamespaceOptions>(options->first);
+  } else if (majorVersion >= 18) {
+    subscribeNamespace.options = SubscribeNamespaceOptions::NAMESPACE;
   } else {
     subscribeNamespace.options = SubscribeNamespaceOptions::BOTH;
   }
 
   // Parse Parameters
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto numParams = decodeVarint(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parseSubscribeNamespace: UNDERFLOW on numParams";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -3004,11 +3367,11 @@ MoQFrameParser::parseSubscribeNamespace(
 folly::Expected<SubscribeTracks, ErrorCode>
 MoQFrameParser::parseSubscribeTracks(folly::io::Cursor& cursor, size_t length)
     const noexcept {
-  CHECK_GE(getDraftMajorVersion(*version_), 18u)
+  XCHECK_GE(getDraftMajorVersion(*version_), 18u)
       << "SUBSCRIBE_TRACKS is draft 18+ only";
   SubscribeTracks subscribeTracks;
 
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parseSubscribeTracks: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -3022,7 +3385,7 @@ MoQFrameParser::parseSubscribeTracks(folly::io::Cursor& cursor, size_t length)
   }
   subscribeTracks.trackNamespacePrefix = TrackNamespace(std::move(res.value()));
 
-  auto numParams = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto numParams = decodeVarint(cursor, length);
   if (!numParams) {
     XLOG(DBG4) << "parseSubscribeTracks: UNDERFLOW on numParams";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -3075,7 +3438,7 @@ folly::Expected<RequestError, ErrorCode> MoQFrameParser::parseRequestError(
   // reasonPhrase
 
   // Parse requestID
-  auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto requestID = decodeVarint(cursor, length);
   if (!requestID) {
     XLOG(DBG4) << "parseRequestError: UNDERFLOW on requestID";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -3084,7 +3447,7 @@ folly::Expected<RequestError, ErrorCode> MoQFrameParser::parseRequestError(
   requestError.requestID = requestID->first;
 
   // Parse errorCode
-  auto errorCode = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto errorCode = decodeVarint(cursor, length);
   if (!errorCode) {
     XLOG(DBG4) << "parseRequestError: UNDERFLOW on errorCode";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -3094,7 +3457,7 @@ folly::Expected<RequestError, ErrorCode> MoQFrameParser::parseRequestError(
 
   // Parse retryInterval (version 16+)
   if (getDraftMajorVersion(*version_) >= 16) {
-    auto retryInterval = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto retryInterval = decodeVarint(cursor, length);
     if (!retryInterval) {
       XLOG(DBG4) << "parseRequestError: UNDERFLOW on retryInterval";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -3110,6 +3473,34 @@ folly::Expected<RequestError, ErrorCode> MoQFrameParser::parseRequestError(
     return folly::makeUnexpected(reasonPhrase.error());
   }
   requestError.reasonPhrase = std::move(reasonPhrase.value());
+
+  if (requestError.errorCode == RequestErrorCode::REDIRECT) {
+    if (getDraftMajorVersion(*version_) < 18) {
+      XLOG(DBG4) << "REDIRECT errorCode received on pre-v18 draft";
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+  }
+
+  if (getDraftMajorVersion(*version_) >= 18 &&
+      requestError.errorCode == RequestErrorCode::REDIRECT) {
+    Redirect redirect;
+
+    auto connectUri = parseFixedString(cursor, length);
+    if (!connectUri) {
+      XLOG(DBG4) << "parseRequestError: UNDERFLOW on Redirect Connect URI";
+      return folly::makeUnexpected(connectUri.error());
+    }
+    redirect.connectUri = std::move(connectUri.value());
+
+    auto fullTrackName = parseFullTrackName(cursor, length);
+    if (!fullTrackName) {
+      XLOG(DBG4) << "parseRequestError: error parsing Redirect Full Track Name";
+      return folly::makeUnexpected(fullTrackName.error());
+    }
+    redirect.fullTrackName = std::move(fullTrackName.value());
+
+    requestError.redirect = std::move(redirect);
+  }
 
   // Check for leftover bytes
   if (length > 0) {
@@ -3127,7 +3518,7 @@ MoQFrameParser::parseUnsubscribeNamespace(
 
   // v15+: Parse Request ID
   if (getDraftMajorVersion(*version_) >= 15) {
-    auto requestID = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto requestID = decodeVarint(cursor, length);
     if (!requestID) {
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
@@ -3152,8 +3543,8 @@ MoQFrameParser::parseUnsubscribeNamespace(
 folly::Expected<Namespace, ErrorCode> MoQFrameParser::parseNamespace(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
-  CHECK(version_) << "Need to have version_ set in order to parse NAMESPACE";
-  CHECK_GE(getDraftMajorVersion(*version_), 16)
+  XCHECK(version_) << "Need to have version_ set in order to parse NAMESPACE";
+  XCHECK_GE(getDraftMajorVersion(*version_), 16)
       << "NAMESPACE message doesn't exist for version 15 and below, this function "
       << "shouldn't be called";
   Namespace ns;
@@ -3175,9 +3566,9 @@ folly::Expected<Namespace, ErrorCode> MoQFrameParser::parseNamespace(
 folly::Expected<NamespaceDone, ErrorCode> MoQFrameParser::parseNamespaceDone(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
-  CHECK(version_)
+  XCHECK(version_)
       << "Need to have version_ set in order to parse NAMESPACE_DONE";
-  CHECK_GE(getDraftMajorVersion(*version_), 16)
+  XCHECK_GE(getDraftMajorVersion(*version_), 16)
       << "NAMESPACE_DONE message doesn't exist for version 15 and below, this function "
       << "shouldn't be called";
   NamespaceDone namespaceDone;
@@ -3218,11 +3609,11 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseExtensions(
     folly::io::Cursor& cursor,
     size_t& length,
     ObjectHeader& objectHeader) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "The version must be set before parsing extensions";
 
   // Parse the length of the extension block
-  auto extLen = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto extLen = decodeVarint(cursor, length);
   if (!extLen) {
     XLOG(DBG4) << "parseExtensions: UNDERFLOW on extLen";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -3278,7 +3669,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseExtension(
     size_t& length,
     ObjectHeader& objectHeader,
     bool allowImmutable) const noexcept {
-  auto type = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto type = decodeVarint(cursor, length);
   if (!type) {
     XLOG(DBG4) << "parseExtension: UNDERFLOW on type";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -3318,7 +3709,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseExtension(
       (getDraftMajorVersion(*version_) >= 14 && !allowImmutable);
 
   if (ext.type & 0x1) {
-    auto extLen = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto extLen = decodeVarint(cursor, length);
     if (!extLen) {
       XLOG(DBG4) << "parseExtension: UNDERFLOW on extLen, ext.type=" << ext.type
                  << " length=" << length;
@@ -3368,7 +3759,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseExtension(
     length -= extLen->first;
   } else {
     // Even-type extension (integer value)
-    auto iVal = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto iVal = decodeVarint(cursor, length);
     if (!iVal) {
       XLOG(DBG4) << "parseExtension: UNDERFLOW on intValue"
                  << " ext.type=" << ext.type << " length=" << length;
@@ -3390,7 +3781,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseExtension(
 folly::Expected<std::vector<std::string>, ErrorCode>
 MoQFrameParser::parseNamespaceTuple(folly::io::Cursor& cursor, size_t& length)
     const noexcept {
-  auto itemCount = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto itemCount = decodeVarint(cursor, length);
   if (!itemCount) {
     XLOG(DBG4) << "parseNamespaceTuple: UNDERFLOW on itemCount";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -3423,6 +3814,7 @@ TrackStatusOk RequestOk::toTrackStatusOk() const {
   TrackStatusOk trackStatusOk;
   trackStatusOk.requestID = requestID;
   trackStatusOk.params = params;
+  trackStatusOk.trackProperties = trackProperties;
 
   // There may or may not be any value in attempting to convert the full object
   // since we only need the request Id to resolve the promise, except for
@@ -3456,6 +3848,7 @@ RequestOk RequestOk::fromTrackStatusOk(const TrackStatusOk& trackStatusOk) {
   RequestOk requestOk;
   requestOk.requestID = trackStatusOk.requestID;
   requestOk.params = trackStatusOk.params;
+  requestOk.trackProperties = trackStatusOk.trackProperties;
 
   // Add expires parameter
   requestOk.requestSpecificParams.emplace_back(
@@ -3476,8 +3869,119 @@ RequestOk RequestOk::fromTrackStatusOk(const TrackStatusOk& trackStatusOk) {
   return requestOk;
 }
 
+static folly::Expected<PublishOk, ErrorCode> requestOkToPublishOk(
+    const RequestOk& requestOk,
+    uint64_t majorVersion) {
+  PublishOk publishOk;
+  publishOk.requestID = requestOk.requestID;
+  publishOk.params = TrackRequestParameters(FrameType::PUBLISH_OK);
+  publishOk.params.setMajorVersion(majorVersion);
+
+  for (const auto& param : requestOk.params) {
+    auto insertResult = publishOk.params.insertParam(param);
+    if (insertResult.hasError()) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+  }
+
+  for (const auto& param : requestOk.requestSpecificParams) {
+    if (!isPublishOkRequestSpecificParam(
+            static_cast<TrackRequestParamKey>(param.key))) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+  }
+
+  std::optional<SubscriptionFilter> filter;
+  for (const auto& param : requestOk.requestSpecificParams) {
+    if (param.key ==
+        folly::to_underlying(TrackRequestParamKey::SUBSCRIPTION_FILTER)) {
+      filter = param.asSubscriptionFilter;
+      break;
+    }
+  }
+  if (filter.has_value()) {
+    publishOk.locType = filter->filterType;
+    publishOk.start = filter->location;
+    publishOk.endGroup = filter->endGroup;
+  } else {
+    publishOk.locType = LocationType::AbsoluteStart;
+    publishOk.start = AbsoluteLocation{0, 0};
+    publishOk.endGroup = std::nullopt;
+  }
+
+  auto maybeGroupOrder = getFirstIntParam(
+      requestOk.requestSpecificParams, TrackRequestParamKey::GROUP_ORDER);
+  publishOk.groupOrder = maybeGroupOrder.has_value()
+      ? static_cast<GroupOrder>(*maybeGroupOrder)
+      : GroupOrder::Default;
+
+  auto maybePriority = getFirstIntParam(
+      requestOk.requestSpecificParams,
+      TrackRequestParamKey::SUBSCRIBER_PRIORITY);
+  publishOk.subscriberPriority = maybePriority.has_value()
+      ? static_cast<uint8_t>(*maybePriority)
+      : kDefaultPriority;
+
+  auto maybeForward = getFirstIntParam(
+      requestOk.requestSpecificParams, TrackRequestParamKey::FORWARD);
+  publishOk.forward = maybeForward.has_value() ? (*maybeForward == 1) : true;
+
+  auto maybeExpires = getFirstIntParam(
+      requestOk.requestSpecificParams, TrackRequestParamKey::EXPIRES);
+  if (maybeExpires.has_value()) {
+    insertPublishOkIntParamIfMissing(
+        publishOk.params,
+        TrackRequestParamKey::EXPIRES,
+        *maybeExpires,
+        "toPublishOk");
+  }
+
+  auto maybeNewGroupRequest = getFirstIntParam(
+      requestOk.requestSpecificParams, TrackRequestParamKey::NEW_GROUP_REQUEST);
+  if (maybeNewGroupRequest.has_value()) {
+    insertPublishOkIntParamIfMissing(
+        publishOk.params,
+        TrackRequestParamKey::NEW_GROUP_REQUEST,
+        *maybeNewGroupRequest,
+        "toPublishOk");
+  }
+
+  return publishOk;
+}
+
+folly::Expected<PublishOk, ErrorCode> RequestOk::toPublishOk(
+    uint64_t majorVersion) const {
+  return requestOkToPublishOk(*this, majorVersion);
+}
+
+// static
+RequestOk RequestOk::fromPublishOk(
+    const PublishOk& publishOk,
+    uint64_t majorVersion) {
+  RequestOk requestOk;
+  requestOk.requestID = publishOk.requestID;
+  requestOk.params = TrackRequestParameters(FrameType::PUBLISH_OK);
+  requestOk.params.setMajorVersion(majorVersion);
+  for (const auto& param : publishOk.params) {
+    if (isPublishOkRequestSpecificParam(
+            static_cast<TrackRequestParamKey>(param.key))) {
+      continue;
+    }
+    auto insertResult = requestOk.params.insertParam(param);
+    if (insertResult.hasError()) {
+      XLOG(WARN) << "fromPublishOk: ignoring param not allowed for PUBLISH_OK"
+                 << " key=" << param.key;
+    }
+  }
+  requestOk.requestSpecificParams =
+      getPublishOkRequestSpecificParams(publishOk, true);
+  return requestOk;
+}
+
 //// Egress ////
 
+// Test-only helper. Always emits a QUIC varint. Production paths use
+// MoQFrameWriter::writeVarint for version-aware dispatch.
 void writeVarint(
     folly::IOBufQueue& buf,
     uint64_t value,
@@ -3498,11 +4002,11 @@ void writeVarint(
   }
 }
 
-void writeFixedString(
+void MoQFrameWriter::writeFixedString(
     folly::IOBufQueue& writeBuf,
     const std::string& str,
     size_t& size,
-    bool& error) {
+    bool& error) const noexcept {
   writeVarint(writeBuf, str.size(), size, error);
   // Avoid appending a zero-length string, which can lead to undefined behavior
   // on some platforms when passing a null data pointer with length 0.
@@ -3512,11 +4016,11 @@ void writeFixedString(
   }
 }
 
-void writeFixedTuple(
+void MoQFrameWriter::writeFixedTuple(
     folly::IOBufQueue& writeBuf,
     const std::vector<std::string>& tup,
     size_t& size,
-    bool& error) {
+    bool& error) const noexcept {
   writeVarint(writeBuf, tup.size(), size, error);
   if (!error) {
     for (auto& str : tup) {
@@ -3525,23 +4029,23 @@ void writeFixedTuple(
   }
 }
 
-void writeTrackNamespace(
+void MoQFrameWriter::writeTrackNamespace(
     folly::IOBufQueue& writeBuf,
     const TrackNamespace& tn,
     size_t& size,
-    bool& error) {
+    bool& error) const noexcept {
   writeFixedTuple(writeBuf, tn.trackNamespace, size, error);
 }
 
-uint16_t* writeFrameHeader(
+uint16_t* MoQFrameWriter::writeFrameHeader(
     folly::IOBufQueue& writeBuf,
     FrameType frameType,
-    bool& error) {
+    bool& error) const noexcept {
   size_t size = 0;
   writeVarint(writeBuf, folly::to_underlying(frameType), size, error);
   auto res = writeBuf.preallocate(2, 256);
   writeBuf.postallocate(2);
-  CHECK_GE(res.second, 2);
+  XCHECK_GE(res.second, 2);
   return static_cast<uint16_t*>(res.first);
 }
 
@@ -3551,7 +4055,7 @@ void writeSize(
     bool& error,
     uint64_t versionIn) {
   if (size > ((1 << 16) - 1)) {
-    LOG(ERROR) << "Control message size exceeds max sz=" << size;
+    XLOG(ERR) << "Control message size exceeds max sz=" << size;
     error = true;
     return;
   }
@@ -3559,11 +4063,11 @@ void writeSize(
   memcpy(sizePtr, &sizeVal, 2);
 }
 
-void writeFullTrackName(
+void MoQFrameWriter::writeFullTrackName(
     folly::IOBufQueue& writeBuf,
     const FullTrackName& fullTrackName,
     size_t& size,
-    bool error) {
+    bool error) const noexcept {
   writeTrackNamespace(writeBuf, fullTrackName.trackNamespace, size, error);
   writeFixedString(writeBuf, fullTrackName.trackName, size, error);
 }
@@ -3623,6 +4127,12 @@ std::string MoQFrameWriter::encodeTokenValue(
 }
 
 bool includeSetupParam(uint64_t version, SetupKey key) {
+  // Draft 18+ delivers requests on independent bidi streams, so auth token
+  // aliasing (which relies on request ordering) is disabled. Strip the param.
+  if (key == SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE &&
+      useBidiRequestStreams(version)) {
+    return false;
+  }
   return key == SetupKey::MAX_REQUEST_ID || key == SetupKey::PATH ||
       key == SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE ||
       key == SetupKey::AUTHORIZATION_TOKEN;
@@ -3633,6 +4143,11 @@ WriteResult writeSetup(
     const Setup& setup,
     uint64_t version,
     bool isClient) noexcept {
+  // Setup is version-agnostic, so we spin up a local MoQFrameWriter to
+  // dispatch to version-aware writeVarint / writeFrameHeader /
+  // writeFixedString.
+  MoQFrameWriter writer;
+  writer.initializeVersion(version);
   size_t size = 0;
   bool error = false;
 
@@ -3642,7 +4157,7 @@ WriteResult writeSetup(
   } else {
     frameType = isClient ? FrameType::CLIENT_SETUP : FrameType::SERVER_SETUP;
   }
-  auto sizePtr = writeFrameHeader(writeBuf, frameType, error);
+  auto sizePtr = writer.writeFrameHeader(writeBuf, frameType, error);
 
   // Pre-ALPN: write version(s) to wire
   if (getDraftMajorVersion(version) < 15) {
@@ -3650,9 +4165,9 @@ WriteResult writeSetup(
         << "Legacy mode only supports draft-14, got draft-"
         << getDraftMajorVersion(version);
     if (isClient) {
-      writeVarint(writeBuf, 1, size, error); // version count
+      writer.writeVarint(writeBuf, 1, size, error); // version count
     }
-    writeVarint(writeBuf, kVersionDraft14, size, error);
+    writer.writeVarint(writeBuf, kVersionDraft14, size, error);
   }
 
   // Collect params that should be included
@@ -3668,7 +4183,11 @@ WriteResult writeSetup(
     filteredParams = sortParamsByKey(std::move(filteredParams));
   }
 
-  writeVarint(writeBuf, filteredParams.size(), size, error);
+  // Draft-17 removed the Number-of-Options field; options span the rest of
+  // the message length. Older drafts still carry an explicit count.
+  if (getDraftMajorVersion(version) < 17) {
+    writer.writeVarint(writeBuf, filteredParams.size(), size, error);
+  }
 
   uint64_t previousKey = 0;
   for (const auto& param : filteredParams) {
@@ -3677,11 +4196,11 @@ WriteResult writeSetup(
       keyToWrite = param.key - previousKey;
       previousKey = param.key;
     }
-    writeVarint(writeBuf, keyToWrite, size, error);
+    writer.writeVarint(writeBuf, keyToWrite, size, error);
     if ((param.key & 0x01) == 0) {
-      writeVarint(writeBuf, param.asUint64, size, error);
+      writer.writeVarint(writeBuf, param.asUint64, size, error);
     } else {
-      writeFixedString(writeBuf, param.asString, size, error);
+      writer.writeFixedString(writeBuf, param.asString, size, error);
     }
   }
   writeSize(sizePtr, size, error, version);
@@ -3710,7 +4229,8 @@ WriteResult MoQFrameWriter::writeSubgroupHeader(
     TrackAlias trackAlias,
     const ObjectHeader& objectHeader,
     SubgroupIDFormat format,
-    bool includeExtensions) const noexcept {
+    bool includeExtensions,
+    bool beginsWithFirstObject) const noexcept {
   size_t size = 0;
   bool error = false;
 
@@ -3725,7 +4245,8 @@ WriteResult MoQFrameWriter::writeSubgroupHeader(
       objectHeader.subgroup == 0 ? SubgroupIDFormat::Zero : format,
       includeExtensions,
       /*endOfGroup=*/false,
-      priorityPresent);
+      priorityPresent,
+      beginsWithFirstObject);
   auto streamTypeInt = folly::to_underlying(streamType);
   writeVarint(writeBuf, streamTypeInt, size, error);
   writeVarint(writeBuf, trackAlias.value, size, error);
@@ -3765,6 +4286,11 @@ WriteResult MoQFrameWriter::writeFetchHeader(
   return size;
 }
 
+void MoQFrameWriter::setFetchGroupOrder(GroupOrder groupOrder) noexcept {
+  fetchGroupOrder_ =
+      groupOrder == GroupOrder::Default ? GroupOrder::OldestFirst : groupOrder;
+}
+
 WriteResult MoQFrameWriter::writeSingleObjectStream(
     folly::IOBufQueue& writeBuf,
     TrackAlias trackAlias,
@@ -3777,7 +4303,8 @@ WriteResult MoQFrameWriter::writeSingleObjectStream(
       objectHeader,
       objectHeader.subgroup == objectHeader.id ? SubgroupIDFormat::FirstObject
                                                : SubgroupIDFormat::Present,
-      hasExtensions);
+      hasExtensions,
+      /*beginsWithFirstObject=*/true);
   if (res) {
     return writeStreamObject(
         writeBuf,
@@ -3970,31 +4497,25 @@ size_t MoQFrameWriter::calculateExtensionVectorSize(
       typeToSize = ext.type - previousType;
       previousType = ext.type;
     }
-    auto maybeTypeSize = quic::getQuicIntegerSize(typeToSize);
-    if (maybeTypeSize.hasError()) {
-      error = true;
+    size += getVarintSize(typeToSize, error);
+    if (error) {
       return 0;
     }
-    size += *maybeTypeSize;
     if (ext.type & 0x1) {
       // odd = length prefix
       auto dataLen =
           ext.arrayValue ? ext.arrayValue->computeChainDataLength() : 0;
-      auto maybeDataLengthSize = quic::getQuicIntegerSize(dataLen);
-      if (maybeDataLengthSize.hasError()) {
-        error = true;
+      size += getVarintSize(dataLen, error);
+      if (error) {
         return 0;
       }
-      size += *maybeDataLengthSize;
       size += dataLen;
     } else {
       // even = single varint
-      auto maybeValueSize = quic::getQuicIntegerSize(ext.intValue);
-      if (maybeValueSize.hasError()) {
-        error = true;
+      size += getVarintSize(ext.intValue, error);
+      if (error) {
         return 0;
       }
-      size += *maybeValueSize;
     }
   }
   return size;
@@ -4016,7 +4537,8 @@ void MoQFrameWriter::writeTrackRequestParams(
     const std::vector<Parameter>& requestSpecificParams,
     size_t& size,
     bool& error) const noexcept {
-  CHECK(*version_) << "Version must be set before writing track request params";
+  XCHECK(*version_)
+      << "Version must be set before writing track request params";
   // Write total count of all parameters
   writeVarint(
       writeBuf, params.size() + requestSpecificParams.size(), size, error);
@@ -4049,6 +4571,68 @@ void MoQFrameWriter::writeTrackRequestParams(
   }
 }
 
+void MoQFrameWriter::writeV18ParamValue(
+    folly::IOBufQueue& writeBuf,
+    const Parameter& param,
+    size_t& size,
+    bool& error) const noexcept {
+  switch (paramEncodingV18(param.key)) {
+    case ParamValueEncoding::Uint8: {
+      if (param.asUint64 > 0xff) {
+        error = true;
+        return;
+      }
+      auto byte = static_cast<uint8_t>(param.asUint64);
+      writeBuf.append(&byte, 1);
+      size += 1;
+      return;
+    }
+    case ParamValueEncoding::Varint:
+      writeVarint(writeBuf, param.asUint64, size, error);
+      return;
+    case ParamValueEncoding::Location:
+      if (!param.largestObject) {
+        error = true;
+        return;
+      }
+      writeVarint(writeBuf, param.largestObject->group, size, error);
+      writeVarint(writeBuf, param.largestObject->object, size, error);
+      return;
+    case ParamValueEncoding::LengthPrefixed: {
+      if (param.key ==
+          folly::to_underlying(TrackRequestParamKey::SUBSCRIPTION_FILTER)) {
+        folly::IOBufQueue tmpBuf{folly::IOBufQueue::cacheChainLength()};
+        size_t tmpSize = 0;
+        writeSubscriptionFilter(
+            tmpBuf, param.asSubscriptionFilter, tmpSize, error);
+        if (!error) {
+          writeVarint(writeBuf, tmpSize, size, error);
+          writeBuf.append(tmpBuf.move());
+          size += tmpSize;
+        }
+      } else if (
+          param.key ==
+          folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
+        // TRACK_FILTER (0x29) is a fork-local length-prefixed param; its value
+        // lives in asTrackFilter, not asString. Mirror the draft-16 path in
+        // writeParamValue so the v18 wire form round-trips (see parseTrackFilter
+        // via parseV18ParamValue -> parseVariableParam).
+        folly::IOBufQueue tmpBuf{folly::IOBufQueue::cacheChainLength()};
+        size_t tmpSize = 0;
+        writeTrackFilter(tmpBuf, param.asTrackFilter, tmpSize, error);
+        if (!error) {
+          writeVarint(writeBuf, tmpSize, size, error);
+          writeBuf.append(tmpBuf.move());
+          size += tmpSize;
+        }
+      } else {
+        writeFixedString(writeBuf, param.asString, size, error);
+      }
+      return;
+    }
+  }
+}
+
 void MoQFrameWriter::writeParamValue(
     folly::IOBufQueue& writeBuf,
     const Parameter& param,
@@ -4063,6 +4647,11 @@ void MoQFrameWriter::writeParamValue(
   const auto expiresKey = folly::to_underlying(TrackRequestParamKey::EXPIRES);
   const auto groupOrderKey =
       folly::to_underlying(TrackRequestParamKey::GROUP_ORDER);
+
+  if (version_.has_value() && getDraftMajorVersion(*version_) >= 18) {
+    writeV18ParamValue(writeBuf, param, size, error);
+    return;
+  }
 
   if (param.key == subscriptionFilterKey) {
     // Subscription filter key is odd, so it needs a length prefix.
@@ -4121,7 +4710,7 @@ void MoQFrameWriter::writeSubscriptionFilter(
     const SubscriptionFilter& filter,
     size_t& size,
     bool& error) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version must be set before writing subscription filter";
 
   // Write filter type
@@ -4142,10 +4731,20 @@ void MoQFrameWriter::writeSubscriptionFilter(
     }
   }
 
-  // Write end group for AbsoluteRange
+  // Write end group for AbsoluteRange.
+  // In draft-18+, EndGroup is encoded as a delta from StartLocation.group.
+  // In draft-17 and earlier, EndGroup is an absolute group number.
   if (filter.filterType == LocationType::AbsoluteRange) {
-    if (filter.endGroup.has_value()) {
-      writeVarint(writeBuf, *filter.endGroup, size, error);
+    if (filter.endGroup.has_value() && filter.location.has_value()) {
+      uint64_t toWrite = *filter.endGroup;
+      if (getDraftMajorVersion(*version_) >= 18) {
+        if (*filter.endGroup < filter.location->group) {
+          error = true;
+          return;
+        }
+        toWrite = *filter.endGroup - filter.location->group;
+      }
+      writeVarint(writeBuf, toWrite, size, error);
     } else {
       error = true;
     }
@@ -4185,10 +4784,10 @@ WriteResult MoQFrameWriter::writeDatagramObject(
   bool isObjectIdZero =
       (objectHeader.id == 0 && (getDraftMajorVersion(version_.value()) >= 14));
 
-  CHECK(!hasLength || objectHeader.status == ObjectStatus::NORMAL)
+  XCHECK(!hasLength || objectHeader.status == ObjectStatus::NORMAL)
       << "non-zero length objects require NORMAL status";
   if (objectHeader.status != ObjectStatus::NORMAL || !hasLength) {
-    CHECK(!objectPayload || objectPayload->computeChainDataLength() == 0)
+    XCHECK(!objectPayload || objectPayload->computeChainDataLength() == 0)
         << "non-empty objectPayload with no header length";
     writeVarint(
         writeBuf,
@@ -4274,6 +4873,7 @@ void MoQFrameWriter::writeFetchObjectDraft15(
     bool forwardingPreferenceIsDatagram) const noexcept {
   // Draft-15+ FETCH object format with Serialization Flags
   uint8_t flags = 0;
+  const bool useFetchObjectDeltas = getDraftMajorVersion(*version_) >= 18;
 
   if (forwardingPreferenceIsDatagram && getDraftMajorVersion(*version_) >= 16) {
     // Set datagram bit
@@ -4304,18 +4904,20 @@ void MoQFrameWriter::writeFetchObjectDraft15(
     }
   }
 
-  // Bit 2 (0x04): Object ID present
-  if (!previousObjectID_.has_value() ||
-      objectHeader.id != previousObjectID_.value() + 1) {
-    flags |=
-        folly::to_underlying(FetchHeaderSerializationBits::OBJECT_ID_BITMASK);
-  }
+  if (!useFetchObjectDeltas) {
+    // Bit 2 (0x04): Object ID field is present.
+    if (!previousObjectID_.has_value() ||
+        objectHeader.id != previousObjectID_.value() + 1) {
+      flags |=
+          folly::to_underlying(FetchHeaderSerializationBits::OBJECT_ID_BITMASK);
+    }
 
-  // Bit 3 (0x08): Group ID present
-  if (!previousFetchGroup_.has_value() ||
-      objectHeader.group != previousFetchGroup_.value()) {
-    flags |=
-        folly::to_underlying(FetchHeaderSerializationBits::GROUP_ID_BITMASK);
+    // Bit 3 (0x08): Group ID field is present.
+    if (!previousFetchGroup_.has_value() ||
+        objectHeader.group != previousFetchGroup_.value()) {
+      flags |=
+          folly::to_underlying(FetchHeaderSerializationBits::GROUP_ID_BITMASK);
+    }
   }
 
   // Bit 4 (0x10): Priority present
@@ -4334,6 +4936,27 @@ void MoQFrameWriter::writeFetchObjectDraft15(
         folly::to_underlying(FetchHeaderSerializationBits::EXTENSIONS_BITMASK);
   }
 
+  FetchObjectDeltaFields fetchObjectDeltaFields;
+
+  if (useFetchObjectDeltas) {
+    auto computedFields = computeFetchObjectDeltaFieldsForWrite(
+        objectHeader, previousFetchGroup_, previousObjectID_, fetchGroupOrder_);
+    if (!computedFields.has_value()) {
+      error = true;
+      return;
+    }
+    fetchObjectDeltaFields = computedFields.value();
+
+    if (fetchObjectDeltaFields.groupIDDelta.has_value()) {
+      flags |=
+          folly::to_underlying(FetchHeaderSerializationBits::GROUP_ID_BITMASK);
+    }
+    if (fetchObjectDeltaFields.objectIDDelta.has_value()) {
+      flags |=
+          folly::to_underlying(FetchHeaderSerializationBits::OBJECT_ID_BITMASK);
+    }
+  }
+
   // Write Serialization Flags - single byte for v15, varint for v16+
   if (getDraftMajorVersion(*version_) >= 16) {
     writeVarint(writeBuf, flags, size, error);
@@ -4342,10 +4965,15 @@ void MoQFrameWriter::writeFetchObjectDraft15(
     size += 1;
   }
 
-  // Write Group ID if flag set
+  // Write Group ID Delta in draft 18+, otherwise Group ID.
   if (flags &
       folly::to_underlying(FetchHeaderSerializationBits::GROUP_ID_BITMASK)) {
-    writeVarint(writeBuf, objectHeader.group, size, error);
+    writeVarint(
+        writeBuf,
+        useFetchObjectDeltas ? *fetchObjectDeltaFields.groupIDDelta
+                             : objectHeader.group,
+        size,
+        error);
   }
 
   // Write Subgroup ID if mode is 0x03
@@ -4357,10 +4985,15 @@ void MoQFrameWriter::writeFetchObjectDraft15(
     writeVarint(writeBuf, objectHeader.subgroup, size, error);
   }
 
-  // Write Object ID if flag set
+  // Write Object ID Delta in draft 18+, otherwise Object ID.
   if (flags &
       folly::to_underlying(FetchHeaderSerializationBits::OBJECT_ID_BITMASK)) {
-    writeVarint(writeBuf, objectHeader.id, size, error);
+    writeVarint(
+        writeBuf,
+        useFetchObjectDeltas ? *fetchObjectDeltaFields.objectIDDelta
+                             : objectHeader.id,
+        size,
+        error);
   }
 
   // Write Priority if flag set
@@ -4440,14 +5073,14 @@ WriteResult MoQFrameWriter::writeStreamObject(
     writeExtensions(writeBuf, objectHeader.extensions, size, error);
   }
   bool hasLength = objectHeader.length && *objectHeader.length > 0;
-  CHECK(!hasLength || objectHeader.status == ObjectStatus::NORMAL)
+  XCHECK(!hasLength || objectHeader.status == ObjectStatus::NORMAL)
       << "non-zero length objects require NORMAL status";
   if (hasLength) {
     writeVarint(writeBuf, *objectHeader.length, size, error);
     writeBuf.append(std::move(objectPayload));
     // TODO: adjust size?
   } else {
-    CHECK(!objectPayload || objectPayload->computeChainDataLength() == 0)
+    XCHECK(!objectPayload || objectPayload->computeChainDataLength() == 0)
         << "non-empty objectPayload with no header length";
     writeVarint(writeBuf, 0, size, error);
     writeVarint(
@@ -4462,7 +5095,7 @@ WriteResult MoQFrameWriter::writeStreamObject(
 WriteResult MoQFrameWriter::writeSubscribeRequest(
     folly::IOBufQueue& writeBuf,
     const SubscribeRequest& subscribeRequest) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write subscribe request";
   size_t size = 0;
   bool error = false;
@@ -4584,7 +5217,7 @@ WriteResult MoQFrameWriter::writeSubscribeRequestHelper(
 WriteResult MoQFrameWriter::writeRequestUpdate(
     folly::IOBufQueue& writeBuf,
     const RequestUpdate& update) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write request update";
   size_t size = 0;
   bool error = false;
@@ -4674,7 +5307,7 @@ WriteResult MoQFrameWriter::writeRequestUpdate(
 WriteResult MoQFrameWriter::writeSubscribeOk(
     folly::IOBufQueue& writeBuf,
     const SubscribeOk& subscribeOk) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write subscribe ok";
   size_t size;
   bool error = false;
@@ -4771,7 +5404,7 @@ WriteResult MoQFrameWriter::writeSubscribeOkHelper(
 WriteResult MoQFrameWriter::writeMaxRequestID(
     folly::IOBufQueue& writeBuf,
     const MaxRequestID& maxRequestID) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write max requestID";
   size_t size = 0;
   bool error = false;
@@ -4787,7 +5420,7 @@ WriteResult MoQFrameWriter::writeMaxRequestID(
 WriteResult MoQFrameWriter::writeRequestsBlocked(
     folly::IOBufQueue& writeBuf,
     const RequestsBlocked& subscribesBlocked) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write subscribes blocked";
   size_t size = 0;
   bool error = false;
@@ -4803,7 +5436,8 @@ WriteResult MoQFrameWriter::writeRequestsBlocked(
 WriteResult MoQFrameWriter::writeUnsubscribe(
     folly::IOBufQueue& writeBuf,
     const Unsubscribe& unsubscribe) const noexcept {
-  CHECK(version_.has_value()) << "Version needs to be set to write unsubscribe";
+  XCHECK(version_.has_value())
+      << "Version needs to be set to write unsubscribe";
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::UNSUBSCRIBE, error);
@@ -4818,7 +5452,7 @@ WriteResult MoQFrameWriter::writeUnsubscribe(
 WriteResult MoQFrameWriter::writePublishDone(
     folly::IOBufQueue& writeBuf,
     const PublishDone& publishDone) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write subscribe done";
   size_t size = 0;
   bool error = false;
@@ -4841,7 +5475,7 @@ WriteResult MoQFrameWriter::writePublishDone(
 WriteResult MoQFrameWriter::writePublish(
     folly::IOBufQueue& writeBuf,
     const PublishRequest& publish) const noexcept {
-  CHECK(version_.has_value()) << "Version needs to be set to write publish";
+  XCHECK(version_.has_value()) << "Version needs to be set to write publish";
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::PUBLISH, error);
@@ -4924,13 +5558,21 @@ WriteResult MoQFrameWriter::writePublish(
 WriteResult MoQFrameWriter::writePublishOk(
     folly::IOBufQueue& writeBuf,
     const PublishOk& publishOk) const noexcept {
-  CHECK(version_.has_value()) << "Version needs to be set to write publish ok";
+  XCHECK(version_.has_value()) << "Version needs to be set to write publish ok";
+  auto majorVersion = getDraftMajorVersion(*version_);
+  if (majorVersion >= 18) {
+    return writeRequestOk(
+        writeBuf,
+        RequestOk::fromPublishOk(publishOk, majorVersion),
+        FrameType::PUBLISH_OK);
+  }
+
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::PUBLISH_OK, error);
   writeVarint(writeBuf, publishOk.requestID.value, size, error);
 
-  if (getDraftMajorVersion(*version_) < 15) {
+  if (majorVersion < 15) {
     uint8_t forwardFlag = publishOk.forward ? 1 : 0;
     writeBuf.append(&forwardFlag, 1);
     size += 1;
@@ -4944,56 +5586,12 @@ WriteResult MoQFrameWriter::writePublishOk(
   }
 
   std::vector<Parameter> requestSpecificParams;
-  if (getDraftMajorVersion(*version_) >= 15) {
-    Parameter subscriptionFilterParam;
-    subscriptionFilterParam.key =
-        folly::to_underlying(TrackRequestParamKey::SUBSCRIPTION_FILTER);
-    subscriptionFilterParam.asSubscriptionFilter = SubscriptionFilter(
-        publishOk.locType,
-        publishOk.start,
-        publishOk.locType == LocationType::AbsoluteRange ? publishOk.endGroup
-                                                         : std::nullopt);
-    requestSpecificParams.push_back(subscriptionFilterParam);
-
-    if (publishOk.subscriberPriority != kDefaultPriority) {
-      Parameter priorityParam;
-      priorityParam.key =
-          folly::to_underlying(TrackRequestParamKey::SUBSCRIBER_PRIORITY);
-      priorityParam.asUint64 = publishOk.subscriberPriority;
-      requestSpecificParams.push_back(priorityParam);
-    }
-
-    if (publishOk.groupOrder != GroupOrder::Default) {
-      Parameter groupOrderParam;
-      groupOrderParam.key =
-          folly::to_underlying(TrackRequestParamKey::GROUP_ORDER);
-      groupOrderParam.asUint64 = folly::to_underlying(publishOk.groupOrder);
-      requestSpecificParams.push_back(groupOrderParam);
-    }
-
-    if (publishOk.forward == 0) {
-      // The forward param defaults to 1 if not specified, so we only need
-      // to insert the parameter if forward is 0.
-      Parameter forwardParam;
-      forwardParam.key = folly::to_underlying(TrackRequestParamKey::FORWARD);
-      forwardParam.asUint64 = 0;
-      requestSpecificParams.push_back(forwardParam);
-    }
-
-    auto newGroupRequestValue = getFirstIntParam(
-        publishOk.params, TrackRequestParamKey::NEW_GROUP_REQUEST);
-    if (newGroupRequestValue.has_value()) {
-      Parameter newGroupRequestParam;
-      newGroupRequestParam.key =
-          folly::to_underlying(TrackRequestParamKey::NEW_GROUP_REQUEST);
-      newGroupRequestParam.asUint64 = *newGroupRequestValue;
-      requestSpecificParams.push_back(newGroupRequestParam);
-    }
+  if (majorVersion >= 15) {
+    requestSpecificParams = getPublishOkRequestSpecificParams(publishOk);
   } else {
     writeVarint(
         writeBuf,
-        getLocationTypeValue(
-            publishOk.locType, getDraftMajorVersion(*version_)),
+        getLocationTypeValue(publishOk.locType, majorVersion),
         size,
         error);
 
@@ -5033,7 +5631,7 @@ WriteResult MoQFrameWriter::writePublishOk(
 WriteResult MoQFrameWriter::writePublishNamespace(
     folly::IOBufQueue& writeBuf,
     const PublishNamespace& publishNamespace) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write publishNamespace";
   size_t size = 0;
   bool error = false;
@@ -5060,16 +5658,19 @@ WriteResult MoQFrameWriter::writeRequestOk(
     folly::IOBufQueue& writeBuf,
     const RequestOk& requestOk,
     FrameType frameType) const noexcept {
-  CHECK(version_.has_value()) << "Version needs to be set to write request ok";
+  XCHECK(version_.has_value()) << "Version needs to be set to write request ok";
   size_t size = 0;
   bool error = false;
+  // Preserve the semantic frame type passed by the caller; we still need it
+  // below to decide whether Track Properties are valid (draft 18+).
+  const FrameType semanticFrameType = frameType;
   if (getDraftMajorVersion(*version_) > 14) {
     frameType = FrameType::REQUEST_OK;
   }
   auto sizePtr = writeFrameHeader(writeBuf, frameType, error);
   writeVarint(writeBuf, requestOk.requestID.value, size, error);
   if (getDraftMajorVersion(*version_) > 14) {
-    if (frameType == FrameType::SUBSCRIBE_NAMESPACE_OK &&
+    if (semanticFrameType == FrameType::SUBSCRIBE_NAMESPACE_OK &&
         !requestOk.params.empty()) {
       return folly::makeUnexpected(
           quic::TransportErrorCode::PROTOCOL_VIOLATION);
@@ -5081,6 +5682,23 @@ WriteResult MoQFrameWriter::writeRequestOk(
         size,
         error);
   }
+  // Draft 18+: Track Properties (bare key-value pairs, no length prefix) are
+  // only allowed for TRACK_STATUS_OK responses.
+  if (getDraftMajorVersion(*version_) >= 18) {
+    if (semanticFrameType == FrameType::TRACK_STATUS_OK) {
+      writeExtensions(
+          writeBuf,
+          requestOk.trackProperties,
+          size,
+          error,
+          /*withLengthPrefix=*/false);
+    } else if (!requestOk.trackProperties.empty()) {
+      // Caller populated Track Properties for a frame type that requires them
+      // to be empty.
+      return folly::makeUnexpected(
+          quic::TransportErrorCode::PROTOCOL_VIOLATION);
+    }
+  }
   writeSize(sizePtr, size, error, *version_);
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
@@ -5091,7 +5709,7 @@ WriteResult MoQFrameWriter::writeRequestOk(
 WriteResult MoQFrameWriter::writePublishNamespaceDone(
     folly::IOBufQueue& writeBuf,
     const PublishNamespaceDone& publishNamespaceDone) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write publishNamespaceDone";
   size_t size = 0;
   bool error = false;
@@ -5100,7 +5718,7 @@ WriteResult MoQFrameWriter::writePublishNamespaceDone(
 
   if (getDraftMajorVersion(*version_) >= 16) {
     // v16+: Write Request ID
-    CHECK(publishNamespaceDone.requestID.has_value())
+    XCHECK(publishNamespaceDone.requestID.has_value())
         << "RequestID required for v16+ PublishNamespaceDone";
     writeVarint(writeBuf, publishNamespaceDone.requestID->value, size, error);
   } else {
@@ -5119,7 +5737,7 @@ WriteResult MoQFrameWriter::writePublishNamespaceDone(
 WriteResult MoQFrameWriter::writePublishNamespaceCancel(
     folly::IOBufQueue& writeBuf,
     const PublishNamespaceCancel& publishNamespaceCancel) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write publishNamespace cancel";
   size_t size = 0;
   bool error = false;
@@ -5128,7 +5746,7 @@ WriteResult MoQFrameWriter::writePublishNamespaceCancel(
 
   if (getDraftMajorVersion(*version_) >= 16) {
     // v16+: Write Request ID
-    CHECK(publishNamespaceCancel.requestID.has_value())
+    XCHECK(publishNamespaceCancel.requestID.has_value())
         << "RequestID required for v16+ PublishNamespaceCancel";
     writeVarint(writeBuf, publishNamespaceCancel.requestID->value, size, error);
   } else {
@@ -5153,7 +5771,7 @@ WriteResult MoQFrameWriter::writePublishNamespaceCancel(
 WriteResult MoQFrameWriter::writeTrackStatus(
     folly::IOBufQueue& writeBuf,
     const TrackStatus& trackStatus) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "version_ needs to be set to write TrackStatusRequest";
   size_t size = 0;
   bool error = false;
@@ -5180,7 +5798,7 @@ WriteResult MoQFrameWriter::writeTrackStatus(
 WriteResult MoQFrameWriter::writeTrackStatusOk(
     folly::IOBufQueue& writeBuf,
     const TrackStatusOk& trackStatusOk) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "version_ needs to be set to write TrackStatus";
 
   size_t size = 0;
@@ -5188,7 +5806,7 @@ WriteResult MoQFrameWriter::writeTrackStatusOk(
 
   if (getDraftMajorVersion(*version_) >= 15) {
     auto requestOk = RequestOk::fromTrackStatusOk(trackStatusOk);
-    return writeRequestOk(writeBuf, requestOk, FrameType::REQUEST_OK);
+    return writeRequestOk(writeBuf, requestOk, FrameType::TRACK_STATUS_OK);
   }
 
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::TRACK_STATUS_OK, error);
@@ -5237,11 +5855,20 @@ WriteResult MoQFrameWriter::writeTrackStatusError(
 WriteResult MoQFrameWriter::writeGoaway(
     folly::IOBufQueue& writeBuf,
     const Goaway& goaway) const noexcept {
-  CHECK(version_.has_value()) << "Version needs to be set to write Goaway";
+  XCHECK(version_.has_value()) << "Version needs to be set to write Goaway";
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::GOAWAY, error);
   writeFixedString(writeBuf, goaway.newSessionUri, size, error);
+  if (getDraftMajorVersion(*version_) >= 18) {
+    writeVarint(writeBuf, goaway.timeout, size, error);
+    // Per draft 18, Request ID is present only when GOAWAY is sent on the
+    // control stream. Callers signal request-stream GOAWAY by leaving
+    // requestID unset.
+    if (goaway.requestID.has_value()) {
+      writeVarint(writeBuf, goaway.requestID->value, size, error);
+    }
+  }
   writeSize(sizePtr, size, error, *version_);
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
@@ -5252,7 +5879,7 @@ WriteResult MoQFrameWriter::writeGoaway(
 WriteResult MoQFrameWriter::writeSubscribeNamespace(
     folly::IOBufQueue& writeBuf,
     const SubscribeNamespace& subscribeNamespace) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write subscribeNamespace";
   auto majorVersion = getDraftMajorVersion(*version_);
   size_t size = 0;
@@ -5298,9 +5925,9 @@ WriteResult MoQFrameWriter::writeSubscribeNamespace(
 WriteResult MoQFrameWriter::writeSubscribeTracks(
     folly::IOBufQueue& writeBuf,
     const SubscribeTracks& subscribeTracks) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write subscribeTracks";
-  CHECK_GE(getDraftMajorVersion(*version_), 18u)
+  XCHECK_GE(getDraftMajorVersion(*version_), 18u)
       << "SUBSCRIBE_TRACKS is draft 18+ only";
   size_t size = 0;
   bool error = false;
@@ -5338,7 +5965,7 @@ WriteResult MoQFrameWriter::writeSubscribeNamespaceOk(
 WriteResult MoQFrameWriter::writeUnsubscribeNamespace(
     folly::IOBufQueue& writeBuf,
     const UnsubscribeNamespace& unsubscribeNamespace) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write unsubscribeNamespace";
   size_t size = 0;
   bool error = false;
@@ -5367,8 +5994,8 @@ WriteResult MoQFrameWriter::writeUnsubscribeNamespace(
 WriteResult MoQFrameWriter::writeNamespace(
     folly::IOBufQueue& writeBuf,
     const Namespace& ns) const noexcept {
-  CHECK(version_.has_value()) << "Version needs to be set to write namespace";
-  CHECK_GE(getDraftMajorVersion(*version_), 16)
+  XCHECK(version_.has_value()) << "Version needs to be set to write namespace";
+  XCHECK_GE(getDraftMajorVersion(*version_), 16)
       << "NAMESPACE message doesn't exist for version 15 and below, this function "
       << "shouldn't be called";
   size_t size = 0;
@@ -5385,9 +6012,9 @@ WriteResult MoQFrameWriter::writeNamespace(
 WriteResult MoQFrameWriter::writeNamespaceDone(
     folly::IOBufQueue& writeBuf,
     const NamespaceDone& namespaceDone) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write namespace done";
-  CHECK_GE(getDraftMajorVersion(*version_), 16)
+  XCHECK_GE(getDraftMajorVersion(*version_), 16)
       << "NAMESPACE_DONE message doesn't exist for version 15 and below, this function "
       << "shouldn't be called";
   size_t size = 0;
@@ -5405,7 +6032,7 @@ WriteResult MoQFrameWriter::writeNamespaceDone(
 WriteResult MoQFrameWriter::writeFetch(
     folly::IOBufQueue& writeBuf,
     const Fetch& fetch) const noexcept {
-  CHECK(version_.has_value()) << "Version needs to be set to write fetch";
+  XCHECK(version_.has_value()) << "Version needs to be set to write fetch";
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::FETCH, error);
@@ -5430,7 +6057,7 @@ WriteResult MoQFrameWriter::writeFetch(
     writeVarint(writeBuf, standalone->end.group, size, error);
     writeVarint(writeBuf, standalone->end.object, size, error);
   } else {
-    CHECK(joining);
+    XCHECK(joining);
 
     writeVarint(
         writeBuf, folly::to_underlying(joining->fetchType), size, error);
@@ -5469,7 +6096,7 @@ WriteResult MoQFrameWriter::writeFetch(
 WriteResult MoQFrameWriter::writeFetchCancel(
     folly::IOBufQueue& writeBuf,
     const FetchCancel& fetchCancel) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write fetch cancel";
   size_t size = 0;
   bool error = false;
@@ -5485,7 +6112,7 @@ WriteResult MoQFrameWriter::writeFetchCancel(
 WriteResult MoQFrameWriter::writeFetchOk(
     folly::IOBufQueue& writeBuf,
     const FetchOk& fetchOk) const noexcept {
-  CHECK(version_.has_value()) << "Version needs to be set to write fetch ok";
+  XCHECK(version_.has_value()) << "Version needs to be set to write fetch ok";
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::FETCH_OK, error);
@@ -5527,7 +6154,7 @@ WriteResult MoQFrameWriter::writeRequestError(
     folly::IOBufQueue& writeBuf,
     const RequestError& requestError,
     FrameType frameType) const noexcept {
-  CHECK(version_.has_value())
+  XCHECK(version_.has_value())
       << "Version needs to be set to write request error";
   // XCHECK that frameType is one of the allowed types for this function
   XCHECK(
@@ -5541,6 +6168,18 @@ WriteResult MoQFrameWriter::writeRequestError(
       frameType == FrameType::SUBSCRIBE_UPDATE)
       << "Invalid frameType passed to writeRequestError: "
       << static_cast<int>(frameType);
+
+  if (requestError.errorCode == RequestErrorCode::REDIRECT) {
+    if (getDraftMajorVersion(*version_) < 18) {
+      XLOG(ERR) << "REDIRECT errorCode is only valid for draft 18+, version="
+                << *version_;
+      return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
+    }
+    if (!requestError.redirect) {
+      XLOG(ERR) << "REDIRECT errorCode without a Redirect struct";
+      return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
+    }
+  }
 
   size_t size = 0;
   bool error = false;
@@ -5562,6 +6201,13 @@ WriteResult MoQFrameWriter::writeRequestError(
   }
   writeFixedString(writeBuf, requestError.reasonPhrase, size, error);
 
+  if (getDraftMajorVersion(*version_) >= 18 &&
+      requestError.errorCode == RequestErrorCode::REDIRECT) {
+    const Redirect& redirect = *requestError.redirect;
+    writeFixedString(writeBuf, redirect.connectUri, size, error);
+    writeFullTrackName(writeBuf, redirect.fullTrackName, size, error);
+  }
+
   writeSize(sizePtr, size, error, *version_);
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
@@ -5576,9 +6222,15 @@ bool isValidSubgroupType(uint64_t version, uint64_t streamType) {
   if ((streamType & 0x06) == 0x06) { // invalid subgroup type
     return false;
   }
+  auto majorVersion = getDraftMajorVersion(version);
+  if (majorVersion < 18 && (streamType & SG_FIRST_OBJECT)) {
+    return false;
+  }
   uint64_t max = 0x3D;
-  if (getDraftMajorVersion(version) < 15) {
+  if (majorVersion < 15) {
     max = 0x1D;
+  } else if (majorVersion >= 18) {
+    max = 0x7D;
   }
   return (streamType <= max);
 }
@@ -5613,11 +6265,20 @@ bool isValidDatagramType(uint64_t version, uint64_t datagramType) {
   }
 }
 
-std::optional<FrameType> getFrameType(const folly::IOBufQueue& readBuf) {
+std::optional<FrameType> getFrameType(
+    const folly::IOBufQueue& readBuf,
+    std::optional<uint64_t> version) {
   if (readBuf.empty()) {
     return std::nullopt;
   }
   folly::io::Cursor cursor(readBuf.front());
+  if (version && getDraftMajorVersion(*version) >= 17) {
+    auto frameType = decodeMoQVarint(cursor);
+    if (!frameType) {
+      return std::nullopt;
+    }
+    return static_cast<FrameType>(frameType->first);
+  }
   auto frameType = quic::follyutils::decodeQuicInteger(cursor);
   if (!frameType) {
     return std::nullopt;

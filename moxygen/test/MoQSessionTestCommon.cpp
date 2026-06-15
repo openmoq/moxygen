@@ -6,6 +6,8 @@
 
 #include "moxygen/test/MoQSessionTestCommon.h"
 
+#include "moxygen/MoQTrackProperties.h"
+
 using namespace moxygen;
 using testing::_;
 
@@ -30,20 +32,25 @@ std::shared_ptr<MockFetchHandle> makeFetchOkResult(
 std::shared_ptr<MockSubscriptionHandle> makeSubscribeOkResult(
     const SubscribeRequest& sub,
     const std::optional<AbsoluteLocation>& largest,
-    const std::optional<uint8_t>& publisherPriority) {
-  ParamBuilder paramBuilder;
-  if (publisherPriority.has_value()) {
-    paramBuilder.add(
-        TrackRequestParamKey::PUBLISHER_PRIORITY, publisherPriority.value());
-  }
+    const std::optional<uint8_t>& publisherPriority,
+    uint64_t majorVersion) {
   SubscribeOk subscribeOk;
   subscribeOk.requestID = sub.requestID;
   subscribeOk.trackAlias = TrackAlias(sub.requestID.value);
   subscribeOk.expires = std::chrono::milliseconds(0);
   subscribeOk.groupOrder = GroupOrder::OldestFirst;
   subscribeOk.largest = largest;
-  for (const auto& param : paramBuilder.build()) {
-    subscribeOk.params.insertParam(param);
+  if (publisherPriority.has_value()) {
+    if (majorVersion >= 16) {
+      setPublisherPriority(subscribeOk, publisherPriority.value());
+    } else {
+      ParamBuilder paramBuilder;
+      paramBuilder.add(
+          TrackRequestParamKey::PUBLISHER_PRIORITY, publisherPriority.value());
+      for (const auto& param : paramBuilder.build()) {
+        subscribeOk.params.insertParam(param);
+      }
+    }
   }
   return std::make_shared<MockSubscriptionHandle>(std::move(subscribeOk));
 }
@@ -91,6 +98,11 @@ TrackStatus getTrackStatus() {
 
 moxygen::SubscribeNamespace getSubscribeNamespace() {
   return SubscribeNamespace{
+      RequestID(0), TrackNamespace{{"foo"}}, true /* forward */};
+}
+
+moxygen::SubscribeTracks getSubscribeTracks() {
+  return SubscribeTracks{
       RequestID(0), TrackNamespace{{"foo"}}, true /* forward */};
 }
 
@@ -225,6 +237,69 @@ void MoQSessionTest::SetUp() {
 void MoQSessionTest::TearDown() {
   // Cancel the timeout to prevent false alarms after test completes
   testTimeout_.cancelTimeout();
+  // Verify every locally-initiated stream (both halves of each bidi, plus
+  // each uni's write half) reached terminal state (FIN or RST). One control
+  // stream per endpoint is intentionally kept open for the session lifetime
+  // and is exempted based on the negotiated version:
+  //   - pre-draft-18: client opens a bidi control stream (id 0); no uni
+  //     control exists.
+  //   - draft-18+:    each endpoint opens a uni control stream (client id 2,
+  //                   server id 3); no bidi control exists.
+  auto extractIds = [](const auto& container) {
+    std::vector<uint64_t> ids;
+    ids.reserve(container.size());
+    if constexpr (requires { container.begin()->first; }) {
+      for (const auto& [id, _] : container) {
+        ids.push_back(id);
+      }
+    } else {
+      for (const auto& id : container) {
+        ids.push_back(id);
+      }
+    }
+    return ids;
+  };
+  auto checkLeak = [&](const auto& container,
+                       folly::Optional<uint64_t> exemptId,
+                       std::string_view kind,
+                       std::string_view side) {
+    std::string leaks;
+    for (uint64_t id : extractIds(container)) {
+      if (exemptId && id == *exemptId) {
+        continue;
+      }
+      if (!leaks.empty()) {
+        leaks += ',';
+      }
+      leaks += std::to_string(id);
+    }
+    EXPECT_TRUE(leaks.empty())
+        << side << "-initiated " << kind
+        << " streams not fully terminated: ids=[" << leaks << "]";
+  };
+
+  const bool uniControl = useUniControlStreams(getServerSelectedVersion());
+  constexpr uint64_t kClientControlBidiId = 0;
+  constexpr uint64_t kClientControlUniId = 2;
+  constexpr uint64_t kServerControlUniId = 3;
+  const folly::Optional<uint64_t> clientBidiExempt =
+      uniControl ? folly::none : folly::make_optional(kClientControlBidiId);
+  const folly::Optional<uint64_t> clientUniExempt =
+      uniControl ? folly::make_optional(kClientControlUniId) : folly::none;
+  const folly::Optional<uint64_t> serverUniExempt =
+      uniControl ? folly::make_optional(kServerControlUniId) : folly::none;
+
+  if (clientWt_) {
+    checkLeak(
+        clientWt_->openLocalBidiStreams(), clientBidiExempt, "bidi", "client");
+    checkLeak(
+        clientWt_->openLocalUniStreams(), clientUniExempt, "uni", "client");
+  }
+  if (serverWt_) {
+    checkLeak(serverWt_->openLocalBidiStreams(), folly::none, "bidi", "server");
+    checkLeak(
+        serverWt_->openLocalUniStreams(), serverUniExempt, "uni", "server");
+  }
 }
 
 folly::Expected<folly::Unit, SessionCloseErrorCode>
@@ -248,9 +323,11 @@ folly::Try<moxygen::Setup> MoQSessionTest::onClientSetup(
   EXPECT_EQ(
       setup.params.at(1).key, folly::to_underlying(SetupKey::MAX_REQUEST_ID));
   EXPECT_EQ(setup.params.at(1).asUint64, initialMaxRequestID_);
-  EXPECT_EQ(
-      setup.params.at(2).key,
-      folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE));
+  if (!useBidiRequestStreams(getServerSelectedVersion())) {
+    EXPECT_EQ(
+        setup.params.at(2).key,
+        folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE));
+  }
   if (failServerSetup_) {
     return folly::makeTryWith(
         []() -> moxygen::Setup { throw std::runtime_error("failed"); });
@@ -261,9 +338,11 @@ folly::Try<moxygen::Setup> MoQSessionTest::onClientSetup(
         SetupParameter{
             folly::to_underlying(SetupKey::MAX_REQUEST_ID),
             initialMaxRequestID_});
-    ss.params.insertParam(
-        SetupParameter{
-            folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
+    if (!useBidiRequestStreams(getServerSelectedVersion())) {
+      ss.params.insertParam(
+          SetupParameter{
+              folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
+    }
     return ss;
   }());
 }
@@ -278,15 +357,13 @@ folly::coro::Task<void> MoQSessionTest::setupMoQSession() {
   clientSession_->setServerMaxTokenCacheSizeGuess(1024);
 
   if (useUniControlStreams(getServerSelectedVersion())) {
-    // Draft 18+: server proactively sends SERVER_SETUP on its uni stream
+    // Draft 18+: server proactively sends SERVER_SETUP on its uni stream.
+    // Auth token aliasing is disabled in this mode, so skip the cache size.
     moxygen::Setup serverSetupMsg;
     serverSetupMsg.params.insertParam(
         SetupParameter{
             folly::to_underlying(SetupKey::MAX_REQUEST_ID),
             initialMaxRequestID_});
-    serverSetupMsg.params.insertParam(
-        SetupParameter{
-            folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
     serverSession_->sendSetup(std::move(serverSetupMsg));
   }
 
@@ -331,14 +408,12 @@ folly::coro::Task<void> MoQSessionTest::setupMoQSessionForPublish(
   serverSession_->start();
 
   if (useUniControlStreams(getServerSelectedVersion())) {
-    // Draft 18+: server proactively sends SERVER_SETUP on its uni stream
+    // Draft 18+: server proactively sends SERVER_SETUP on its uni stream.
+    // Auth token aliasing is disabled in this mode, so skip the cache size.
     moxygen::Setup serverSetupMsg;
     serverSetupMsg.params.insertParam(
         SetupParameter{
             folly::to_underlying(SetupKey::MAX_REQUEST_ID), maxRequestID});
-    serverSetupMsg.params.insertParam(
-        SetupParameter{
-            folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
     serverSession_->sendSetup(std::move(serverSetupMsg));
   }
 
@@ -502,10 +577,9 @@ uint64_t MoQSessionTest::getServerSelectedVersion() {
 }
 
 uint64_t MoQSessionTest::serverObjectStreamId(uint64_t n) const {
-  // FakeSharedWebTransport uni stream IDs: 2, 6, 10, 14, ...
-  // In draft 18, ID 2 is the server's outgoing control stream,
-  // so object streams start at 6.
-  uint64_t base = useUniControlStreams(GetParam().serverVersion) ? 6 : 2;
+  // Server uni IDs are 3, 7, 11, ...; draft 18 reserves 3 for the control
+  // stream.
+  uint64_t base = useUniControlStreams(GetParam().serverVersion) ? 7 : 3;
   return base + n * 4;
 }
 
@@ -518,5 +592,29 @@ folly::coro::Task<void> MoQSessionTest::rescheduleN(int n) {
     co_await folly::coro::co_reschedule_on_current_executor;
   }
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    Draft18Test,
+    Draft18Test,
+    testing::Values(VersionParams{{kVersionDraft18}, kVersionDraft18}));
+
+namespace {
+std::vector<VersionParams> getPreDraft18VersionParams() {
+  std::vector<VersionParams> result;
+  result.reserve(kSupportedVersions.size());
+  for (auto v : kSupportedVersions) {
+    if (getDraftMajorVersion(v) >= 18) {
+      continue;
+    }
+    result.emplace_back(std::vector<uint64_t>{v}, v);
+  }
+  return result;
+}
+} // namespace
+
+INSTANTIATE_TEST_SUITE_P(
+    PreDraft18Test,
+    PreDraft18Test,
+    testing::ValuesIn(getPreDraft18VersionParams()));
 
 }} // namespace moxygen::test

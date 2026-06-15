@@ -6,6 +6,8 @@
 
 #include "moxygen/test/MoQSessionTestCommon.h"
 
+#include <quic/api/test/MockQuicSocket.h>
+
 using namespace moxygen;
 using namespace moxygen::test;
 using testing::_;
@@ -219,6 +221,430 @@ CO_TEST_P_X(MoQAuthorityPathTest, PathInClientSetupConflictsWithPreSetPath) {
   EXPECT_TRUE(result.hasException() || serverWt_->isSessionClosed());
 }
 
+class Draft18GoawayRequestRejectionTest : public MoQSessionTest {
+ protected:
+  std::shared_ptr<testing::NiceMock<MockTrackConsumer>>
+  makeKeepAliveConsumer() {
+    auto keepAliveConsumer =
+        std::make_shared<testing::NiceMock<MockTrackConsumer>>();
+    ON_CALL(*keepAliveConsumer, setTrackAlias(_))
+        .WillByDefault(
+            testing::Return(
+                folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
+    ON_CALL(*keepAliveConsumer, publishDone(_))
+        .WillByDefault(
+            testing::Return(
+                folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
+    return keepAliveConsumer;
+  }
+
+  folly::coro::Task<std::shared_ptr<Publisher::SubscriptionHandle>>
+  openServerSubscriptionToKeepDrainOpen(
+      std::shared_ptr<TrackConsumer> keepAliveConsumer) {
+    expectSubscribe(
+        [](SubscribeRequest sub, auto /* pub */) -> TaskSubscribeResult {
+          co_return makeSubscribeOkResult(sub);
+        },
+        MoQControlCodec::Direction::CLIENT);
+    auto keepAlive = co_await serverSession_->subscribe(
+        getSubscribe(kTestTrackName), keepAliveConsumer);
+    EXPECT_FALSE(keepAlive.hasError());
+    if (keepAlive.hasError()) {
+      co_return nullptr;
+    }
+    co_return keepAlive.value();
+  }
+
+  void expectNoServerPeerRequests() {
+    EXPECT_CALL(*serverPublisher, subscribe(_, _)).Times(0);
+    EXPECT_CALL(*serverPublisher, fetch(_, _)).Times(0);
+    EXPECT_CALL(*serverPublisher, trackStatus(_)).Times(0);
+    EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _)).Times(0);
+    EXPECT_CALL(*serverSubscriber, publish(_, _)).Times(0);
+    EXPECT_CALL(*serverSubscriber, publishNamespace(_, _)).Times(0);
+  }
+
+  template <typename StartRequest>
+  folly::coro::Task<void> expectInboundRequestRejectedAfterGoaway(
+      const char* /* requestName */,
+      StartRequest startRequest) {
+    co_await setupMoQSession();
+
+    auto keepAliveConsumer = makeKeepAliveConsumer();
+    auto keepAlive =
+        co_await openServerSubscriptionToKeepDrainOpen(keepAliveConsumer);
+    if (!keepAlive) {
+      co_return;
+    }
+
+    // Server's first uni stream id is 3 (QUIC-style: server uses odd uni
+    // stream id type = 3). The session's outgoing uni control stream is the
+    // first uni stream the server creates.
+    auto serverControl = serverWt_->writeHandles[3];
+    CHECK(serverControl != nullptr);
+    serverControl->setImmediateDelivery(false);
+    serverSession_->goaway(Goaway{});
+    co_await rescheduleN(2);
+
+    std::optional<RequestErrorCode> errorCode;
+    folly::coro::Baton done;
+    folly::coro::co_withExecutor(
+        MoQExecutor_.get(),
+        folly::coro::co_invoke([&]() -> folly::coro::Task<void> {
+          errorCode = co_await startRequest();
+          done.post();
+        }))
+        .start();
+
+    co_await rescheduleN(4);
+    serverControl->deliverInflightData();
+    co_await rescheduleN(4);
+    serverControl->deliverInflightData();
+    co_await done;
+
+    EXPECT_TRUE(errorCode.has_value());
+    if (!errorCode.has_value()) {
+      co_return;
+    }
+    EXPECT_EQ(*errorCode, RequestErrorCode::GOING_AWAY);
+    clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+  }
+
+  template <typename StartRequest>
+  folly::coro::Task<void> expectLocalRequestRejectedAfterGoaway(
+      const char* requestName,
+      StartRequest startRequest) {
+    co_await setupMoQSession();
+
+    auto keepAliveConsumer = makeKeepAliveConsumer();
+    auto keepAlive =
+        co_await openServerSubscriptionToKeepDrainOpen(keepAliveConsumer);
+    if (!keepAlive) {
+      co_return;
+    }
+
+    folly::coro::Baton goawayReceived;
+    EXPECT_CALL(*clientPublisher, goaway(_))
+        .WillOnce(testing::Invoke([&goawayReceived](Goaway /* goaway */) {
+          goawayReceived.post();
+        }));
+    serverSession_->goaway(Goaway{});
+    co_await goawayReceived;
+
+    expectNoServerPeerRequests();
+    auto errorCode = co_await startRequest();
+    co_await rescheduleN(4);
+
+    EXPECT_EQ(errorCode, RequestErrorCode::GOING_AWAY);
+    clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    Draft18GoawayRequestRejectionTest,
+    Draft18GoawayRequestRejectionTest,
+    testing::Values(VersionParams{{kVersionDraft18}, kVersionDraft18}));
+
+CO_TEST_P_X(
+    Draft18GoawayRequestRejectionTest,
+    SentGoawayRejectsInboundSubscribe) {
+  co_await expectInboundRequestRejectedAfterGoaway(
+      "SUBSCRIBE", [this]() -> folly::coro::Task<RequestErrorCode> {
+        auto result = co_await clientSession_->subscribe(
+            getSubscribe(kTestTrackName), subscribeCallback_);
+        EXPECT_TRUE(result.hasError());
+        if (!result.hasError()) {
+          co_return RequestErrorCode::INTERNAL_ERROR;
+        }
+        co_return result.error().errorCode;
+      });
+}
+
+CO_TEST_P_X(Draft18GoawayRequestRejectionTest, SentGoawayRejectsInboundFetch) {
+  co_await expectInboundRequestRejectedAfterGoaway(
+      "FETCH", [this]() -> folly::coro::Task<RequestErrorCode> {
+        auto result = co_await clientSession_->fetch(
+            getFetch({0, 0}, {0, 1}), fetchCallback_);
+        EXPECT_TRUE(result.hasError());
+        if (!result.hasError()) {
+          co_return RequestErrorCode::INTERNAL_ERROR;
+        }
+        co_return result.error().errorCode;
+      });
+}
+
+CO_TEST_P_X(
+    Draft18GoawayRequestRejectionTest,
+    SentGoawayRejectsInboundPublish) {
+  co_await expectInboundRequestRejectedAfterGoaway(
+      "PUBLISH", [this]() -> folly::coro::Task<RequestErrorCode> {
+        PublishRequest pub{
+            RequestID(0),
+            FullTrackName{TrackNamespace{{"test"}}, "test-track"},
+            TrackAlias(100),
+            GroupOrder::Default,
+            AbsoluteLocation{0, 100},
+            true,
+        };
+        auto result =
+            clientSession_->publish(std::move(pub), makePublishHandle());
+        if (result.hasError()) {
+          co_return result.error().errorCode;
+        }
+        auto reply = co_await std::move(result.value().reply);
+        EXPECT_TRUE(reply.hasError());
+        if (!reply.hasError()) {
+          co_return RequestErrorCode::INTERNAL_ERROR;
+        }
+        co_return reply.error().errorCode;
+      });
+}
+
+CO_TEST_P_X(
+    Draft18GoawayRequestRejectionTest,
+    SentGoawayRejectsInboundTrackStatus) {
+  co_await expectInboundRequestRejectedAfterGoaway(
+      "TRACK_STATUS", [this]() -> folly::coro::Task<RequestErrorCode> {
+        auto result = co_await clientSession_->trackStatus(getTrackStatus());
+        EXPECT_TRUE(result.hasError());
+        if (!result.hasError()) {
+          co_return RequestErrorCode::INTERNAL_ERROR;
+        }
+        co_return result.error().errorCode;
+      });
+}
+
+CO_TEST_P_X(
+    Draft18GoawayRequestRejectionTest,
+    SentGoawayRejectsInboundPublishNamespace) {
+  co_await expectInboundRequestRejectedAfterGoaway(
+      "PUBLISH_NAMESPACE", [this]() -> folly::coro::Task<RequestErrorCode> {
+        auto result =
+            co_await clientSession_->publishNamespace(getPublishNamespace());
+        EXPECT_TRUE(result.hasError());
+        if (!result.hasError()) {
+          co_return RequestErrorCode::INTERNAL_ERROR;
+        }
+        co_return result.error().errorCode;
+      });
+}
+
+CO_TEST_P_X(
+    Draft18GoawayRequestRejectionTest,
+    SentGoawayRejectsInboundSubscribeNamespace) {
+  co_await expectInboundRequestRejectedAfterGoaway(
+      "SUBSCRIBE_NAMESPACE", [this]() -> folly::coro::Task<RequestErrorCode> {
+        auto result = co_await clientSession_->subscribeNamespace(
+            getSubscribeNamespace(), nullptr);
+        EXPECT_TRUE(result.hasError());
+        if (!result.hasError()) {
+          co_return RequestErrorCode::INTERNAL_ERROR;
+        }
+        co_return result.error().errorCode;
+      });
+}
+
+CO_TEST_P_X(
+    Draft18GoawayRequestRejectionTest,
+    ReceivedGoawayRejectsLocalSubscribe) {
+  co_await expectLocalRequestRejectedAfterGoaway(
+      "SUBSCRIBE", [this]() -> folly::coro::Task<RequestErrorCode> {
+        auto result = co_await clientSession_->subscribe(
+            getSubscribe(kTestTrackName), subscribeCallback_);
+        EXPECT_TRUE(result.hasError());
+        if (!result.hasError()) {
+          co_return RequestErrorCode::INTERNAL_ERROR;
+        }
+        co_return result.error().errorCode;
+      });
+}
+
+CO_TEST_P_X(
+    Draft18GoawayRequestRejectionTest,
+    ReceivedGoawayRejectsLocalFetch) {
+  co_await expectLocalRequestRejectedAfterGoaway(
+      "FETCH", [this]() -> folly::coro::Task<RequestErrorCode> {
+        auto result = co_await clientSession_->fetch(
+            getFetch({0, 0}, {0, 1}), fetchCallback_);
+        EXPECT_TRUE(result.hasError());
+        if (!result.hasError()) {
+          co_return RequestErrorCode::INTERNAL_ERROR;
+        }
+        co_return result.error().errorCode;
+      });
+}
+
+CO_TEST_P_X(
+    Draft18GoawayRequestRejectionTest,
+    ReceivedGoawayRejectsLocalPublish) {
+  co_await expectLocalRequestRejectedAfterGoaway(
+      "PUBLISH", [this]() -> folly::coro::Task<RequestErrorCode> {
+        PublishRequest pub{
+            RequestID(0),
+            FullTrackName{TrackNamespace{{"test"}}, "test-track"},
+            TrackAlias(100),
+            GroupOrder::Default,
+            AbsoluteLocation{0, 100},
+            true,
+        };
+        auto result =
+            clientSession_->publish(std::move(pub), makePublishHandle());
+        EXPECT_TRUE(result.hasError());
+        if (!result.hasError()) {
+          co_return RequestErrorCode::INTERNAL_ERROR;
+        }
+        co_return result.error().errorCode;
+      });
+}
+
+CO_TEST_P_X(
+    Draft18GoawayRequestRejectionTest,
+    ReceivedGoawayRejectsLocalTrackStatus) {
+  co_await expectLocalRequestRejectedAfterGoaway(
+      "TRACK_STATUS", [this]() -> folly::coro::Task<RequestErrorCode> {
+        auto result = co_await clientSession_->trackStatus(getTrackStatus());
+        EXPECT_TRUE(result.hasError());
+        if (!result.hasError()) {
+          co_return RequestErrorCode::INTERNAL_ERROR;
+        }
+        co_return result.error().errorCode;
+      });
+}
+
+CO_TEST_P_X(
+    Draft18GoawayRequestRejectionTest,
+    ReceivedGoawayRejectsLocalPublishNamespace) {
+  co_await expectLocalRequestRejectedAfterGoaway(
+      "PUBLISH_NAMESPACE", [this]() -> folly::coro::Task<RequestErrorCode> {
+        auto result =
+            co_await clientSession_->publishNamespace(getPublishNamespace());
+        EXPECT_TRUE(result.hasError());
+        if (!result.hasError()) {
+          co_return RequestErrorCode::INTERNAL_ERROR;
+        }
+        co_return result.error().errorCode;
+      });
+}
+
+CO_TEST_P_X(
+    Draft18GoawayRequestRejectionTest,
+    ReceivedGoawayRejectsLocalSubscribeNamespace) {
+  co_await expectLocalRequestRejectedAfterGoaway(
+      "SUBSCRIBE_NAMESPACE", [this]() -> folly::coro::Task<RequestErrorCode> {
+        auto result = co_await clientSession_->subscribeNamespace(
+            getSubscribeNamespace(), nullptr);
+        EXPECT_TRUE(result.hasError());
+        if (!result.hasError()) {
+          co_return RequestErrorCode::INTERNAL_ERROR;
+        }
+        co_return result.error().errorCode;
+      });
+}
+
+class RecordingSessionCloseCallback
+    : public MoQSession::MoQSessionCloseCallback {
+ public:
+  void onMoQSessionClosed(
+      SessionCloseErrorCode error,
+      folly::Optional<uint32_t> /* wtError */) override {
+    errorCode = error;
+    closed.post();
+  }
+
+  std::optional<SessionCloseErrorCode> errorCode;
+  folly::coro::Baton closed;
+};
+
+class Draft18GoawayTimeoutTest : public MoQSessionTest {
+ protected:
+  folly::coro::Task<std::shared_ptr<Publisher::SubscriptionHandle>>
+  openPeerSubscription() {
+    co_await setupMoQSession();
+    expectSubscribe([](auto sub, auto /* pub */) -> TaskSubscribeResult {
+      co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+    });
+
+    auto result = co_await clientSession_->subscribe(
+        getSubscribe(kTestTrackName), subscribeCallback_);
+    EXPECT_FALSE(result.hasError());
+    if (result.hasError()) {
+      co_return nullptr;
+    }
+    co_return result.value();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    Draft18GoawayTimeoutTest,
+    Draft18GoawayTimeoutTest,
+    testing::Values(VersionParams{{kVersionDraft18}, kVersionDraft18}));
+
+CO_TEST_P_X(Draft18GoawayTimeoutTest, TimeoutClosesOpenPeerSubscription) {
+  auto subscription = co_await openPeerSubscription();
+  if (!subscription) {
+    co_return;
+  }
+
+  RecordingSessionCloseCallback closeCallback;
+  serverSession_->setSessionCloseCallback(&closeCallback);
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
+      .WillOnce([](const PublishDone& done) {
+        EXPECT_EQ(done.statusCode, PublishDoneStatusCode::SESSION_CLOSED);
+        return folly::Expected<folly::Unit, MoQPublishError>(folly::unit);
+      });
+
+  Goaway goaway;
+  goaway.timeout = 1;
+  serverSession_->goaway(goaway);
+
+  co_await closeCallback.closed;
+  EXPECT_EQ(closeCallback.errorCode, SessionCloseErrorCode::GOAWAY_TIMEOUT);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(Draft18GoawayTimeoutTest, ClosingPeerSubscriptionCancelsTimeout) {
+  auto subscription = co_await openPeerSubscription();
+  if (!subscription) {
+    co_return;
+  }
+
+  RecordingSessionCloseCallback closeCallback;
+  serverSession_->setSessionCloseCallback(&closeCallback);
+
+  Goaway goaway;
+  goaway.timeout = 1000;
+  serverSession_->goaway(goaway);
+  EXPECT_FALSE(closeCallback.errorCode.has_value());
+
+  subscription->unsubscribe();
+  co_await closeCallback.closed;
+  EXPECT_EQ(closeCallback.errorCode, SessionCloseErrorCode::NO_ERROR);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    Draft18GoawayTimeoutTest,
+    ZeroTimeoutDoesNotCloseOpenPeerSubscription) {
+  auto subscription = co_await openPeerSubscription();
+  if (!subscription) {
+    co_return;
+  }
+
+  RecordingSessionCloseCallback closeCallback;
+  serverSession_->setSessionCloseCallback(&closeCallback);
+
+  Goaway goaway;
+  goaway.timeout = 0;
+  serverSession_->goaway(goaway);
+  co_await rescheduleN(4);
+  EXPECT_FALSE(closeCallback.errorCode.has_value());
+
+  subscription->unsubscribe();
+  co_await closeCallback.closed;
+  EXPECT_EQ(closeCallback.errorCode, SessionCloseErrorCode::NO_ERROR);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, Goaway) {
   co_await setupMoQSession();
   expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
@@ -235,7 +661,13 @@ CO_TEST_P_X(MoQSessionTest, Goaway) {
   clientSession_->goaway(goaway);
   folly::coro::Baton goawayBaton;
   EXPECT_CALL(*serverPublisher, goaway(_))
-      .WillOnce(testing::Invoke([&goawayBaton](auto /* goaway */) -> void {
+      .WillOnce(testing::Invoke([&](auto receivedGoaway) -> void {
+        if (getDraftMajorVersion(getServerSelectedVersion()) >= 18) {
+          ASSERT_TRUE(receivedGoaway.requestID.has_value());
+          EXPECT_EQ(*receivedGoaway.requestID, RequestID(1));
+        } else {
+          EXPECT_FALSE(receivedGoaway.requestID.has_value());
+        }
         goawayBaton.post();
         return;
       }));
@@ -497,13 +929,19 @@ class DummyMoQClientBase : public MoQClientBase {
   using MoQClientBase::MoQClientBase;
 
   void test_onNewBidiStream(proxygen::WebTransport::BidiStreamHandle bidi) {
-    MoQClientBase::onNewBidiStream(std::move(bidi));
+    if (moqSession_) {
+      moqSession_->onNewBidiStream(std::move(bidi));
+    }
   }
   void test_onNewUniStream(proxygen::WebTransport::StreamReadHandle* handle) {
-    MoQClientBase::onNewUniStream(handle);
+    if (moqSession_) {
+      moqSession_->onNewUniStream(handle);
+    }
   }
   void test_onDatagram(std::unique_ptr<folly::IOBuf> datagram) {
-    MoQClientBase::onDatagram(std::move(datagram));
+    if (moqSession_) {
+      moqSession_->onDatagram(std::move(datagram));
+    }
   }
   void test_goaway(const Goaway& goaway) {
     MoQClientBase::goaway(goaway);
@@ -519,6 +957,24 @@ class DummyMoQClientBase : public MoQClientBase {
     co_return nullptr;
   }
 };
+
+class TestMoQClient : public MoQClient {
+ public:
+  using MoQClient::MoQClient;
+
+  void setQuicWebTransport(std::shared_ptr<proxygen::QuicWebTransport> wt) {
+    quicWebTransport_ = std::move(wt);
+  }
+};
+
+std::shared_ptr<proxygen::QuicWebTransport> makeTestQuicWebTransport() {
+  auto quicSocket = std::make_shared<testing::NiceMock<quic::MockQuicSocket>>();
+  ON_CALL(*quicSocket, setDatagramCallback(_))
+      .WillByDefault(
+          [](quic::QuicSocket::DatagramCallback*)
+              -> quic::Expected<void, quic::LocalErrorCode> { return {}; });
+  return std::make_shared<proxygen::QuicWebTransport>(std::move(quicSocket));
+}
 
 TEST(MoQClientBaseTest, CallbacksIgnoredWhenSessionNull) {
   folly::EventBase evb;
@@ -541,6 +997,63 @@ TEST(MoQClientBaseTest, CallbacksIgnoredWhenSessionNull) {
   client.test_onDatagram(folly::IOBuf::copyBuffer("hi"));
   client.test_goaway(Goaway{"/newSession"});
 }
+
+TEST(MoQClientTest, TransportStatsUnavailableAfterSessionClose) {
+  folly::EventBase evb;
+  auto exec = std::make_shared<MoQFollyExecutorImpl>(&evb);
+
+  auto [clientWt, serverWt] =
+      proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
+  (void)serverWt;
+  auto session = std::make_shared<MoQSession>(
+      folly::MaybeManagedPtr<proxygen::WebTransport>(clientWt.get()), exec);
+
+  auto quicWebTransport = makeTestQuicWebTransport();
+  auto retainedQuicWebTransport = quicWebTransport;
+
+  TestMoQClient client(exec, proxygen::URL("https://example.com:443/"));
+  client.moqSession_ = session;
+  client.setQuicWebTransport(std::move(quicWebTransport));
+
+  session->close(SessionCloseErrorCode::NO_ERROR);
+  static_cast<proxygen::WebTransport*>(retainedQuicWebTransport.get())
+      ->closeSession();
+
+  EXPECT_FALSE(client.getTransportInfo().has_value());
+
+  auto flowControl = client.getConnectionFlowControl();
+  ASSERT_FALSE(flowControl.has_value());
+  EXPECT_EQ(flowControl.error(), quic::LocalErrorCode::CONNECTION_CLOSED);
+}
+
+TEST(MoQClientTest, TransportStatsUnavailableAfterSocketClose) {
+  folly::EventBase evb;
+  auto exec = std::make_shared<MoQFollyExecutorImpl>(&evb);
+
+  auto [clientWt, serverWt] =
+      proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
+  (void)serverWt;
+  auto session = std::make_shared<MoQSession>(
+      folly::MaybeManagedPtr<proxygen::WebTransport>(clientWt.get()), exec);
+
+  auto quicWebTransport = makeTestQuicWebTransport();
+  auto retainedQuicWebTransport = quicWebTransport;
+
+  TestMoQClient client(exec, proxygen::URL("https://example.com:443/"));
+  client.moqSession_ = session;
+  client.setQuicWebTransport(std::move(quicWebTransport));
+
+  static_cast<proxygen::WebTransport*>(retainedQuicWebTransport.get())
+      ->closeSession();
+
+  EXPECT_FALSE(session->isClosed());
+  EXPECT_FALSE(client.getTransportInfo().has_value());
+
+  auto flowControl = client.getConnectionFlowControl();
+  ASSERT_FALSE(flowControl.has_value());
+  EXPECT_EQ(flowControl.error(), quic::LocalErrorCode::CONNECTION_CLOSED);
+}
+
 TEST(MoQRelayClientTest, ShutdownClearsHandlersAndResetsSession) {
   folly::EventBase evb;
   auto exec = std::make_shared<MoQFollyExecutorImpl>(&evb);

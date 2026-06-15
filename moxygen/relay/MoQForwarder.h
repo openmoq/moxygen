@@ -66,6 +66,11 @@ class MoQForwarder : public TrackConsumer {
    public:
     virtual ~Callback() = default;
     virtual void onEmpty(MoQForwarder*) = 0;
+    // Fires when the forwarder's source terminates (publishDone), before its
+    // subscribers are drained. Distinct from onEmpty (last subscriber left):
+    // this signals the publisher/upstream is gone, which bounds the forwarder's
+    // lifetime in any owning registry.
+    virtual void onPublishDone(MoQForwarder*) {}
     virtual void forwardChanged(MoQForwarder* fwd, bool /*forward*/) {
       forwardChanged(fwd);
     }
@@ -146,15 +151,18 @@ class MoQForwarder : public TrackConsumer {
     // publishing subgroups.  Having this state here makes it easy to remove
     // a Subscriber and all open subgroups.
     SubgroupConsumerMap subgroups;
-    MoQForwarder& forwarder;
-    bool isPinned() const {
-      return pinned;
-    }
-
+    MoQForwarder* forwarder;
     bool shouldForward;
     bool passive{false};
     bool pinned{false};
     bool receivedPublishDone_{false};
+    bool isPinned() const {
+      return pinned;
+    }
+
+    void detach() {
+      forwarder = nullptr;
+    }
 
    private:
     // Updates shouldForward and keeps forwardingSubscribers_ in sync,
@@ -268,7 +276,7 @@ class MoQForwarder : public TrackConsumer {
       uint64_t groupID,
       uint64_t subgroupID,
       Priority priority,
-      bool containsLastInGroup = false) override;
+      BeginSubgroupOptions options = {}) override;
 
   folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
   awaitStreamCredit() override;
@@ -291,13 +299,17 @@ class MoQForwarder : public TrackConsumer {
     MoQForwarder* forwarder_;
     SubgroupIdentifier identifier_;
     Priority priority_;
-    bool containsLastInGroup_{false};
+    TrackConsumer::BeginSubgroupOptions options_;
+    // Set only when upstream marked this stream as starting with the original
+    // first object for the logical subgroup.
+    std::optional<uint64_t> firstObjectId_;
 
     template <typename Fn>
     folly::Expected<folly::Unit, MoQPublishError> forEachSubscriberSubgroup(
         Fn&& fn,
         bool makeNew = true,
-        const std::string& callsite = "");
+        const std::string& callsite = "",
+        bool beginsWithFirstObjectForNewSubgroups = false);
 
     // Helper to erase subgroup from subscriber and remove subscriber if
     // draining
@@ -317,13 +329,15 @@ class MoQForwarder : public TrackConsumer {
     // Updates largest on the forwarder (no-op if detached)
     void updateLargest(uint64_t group, uint64_t object);
 
+    bool startsWithFirstObject(uint64_t objectID);
+
    public:
     SubgroupForwarder(
         MoQForwarder& forwarder,
         uint64_t group,
         uint64_t subgroup,
         Priority priority,
-        bool containsLastInGroup = false);
+        TrackConsumer::BeginSubgroupOptions options = {});
 
     // Detach from the owning MoQForwarder (called from MoQForwarder destructor)
     void detach();

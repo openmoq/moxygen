@@ -110,7 +110,7 @@ class MockTrackConsumer : public TrackConsumer {
       (uint64_t groupID,
        uint64_t subgroupID,
        Priority priority,
-       bool containsLastInGroup),
+       TrackConsumer::BeginSubgroupOptions options),
       (override));
 
   MOCK_METHOD(
@@ -317,6 +317,26 @@ class MockPublishNamespaceHandle : public Subscriber::PublishNamespaceHandle {
       ());
 };
 
+class MockSubscribeTracksHandle : public Publisher::SubscribeTracksHandle {
+ public:
+  MockSubscribeTracksHandle() = default;
+  explicit MockSubscribeTracksHandle(SubscribeTracksOk ok)
+      : Publisher::SubscribeTracksHandle(std::move(ok)) {}
+
+  MOCK_METHOD(void, unsubscribeTracks, (), (override));
+
+  folly::coro::Task<folly::Expected<RequestOk, RequestError>> requestUpdate(
+      RequestUpdate update) override {
+    requestUpdateCalled(update);
+    co_return requestUpdateResult();
+  }
+  MOCK_METHOD(void, requestUpdateCalled, (RequestUpdate));
+  MOCK_METHOD(
+      (folly::Expected<RequestOk, RequestError>),
+      requestUpdateResult,
+      ());
+};
+
 class MockPublishNamespaceCallback
     : public Subscriber::PublishNamespaceCallback {
  public:
@@ -359,6 +379,12 @@ class MockPublisher : public Publisher {
       folly::coro::Task<SubscribeNamespaceResult>,
       subscribeNamespace,
       (SubscribeNamespace, std::shared_ptr<NamespacePublishHandle>),
+      (override));
+
+  MOCK_METHOD(
+      folly::coro::Task<SubscribeTracksResult>,
+      subscribeTracks,
+      (SubscribeTracks),
       (override));
 
   MOCK_METHOD(void, goaway, (Goaway), (override));
@@ -411,6 +437,14 @@ class MockPublisherStats : public MoQPublisherStatsCallback {
       void,
       onSubscribeNamespaceError,
       (SubscribeNamespaceErrorCode),
+      (override));
+
+  MOCK_METHOD(void, onSubscribeTracksSuccess, (), (override));
+
+  MOCK_METHOD(
+      void,
+      onSubscribeTracksError,
+      (SubscribeTracksErrorCode),
       (override));
 
   MOCK_METHOD(void, onUnsubscribeNamespace, (), (override));
@@ -470,6 +504,14 @@ class MockSubscriberStats : public MoQSubscriberStatsCallback {
       void,
       onSubscribeNamespaceError,
       (SubscribeNamespaceErrorCode),
+      (override));
+
+  MOCK_METHOD(void, onSubscribeTracksSuccess, (), (override));
+
+  MOCK_METHOD(
+      void,
+      onSubscribeTracksError,
+      (SubscribeTracksErrorCode),
       (override));
 
   MOCK_METHOD(void, onUnsubscribeNamespace, (), (override));

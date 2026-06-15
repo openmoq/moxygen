@@ -4,12 +4,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <folly/logging/xlog.h>
 #include <moxygen/ObjectReceiver.h>
 #include <moxygen/samples/chat/MoQChatClient.h>
 
 #include <folly/init/Init.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/portability/GFlags.h>
+#include <moxygen/samples/util/Utils.h>
 #include <moxygen/util/InsecureVerifierDangerousDoNotUseInProduction.h>
 
 DEFINE_string(connect_url, "", "URL for webtransport server");
@@ -26,6 +28,12 @@ DEFINE_string(
     versions,
     "",
     "Comma-separated MoQ draft versions (e.g. \"14,16\"). Empty = all supported.");
+DEFINE_bool(
+    qmux,
+    false,
+    "Connect over QMUX-on-TCP (TLS via Fizz is mandatory) instead of "
+    "QUIC/WebTransport. Mutually exclusive with --quic_transport.");
+DEFINE_bool(quic_transport, false, "Use raw QUIC transport");
 
 namespace moxygen {
 
@@ -43,13 +51,17 @@ MoQChatClient::MoQChatClient(
               std::chrono::system_clock::now()))),
       executor_(std::make_shared<MoQFollyExecutorImpl>(evb)),
       moqClient_(
-          executor_,
-          std::move(url),
-          FLAGS_insecure
-              ? std::make_shared<
-                    moxygen::test::
-                        InsecureVerifierDangerousDoNotUseInProduction>()
-              : nullptr) {}
+          samples::makeRelayClientTransport(
+              executor_,
+              std::move(url),
+              FLAGS_insecure
+                  ? std::make_shared<
+                        test::InsecureVerifierDangerousDoNotUseInProduction>()
+                  : nullptr,
+              FLAGS_qmux ? samples::TransportType::QMUX
+                  : FLAGS_quic_transport
+                  ? samples::TransportType::QUIC
+                  : samples::TransportType::WEB_TRANSPORT)) {}
 
 folly::coro::Task<void> MoQChatClient::run() noexcept {
   XLOG(INFO) << __func__;
@@ -188,6 +200,17 @@ void MoQChatClient::ChatNamespacePublishHandle::namespaceMsg(
       .start();
 }
 
+void MoQChatClient::ChatNamespacePublishHandle::namespaceDoneMsg(
+    const TrackNamespace& trackNamespaceSuffix) {
+  auto parts = prefix_.trackNamespace;
+  parts.insert(
+      parts.end(),
+      trackNamespaceSuffix.trackNamespace.begin(),
+      trackNamespaceSuffix.trackNamespace.end());
+  TrackNamespace fullNs(std::move(parts));
+  client_->publishNamespaceDone(fullNs);
+}
+
 folly::coro::Task<Publisher::SubscribeResult> MoQChatClient::subscribe(
     SubscribeRequest subscribeReq,
     std::shared_ptr<TrackConsumer> consumer) {
@@ -287,7 +310,7 @@ void MoQChatClient::handleInput(const std::string& input) {
 
 folly::coro::Task<void> MoQChatClient::subscribeToUser(
     TrackNamespace trackNamespace) {
-  CHECK_GE(trackNamespace.size(), 5);
+  XCHECK_GE(trackNamespace.size(), 5);
   std::string username = trackNamespace[2];
   std::string deviceId = trackNamespace[3];
   std::string timestampStr = trackNamespace[4];
@@ -409,6 +432,8 @@ void MoQChatClient::publishDone(PublishDone pubDone) {
 
 int main(int argc, char* argv[]) {
   folly::Init init(&argc, &argv, false);
+  XLOG_IF(FATAL, FLAGS_qmux && FLAGS_quic_transport)
+      << "--qmux and --quic_transport are mutually exclusive";
   folly::EventBase eventBase;
   proxygen::URL url(FLAGS_connect_url);
   if (!url.isValid() || !url.hasHost()) {

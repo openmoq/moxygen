@@ -8,21 +8,20 @@
 #include <folly/String.h>
 #include <folly/coro/Error.h>
 #include <quic/client/QuicClientTransport.h>
+#include <quic/common/address/QuicSocketAddressBridge.h>
 #include <moxygen/MoQClientBase.h>
 
 #include <utility>
 
 namespace moxygen {
 
-folly::coro::Task<void> MoQClientBase::setupMoQSession(
+folly::coro::Task<void> MoQClientBase::connectAndSendSetup(
     std::chrono::milliseconds connect_timeout,
     std::chrono::milliseconds transaction_timeout,
     std::shared_ptr<Publisher> publishHandler,
     std::shared_ptr<Subscriber> subscribeHandler,
     const quic::TransportSettings& transportSettings,
     const std::vector<std::string>& alpns) {
-  proxygen::WebTransport* wt = nullptr;
-
   std::vector<std::string> alpn =
       alpns.empty() ? getDefaultMoqtProtocols(false) : alpns;
   XLOG(DBG1) << "MoQClientBase: QUIC ALPNs: " << folly::join(", ", alpn);
@@ -48,8 +47,10 @@ folly::coro::Task<void> MoQClientBase::setupMoQSession(
     if (auto dcid = quicClient->getServerConnectionId()) {
       logger_->setDcid(*dcid);
     }
-    logger_->setLocalAddress(quicClient->getLocalAddress());
-    logger_->setPeerAddress(quicClient->getPeerAddress());
+    logger_->setLocalAddress(
+        quic::toFollySocketAddress(quicClient->getLocalAddress()));
+    logger_->setPeerAddress(
+        quic::toFollySocketAddress(quicClient->getPeerAddress()));
   }
 
   // Detect negotiated ALPN before wrapping the socket
@@ -60,18 +61,23 @@ folly::coro::Task<void> MoQClientBase::setupMoQSession(
   }
 
   // Make WebTransport object
+  quicSocket_ = quicClient.get();
   quicWebTransport_ =
       std::make_shared<proxygen::QuicWebTransport>(std::move(quicClient));
-  quicWebTransport_->setHandler(this);
-  wt = quicWebTransport_.get();
+  auto* wt = quicWebTransport_.get();
 
-  auto moqHandshakeStart = std::chrono::steady_clock::now();
-
-  auto result = co_await folly::coro::co_awaitTry(completeSetupMoQSession(
+  completeSetupMoQSession(
       wt,
       url_.getPath(),
       std::move(publishHandler),
-      std::move(subscribeHandler)));
+      std::move(subscribeHandler));
+}
+
+folly::coro::Task<Setup> MoQClientBase::awaitSetupComplete() {
+  auto moqHandshakeStart = std::chrono::steady_clock::now();
+
+  auto result =
+      co_await folly::coro::co_awaitTry(moqSession_->awaitPeerSetup());
 
   moqHandshakeTime_ = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - moqHandshakeStart);
@@ -79,9 +85,51 @@ folly::coro::Task<void> MoQClientBase::setupMoQSession(
   if (result.hasException()) {
     co_yield folly::coro::co_error(result.exception());
   }
+
+  if (quicSocket_) {
+    auto transportInfo = quicSocket_->getTransportInfo();
+    XLOG(DBG1) << "MoQ setup complete, usedZeroRtt="
+               << transportInfo.usedZeroRtt;
+  }
+
+  // Update early data handler with server's params for future 0-RTT
+  if (earlyDataHandler_ && result.hasValue()) {
+    uint64_t serverMaxRequestID = 0;
+    uint64_t serverMaxAuthTokenCacheSize = 0;
+    for (const auto& param : result->params) {
+      if (param.key == folly::to_underlying(SetupKey::MAX_REQUEST_ID)) {
+        serverMaxRequestID = param.asUint64;
+      } else if (
+          param.key ==
+          folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE)) {
+        serverMaxAuthTokenCacheSize = param.asUint64;
+      }
+    }
+    earlyDataHandler_->setCurrentParams(
+        serverMaxRequestID, serverMaxAuthTokenCacheSize);
+  }
+
+  co_return std::move(*result);
 }
 
-folly::coro::Task<Setup> MoQClientBase::completeSetupMoQSession(
+folly::coro::Task<void> MoQClientBase::setupMoQSession(
+    std::chrono::milliseconds connect_timeout,
+    std::chrono::milliseconds transaction_timeout,
+    std::shared_ptr<Publisher> publishHandler,
+    std::shared_ptr<Subscriber> subscribeHandler,
+    const quic::TransportSettings& transportSettings,
+    const std::vector<std::string>& alpns) {
+  co_await connectAndSendSetup(
+      connect_timeout,
+      transaction_timeout,
+      std::move(publishHandler),
+      std::move(subscribeHandler),
+      transportSettings,
+      alpns);
+  co_await awaitSetupComplete();
+}
+
+void MoQClientBase::completeSetupMoQSession(
     proxygen::WebTransport* wt,
     const std::optional<std::string>& pathParam,
     std::shared_ptr<Publisher> publishHandler,
@@ -89,6 +137,10 @@ folly::coro::Task<Setup> MoQClientBase::completeSetupMoQSession(
   //  Create MoQSession and Setup MoQSession parameters
   moqSession_ =
       createSession(folly::MaybeManagedPtr<proxygen::WebTransport>(wt));
+  if (quicWebTransport_) {
+    quicWebTransport_->setHandler(moqSession_.get());
+  }
+  moqSession_->setLogger(logger_);
 
   moqSession_->setPath(url_.getPath());
   moqSession_->setAuthority(url_.getHostAndPortOmitDefault());
@@ -110,7 +162,7 @@ folly::coro::Task<Setup> MoQClientBase::completeSetupMoQSession(
         clientSetup,
         moqSession_->getNegotiatedVersion().value_or(kVersionDraft14));
   }
-  return moqSession_->setup(clientSetup);
+  moqSession_->sendSetup(clientSetup);
 }
 
 Setup MoQClientBase::getClientSetup(const std::optional<std::string>& path) {
@@ -147,70 +199,18 @@ Setup MoQClientBase::getClientSetup(const std::optional<std::string>& path) {
   return clientSetup;
 }
 
-void MoQClientBase::onSessionEnd(folly::Optional<uint32_t> err) noexcept {
-  if (logger_) {
-    logger_->outputLogs();
-  }
-
-  // Clear handler FIRST to prevent further callbacks
-  if (quicWebTransport_) {
-    quicWebTransport_->setHandler(nullptr);
-  }
-
-  // Take ownership and clear members before calling into session.
-  // If 'this' is destroyed during session->onSessionEnd(),
-  // we only touch local stack variables after that.
-  auto session = std::exchange(moqSession_, nullptr);
-  auto wt = std::exchange(quicWebTransport_, nullptr);
-
-  if (session) {
-    session->onSessionEnd(err);
-  }
-}
-
-void MoQClientBase::onSessionDrain() noexcept {
-  XLOG(DBG1) << "Received DRAIN_SESSION capsule";
-}
-
-void MoQClientBase::onNewBidiStream(
-    proxygen::WebTransport::BidiStreamHandle bidi) noexcept {
-  XLOG(DBG1) << __func__;
-  if (!moqSession_) {
-    XLOG(DBG1) << "onNewBidiStream after session reset; ignoring";
-    return;
-  }
-  moqSession_->onNewBidiStream(std::move(bidi));
-}
-
-void MoQClientBase::onNewUniStream(
-    proxygen::WebTransport::StreamReadHandle* stream) noexcept {
-  XLOG(DBG1) << __func__;
-  if (!moqSession_) {
-    XLOG(DBG1) << "onNewUniStream after session reset; ignoring";
-    return;
-  }
-  moqSession_->onNewUniStream(stream);
-}
-
-void MoQClientBase::onDatagram(
-    std::unique_ptr<folly::IOBuf> datagram) noexcept {
-  if (!moqSession_) {
-    XLOG(DBG1) << "onDatagram after session reset; ignoring";
-    return;
-  }
-  moqSession_->onDatagram(std::move(datagram));
-}
-
 void MoQClientBase::goaway(const Goaway& goaway) {
   XLOG(DBG1) << __func__;
-  if (!moqSession_) {
-    return;
+  if (moqSession_) {
+    moqSession_->goaway(goaway);
   }
-  moqSession_->goaway(goaway);
 }
 
 void MoQClientBase::setLogger(const std::shared_ptr<MLogger>& logger) {
   logger_ = logger;
+  if (moqSession_) {
+    moqSession_->setLogger(logger_);
+  }
 }
 
 MoQClientBase::SessionFactory MoQClientBase::defaultSessionFactory() {

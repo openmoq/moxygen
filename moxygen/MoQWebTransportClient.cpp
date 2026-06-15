@@ -10,6 +10,7 @@
 #include <proxygen/lib/http/HQConnector.h>
 #include <proxygen/lib/http/session/QuicProtocolInfo.h>
 #include <proxygen/lib/http/webtransport/HTTPWebTransport.h>
+#include <quic/common/address/QuicSocketAddressBridge.h>
 #include <moxygen/MoQFramer.h>
 
 namespace {
@@ -133,8 +134,10 @@ folly::coro::Task<void> MoQWebTransportClient::setupMoQSession(
         logger_->setDcid(*quicInfo->serverConnectionId);
       }
     }
-    logger_->setLocalAddress(session->getLocalAddress());
-    logger_->setPeerAddress(session->getPeerAddress());
+    logger_->setLocalAddress(
+        quic::toFollySocketAddress(session->getLocalAddress()));
+    logger_->setPeerAddress(
+        quic::toFollySocketAddress(session->getPeerAddress()));
   }
 
   // Establish WebTransport session
@@ -148,8 +151,9 @@ folly::coro::Task<void> MoQWebTransportClient::setupMoQSession(
   session->drain();
   wt = wtTry.value();
 
-  co_await completeSetupMoQSession(
+  completeSetupMoQSession(
       wt, std::nullopt, std::move(publishHandler), std::move(subscribeHandler));
+  co_await awaitSetupComplete();
 }
 
 void MoQWebTransportClient::HTTPHandler::onHeadersComplete(
@@ -195,7 +199,9 @@ void MoQWebTransportClient::HTTPHandler::onError(
   }
   // the moq session has been torn down...
   XLOG(ERR) << folly::exceptionStr(ex);
-  client_.onSessionEnd(folly::none);
+  if (moqSession_) {
+    moqSession_->onSessionEnd(folly::none);
+  }
 }
 
 } // namespace moxygen

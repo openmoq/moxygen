@@ -50,7 +50,7 @@ class SubscriptionHandle {
   virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) = 0;
 
-  const SubscribeOk& subscribeOk() const {
+  virtual const SubscribeOk& subscribeOk() const {
     return *subscribeOk_;
   }
 
@@ -108,7 +108,7 @@ class Publisher {
     virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
         RequestUpdate reqUpdate) = 0;
 
-    const FetchOk& fetchOk() const {
+    virtual const FetchOk& fetchOk() const {
       return *fetchOk_;
     }
 
@@ -145,7 +145,7 @@ class Publisher {
     virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
         RequestUpdate reqUpdate) = 0;
 
-    const SubscribeNamespaceOk& subscribeNamespaceOk() const {
+    virtual const SubscribeNamespaceOk& subscribeNamespaceOk() const {
       return *subscribeNamespaceOk_;
     }
 
@@ -184,8 +184,10 @@ class Publisher {
   }
 
   // On successful SUBSCRIBE_TRACKS, a SubscribeTracksHandle is returned,
-  // which the caller can use to unsubscribe from the tracks or update the
-  // request.
+  // which the caller can use to unsubscribe from the tracks. The message
+  // has no updateable per-request state, so REQUEST_UPDATE is not accepted
+  // on SUBSCRIBE_TRACKS bidi streams; the requestUpdate() override below
+  // remains for interface compatibility but always returns NOT_SUPPORTED.
   class SubscribeTracksHandle {
    public:
     SubscribeTracksHandle() = default;
@@ -199,7 +201,7 @@ class Publisher {
     virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
         RequestUpdate reqUpdate) = 0;
 
-    const SubscribeTracksOk& subscribeTracksOk() const {
+    virtual const SubscribeTracksOk& subscribeTracksOk() const {
       return *subscribeTracksOk_;
     }
 

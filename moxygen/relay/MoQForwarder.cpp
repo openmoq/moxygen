@@ -5,6 +5,7 @@
  */
 
 #include "moxygen/relay/MoQForwarder.h"
+#include <folly/logging/xlog.h>
 #include "moxygen/MoQTrackProperties.h"
 
 namespace moxygen {
@@ -54,7 +55,8 @@ folly::Expected<folly::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::forEachSubscriberSubgroup(
     Fn&& fn,
     bool makeNew,
-    const std::string& callsite) {
+    const std::string& callsite,
+    bool beginsWithFirstObjectForNewSubgroups) {
   if (!forwarder_) {
     return folly::makeUnexpected(
         MoQPublishError(MoQPublishError::CANCELLED, "Forwarder detached"));
@@ -112,11 +114,10 @@ MoQForwarder::SubgroupForwarder::forEachSubscriberSubgroup(
       XCHECK(sub->trackConsumer);
       XLOG(DBG2) << "Making new subgroup for consumer=" << sub->trackConsumer
                  << " " << callsite;
+      auto options = options_;
+      options.beginsWithFirstObject = beginsWithFirstObjectForNewSubgroups;
       auto res = sub->trackConsumer->beginSubgroup(
-          identifier_.group,
-          identifier_.subgroup,
-          priority_,
-          containsLastInGroup_);
+          identifier_.group, identifier_.subgroup, priority_, options);
       if (res.hasError()) {
         forwarder_->removeSubscriberOnError(*sub, res.error(), callsite);
       } else {
@@ -146,6 +147,9 @@ MoQForwarder::MoQForwarder(
 MoQForwarder::~MoQForwarder() {
   for (auto& [id, subgroupForwarder] : subgroups_) {
     subgroupForwarder->detach();
+  }
+  for (auto& [_, sub] : subscribers_) {
+    sub->detach();
   }
 }
 
@@ -391,7 +395,7 @@ folly::Expected<SubscribeRange, FetchError> MoQForwarder::resolveJoiningFetch(
     return folly::makeUnexpected(
         FetchError{RequestID(0), FetchErrorCode::INTERNAL_ERROR, "No largest"});
   }
-  CHECK(
+  XCHECK(
       joining.fetchType == FetchType::RELATIVE_JOINING ||
       joining.fetchType == FetchType::ABSOLUTE_JOINING);
   auto& largest = *subIt->second->subscribeOk().largest;
@@ -468,6 +472,7 @@ void MoQForwarder::removeSubscriberIt(
       removeForwardingSubscriber();
     }
   }
+  subIt->second->detach();
   subscribers_.erase(subIt);
   XLOG(DBG1) << "subscribers_.size()=" << subscribers_.size();
   checkAndFireOnEmpty();
@@ -575,7 +580,7 @@ MoQForwarder::beginSubgroup(
     uint64_t groupID,
     uint64_t subgroupID,
     Priority priority,
-    bool containsLastInGroup) {
+    BeginSubgroupOptions options) {
   updateLargest(groupID, 0);
   SubgroupIdentifier subgroupIdentifier({groupID, subgroupID});
 
@@ -611,7 +616,7 @@ MoQForwarder::beginSubgroup(
   }
 
   auto subgroupForwarder = std::make_shared<SubgroupForwarder>(
-      *this, groupID, subgroupID, priority, containsLastInGroup);
+      *this, groupID, subgroupID, priority, options);
   auto res = forEachSubscriber([&](const std::shared_ptr<Subscriber>& sub) {
     if (!checkRange(*sub) || !sub->checkShouldForward()) {
       return;
@@ -622,7 +627,7 @@ MoQForwarder::beginSubgroup(
       return;
     }
     auto sgRes = sub->trackConsumer->beginSubgroup(
-        groupID, subgroupID, priority, containsLastInGroup);
+        groupID, subgroupID, priority, options);
     if (sgRes.hasError()) {
       removeSubscriberOnError(*sub, sgRes.error(), "beginSubgroup");
     } else {
@@ -679,6 +684,11 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::publishDone(
     PublishDone pubDone) {
   XLOG(DBG1) << __func__ << " pubDone reason=" << pubDone.reasonPhrase;
   draining_ = true;
+  if (callback_) {
+    // Signal source termination before draining subscribers, so any owning
+    // registry can release this forwarder (identity-scoped via the pointer).
+    callback_->onPublishDone(this);
+  }
   forEachSubscriber([&](const std::shared_ptr<Subscriber>& sub) {
     drainSubscriberByKey(
         sub->mapKey,
@@ -752,7 +762,7 @@ MoQForwarder::Subscriber::Subscriber(
       requestID(sid),
       range(r),
       trackConsumer(std::move(tc)),
-      forwarder(f),
+      forwarder(&f),
       shouldForward(shouldForwardIn) {}
 
 void MoQForwarder::Subscriber::setPublisherGroupOrder(
@@ -777,12 +787,12 @@ void MoQForwarder::Subscriber::setExtensions(Extensions extensions) {
 PublishRequest MoQForwarder::Subscriber::getPublishRequest() const {
   return PublishRequest{
       RequestID(0),
-      forwarder.fullTrackName(),
+      forwarder->fullTrackName(),
       TrackAlias(0),
-      forwarder.groupOrder(),
-      forwarder.largest(),
+      forwarder->groupOrder(),
+      forwarder->largest(),
       shouldForward,
-      forwarder.extensions()};
+      forwarder->extensions()};
 }
 
 void MoQForwarder::Subscriber::setParam(const TrackRequestParameter& param) {
@@ -802,32 +812,32 @@ void MoQForwarder::Subscriber::setParam(const TrackRequestParameter& param) {
 }
 
 void MoQForwarder::Subscriber::updateForwardState(bool newForward) {
-  if (passive) {
-    shouldForward = newForward;
-    return;
-  }
+  XCHECK(forwarder);
   auto wasForwarding = shouldForward;
   shouldForward = newForward;
   if (shouldForward && !wasForwarding) {
-    forwarder.addForwardingSubscriber();
+    forwarder->addForwardingSubscriber();
   } else if (wasForwarding && !shouldForward) {
-    forwarder.removeForwardingSubscriber();
+    forwarder->removeForwardingSubscriber();
   }
 }
 
 void MoQForwarder::Subscriber::onPublishOk(const PublishOk& pubOk) {
+  if (!forwarder) {
+    return;
+  }
   // Update subscriber range from PUBLISH_OK
   std::optional<AbsoluteLocation> end;
   if (pubOk.endGroup) {
     end = AbsoluteLocation{*pubOk.endGroup, 0};
   }
   range =
-      toSubscribeRange(pubOk.start, end, pubOk.locType, forwarder.largest());
+      toSubscribeRange(pubOk.start, end, pubOk.locType, forwarder->largest());
 
   updateForwardState(pubOk.forward);
 
   // Handle NEW_GROUP_REQUEST forwarding if present
-  forwarder.tryProcessNewGroupRequest(pubOk.params);
+  forwarder->tryProcessNewGroupRequest(pubOk.params);
 }
 
 folly::coro::Task<folly::Expected<RequestOk, RequestError>>
@@ -863,20 +873,23 @@ MoQForwarder::Subscriber::requestUpdate(RequestUpdate requestUpdate) {
     range.end = newEnd;
   }
 
-  // Only update forward state if explicitly provided (per draft 15+)
-  if (requestUpdate.forward.has_value()) {
-    updateForwardState(*requestUpdate.forward);
+  if (forwarder) {
+    // Only update forward state if explicitly provided (per draft 15+)
+    if (requestUpdate.forward.has_value()) {
+      updateForwardState(*requestUpdate.forward);
+    }
+    // Only update new group request if provided
+    forwarder->tryProcessNewGroupRequest(requestUpdate.params);
   }
-
-  // Only update new group request if provided
-  forwarder.tryProcessNewGroupRequest(requestUpdate.params);
 
   co_return RequestOk{.requestID = requestUpdate.requestID};
 }
 
 void MoQForwarder::Subscriber::unsubscribe() {
-  XLOG(DBG4) << "unsubscribe key=" << mapKey;
-  forwarder.removeSubscriberByKey(mapKey, std::nullopt, "unsubscribe");
+  XLOG(DBG4) << "unsubscribe sess=" << this;
+  if (forwarder) {
+    forwarder->removeSubscriber(session, std::nullopt, "unsubscribe");
+  }
 }
 
 bool MoQForwarder::Subscriber::checkShouldForward() {
@@ -893,11 +906,11 @@ MoQForwarder::SubgroupForwarder::SubgroupForwarder(
     uint64_t group,
     uint64_t subgroup,
     Priority priority,
-    bool containsLastInGroup)
+    TrackConsumer::BeginSubgroupOptions options)
     : forwarder_(&forwarder),
       identifier_{group, subgroup},
       priority_(priority),
-      containsLastInGroup_(containsLastInGroup) {}
+      options_(options) {}
 
 void MoQForwarder::SubgroupForwarder::detach() {
   forwarder_ = nullptr;
@@ -918,6 +931,16 @@ void MoQForwarder::countReceivedObject(uint64_t groupID) {
     lastGroupSeen_ = groupID;
     totalGroupsReceived_++;
   }
+}
+
+bool MoQForwarder::SubgroupForwarder::startsWithFirstObject(uint64_t objectID) {
+  if (!options_.beginsWithFirstObject) {
+    return false;
+  }
+  if (!firstObjectId_) {
+    firstObjectId_ = objectID;
+  }
+  return objectID == *firstObjectId_;
 }
 
 void MoQForwarder::SubgroupForwarder::closeSubgroupForSubscriber(
@@ -962,6 +985,7 @@ MoQForwarder::SubgroupForwarder::object(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
   }
   updateLargest(identifier_.group, objectID);
+  const auto beginsWithFirstObject = startsWithFirstObject(objectID);
   auto res = forEachSubscriberSubgroup(
       [&](const std::shared_ptr<Subscriber>& sub,
           const std::shared_ptr<SubgroupConsumer>& subgroupConsumer) {
@@ -974,7 +998,10 @@ MoQForwarder::SubgroupForwarder::object(
         if (finSubgroup) {
           closeSubgroupForSubscriber(sub, "SubgroupForwarder::object");
         }
-      });
+      },
+      /*makeNew=*/true,
+      "SubgroupForwarder::object",
+      beginsWithFirstObject);
   if (finSubgroup) {
     return removeSubgroupAndCheckEmpty();
   }
@@ -999,6 +1026,7 @@ MoQForwarder::SubgroupForwarder::beginObject(
   if (length > payloadLength) {
     currentObjectLength_ = length - payloadLength;
   }
+  const auto beginsWithFirstObject = startsWithFirstObject(objectID);
   return cleanupOnError(forEachSubscriberSubgroup(
       [&](const std::shared_ptr<Subscriber>& sub,
           const std::shared_ptr<SubgroupConsumer>& subgroupConsumer) {
@@ -1009,7 +1037,10 @@ MoQForwarder::SubgroupForwarder::beginObject(
               forwarder_->handleSubgroupError(
                   *sub, identifier_, err, "SubgroupForwarder::beginObject");
             });
-      }));
+      },
+      /*makeNew=*/true,
+      "SubgroupForwarder::beginObject",
+      beginsWithFirstObject));
 }
 
 folly::Expected<folly::Unit, MoQPublishError>
@@ -1019,6 +1050,7 @@ MoQForwarder::SubgroupForwarder::endOfGroup(uint64_t endOfGroupObjectID) {
         MoQPublishError::API_ERROR, "Still publishing previous object"));
   }
   updateLargest(identifier_.group, endOfGroupObjectID);
+  const auto beginsWithFirstObject = startsWithFirstObject(endOfGroupObjectID);
   forEachSubscriberSubgroup(
       [&](const std::shared_ptr<Subscriber>& sub,
           const std::shared_ptr<SubgroupConsumer>& subgroupConsumer) {
@@ -1028,7 +1060,10 @@ MoQForwarder::SubgroupForwarder::endOfGroup(uint64_t endOfGroupObjectID) {
                   *sub, identifier_, err, "SubgroupForwarder::endOfGroup");
             });
         closeSubgroupForSubscriber(sub, "SubgroupForwarder::endOfGroup");
-      });
+      },
+      /*makeNew=*/true,
+      "SubgroupForwarder::endOfGroup",
+      beginsWithFirstObject);
   // Cleanup operation - succeed even with no subscribers
   return removeSubgroupAndCheckEmpty();
 }
@@ -1041,16 +1076,24 @@ MoQForwarder::SubgroupForwarder::endOfTrackAndGroup(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
   }
   updateLargest(identifier_.group, endOfTrackObjectID);
-  forEachSubscriberSubgroup([&](const std::shared_ptr<Subscriber>& sub,
-                                const std::shared_ptr<SubgroupConsumer>&
-                                    subgroupConsumer) {
-    subgroupConsumer->endOfTrackAndGroup(endOfTrackObjectID)
-        .onError([this, sub](const auto& err) {
-          forwarder_->handleSubgroupError(
-              *sub, identifier_, err, "SubgroupForwarder::endOfTrackAndGroup");
-        });
-    closeSubgroupForSubscriber(sub, "SubgroupForwarder::endOfTrackAndGroup");
-  });
+  const auto beginsWithFirstObject = startsWithFirstObject(endOfTrackObjectID);
+  forEachSubscriberSubgroup(
+      [&](const std::shared_ptr<Subscriber>& sub,
+          const std::shared_ptr<SubgroupConsumer>& subgroupConsumer) {
+        subgroupConsumer->endOfTrackAndGroup(endOfTrackObjectID)
+            .onError([this, sub](const auto& err) {
+              forwarder_->handleSubgroupError(
+                  *sub,
+                  identifier_,
+                  err,
+                  "SubgroupForwarder::endOfTrackAndGroup");
+            });
+        closeSubgroupForSubscriber(
+            sub, "SubgroupForwarder::endOfTrackAndGroup");
+      },
+      /*makeNew=*/true,
+      "SubgroupForwarder::endOfTrackAndGroup",
+      beginsWithFirstObject);
   // Cleanup operation - succeed even with no subscribers
   return removeSubgroupAndCheckEmpty();
 }

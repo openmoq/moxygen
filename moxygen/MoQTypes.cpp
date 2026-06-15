@@ -5,6 +5,7 @@
  */
 
 #include <moxygen/MoQTypes.h>
+#include <moxygen/MoQVersions.h>
 
 #include <folly/Conv.h>
 #include <folly/String.h>
@@ -45,7 +46,7 @@ const char* getFrameTypeString(moxygen::FrameType type) {
 #if defined(__APPLE__)
   __builtin_unreachable();
 #else
-  LOG(FATAL) << "Unreachable";
+  XLOG(FATAL) << "Unreachable";
 #endif
 }
 
@@ -67,7 +68,7 @@ const char* getStreamTypeString(moxygen::StreamType type) {
 #if defined(__APPLE__)
   __builtin_unreachable();
 #else
-  LOG(FATAL) << "Unreachable";
+  XLOG(FATAL) << "Unreachable";
 #endif
 }
 
@@ -86,13 +87,19 @@ const char* getObjectStatusString(moxygen::ObjectStatus objectStatus) {
 #if defined(__APPLE__)
   __builtin_unreachable();
 #else
-  LOG(FATAL) << "Unreachable";
+  XLOG(FATAL) << "Unreachable";
 #endif
 }
 
 } // namespace
 
 namespace moxygen {
+
+PublishDoneStatusCode tooFarBehindCode(uint64_t negotiatedVersion) {
+  return getDraftMajorVersion(negotiatedVersion) <= 16
+      ? PublishDoneStatusCode::TOO_FAR_BEHIND_16
+      : PublishDoneStatusCode::TOO_FAR_BEHIND;
+}
 
 std::string AbsoluteLocation::describe() const {
   return folly::to<std::string>("{", group, ",", object, "}");
@@ -189,12 +196,14 @@ const folly::F14FastSet<FrameType> kAllowedFramesForDeliveryTimeout = {
     FrameType::SUBSCRIBE,
     FrameType::SUBSCRIBE_UPDATE};
 
-// In v16+, DELIVERY_TIMEOUT is allowed in subscriber request messages and
-// PUBLISH_OK
-const folly::F14FastSet<FrameType> kAllowedFramesForDeliveryTimeoutV16 = {
+// In v18+, key 0x02 is OBJECT_DELIVERY_TIMEOUT. REQUEST_OK is accepted at
+// parse time because PUBLISH_OK is encoded on the wire as REQUEST_OK; the
+// PUBLISH_OK conversion validates once the pending request resolves.
+const folly::F14FastSet<FrameType> kAllowedFramesForObjectDeliveryTimeoutV18 = {
+    FrameType::PUBLISH_OK,
+    FrameType::REQUEST_OK,
     FrameType::SUBSCRIBE,
-    FrameType::FETCH,
-    FrameType::PUBLISH_OK};
+    FrameType::REQUEST_UPDATE};
 
 const folly::F14FastSet<FrameType> kAllowedFramesForSubscriberPriority = {
     FrameType::SUBSCRIBE,
@@ -236,6 +245,22 @@ const folly::F14FastSet<FrameType> kAllowedFramesForNewGroupRequest = {
     FrameType::REQUEST_UPDATE,
     FrameType::PUBLISH_OK};
 
+// v18+ SUBGROUP_DELIVERY_TIMEOUT (0x06): MAY appear in PUBLISH_OK,
+// SUBSCRIBE, or REQUEST_UPDATE.
+const folly::F14FastSet<FrameType> kAllowedFramesForSubgroupDeliveryTimeout = {
+    FrameType::PUBLISH_OK,
+    FrameType::REQUEST_OK,
+    FrameType::SUBSCRIBE,
+    FrameType::REQUEST_UPDATE};
+
+// v18+ FILL_TIMEOUT (0x0A): MAY appear in FETCH only.
+const folly::F14FastSet<FrameType> kAllowedFramesForFillTimeout = {
+    FrameType::FETCH};
+
+// v18+ TRACK_NAMESPACE_PREFIX (0x34): MAY appear in REQUEST_UPDATE only.
+const folly::F14FastSet<FrameType> kAllowedFramesForTrackNamespacePrefix = {
+    FrameType::REQUEST_UPDATE};
+
 const folly::F14FastSet<FrameType> kAllowedFramesForTrackFilter = {
     FrameType::SUBSCRIBE_NAMESPACE};
 
@@ -258,6 +283,11 @@ const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
         {TrackRequestParamKey::FORWARD, kAllowedFramesForForward},
         {TrackRequestParamKey::NEW_GROUP_REQUEST,
          kAllowedFramesForNewGroupRequest},
+        {TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT,
+         kAllowedFramesForSubgroupDeliveryTimeout},
+        {TrackRequestParamKey::FILL_TIMEOUT, kAllowedFramesForFillTimeout},
+        {TrackRequestParamKey::TRACK_NAMESPACE_PREFIX,
+         kAllowedFramesForTrackNamespacePrefix},
         {TrackRequestParamKey::TRACK_FILTER, kAllowedFramesForTrackFilter},
 };
 
@@ -268,9 +298,26 @@ const folly::F14FastSet<FrameType> kAllowAllParamsFrameTypes = {
     FrameType::SETUP,
 };
 
-bool Parameters::isKnownParamKey(uint64_t key) {
-  return kParamAllowlist.find(static_cast<TrackRequestParamKey>(key)) !=
-      kParamAllowlist.end();
+// Parameter keys introduced in draft 18 that reuse no earlier key value. They
+// must be treated as unknown (and therefore rejected) when the negotiated draft
+// is below 18.
+static bool isV18OnlyParamKey(TrackRequestParamKey key) {
+  switch (key) {
+    case TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT:
+    case TrackRequestParamKey::FILL_TIMEOUT:
+    case TrackRequestParamKey::TRACK_NAMESPACE_PREFIX:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool Parameters::isKnownParamKey(uint64_t key, uint64_t majorVersion) {
+  auto typedKey = static_cast<TrackRequestParamKey>(key);
+  if (majorVersion < 18 && isV18OnlyParamKey(typedKey)) {
+    return false;
+  }
+  return kParamAllowlist.find(typedKey) != kParamAllowlist.end();
 }
 
 bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
@@ -279,15 +326,25 @@ bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
     return true;
   }
 
+  if (key == TrackRequestParamKey::OBJECT_DELIVERY_TIMEOUT &&
+      majorVersion_.has_value() && *majorVersion_ >= 18) {
+    return kAllowedFramesForObjectDeliveryTimeoutV18.contains(frameType_);
+  }
+
   // v16+ version-specific restrictions for track property params
   if (majorVersion_.has_value() && *majorVersion_ >= 16) {
     switch (key) {
       case TrackRequestParamKey::MAX_CACHE_DURATION:
-      case TrackRequestParamKey::PUBLISHER_PRIORITY:
-        // These are extensions-only in v16+, not allowed as params
+        // Key 0x04 is reinterpreted as RENDEZVOUS_TIMEOUT in v18+; allowed
+        // only on SUBSCRIBE. In v16/v17 it remains MAX_CACHE_DURATION which
+        // is extensions-only.
+        if (*majorVersion_ >= 18 && frameType_ == FrameType::SUBSCRIBE) {
+          return true;
+        }
         return false;
-      case TrackRequestParamKey::DELIVERY_TIMEOUT:
-        return kAllowedFramesForDeliveryTimeoutV16.contains(frameType_);
+      case TrackRequestParamKey::PUBLISHER_PRIORITY:
+        // Extensions-only in v16+, not allowed as a param.
+        return false;
       default:
         break;
     }
@@ -298,6 +355,12 @@ bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
   if (majorVersion_.has_value() && *majorVersion_ >= 18 &&
       key == TrackRequestParamKey::FORWARD &&
       frameType_ == FrameType::SUBSCRIBE_NAMESPACE) {
+    return false;
+  }
+
+  // v18-only parameter keys.
+  if (isV18OnlyParamKey(key) &&
+      (!majorVersion_.has_value() || *majorVersion_ < 18)) {
     return false;
   }
 
@@ -396,7 +459,7 @@ Fetch::Fetch(
       priority(p),
       groupOrder(g),
       args(JoiningFetch(jsid, joiningStart, fetchType)) {
-  CHECK(
+  XCHECK(
       fetchType == FetchType::RELATIVE_JOINING ||
       fetchType == FetchType::ABSOLUTE_JOINING);
   for (const auto& param : pa) {

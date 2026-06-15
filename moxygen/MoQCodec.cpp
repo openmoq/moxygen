@@ -19,7 +19,7 @@ void MoQCodec::onIngressStart(std::unique_ptr<folly::IOBuf> data) {
 folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrameHeaderType(
     folly::io::Cursor& cursor,
     size_t& remainingLength) {
-  auto type = quic::follyutils::decodeQuicInteger(cursor);
+  auto type = moqFrameParser_.decodeVarint(cursor);
   if (!type) {
     XLOG(DBG6) << __func__ << " underflow";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -172,7 +172,7 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
   while (!connError_ && ingress_.chainLength() > totalBytesConsumed) {
     switch (parseState_) {
       case ParseState::STREAM_HEADER_TYPE: {
-        auto type = quic::follyutils::decodeQuicInteger(cursor);
+        auto type = moqFrameParser_.decodeVarint(cursor);
         if (!type) {
           XLOG(DBG6) << __func__ << " underflow";
           connError_ = ErrorCode::PARSE_UNDERFLOW;
@@ -282,7 +282,7 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
           // Normal object header
           curObjectHeader_ = std::get<ObjectHeader>(fetchRes->value);
         } else {
-          DCHECK(streamType_ == StreamType::SUBGROUP_HEADER_SG);
+          XDCHECK(streamType_ == StreamType::SUBGROUP_HEADER_SG);
           auto subgroupRes = moqFrameParser_.parseSubgroupObjectHeader(
               cursor, remainingLength, curObjectHeader_, subgroupOptions_);
           if (subgroupRes.hasError()) {
@@ -515,7 +515,8 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       auto res = moqFrameParser_.parseRequestUpdate(cursor, curFrameLength_);
       if (res) {
         if (auto rid = getStreamRequestID()) {
-          res->requestID = *rid;
+          // Stream is bound to the existing request; update has its own id.
+          res->existingRequestID = *rid;
         }
         if (callback_) {
           callback_->onRequestUpdate(std::move(res.value()));
@@ -561,9 +562,8 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       auto res = moqFrameParser_.parseRequestError(
           cursor, curFrameLength_, curFrameType_);
       if (res) {
-        if (auto rid = getStreamRequestID()) {
-          res->requestID = *rid;
-        }
+        // TODO(draft-18): drop the on-wire requestID per spec §10.6 and
+        // substitute stream id for terminal / FIFO for post-terminal here.
         if (callback_) {
           callback_->onRequestError(std::move(res.value()), curFrameType_);
         }
@@ -606,6 +606,12 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       break;
     }
     case FrameType::PUBLISH_OK: {
+      if (getDraftMajorVersion(*moqFrameParser_.getVersion()) >= 18) {
+        XLOG(ERR) << "Received deprecated PUBLISH_OK frame in version="
+                  << getDraftMajorVersion(*moqFrameParser_.getVersion());
+        return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+      }
+
       auto res = moqFrameParser_.parsePublishOk(cursor, curFrameLength_);
       if (res) {
         if (callback_) {
@@ -693,9 +699,8 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       auto res = moqFrameParser_.parseRequestOk(
           cursor, curFrameLength_, curFrameType_);
       if (res) {
-        if (auto rid = getStreamRequestID()) {
-          res->requestID = *rid;
-        }
+        // TODO(draft-18): drop the on-wire requestID per spec §10.5 and
+        // substitute stream id for terminal / FIFO for post-terminal here.
         if (callback_) {
           callback_->onRequestOk(std::move(res.value()), curFrameType_);
         }

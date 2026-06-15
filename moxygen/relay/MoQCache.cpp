@@ -806,7 +806,7 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
       uint64_t groupID,
       uint64_t subgroupID,
       Priority priority,
-      bool /*containsLastInGroup*/ = false) override {
+      BeginSubgroupOptions options = {}) override {
     // TODO: Handle containsLastInGroup parameter when caching
     // Check if the group is known to not exist
     if (isGroupNonExistent(track_.gaps, groupID)) {
@@ -816,7 +816,7 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
       return folly::makeUnexpected(MoQPublishError(
           MoQPublishError::MALFORMED_TRACK, "Invalid status change"));
     }
-    auto res = consumer_->beginSubgroup(groupID, subgroupID, priority);
+    auto res = consumer_->beginSubgroup(groupID, subgroupID, priority, options);
     if (res.hasValue() && !track_.evicted) {
       track_.getOrCreateGroupWithEviction(groupID, cache_, ftn_);
       return std::make_shared<SubgroupWriteback>(
@@ -1339,7 +1339,7 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetch(
     std::shared_ptr<FetchConsumer> consumer,
     std::shared_ptr<Publisher> upstream) {
   auto standalone = std::get_if<StandaloneFetch>(&fetch.args);
-  CHECK(standalone);
+  XCHECK(standalone);
   auto emplaceResult =
       cache_.emplace(fetch.fullTrackName, std::make_shared<CacheTrack>());
   auto trackIt = emplaceResult.first;
@@ -1443,7 +1443,7 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchImpl(
   XLOG(DBG1) << "fetchImpl for {" << standalone->start.group << ","
              << standalone->start.object << "}, {" << standalone->end.group
              << "," << standalone->end.object << "}";
-  CHECK(standalone);
+  XCHECK(standalone);
   auto token = co_await folly::coro::co_current_cancellation_token;
   std::optional<AbsoluteLocation> fetchStart;
   bool servedOneObject = false;
