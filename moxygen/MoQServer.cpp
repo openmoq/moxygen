@@ -7,12 +7,14 @@
 #include "moxygen/MoQServer.h"
 #include <folly/Portability.h>
 #include <folly/String.h>
+#include <folly/logging/xlog.h>
 #include <folly/net/NetOps.h>
 #include <proxygen/httpserver/samples/hq/FizzContext.h>
 #include <proxygen/lib/http/session/HQSession.h>
 #include <proxygen/lib/http/webtransport/HTTPWebTransport.h>
 #include <proxygen/lib/http/webtransport/QuicWebTransport.h>
 #include <proxygen/lib/http/webtransport/QuicWtSession.h>
+#include <quic/common/address/QuicSocketAddressBridge.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
 
 #include <utility>
@@ -121,12 +123,12 @@ MoQServer::MoQServer(
 
 void MoQServer::registerAlpnHandler(const std::vector<std::string>& alpns) {
   if (!factory_) {
-    XLOG(INFO) << "Cannot register ALPN handler: factory not initialized";
+    XLOG(DBG1) << "Cannot register ALPN handler: factory not initialized";
     return;
   }
 
   if (hqServer_) {
-    XLOG(INFO) << "Cannot register ALPN handler: server already started";
+    XLOG(DBG1) << "Cannot register ALPN handler: server already started";
     return;
   }
 
@@ -187,8 +189,8 @@ void MoQServer::createMoQQuicSession(
   // Capture connection IDs and addresses before moving the socket
   auto clientCid = quicSocket->getClientConnectionId();
   auto serverCid = quicSocket->getServerConnectionId();
-  auto peerAddress = quicSocket->getPeerAddress();
-  auto localAddress = quicSocket->getLocalAddress();
+  auto peerAddress = quic::toFollySocketAddress(quicSocket->getPeerAddress());
+  auto localAddress = quic::toFollySocketAddress(quicSocket->getLocalAddress());
 
   auto qevb = quicSocket->getEventBase();
   const bool useQuicWtSession = useQuicWtSession_ && useQuicWtSession_();
@@ -326,7 +328,7 @@ void MoQServer::Handler::onHeadersComplete(
         negotiatedProtocol = wtProtocol.value();
         XLOG(DBG1) << "WebTransport: Negotiated protocol: " << *wtProtocol;
       } else {
-        VLOG(4) << "Failed to negotiate WebTransport protocol";
+        XLOG(DBG4) << "Failed to negotiate WebTransport protocol";
         resp.setStatusCode(400);
       }
     }
@@ -361,8 +363,10 @@ void MoQServer::Handler::onHeadersComplete(
         if (auto serverCid = quicSocket->getServerConnectionId()) {
           logger->setSrcCid(*serverCid);
         }
-        logger->setPeerAddress(quicSocket->getPeerAddress());
-        logger->setLocalAddress(quicSocket->getLocalAddress());
+        logger->setPeerAddress(
+            quic::toFollySocketAddress(quicSocket->getPeerAddress()));
+        logger->setLocalAddress(
+            quic::toFollySocketAddress(quicSocket->getLocalAddress()));
       }
     }
     clientSession_->setLogger(logger);

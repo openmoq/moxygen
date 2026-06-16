@@ -9,6 +9,7 @@
 #include <folly/Expected.h>
 #include <folly/hash/Hash.h>
 #include <folly/io/IOBuf.h>
+#include <folly/logging/xlog.h>
 #include <algorithm>
 #include <limits>
 #include <optional>
@@ -89,12 +90,19 @@ enum class PublishDoneStatusCode : uint32_t {
   TRACK_ENDED = 0x2,
   SUBSCRIPTION_ENDED = 0x3,
   GOING_AWAY = 0x4,
-  EXPIRED = 0x5,
-  TOO_FAR_BEHIND = 0x6,
+  TOO_FAR_BEHIND = 0x5, // use tooFarBehindCode(version) on the wire
+  EXPIRED = 0x6,
+  TOO_FAR_BEHIND_16 = 0x6, // draft <= 16 value, swapped with EXPIRED in d18
   UPDATE_FAILED = 0x8,
+  EXCESSIVE_LOAD = 0x9,
+  MALFORMED_TRACK = 0x12,
   //
   SESSION_CLOSED = std::numeric_limits<uint32_t>::max()
 };
+
+// Returns the on-wire PUBLISH_DONE code for TOO_FAR_BEHIND for
+// negotiatedVersion
+PublishDoneStatusCode tooFarBehindCode(uint64_t negotiatedVersion);
 
 enum class TrackStatusCode : uint32_t {
   IN_PROGRESS = 0x0,
@@ -115,40 +123,47 @@ enum class TrackStatusCode : uint32_t {
 // Consolidated error code enum for all request types
 enum class RequestErrorCode : uint32_t {
   // Shared error codes (same semantic meaning across request types)
-  INTERNAL_ERROR = 0,
-  UNAUTHORIZED = 1,
-  TIMEOUT = 2,
-  NOT_SUPPORTED = 3,
-  TRACK_NOT_EXIST = 4,
-  INVALID_RANGE = 5,
-
-  // Note: Pending draft update
-  GOING_AWAY = 6,
-
-  // SubscribeNamespace-specific codes
-  NAMESPACE_PREFIX_UNKNOWN = 4, // Same value as TRACK_NOT_EXIST
-
-  // PublishNamespace-specific codes
-  UNINTERESTED = 4, // Same value as TRACK_NOT_EXIST
-
+  INTERNAL_ERROR = 0x0,
+  UNAUTHORIZED = 0x1,
+  TIMEOUT = 0x2,
+  NOT_SUPPORTED = 0x3,
+  MALFORMED_AUTH_TOKEN = 0x4,
+  EXPIRED_AUTH_TOKEN = 0x5,
+  GOING_AWAY = 0x6,
+  EXCESSIVE_LOAD = 0x9, // draft 18+
+  DOES_NOT_EXIST = 0x10,
+  TRACK_NOT_EXIST = 0x10,          // alias of DOES_NOT_EXIST
+  NAMESPACE_PREFIX_UNKNOWN = 0x10, // alias of DOES_NOT_EXIST
+  INVALID_RANGE = 0x11,
+  MALFORMED_TRACK = 0x12,
   DUPLICATE_SUBSCRIPTION = 0x19,
+  UNINTERESTED = 0x20,
 
   // Draft 18+: returned by SUBSCRIBE_TRACKS when the requesting session
   // already has an established SUBSCRIBE_TRACKS at an overlapping prefix
   // (ancestor, descendant, or exact). See draft-ietf-moq-transport §10.19
   // for the semantics and §15.10.2 for the on-wire value.
   PREFIX_OVERLAP = 0x30,
+  NAMESPACE_TOO_LARGE = 0x31, // draft 18+
+  INVALID_JOINING_REQUEST_ID = 0x32,
+  UNSUPPORTED_EXTENSION = 0x33, // draft 18+
+  REDIRECT = 0x34,              // draft 18+
 
   // Special values
   CANCELLED = std::numeric_limits<uint32_t>::max(),
 };
 
 enum class ResetStreamErrorCode : uint32_t {
-  INTERNAL_ERROR = 0,
-  DELIVERY_TIMEOUT = 1,
-  SESSION_CLOSED = 2,
-  CANCELLED = 3,        // received UNSUBSCRIBE / FETCH_CANCEL / STOP_SENDING
-  MALFORMED_TRACK = 12, // track violated protocol ordering constraints
+  INTERNAL_ERROR = 0x0,
+  CANCELLED = 0x1, // received UNSUBSCRIBE / FETCH_CANCEL / STOP_SENDING
+  DELIVERY_TIMEOUT = 0x2,
+  SESSION_CLOSED = 0x3,
+  GOING_AWAY = 0x4,            // draft 18+
+  TOO_FAR_BEHIND = 0x5,        // draft 18+
+  UNKNOWN_OBJECT_STATUS = 0x6, // draft 18+ (was 0x4 in draft 16)
+  EXPIRED_AUTH_TOKEN = 0x7,    // draft 18+
+  EXCESSIVE_LOAD = 0x9,        // draft 18+
+  MALFORMED_TRACK = 0x12,      // track violated protocol ordering constraints
 };
 
 enum class FrameType : uint64_t {
@@ -562,7 +577,11 @@ using TrackRequestParameter = Parameter;
 
 enum class TrackRequestParamKey : uint64_t {
   AUTHORIZATION_TOKEN = 3,
+  // Key 0x02: DELIVERY_TIMEOUT for drafts < 18
+  // OBJECT_DELIVERY_TIMEOUT for drafts >= 18.
   DELIVERY_TIMEOUT = 2,
+  OBJECT_DELIVERY_TIMEOUT = 2,
+  SUBGROUP_DELIVERY_TIMEOUT = 6,
   // Key 0x04: MAX_CACHE_DURATION for drafts < 18
   // RENDEZVOUS_TIMEOUT for drafts >= 18.
   MAX_CACHE_DURATION = 4,
@@ -573,9 +592,11 @@ enum class TrackRequestParamKey : uint64_t {
   EXPIRES = 8,
   GROUP_ORDER = 0x22,
   LARGEST_OBJECT = 0x9,
+  FILL_TIMEOUT = 0x0A,
   FORWARD = 0x10,
   TRACK_FILTER = 0x29,
   NEW_GROUP_REQUEST = 0x32,
+  TRACK_NAMESPACE_PREFIX = 0x34,
 };
 
 inline bool isRendezvousTimeoutParam(uint64_t key, uint64_t majorVersion) {
@@ -601,8 +622,9 @@ class Parameters {
   // Validates if a parameter is allowed for frameType_
   bool isParamAllowed(TrackRequestParamKey key) const;
 
-  // Returns true if key is a known parameter key in kParamAllowlist
-  static bool isKnownParamKey(uint64_t key);
+  // Returns true if key is a known parameter key for the negotiated draft
+  // version. Keys introduced in draft 18 are treated as unknown below v18.
+  static bool isKnownParamKey(uint64_t key, uint64_t majorVersion);
 
   const Parameter& getParam(size_t position) const {
     return params_.at(position);
@@ -637,13 +659,13 @@ class Parameters {
     if (!isParamAllowed(key)) {
       return folly::makeUnexpected(ErrorCode::INVALID_REQUEST_ID);
     }
-    CHECK_LE(position, params_.size());
+    XCHECK_LE(position, params_.size());
     params_.insert(params_.begin() + position, std::move(param));
     return folly::unit;
   }
 
   void eraseParam(size_t position) {
-    CHECK_LT(position, params_.size());
+    XCHECK_LT(position, params_.size());
     params_.erase(params_.begin() + position);
   }
 
@@ -1067,7 +1089,7 @@ struct TrackNamespace {
     return true;
   }
   void trimEnd() {
-    CHECK_GT(size(), 0);
+    XCHECK_GT(size(), 0u);
     trackNamespace.pop_back();
   }
 };
@@ -1262,7 +1284,7 @@ struct JoiningFetch {
       : joiningRequestID(jsid),
         joiningStart(joiningStartIn),
         fetchType(fetchTypeIn) {
-    CHECK(
+    XCHECK(
         fetchType == FetchType::RELATIVE_JOINING ||
         fetchType == FetchType::ABSOLUTE_JOINING);
   }
@@ -1376,12 +1398,22 @@ struct RequestOk {
 
   TrackStatusOk toTrackStatusOk() const;
   static RequestOk fromTrackStatusOk(const TrackStatusOk& trackStatusOk);
+  folly::Expected<PublishOk, ErrorCode> toPublishOk(
+      uint64_t majorVersion) const;
+  static RequestOk fromPublishOk(
+      const PublishOk& publishOk,
+      uint64_t majorVersion);
 };
 
 using SubscribeNamespaceOk = RequestOk;
 using SubscribeTracksOk = RequestOk;
 using PublishNamespaceOk = RequestOk;
 using SubscribeUpdateOk = RequestOk;
+
+struct Redirect {
+  std::string connectUri;
+  FullTrackName fullTrackName;
+};
 
 // Consolidated request error structure
 struct RequestError {
@@ -1393,6 +1425,8 @@ struct RequestError {
   // If the value is 0, the request SHOULD NOT be retried.
   // A value of 1 indicates the request can be retried immediately.
   std::optional<std::chrono::milliseconds> retryInterval = std::nullopt;
+  // Draft 18+: present only when errorCode == REDIRECT.
+  std::optional<Redirect> redirect = std::nullopt;
 };
 
 // Type aliases for backward compatibility

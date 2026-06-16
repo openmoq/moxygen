@@ -43,10 +43,13 @@ std::shared_ptr<MockFetchHandle> makeFetchOkResult(
     const Fetch& fetch,
     const AbsoluteLocation& location);
 
+// At draft 16+, PUBLISHER_PRIORITY moves from param to extension; pass
+// majorVersion so the helper picks the correct mechanism.
 std::shared_ptr<MockSubscriptionHandle> makeSubscribeOkResult(
     const SubscribeRequest& sub,
     const std::optional<AbsoluteLocation>& largest = std::nullopt,
-    const std::optional<uint8_t>& publisherPriority = std::nullopt);
+    const std::optional<uint8_t>& publisherPriority = std::nullopt,
+    uint64_t majorVersion = 0);
 
 TrackStatusOk makeTrackStatusOkResult(
     const TrackStatus& req,
@@ -263,5 +266,14 @@ class MoQSessionTest : public testing::TestWithParam<VersionParams>,
   std::shared_ptr<MockPublisherStats> serverPublisherStatsCallback_;
   TestTimeoutCallback testTimeout_;
 };
+
+// Parameterized to draft 18+ only. Use for tests that exercise bidi request
+// streams, uni control streams, or other draft-18-introduced behavior.
+class Draft18Test : public MoQSessionTest {};
+
+// Parameterized to pre-draft-18 versions only. Use for tests that exercise
+// MAX_REQUEST_ID / REQUESTS_BLOCKED request-ID flow control, which was
+// removed in draft 18 in favor of QUIC bidi stream limits.
+class PreDraft18Test : public MoQSessionTest {};
 
 }} // namespace moxygen::test

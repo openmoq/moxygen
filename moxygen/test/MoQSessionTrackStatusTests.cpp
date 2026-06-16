@@ -30,7 +30,7 @@ CO_TEST_P_X(MoQSessionTest, TrackStatusOk) {
   EXPECT_FALSE(res.hasError());
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
-CO_TEST_P_X(MoQSessionTest, TrackStatusExceptionReleasesRequestID) {
+CO_TEST_P_X(PreDraft18Test, TrackStatusExceptionReleasesRequestID) {
   co_await setupMoQSession();
   auto initialMaxRequestID = serverSession_->maxRequestID();
   EXPECT_CALL(*serverPublisherStatsCallback_, onTrackStatus());
@@ -50,6 +50,40 @@ CO_TEST_P_X(MoQSessionTest, TrackStatusExceptionReleasesRequestID) {
   co_await folly::coro::co_reschedule_on_current_executor;
   // The server should have retired the request ID despite the exception.
   EXPECT_GT(serverSession_->maxRequestID(), initialMaxRequestID);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+// Draft-18 mirror of TrackStatusExceptionReleasesRequestID: when the
+// publisher throws, the trackStatus bidi must reach terminal state on both
+// halves so the QUIC bidi-stream credit is returned and a subsequent request
+// can be issued under a tight stream limit.
+CO_TEST_P_X(Draft18Test, TrackStatusExceptionReleasesBidiStreamCredit) {
+  clientWt_->setMaxLocalBidiStreams(1);
+  co_await setupMoQSession();
+
+  EXPECT_CALL(*serverPublisherStatsCallback_, onTrackStatus()).Times(2);
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onTrackStatus()).Times(2);
+  EXPECT_CALL(*serverPublisher, trackStatus(_))
+      .WillOnce(
+          [](TrackStatus) -> folly::coro::Task<Publisher::TrackStatusResult> {
+            co_yield folly::coro::co_error(
+                std::runtime_error("trackStatus exploded"));
+          })
+      .WillOnce(
+          [](TrackStatus request)
+              -> folly::coro::Task<Publisher::TrackStatusResult> {
+            co_return makeTrackStatusOkResult(request, AbsoluteLocation{0, 0});
+          });
+
+  auto first = co_await clientSession_->trackStatus(getTrackStatus());
+  EXPECT_TRUE(first.hasError());
+  // Let both peers complete their FIN/RST handshake on the bidi.
+  co_await folly::coro::co_reschedule_on_current_executor;
+  co_await folly::coro::co_reschedule_on_current_executor;
+
+  // Credit must be replenished — second trackStatus succeeds.
+  auto second = co_await clientSession_->trackStatus(getTrackStatus());
+  EXPECT_FALSE(second.hasError());
+
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 CO_TEST_P_X(MoQSessionTest, TrackStatusWithAuthorizationToken) {
@@ -142,6 +176,7 @@ namespace {
 class ValidatorSession : public MockMoQSession {
  public:
   using MockMoQSession::MockMoQSession;
+  using MoQSession::validateRequestOkParams;
   using MoQSession::validateRequestOkTrackProperties;
 };
 
@@ -239,4 +274,112 @@ TEST(
   EXPECT_TRUE(session->validateRequestOkTrackProperties(
       requestOk, FrameType::REQUEST_OK));
   EXPECT_FALSE(session->isClosed());
+}
+
+// === Param validation tests for REQUEST_OK shorthands (draft 18+) ===
+//
+// REQUEST_OK is parsed against the union of params allowed for any shorthand
+// (e.g. OBJECT_DELIVERY_TIMEOUT lists REQUEST_OK so PUBLISH_OK passes). Once
+// the shorthand resolves, generic params not allowed for it must be rejected.
+// Both MoQSession::onRequestOk and MoQRelaySession::onRequestOk delegate to the
+// shared validateRequestOkParams helper.
+
+namespace {
+RequestOk makeRequestOkWithObjectDeliveryTimeout() {
+  RequestOk requestOk;
+  requestOk.requestID = RequestID(1);
+  requestOk.params.setMajorVersion(getDraftMajorVersion(kVersionDraft18));
+  requestOk.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::OBJECT_DELIVERY_TIMEOUT),
+      uint64_t(1000)));
+  return requestOk;
+}
+} // namespace
+
+TEST(
+    MoQSessionRequestOkParamsValidation,
+    AllowsObjectDeliveryTimeoutForPublishOk) {
+  auto session = makeValidatorSession(kVersionDraft18);
+  auto requestOk = makeRequestOkWithObjectDeliveryTimeout();
+  EXPECT_TRUE(
+      session->validateRequestOkParams(requestOk, FrameType::PUBLISH_OK));
+  EXPECT_FALSE(session->isClosed());
+}
+
+TEST(
+    MoQSessionRequestOkParamsValidation,
+    RejectsObjectDeliveryTimeoutForNonPublishOkShorthands) {
+  // OBJECT_DELIVERY_TIMEOUT is valid for PUBLISH_OK but not for these
+  // REQUEST_OK shorthands (spec 10.2.4). The parser accepts the superset;
+  // resolution must reject it here with PROTOCOL_VIOLATION.
+  for (auto frameType :
+       {FrameType::TRACK_STATUS_OK,
+        FrameType::SUBSCRIBE_NAMESPACE_OK,
+        FrameType::PUBLISH_NAMESPACE_OK}) {
+    auto session = makeValidatorSession(kVersionDraft18);
+    CloseCallbackRecorder recorder;
+    session->setSessionCloseCallback(&recorder);
+    auto requestOk = makeRequestOkWithObjectDeliveryTimeout();
+
+    EXPECT_FALSE(session->validateRequestOkParams(requestOk, frameType))
+        << "frameType=" << folly::to_underlying(frameType);
+    EXPECT_TRUE(session->isClosed())
+        << "frameType=" << folly::to_underlying(frameType);
+    EXPECT_EQ(recorder.lastError, SessionCloseErrorCode::PROTOCOL_VIOLATION)
+        << "frameType=" << folly::to_underlying(frameType);
+  }
+}
+
+TEST(MoQSessionRequestOkParamsValidation, PreDraft18SkipsParamValidation) {
+  // Pre-18 each shorthand had its own frame type, so there is no superset to
+  // re-check; the validator is a no-op.
+  auto session = makeValidatorSession(kVersionDraft17);
+  RequestOk requestOk;
+  requestOk.requestID = RequestID(1);
+  EXPECT_TRUE(
+      session->validateRequestOkParams(requestOk, FrameType::TRACK_STATUS_OK));
+  EXPECT_FALSE(session->isClosed());
+}
+
+// Peer FINs the TRACK_STATUS bidi before TRACK_STATUS_OK / TRACK_STATUS_ERROR;
+// the sender's coroutine must resolve with a synthesized TrackStatusError.
+CO_TEST_P_X(Draft18Test, TrackStatusFailsOnPeerFinWithoutReply) {
+  co_await setupMoQSession();
+
+  folly::coro::Baton serverSawRequest;
+  folly::coro::Baton releaseHandler;
+  EXPECT_CALL(*serverPublisher, trackStatus(_))
+      .WillOnce(
+          [&](TrackStatus request)
+              -> folly::coro::Task<Publisher::TrackStatusResult> {
+            serverSawRequest.post();
+            co_await releaseHandler;
+            co_return makeTrackStatusOkResult(request);
+          });
+
+  std::optional<TrackStatusErrorCode> errorCode;
+  folly::coro::Baton done;
+  folly::coro::co_withExecutor(
+      MoQExecutor_.get(),
+      folly::coro::co_invoke([&]() -> folly::coro::Task<void> {
+        auto result = co_await clientSession_->trackStatus(getTrackStatus());
+        if (result.hasError()) {
+          errorCode = result.error().errorCode;
+        }
+        done.post();
+      }))
+      .start();
+
+  co_await serverSawRequest;
+  serverWt_->writeHandles.at(0)->writeStreamData(
+      nullptr, /*fin=*/true, nullptr);
+
+  co_await done;
+  EXPECT_TRUE(errorCode.has_value());
+  if (errorCode.has_value()) {
+    EXPECT_EQ(*errorCode, TrackStatusErrorCode::CANCELLED);
+  }
+
+  releaseHandler.post();
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }

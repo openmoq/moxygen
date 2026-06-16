@@ -1175,6 +1175,30 @@ TEST(MoQCodecTest, ControlStreamRejectsSubscribeTracksV18) {
   serverCodec.onIngress(tracksBuf.move(), false);
 }
 
+TEST(MoQCodecTest, ControlStreamRejectsPublishOkWireTypeV18) {
+  folly::IOBufQueue setupBuf{folly::IOBufQueue::cacheChainLength()};
+  moxygen::Setup setup;
+  setup.params.insertParam(
+      Parameter(folly::to_underlying(SetupKey::PATH), "/foo"));
+  writeClientSetup(setupBuf, setup, kVersionDraft18);
+
+  testing::NiceMock<MockMoQCodecCallback> callback;
+  MoQControlCodec serverCodec(MoQControlCodec::Direction::SERVER, &callback);
+  serverCodec.initializeVersion(kVersionDraft18);
+  EXPECT_CALL(callback, onClientSetup(testing::_));
+  serverCodec.onIngress(setupBuf.move(), false);
+
+  MoQFrameWriter draft17Writer;
+  draft17Writer.initializeVersion(kVersionDraft17);
+  folly::IOBufQueue publishOkBuf{folly::IOBufQueue::cacheChainLength()};
+  PublishOk publishOk;
+  publishOk.requestID = RequestID(1);
+  ASSERT_TRUE(draft17Writer.writePublishOk(publishOkBuf, publishOk).hasValue());
+
+  EXPECT_CALL(callback, onConnectionError(ErrorCode::PROTOCOL_VIOLATION));
+  serverCodec.onIngress(publishOkBuf.move(), false);
+}
+
 // SUBSCRIBE_TRACKS arriving on a fresh bidi stream — the new dispatch case in
 // MoQControlCodec::parseFrame should route it to onSubscribeTracks.
 TEST(MoQCodecTest, BidiCodecParsesSubscribeTracksV18) {
@@ -1237,7 +1261,7 @@ TEST(MoQCodecTest, BidiCodecRejectsLegacyWireWhenOnlyV18Listed) {
   testing::NiceMock<MockMoQCodecCallback> callback;
   MoQBidiStreamCodec bidiCodec(
       &callback, {FrameType::SUBSCRIBE_NAMESPACE, FrameType::REQUEST_UPDATE});
-  bidiCodec.initializeVersion(kVersionDraft18);
+  bidiCodec.initializeVersion(kVersionDraft17);
 
   EXPECT_CALL(callback, onConnectionError(ErrorCode::PROTOCOL_VIOLATION));
   bidiCodec.onIngress(buf.move(), false);
@@ -1268,5 +1292,5 @@ TEST(MoQCodecTest, BidiCodecRejectsV18WireWhenOnlyLegacyListed) {
 INSTANTIATE_TEST_SUITE_P(
     MoQCodecTest,
     MoQCodecTest,
-    ::testing::ValuesIn(kSupportedVersions));
+    ::testing::Values(kVersionDraft14, kVersionDraft15, kVersionDraft16));
 } // namespace moxygen::test

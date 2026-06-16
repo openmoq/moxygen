@@ -16,6 +16,7 @@ moxygen_add_library(moxygen_moq_types
   SRCS
     MoQTypes.cpp
   DEPS
+    moxygen_moq_versions
     Folly::folly_container_f14_hash
     Folly::folly_conv
     Folly::folly_logging_logging
@@ -70,6 +71,7 @@ moxygen_add_library(moxygen_moq_location
 
 moxygen_add_library(moxygen_moq
   SRCS
+    BidiStreamControl.cpp
     MoQSession.cpp
   DEPS
     moxygen_events_moq_delivery_timeout_manager
@@ -77,6 +79,7 @@ moxygen_add_library(moxygen_moq
     mvfst::mvfst_priority_http_priority_queue
     Folly::folly_coro_collect
     Folly::folly_coro_future_util
+    Folly::folly_utility
   EXPORTED_DEPS
     moxygen_events_moq_delivery_timer
     moxygen_events_moq_executor
@@ -86,10 +89,13 @@ moxygen_add_library(moxygen_moq
     moxygen_moq_types
     moxygen_stats_moq_stats
     proxygen::proxygen_http_webtransport
+    Folly::folly_cancellation_token
     Folly::folly_container_f14_hash
     Folly::folly_coro_promise
     Folly::folly_coro_task
     Folly::folly_coro_timeout
+    Folly::folly_function
+    Folly::folly_io_iobuf
     Folly::folly_logging_logging
     Folly::folly_maybe_managed_ptr
 )
@@ -248,6 +254,7 @@ moxygen_add_library(moxygen_moq_qmux_server
     mvfst::mvfst_state_transport_settings
     fizz::fizz
     Folly::folly_cancellation_token
+    Folly::folly_function
     Folly::folly_io_async_async_transport
     Folly::folly_io_async_scoped_event_base_thread
     Folly::folly_io_async_server_socket
