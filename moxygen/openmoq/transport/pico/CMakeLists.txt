@@ -39,10 +39,9 @@ if(TARGET picohttp-core)
 endif()
 
 # XLog sink: routes picoquic's internal C-side log events into folly XLOG.
-# Implements a 4th picoquic_unified_logging_t and installs it via
-# quic->text_log_fns. Reaches into picoquic_internal.h (which is not in the
-# public install), so this target needs ${picoquic_SOURCE_DIR}/picoquic on
-# its include path — same trick openmoq_pico_base uses for picohttp headers.
+# Implements a 4th picoquic_unified_logging_t and installs it via picoquic's
+# public picoquic_set_unified_log_fns() setter (added by openmoq/picoquic#28).
+# No internal-header dependency.
 #
 # Opt-in: consumers call installPicoQuicXLogSink(quic) explicitly. Doesn't
 # alter any default-path behavior.
@@ -52,9 +51,9 @@ moxygen_add_library(openmoq_pico_xlog_sink
   EXPORTED_DEPS
     picoquic::picoquic-core
     Folly::folly_logging_logging
+    Folly::folly_range
+    Folly::folly_string
 )
-target_include_directories(openmoq_pico_xlog_sink PRIVATE
-  $<BUILD_INTERFACE:${picoquic_SOURCE_DIR}/picoquic>)
 
 # Shared server base: ALPN selection, picoCallback, per-connection context,
 # onNewConnectionImpl. Used by both the thread-based and EventBase servers.
