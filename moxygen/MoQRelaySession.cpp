@@ -1120,6 +1120,38 @@ class SubNsStreamCallback : public MoQControlCodec::ControlCallback {
   std::shared_ptr<Publisher::NamespacePublishHandle> namespacePublishHandle_;
 };
 
+class SubTracksStreamCallback : public MoQControlCodec::ControlCallback {
+ public:
+  SubTracksStreamCallback(
+      MoQSession* session,
+      std::shared_ptr<Publisher::PublishBlockedHandle> publishBlockedHandle)
+      : session_(session),
+        publishBlockedHandle_(std::move(publishBlockedHandle)) {}
+
+  void onConnectionError(ErrorCode error) override {
+    session_->close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+  }
+
+  void onPublishBlocked(PublishBlocked publishBlocked) override {
+    if (publishBlockedHandle_) {
+      publishBlockedHandle_->publishBlocked(
+          publishBlocked.trackNamespaceSuffix, publishBlocked.trackName);
+    }
+  }
+
+  void onRequestOk(RequestOk ok, FrameType /*frameType*/) override {
+    session_->onRequestOk(std::move(ok), FrameType::REQUEST_OK);
+  }
+
+  void onRequestError(RequestError error, FrameType /*frameType*/) override {
+    session_->onRequestError(std::move(error), FrameType::REQUEST_ERROR);
+  }
+
+ private:
+  MoQSession* session_;
+  std::shared_ptr<Publisher::PublishBlockedHandle> publishBlockedHandle_;
+};
+
 // SubscribeNamespace subscriber methods
 folly::coro::Task<Publisher::SubscribeNamespaceResult>
 MoQRelaySession::subscribeNamespace(
@@ -1414,7 +1446,9 @@ void MoQRelaySession::onUnsubscribeNamespace(UnsubscribeNamespace unsub) {
 
 // Draft 18+: SUBSCRIBE_TRACKS subscriber methods
 folly::coro::Task<Publisher::SubscribeTracksResult>
-MoQRelaySession::subscribeTracks(SubscribeTracks subTracks) {
+MoQRelaySession::subscribeTracks(
+    SubscribeTracks subTracks,
+    std::shared_ptr<PublishBlockedHandle> publishBlockedHandle) {
   XLOG(DBG1) << __func__ << " prefix=" << subTracks.trackNamespacePrefix
              << " sess=" << this;
   if (getDraftMajorVersion(*getNegotiatedVersion()) < 18) {
@@ -1446,9 +1480,14 @@ MoQRelaySession::subscribeTracks(SubscribeTracks subTracks) {
   auto sendResult = sendRequest(
       buf,
       FrameType::REQUEST_OK,
-      /*postTerminal=*/{FrameType::REQUEST_OK, FrameType::REQUEST_ERROR},
+      /*postTerminal=*/
+      {FrameType::REQUEST_OK,
+       FrameType::REQUEST_ERROR,
+       FrameType::PUBLISH_BLOCKED},
       subTracks.requestID,
-      /*minBidiDraftVersion=*/18);
+      /*minBidiDraftVersion=*/18,
+      std::make_unique<SubTracksStreamCallback>(
+          this, std::move(publishBlockedHandle)));
   if (sendResult.hasError()) {
     co_return folly::makeUnexpected(SubscribeTracksError(
         {RequestID(0),
@@ -1493,7 +1532,7 @@ MoQRelaySession::subscribeTracks(SubscribeTracks subTracks) {
 // Draft 18+: SUBSCRIBE_TRACKS publisher methods
 void MoQRelaySession::onSubscribeTracksImpl(
     const SubscribeTracks& subTracks,
-    std::shared_ptr<MessageReply> messageReply) {
+    std::shared_ptr<SubscribeTracksReply> subTracksReply) {
   XLOG(DBG1) << __func__ << " prefix=" << subTracks.trackNamespacePrefix
              << " sess=" << this;
   if (closeSessionIfRequestIDInvalid(subTracks.requestID, false, true)) {
@@ -1507,7 +1546,7 @@ void MoQRelaySession::onSubscribeTracksImpl(
             subTracks.requestID,
             SubscribeTracksErrorCode::GOING_AWAY,
             "Session going away"},
-        std::move(messageReply));
+        std::move(subTracksReply));
     return;
   }
   if (!publishHandler_) {
@@ -1516,26 +1555,29 @@ void MoQRelaySession::onSubscribeTracksImpl(
             subTracks.requestID,
             SubscribeTracksErrorCode::NOT_SUPPORTED,
             "Not a publisher"},
-        std::move(messageReply));
+        std::move(subTracksReply));
     return;
   }
   co_withExecutor(
       exec_.get(),
       co_withCancellation(
           cancellationSource_.getToken(),
-          handleSubscribeTracks(subTracks, std::move(messageReply))))
+          handleSubscribeTracks(subTracks, std::move(subTracksReply))))
       .start();
 }
 
 folly::coro::Task<void> MoQRelaySession::handleSubscribeTracks(
     SubscribeTracks subTracks,
-    std::shared_ptr<MessageReply> messageReply) {
+    std::shared_ptr<SubscribeTracksReply> subTracksReply) {
   co_await folly::coro::co_safe_point;
   folly::RequestContextScopeGuard guard;
   setRequestSession();
+  std::shared_ptr<Publisher::PublishBlockedHandle> publishBlockedHandle =
+      subTracksReply;
   auto subTracksResult = co_await co_awaitTry(co_withCancellation(
       cancellationSource_.getToken(),
-      publishHandler_->subscribeTracks(subTracks)));
+      publishHandler_->subscribeTracks(
+          subTracks, std::move(publishBlockedHandle))));
   if (subTracksResult.hasException()) {
     XLOG(ERR) << "Exception in subscribeTracks publisher callback ex="
               << subTracksResult.exception().what().toStdString();
@@ -1544,27 +1586,27 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeTracks(
             subTracks.requestID,
             SubscribeTracksErrorCode::INTERNAL_ERROR,
             subTracksResult.exception().what().toStdString()},
-        std::move(messageReply));
+        std::move(subTracksReply));
     co_return;
   }
   if (subTracksResult->hasError()) {
     auto err = std::move(subTracksResult->error());
     err.requestID = subTracks.requestID; // In case the app got it wrong
-    subscribeTracksError(err, std::move(messageReply));
+    subscribeTracksError(err, std::move(subTracksReply));
     co_return;
   }
   auto handle = std::move(subTracksResult->value());
   auto subTracksOk = handle->subscribeTracksOk();
-  subscribeTracksOk(subTracksOk, std::move(messageReply));
+  subscribeTracksOk(subTracksOk, std::move(subTracksReply));
   subscribeTracksHandles_[subTracks.requestID] = std::move(handle);
 }
 
 void MoQRelaySession::subscribeTracksOk(
     const RequestOk& subTracksOk,
-    std::shared_ptr<MessageReply>&& messageReply) {
+    std::shared_ptr<SubscribeTracksReply>&& subTracksReply) {
   XLOG(DBG1) << __func__ << " id=" << subTracksOk.requestID << " sess=" << this;
   MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscribeTracksSuccess);
-  auto res = messageReply->ok(subTracksOk);
+  auto res = subTracksReply->ok(subTracksOk);
   if (!res) {
     XLOG(ERR) << "writeSubscribeTracksOk failed sess=" << this;
   }

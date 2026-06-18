@@ -2005,7 +2005,8 @@ folly::Expected<RequestUpdate, ErrorCode> MoQFrameParser::parseRequestUpdate(
   requestUpdate.requestID = requestID->first;
   length -= requestID->second;
 
-  if (getDraftMajorVersion(*version_) >= 14) {
+  if (getDraftMajorVersion(*version_) >= 14 &&
+      getDraftMajorVersion(*version_) < 18) {
     auto existingRequestID = decodeVarint(cursor, length);
     if (!existingRequestID) {
       XLOG(DBG4) << "parseRequestUpdate: UNDERFLOW on existingRequestID";
@@ -2112,13 +2113,16 @@ folly::Expected<SubscribeOk, ErrorCode> MoQFrameParser::parseSubscribeOk(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
   SubscribeOk subscribeOk;
-  auto requestID = decodeVarint(cursor, length);
-  if (!requestID) {
-    XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on requestID";
-    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  // Draft 18+: requestID is implicit from the bidi request stream context.
+  if (getDraftMajorVersion(*version_) < 18) {
+    auto requestID = decodeVarint(cursor, length);
+    if (!requestID) {
+      XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on requestID";
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    length -= requestID->second;
+    subscribeOk.requestID = requestID->first;
   }
-  length -= requestID->second;
-  subscribeOk.requestID = requestID->first;
   auto trackAlias = decodeVarint(cursor, length);
   if (!trackAlias) {
     XLOG(DBG4) << "parseSubscribeOk: UNDERFLOW on trackAlias";
@@ -2270,13 +2274,16 @@ folly::Expected<PublishDone, ErrorCode> MoQFrameParser::parsePublishDone(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
   PublishDone publishDone;
-  auto requestID = decodeVarint(cursor, length);
-  if (!requestID) {
-    XLOG(DBG4) << "parsePublishDone: UNDERFLOW on requestID";
-    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  // Draft 18+: requestID is implicit from the bidi request stream context.
+  if (getDraftMajorVersion(*version_) < 18) {
+    auto requestID = decodeVarint(cursor, length);
+    if (!requestID) {
+      XLOG(DBG4) << "parsePublishDone: UNDERFLOW on requestID";
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    length -= requestID->second;
+    publishDone.requestID = requestID->first;
   }
-  length -= requestID->second;
-  publishDone.requestID = requestID->first;
 
   auto statusCode = decodeVarint(cursor, length);
   if (!statusCode) {
@@ -2730,13 +2737,16 @@ folly::Expected<PublishNamespaceOk, ErrorCode> MoQFrameParser::parseRequestOk(
     size_t length,
     FrameType frameType) const noexcept {
   RequestOk requestOk;
-  auto requestID = decodeVarint(cursor, length);
-  if (!requestID) {
-    XLOG(DBG4) << "parseRequestOk: UNDERFLOW on requestID";
-    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  // Draft 18+: requestID is implicit from the bidi request stream context.
+  if (getDraftMajorVersion(*version_) < 18) {
+    auto requestID = decodeVarint(cursor, length);
+    if (!requestID) {
+      XLOG(DBG4) << "parseRequestOk: UNDERFLOW on requestID";
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    length -= requestID->second;
+    requestOk.requestID = requestID->first;
   }
-  length -= requestID->second;
-  requestOk.requestID = requestID->first;
   if (getDraftMajorVersion(*version_) > 14) {
     // Parse track request params into requestOk.params
     auto numParams = decodeVarint(cursor, length);
@@ -3203,13 +3213,16 @@ folly::Expected<FetchOk, ErrorCode> MoQFrameParser::parseFetchOk(
     folly::io::Cursor& cursor,
     size_t length) const noexcept {
   FetchOk fetchOk;
-  auto res = decodeVarint(cursor, length);
-  if (!res) {
-    XLOG(DBG4) << "parseFetchOk: UNDERFLOW on requestID";
-    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  // Draft 18+: requestID is implicit from the bidi request stream context.
+  if (getDraftMajorVersion(*version_) < 18) {
+    auto res = decodeVarint(cursor, length);
+    if (!res) {
+      XLOG(DBG4) << "parseFetchOk: UNDERFLOW on requestID";
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    fetchOk.requestID = res->first;
+    length -= res->second;
   }
-  fetchOk.requestID = res->first;
-  length -= res->second;
 
   // Check for next two bytes
   if (getDraftMajorVersion(*version_) < 15) {
@@ -3409,6 +3422,37 @@ MoQFrameParser::parseSubscribeTracks(folly::io::Cursor& cursor, size_t length)
   return subscribeTracks;
 }
 
+folly::Expected<PublishBlocked, ErrorCode> MoQFrameParser::parsePublishBlocked(
+    folly::io::Cursor& cursor,
+    size_t length) const noexcept {
+  XCHECK(version_)
+      << "Need to have version_ set in order to parse PUBLISH_BLOCKED";
+  XCHECK_GE(getDraftMajorVersion(*version_), 18u)
+      << "PUBLISH_BLOCKED is draft 18+ only";
+  PublishBlocked publishBlocked;
+
+  // Track Namespace Suffix
+  auto res = parseNamespaceTuple(cursor, length);
+  if (!res) {
+    XLOG(DBG4) << "parsePublishBlocked: error parsing track namespace suffix";
+    return folly::makeUnexpected(res.error());
+  }
+  publishBlocked.trackNamespaceSuffix = TrackNamespace(std::move(res.value()));
+
+  // Track Name Length + Track Name
+  auto trackName = parseFixedString(cursor, length);
+  if (!trackName) {
+    XLOG(DBG4) << "parsePublishBlocked: UNDERFLOW on trackName";
+    return folly::makeUnexpected(trackName.error());
+  }
+  publishBlocked.trackName = std::move(trackName.value());
+
+  if (length > 0) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+  return publishBlocked;
+}
+
 folly::Expected<SubscribeNamespaceOk, ErrorCode>
 MoQFrameParser::parseSubscribeNamespaceOk(
     folly::io::Cursor& cursor,
@@ -3434,17 +3478,16 @@ folly::Expected<RequestError, ErrorCode> MoQFrameParser::parseRequestError(
       << "Invalid frameType passed to parseRequestError: "
       << static_cast<int>(frameType);
 
-  // All error types follow the same pattern: requestID → errorCode →
-  // reasonPhrase
-
-  // Parse requestID
-  auto requestID = decodeVarint(cursor, length);
-  if (!requestID) {
-    XLOG(DBG4) << "parseRequestError: UNDERFLOW on requestID";
-    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  // Draft 18+: requestID is implicit from the bidi request stream context.
+  if (getDraftMajorVersion(*version_) < 18) {
+    auto requestID = decodeVarint(cursor, length);
+    if (!requestID) {
+      XLOG(DBG4) << "parseRequestError: UNDERFLOW on requestID";
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    length -= requestID->second;
+    requestError.requestID = requestID->first;
   }
-  length -= requestID->second;
-  requestError.requestID = requestID->first;
 
   // Parse errorCode
   auto errorCode = decodeVarint(cursor, length);
@@ -5223,7 +5266,8 @@ WriteResult MoQFrameWriter::writeRequestUpdate(
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::SUBSCRIBE_UPDATE, error);
   writeVarint(writeBuf, update.requestID.value, size, error);
-  if (getDraftMajorVersion(*version_) >= 14) {
+  if (getDraftMajorVersion(*version_) >= 14 &&
+      getDraftMajorVersion(*version_) < 18) {
     writeVarint(writeBuf, update.existingRequestID.value, size, error);
   }
 
@@ -5329,7 +5373,10 @@ WriteResult MoQFrameWriter::writeSubscribeOkHelper(
     const SubscribeOk& subscribeOk) const noexcept {
   size_t size = 0;
   bool error = false;
-  writeVarint(writeBuf, subscribeOk.requestID.value, size, error);
+  // Draft 18+: requestID is implicit from the bidi request stream context.
+  if (getDraftMajorVersion(*version_) < 18) {
+    writeVarint(writeBuf, subscribeOk.requestID.value, size, error);
+  }
   writeVarint(writeBuf, subscribeOk.trackAlias.value, size, error);
 
   // For < v15: write expires and groupOrder as fixed fields
@@ -5457,7 +5504,10 @@ WriteResult MoQFrameWriter::writePublishDone(
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::PUBLISH_DONE, error);
-  writeVarint(writeBuf, publishDone.requestID.value, size, error);
+  // Draft 18+: requestID is implicit from the bidi request stream context.
+  if (getDraftMajorVersion(*version_) < 18) {
+    writeVarint(writeBuf, publishDone.requestID.value, size, error);
+  }
   writeVarint(
       writeBuf, folly::to_underlying(publishDone.statusCode), size, error);
   writeVarint(writeBuf, publishDone.streamCount, size, error);
@@ -5668,7 +5718,10 @@ WriteResult MoQFrameWriter::writeRequestOk(
     frameType = FrameType::REQUEST_OK;
   }
   auto sizePtr = writeFrameHeader(writeBuf, frameType, error);
-  writeVarint(writeBuf, requestOk.requestID.value, size, error);
+  // Draft 18+: requestID is implicit from the bidi request stream context.
+  if (getDraftMajorVersion(*version_) < 18) {
+    writeVarint(writeBuf, requestOk.requestID.value, size, error);
+  }
   if (getDraftMajorVersion(*version_) > 14) {
     if (semanticFrameType == FrameType::SUBSCRIBE_NAMESPACE_OK &&
         !requestOk.params.empty()) {
@@ -5955,6 +6008,26 @@ WriteResult MoQFrameWriter::writeSubscribeTracks(
   return size;
 }
 
+WriteResult MoQFrameWriter::writePublishBlocked(
+    folly::IOBufQueue& writeBuf,
+    const PublishBlocked& publishBlocked) const noexcept {
+  XCHECK(version_.has_value())
+      << "Version needs to be set to write publishBlocked";
+  XCHECK_GE(getDraftMajorVersion(*version_), 18u)
+      << "PUBLISH_BLOCKED is draft 18+ only";
+  size_t size = 0;
+  bool error = false;
+  auto sizePtr = writeFrameHeader(writeBuf, FrameType::PUBLISH_BLOCKED, error);
+  writeTrackNamespace(
+      writeBuf, publishBlocked.trackNamespaceSuffix, size, error);
+  writeFixedString(writeBuf, publishBlocked.trackName, size, error);
+  writeSize(sizePtr, size, error, *version_);
+  if (error) {
+    return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
+  }
+  return size;
+}
+
 WriteResult MoQFrameWriter::writeSubscribeNamespaceOk(
     folly::IOBufQueue& writeBuf,
     const SubscribeNamespaceOk& subscribeNamespaceOk) const noexcept {
@@ -6116,7 +6189,10 @@ WriteResult MoQFrameWriter::writeFetchOk(
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::FETCH_OK, error);
-  writeVarint(writeBuf, fetchOk.requestID.value, size, error);
+  // Draft 18+: requestID is implicit from the bidi request stream context.
+  if (getDraftMajorVersion(*version_) < 18) {
+    writeVarint(writeBuf, fetchOk.requestID.value, size, error);
+  }
   if (getDraftMajorVersion(*version_) < 15) {
     auto order = folly::to_underlying(fetchOk.groupOrder);
     writeBuf.append(&order, 1);
@@ -6188,7 +6264,10 @@ WriteResult MoQFrameWriter::writeRequestError(
   }
   auto sizePtr = writeFrameHeader(writeBuf, frameType, error);
 
-  writeVarint(writeBuf, requestError.requestID.value, size, error);
+  // Draft 18+: requestID is implicit from the bidi request stream context.
+  if (getDraftMajorVersion(*version_) < 18) {
+    writeVarint(writeBuf, requestError.requestID.value, size, error);
+  }
   writeVarint(
       writeBuf, folly::to_underlying(requestError.errorCode), size, error);
   // Write retryInterval for version 16+

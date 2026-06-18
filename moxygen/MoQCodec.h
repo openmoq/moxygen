@@ -8,6 +8,8 @@
 
 #include "moxygen/MoQFramer.h"
 
+#include <deque>
+
 namespace moxygen {
 
 class MoQCodec {
@@ -100,6 +102,8 @@ class MoQControlCodec : public MoQCodec {
     virtual void onGoaway(Goaway) {}
     // Draft 18+ only.
     virtual void onSubscribeTracks(SubscribeTracks) {}
+    // Draft 18+ only.
+    virtual void onPublishBlocked(PublishBlocked) {}
   };
 
   enum class Direction { CLIENT, SERVER };
@@ -113,10 +117,21 @@ class MoQControlCodec : public MoQCodec {
   // If ParseResult::BLOCKED is returned, must call onIngress again to restart
   ParseResult onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) override;
 
+ public:
+  // Draft 18+: REQUEST_OK / REQUEST_ERROR carry no on-wire requestID; codec
+  // supplies it (terminal = stream's primary; post-terminal = FIFO).
+  virtual std::optional<RequestID> takeNextResponseRequestID() {
+    return std::nullopt;
+  }
+  virtual bool hasPendingPostTerminalResponse() const {
+    return false;
+  }
+
  protected:
   virtual std::optional<RequestID> getStreamRequestID() const {
     return std::nullopt;
   }
+  virtual void setStreamRequestID(RequestID) {}
 
   virtual bool checkFrameAllowed(FrameType f) {
     const auto major =
@@ -138,7 +153,6 @@ class MoQControlCodec : public MoQCodec {
       case FrameType::PUBLISH_OK:
       case FrameType::PUBLISH_ERROR:
       case FrameType::TRACK_STATUS:
-      case FrameType::TRACK_STATUS_ERROR:
       case FrameType::FETCH:
       case FrameType::FETCH_OK:
       case FrameType::FETCH_ERROR:
@@ -177,6 +191,12 @@ class MoQControlCodec : public MoQCodec {
       case FrameType::SUBSCRIBE_NAMESPACE:
       case FrameType::SUBSCRIBE_TRACKS:
         return false;
+      // Wire type 0xF is TRACK_STATUS_ERROR in drafts < 18, but PUBLISH_BLOCKED
+      // in draft 18+. It shouldn't be allowed on the control stream. It is only
+      // allowed on a SUBSCRIBE_TRACKS stream.
+      case FrameType::TRACK_STATUS_ERROR:
+        return !negotiatedVersion_ ||
+            getDraftMajorVersion(*negotiatedVersion_) < 18;
     }
     return false;
   }
@@ -221,8 +241,9 @@ class MoQBidiStreamCodec : public MoQControlCodec {
       std::optional<FrameType> okType = std::nullopt)
       : MoQControlCodec(Direction::SERVER, callback),
         allowedFrames_(std::move(allowedFrames)),
-        requestID_(requestID),
-        okType_(okType) {
+        streamRequestID_(requestID),
+        okType_(okType),
+        primaryResponseIDConsumed_(!okType_) {
     if (okType_) {
       allowedFrames_.push_back(*okType_);
       allowedFrames_.push_back(FrameType::REQUEST_ERROR);
@@ -248,19 +269,23 @@ class MoQBidiStreamCodec : public MoQControlCodec {
       return false;
     }
     if (!firstFrameSeen_) {
-      // Response-side: first frame on the stream MUST be the terminal reply
-      // (okType or REQUEST_ERROR).
+      // Response-side: first frame MUST be the terminal reply.
       if (okType_ && f != *okType_ && f != FrameType::REQUEST_ERROR) {
         return false;
       }
     } else {
       // Post-first-frame: no fresh request-initiating frame, and a non-
       // REQUEST_OK okType_ (e.g. SUBSCRIBE_OK) may only appear once.
-      // TODO: gate post-terminal REQUEST_OK/REQUEST_ERROR on sender-side queue.
       if (isRequestInitiating(f)) {
         return false;
       }
       if (okType_ && *okType_ != FrameType::REQUEST_OK && f == *okType_) {
+        return false;
+      }
+      // Post-terminal REQUEST_OK / REQUEST_ERROR only valid with a pending
+      // update.
+      if ((f == FrameType::REQUEST_OK || f == FrameType::REQUEST_ERROR) &&
+          !hasPendingPostTerminalResponse()) {
         return false;
       }
     }
@@ -277,13 +302,43 @@ class MoQBidiStreamCodec : public MoQControlCodec {
   }
 
   std::optional<RequestID> getStreamRequestID() const override {
-    return requestID_;
+    return streamRequestID_;
+  }
+
+  void setStreamRequestID(RequestID requestID) override {
+    streamRequestID_ = requestID;
+  }
+
+ public:
+  // Terminal uses the stream's primary request id once. Post-terminal pops from
+  // the queue (sender appends one entry per REQUEST_UPDATE sent).
+  void setResponseIDQueue(std::deque<RequestID>* queue) {
+    responseIDQueue_ = queue;
+  }
+  std::optional<RequestID> takeNextResponseRequestID() override {
+    if (!primaryResponseIDConsumed_) {
+      primaryResponseIDConsumed_ = true;
+      if (streamRequestID_) {
+        return streamRequestID_;
+      }
+    }
+    if (!responseIDQueue_ || responseIDQueue_->empty()) {
+      return std::nullopt;
+    }
+    auto id = responseIDQueue_->front();
+    responseIDQueue_->pop_front();
+    return id;
+  }
+  bool hasPendingPostTerminalResponse() const override {
+    return responseIDQueue_ && !responseIDQueue_->empty();
   }
 
  private:
   std::vector<FrameType> allowedFrames_;
-  std::optional<RequestID> requestID_;
+  std::optional<RequestID> streamRequestID_;
   std::optional<FrameType> okType_;
+  std::deque<RequestID>* responseIDQueue_{nullptr};
+  bool primaryResponseIDConsumed_{false};
   bool firstFrameSeen_{false};
 };
 

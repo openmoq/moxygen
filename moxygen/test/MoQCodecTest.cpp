@@ -1199,6 +1199,36 @@ TEST(MoQCodecTest, ControlStreamRejectsPublishOkWireTypeV18) {
   serverCodec.onIngress(publishOkBuf.move(), false);
 }
 
+// PUBLISH_BLOCKED (wire type 0xF in draft 18) is a request-stream-only message
+// (draft 18 §10.20). It must never be accepted on the control stream, even
+// though 0xF is TRACK_STATUS_ERROR (a control-stream message) in older drafts.
+TEST(MoQCodecTest, ControlStreamRejectsPublishBlockedV18) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft18);
+  folly::IOBufQueue setupBuf{folly::IOBufQueue::cacheChainLength()};
+  moxygen::Setup setup;
+  setup.params.insertParam(
+      Parameter(folly::to_underlying(SetupKey::PATH), "/foo"));
+  writeClientSetup(setupBuf, setup, kVersionDraft18);
+
+  testing::NiceMock<MockMoQCodecCallback> callback;
+  MoQControlCodec serverCodec(MoQControlCodec::Direction::SERVER, &callback);
+  serverCodec.initializeVersion(kVersionDraft18);
+  EXPECT_CALL(callback, onClientSetup(testing::_));
+  serverCodec.onIngress(setupBuf.move(), false);
+
+  // Feed PUBLISH_BLOCKED on the control stream — must be rejected.
+  PublishBlocked publishBlocked;
+  publishBlocked.trackNamespaceSuffix =
+      TrackNamespace(std::vector<std::string>{"example.com", "live"});
+  publishBlocked.trackName = "highlights";
+  folly::IOBufQueue blockedBuf{folly::IOBufQueue::cacheChainLength()};
+  ASSERT_TRUE(
+      writer.writePublishBlocked(blockedBuf, publishBlocked).hasValue());
+  EXPECT_CALL(callback, onConnectionError(ErrorCode::PROTOCOL_VIOLATION));
+  serverCodec.onIngress(blockedBuf.move(), false);
+}
+
 // SUBSCRIBE_TRACKS arriving on a fresh bidi stream — the new dispatch case in
 // MoQControlCodec::parseFrame should route it to onSubscribeTracks.
 TEST(MoQCodecTest, BidiCodecParsesSubscribeTracksV18) {
@@ -1350,6 +1380,96 @@ TEST(MoQCodecTest, BidiCodecRejectsDuplicateRequestOnSameStreamV18) {
   bidiCodec.onIngress(buf.move(), false);
 }
 
+TEST(MoQCodecTest, BidiCodecSetsExistingRequestIdOnRequestUpdateV18) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft18);
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  auto sub = SubscribeRequest::make(
+      FullTrackName({TrackNamespace({"hello"}), "world"}),
+      255,
+      GroupOrder::Default,
+      true,
+      LocationType::LargestObject,
+      std::nullopt,
+      0,
+      {});
+  sub.requestID = RequestID(2);
+  ASSERT_TRUE(writer.writeSubscribeRequest(buf, sub).hasValue());
+
+  RequestUpdate update;
+  update.requestID = RequestID(4);
+  update.existingRequestID = sub.requestID;
+  ASSERT_TRUE(writer.writeRequestUpdate(buf, update).hasValue());
+
+  testing::NiceMock<MockMoQCodecCallback> callback;
+  MoQBidiStreamCodec bidiCodec(
+      &callback, {FrameType::SUBSCRIBE, FrameType::REQUEST_UPDATE});
+  bidiCodec.initializeVersion(kVersionDraft18);
+
+  testing::InSequence seq;
+  EXPECT_CALL(callback, onFrame(FrameType::SUBSCRIBE));
+  EXPECT_CALL(callback, onSubscribe(testing::_))
+      .WillOnce(testing::Invoke([](SubscribeRequest actual) {
+        EXPECT_EQ(actual.requestID, RequestID(2));
+      }));
+  EXPECT_CALL(callback, onFrame(FrameType::REQUEST_UPDATE));
+  EXPECT_CALL(callback, onRequestUpdate(testing::_))
+      .WillOnce(testing::Invoke([](RequestUpdate actual) {
+        EXPECT_EQ(actual.requestID, RequestID(4));
+        EXPECT_EQ(actual.existingRequestID, RequestID(2));
+      }));
+  EXPECT_CALL(callback, onConnectionError(testing::_)).Times(0);
+
+  bidiCodec.onIngress(buf.move(), false);
+}
+
+TEST(MoQCodecTest, BidiRequestSideRequestOkUsesPendingUpdateIdV18) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft18);
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+
+  PublishRequest pub;
+  pub.requestID = RequestID(0);
+  pub.fullTrackName = FullTrackName({TrackNamespace({"hello"}), "world"});
+  pub.trackAlias = TrackAlias(100);
+  pub.groupOrder = GroupOrder::Default;
+  pub.largest = std::nullopt;
+  pub.forward = true;
+  ASSERT_TRUE(writer.writePublish(buf, pub).hasValue());
+
+  RequestOk updateOk;
+  updateOk.requestID = RequestID(999);
+  ASSERT_TRUE(
+      writer.writeRequestOk(buf, updateOk, FrameType::REQUEST_OK).hasValue());
+
+  testing::NiceMock<MockMoQCodecCallback> callback;
+  MoQBidiStreamCodec bidiCodec(
+      &callback,
+      {FrameType::PUBLISH,
+       FrameType::REQUEST_UPDATE,
+       FrameType::REQUEST_OK,
+       FrameType::REQUEST_ERROR});
+  bidiCodec.initializeVersion(kVersionDraft18);
+  std::deque<RequestID> responseIDQueue{RequestID(2)};
+  bidiCodec.setResponseIDQueue(&responseIDQueue);
+
+  testing::InSequence seq;
+  EXPECT_CALL(callback, onFrame(FrameType::PUBLISH));
+  EXPECT_CALL(callback, onPublish(testing::_))
+      .WillOnce(testing::Invoke([](PublishRequest actual) {
+        EXPECT_EQ(actual.requestID, RequestID(0));
+      }));
+  EXPECT_CALL(callback, onFrame(FrameType::REQUEST_OK));
+  EXPECT_CALL(callback, onRequestOk(testing::_, FrameType::REQUEST_OK))
+      .WillOnce(testing::Invoke([](RequestOk actual, FrameType) {
+        EXPECT_EQ(actual.requestID, RequestID(2));
+      }));
+  EXPECT_CALL(callback, onConnectionError(testing::_)).Times(0);
+
+  bidiCodec.onIngress(buf.move(), false);
+  EXPECT_TRUE(responseIDQueue.empty());
+}
+
 // Post-terminal OK semantics on draft-18 bidi response streams. A REQUEST_OK
 // ack of a follow-up REQUEST_UPDATE must pass on both REQUEST_OK-typed and
 // SUBSCRIBE_OK-typed streams; a repeated typed terminal (SUBSCRIBE_OK twice)
@@ -1381,6 +1501,11 @@ TEST(MoQCodecTest, BidiCodecPostTerminalOkV18) {
     MoQBidiStreamCodec codec(
         &callback, std::move(allowedFrames), RequestID(1), okType);
     codec.initializeVersion(kVersionDraft18);
+    // Simulate the sender having dispatched one REQUEST_UPDATE: the codec
+    // FIFO-correlates post-terminal REQUEST_OK / REQUEST_ERROR against this
+    // queue, so a post-terminal OK is only legal when an id is pending.
+    std::deque<RequestID> responseIDQueue{RequestID(2)};
+    codec.setResponseIDQueue(&responseIDQueue);
     EXPECT_CALL(callback, onConnectionError(ErrorCode::PROTOCOL_VIOLATION))
         .Times(expectError ? 1 : 0);
     folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};

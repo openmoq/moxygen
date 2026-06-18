@@ -1497,8 +1497,8 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
       groupID,
       subgroupID,
       pubPriority,
-      SubgroupIDFormat::Present,
-      true,
+      options.subgroupIDFormat,
+      options.includeExtensions,
       options);
 }
 
@@ -2777,11 +2777,13 @@ std::unique_ptr<MoQControlCodec> MoQSession::makeBidiCodec(
     MoQControlCodec::ControlCallback* callback,
     std::vector<FrameType> allowedFrames,
     std::optional<RequestID> requestID,
-    std::optional<FrameType> okType) {
+    std::optional<FrameType> okType,
+    std::deque<RequestID>* responseIDQueue) {
   auto codec = std::make_unique<MoQBidiStreamCodec>(
       callback, std::move(allowedFrames), requestID, okType);
   codec->initializeVersion(*negotiatedVersion_);
   codec->setTokenCache(&receiveTokenCache_);
+  codec->setResponseIDQueue(responseIDQueue);
   return codec;
 }
 
@@ -2793,6 +2795,18 @@ void MoQSession::BidiRequestCallback::onConnectionError(ErrorCode error) {
 void MoQSession::BidiRequestCallback::onRequestUpdate(
     RequestUpdate requestUpdate) {
   session_->onRequestUpdate(std::move(requestUpdate));
+}
+
+void MoQSession::BidiRequestCallback::onRequestOk(
+    RequestOk requestOk,
+    FrameType frameType) {
+  session_->onRequestOk(std::move(requestOk), frameType);
+}
+
+void MoQSession::BidiRequestCallback::onRequestError(
+    RequestError requestError,
+    FrameType frameType) {
+  session_->onRequestError(std::move(requestError), frameType);
 }
 
 bool MoQSession::BidiRequestCallback::handleFirstFrame(RequestID reqId) {
@@ -2829,6 +2843,10 @@ void MoQSession::BidiRequestCallback::onPublish(PublishRequest pub) {
   }
 }
 
+void MoQSession::BidiRequestCallback::onPublishDone(PublishDone publishDone) {
+  session_->onPublishDone(std::move(publishDone));
+}
+
 void MoQSession::BidiRequestCallback::onPublishNamespace(
     PublishNamespace pubNs) {
   if (handleFirstFrame(pubNs.requestID)) {
@@ -2853,8 +2871,8 @@ void MoQSession::BidiRequestCallback::onSubscribeNamespace(
 void MoQSession::BidiRequestCallback::onSubscribeTracks(
     SubscribeTracks subTracks) {
   if (handleFirstFrame(subTracks.requestID)) {
-    auto messageReply = session_->getMessageReply(replyContext_);
-    session_->onSubscribeTracksImpl(subTracks, std::move(messageReply));
+    auto subTracksReply = session_->getSubTracksReply(replyContext_);
+    session_->onSubscribeTracksImpl(subTracks, std::move(subTracksReply));
   }
 }
 
@@ -2995,7 +3013,6 @@ MoQSession::sendRequest(
     bidiStream->writeHandle->writeStreamData(
         writeBuf.move(), /*fin=*/false, nullptr);
     auto* cb = senderCallback ? senderCallback.get() : this;
-    auto codec = makeBidiCodec(cb, std::move(postTerminal), requestID, okType);
     // Any peer close (FIN or RST) before the terminal reply also fails the
     // pending request via failPendingRequestOnEarlyClose in controlReadLoop.
     auto control = std::make_shared<BidiStreamControl>(
@@ -3003,6 +3020,12 @@ MoQSession::sendRequest(
         cancellationSource_.getToken(),
         /*finIsCancellation=*/true);
     control->setRequestID(requestID);
+    auto codec = makeBidiCodec(
+        cb,
+        std::move(postTerminal),
+        requestID,
+        okType,
+        &control->responseIDQueue());
     if (onPeerTermination) {
       control->setOnPeerTermination(std::move(onPeerTermination));
     }
@@ -3151,6 +3174,8 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     TrackConsumer::BeginSubgroupOptions beginOptions;
     beginOptions.containsLastInGroup = options.hasEndOfGroup;
     beginOptions.beginsWithFirstObject = options.beginsWithFirstObject;
+    beginOptions.subgroupIDFormat = options.subgroupIDFormat;
+    beginOptions.includeExtensions = options.hasExtensions;
     auto res = callback->beginSubgroup(
         group, subgroup, effectivePriority, beginOptions);
     if (res.hasValue()) {
@@ -5197,7 +5222,9 @@ Subscriber::PublishResult MoQSession::publish(
       writeBuf,
       FrameType::REQUEST_OK,
       /*postTerminal=*/
-      {FrameType::REQUEST_UPDATE, FrameType::REQUEST_ERROR},
+      {FrameType::REQUEST_UPDATE,
+       FrameType::REQUEST_OK,
+       FrameType::REQUEST_ERROR},
       pub.requestID,
       /*minBidiDraftVersion=*/18,
       /*senderCallback=*/nullptr,
@@ -5751,6 +5778,11 @@ void MoQSession::requestUpdate(
       XLOG(ERR) << "writeRequestUpdate failed sess=" << this;
       return;
     }
+    // Draft 18+: response REQUEST_OK/ERROR has no wire requestID; record
+    // this update's id so the response codec can correlate FIFO-order.
+    if (getDraftMajorVersion(*negotiatedVersion_) >= 18) {
+      control->responseIDQueue().push_back(reqUpdate.requestID);
+    }
     wh->writeStreamData(buf.move(), /*fin=*/false, nullptr);
   } else {
     auto res = moqFrameWriter_.writeRequestUpdate(controlWriteBuf_, reqUpdate);
@@ -6196,7 +6228,12 @@ std::optional<MoQSession::BidiStreamConfig> MoQSession::getBidiStreamConfig(
             [this](RequestID id) { onFetchCancel(FetchCancel{id}); }};
       case FrameType::PUBLISH:
         return BidiStreamConfig{
-            {FrameType::PUBLISH, FrameType::REQUEST_UPDATE}, nullptr};
+            {FrameType::PUBLISH,
+             FrameType::REQUEST_UPDATE,
+             FrameType::PUBLISH_DONE,
+             FrameType::REQUEST_OK,
+             FrameType::REQUEST_ERROR},
+            nullptr};
       case FrameType::PUBLISH_NAMESPACE:
         // Publisher (sender) closes the stream (FIN or RST) to withdraw
         // the announce — both signal end-of-PUBLISH_NAMESPACE.
@@ -6310,6 +6347,14 @@ folly::coro::Task<void> MoQSession::bidiStreamDemuxer(
       auto* cbPtr = cb.get();
       auto mergedToken = folly::cancellation_token_merge(
           cancellationSource_.getToken(), control->getReadCancelToken());
+      // FIFO-correlate post-terminal REQUEST_OK/ERROR for REQUEST_UPDATEs
+      // this end sends (e.g. PUBLISH bidi).
+      auto codec = makeBidiCodec(
+          cbPtr,
+          config->allowedFrames,
+          /*requestID=*/std::nullopt,
+          /*okType=*/std::nullopt,
+          &control->responseIDQueue());
       co_withExecutor(
           exec_.get(),
           co_withCancellation(
@@ -6317,7 +6362,7 @@ folly::coro::Task<void> MoQSession::bidiStreamDemuxer(
               controlReadLoop(
                   bh.readHandle,
                   std::move(accumulatedData),
-                  makeBidiCodec(cbPtr, config->allowedFrames),
+                  std::move(codec),
                   std::move(cb),
                   std::move(control))))
           .start();
@@ -6855,7 +6900,7 @@ void MoQSession::subscribeNamespaceError(
 // Draft 18+: SUBSCRIBE_TRACKS handlers and helpers
 void MoQSession::onSubscribeTracksImpl(
     const SubscribeTracks& subscribeTracks,
-    std::shared_ptr<MessageReply> messageReply) {
+    std::shared_ptr<SubscribeTracksReply> subTracksReply) {
   XLOG(DBG1) << __func__ << " prefix=" << subscribeTracks.trackNamespacePrefix
              << " - sending NOT_SUPPORTED error, sess=" << this;
   if (receivedGoaway_) {
@@ -6864,7 +6909,7 @@ void MoQSession::onSubscribeTracksImpl(
             subscribeTracks.requestID,
             SubscribeTracksErrorCode::GOING_AWAY,
             "Session received GOAWAY"},
-        std::move(messageReply));
+        std::move(subTracksReply));
     return;
   }
   subscribeTracksError(
@@ -6872,19 +6917,19 @@ void MoQSession::onSubscribeTracksImpl(
           subscribeTracks.requestID,
           SubscribeTracksErrorCode::NOT_SUPPORTED,
           "SubscribeTracks not supported by simple client"},
-      std::move(messageReply));
+      std::move(subTracksReply));
 }
 
 void MoQSession::subscribeTracksError(
     const SubscribeTracksError& subscribeTracksError,
-    std::shared_ptr<MessageReply>&& messageReply) {
+    std::shared_ptr<SubscribeTracksReply>&& subTracksReply) {
   XLOG(DBG1) << __func__ << " reqID=" << subscribeTracksError.requestID.value
              << " sess=" << this;
   MOQ_PUBLISHER_STATS(
       publisherStatsCallback_,
       onSubscribeTracksError,
       subscribeTracksError.errorCode);
-  auto res = messageReply->error(subscribeTracksError);
+  auto res = subTracksReply->error(subscribeTracksError);
   if (!res) {
     XLOG(ERR) << "writeSubscribeTracksError failed sess=" << this;
   }
@@ -6999,6 +7044,59 @@ WriteResult MessageReply::error(const SubscribeTracksError& errorMsg) {
   // After ERROR the publisher is done with this stream — FIN it.
   replyContext_->flushFinal();
   return res;
+}
+
+WriteResult SubscribeTracksReply::ok(const RequestOk& okMsg) {
+  if (errorSent_ || okSent_) {
+    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
+  }
+  auto res = moqFrameWriter_.writeRequestOk(
+      replyContext_->writeBuf(), okMsg, FrameType::REQUEST_OK);
+  replyContext_->flush();
+  okSent_ = true;
+  flushPendingMessages();
+  return res;
+}
+
+WriteResult SubscribeTracksReply::error(const SubscribeTracksError& errorMsg) {
+  if (okSent_ || errorSent_) {
+    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
+  }
+  auto res = moqFrameWriter_.writeRequestError(
+      replyContext_->writeBuf(), errorMsg, FrameType::REQUEST_ERROR);
+  pendingBuf_.move();
+  replyContext_->flush(/*fin=*/true);
+  errorSent_ = true;
+  return res;
+}
+
+void SubscribeTracksReply::publishBlocked(
+    const TrackNamespace& trackNamespaceSuffix,
+    const std::string& trackName) {
+  if (errorSent_) {
+    XLOG(ERR) << "Ignoring PUBLISH_BLOCKED after REQUEST_ERROR";
+    return;
+  }
+  auto res = moqFrameWriter_.writePublishBlocked(
+      replyContext_->writeBuf(),
+      PublishBlocked{trackNamespaceSuffix, trackName});
+  if (!res) {
+    XLOG(ERR) << "writePublishBlocked failed err=" << uint64_t(res.error());
+    replyContext_->writeBuf().move();
+    return;
+  }
+  if (okSent_) {
+    replyContext_->flush();
+  } else {
+    pendingBuf_.append(replyContext_->writeBuf().move());
+  }
+}
+
+void SubscribeTracksReply::flushPendingMessages() {
+  if (!pendingBuf_.empty()) {
+    replyContext_->writeBuf().append(pendingBuf_.move());
+    replyContext_->flush();
+  }
 }
 
 } // namespace moxygen
