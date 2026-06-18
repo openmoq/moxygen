@@ -6,6 +6,8 @@
 
 #include "moxygen/openmoq/transport/pico/PicoQuicXLogSink.h"
 
+#include <folly/Range.h>
+#include <folly/String.h>
 #include <folly/logging/xlog.h>
 
 #include <cstdarg>
@@ -13,13 +15,9 @@
 #include <cstring>
 #include <string>
 
-// picoquic_internal.h is NOT installed publicly — we reach for it through the
-// picoquic source tree (CMake adds ${picoquic_SOURCE_DIR}/picoquic to our
-// include path). The slot we target is picoquic_quic_t::text_log_fns, defined
-// only in this internal header. Same trick picoquic's own qlog backend uses.
 extern "C" {
 #include "picoquic.h"
-#include "picoquic_internal.h"
+#include "picoquic_set_unified_log_fns.h"
 #include "picoquic_unified_log.h"
 }
 
@@ -33,14 +31,7 @@ std::string cidToHex(const picoquic_connection_id_t* cid) {
   if (!cid || cid->id_len == 0) {
     return "<empty>";
   }
-  static constexpr char kHex[] = "0123456789abcdef";
-  std::string out;
-  out.reserve(static_cast<size_t>(cid->id_len) * 2);
-  for (uint8_t i = 0; i < cid->id_len; ++i) {
-    out.push_back(kHex[(cid->id[i] >> 4) & 0x0f]);
-    out.push_back(kHex[cid->id[i] & 0x0f]);
-  }
-  return out;
+  return folly::hexlify(folly::ByteRange{cid->id, cid->id_len});
 }
 
 // Stable short connection identifier (first 8 hex chars of initial CID).
@@ -236,7 +227,10 @@ extern "C" void xlogLogCcDump(
 
 // ─── the unified-logging struct (process-lifetime) ───────────────────────────
 
-constexpr picoquic_unified_logging_t kXLogBackend = {
+// Non-const because picoquic_set_unified_log_fns() takes a non-const pointer
+// (matching its internal field type). Process-lifetime storage — never mutated
+// at runtime.
+picoquic_unified_logging_t kXLogBackend = {
     // Per-context functions
     .log_quic_app_message = xlogLogQuicAppMessage,
     .log_quic_pdu = xlogLogQuicPdu,
@@ -264,7 +258,10 @@ void installPicoQuicXLogSink(picoquic_quic_t* quic) {
     XLOG(ERR) << "installPicoQuicXLogSink: null quic context";
     return;
   }
-  quic->text_log_fns = const_cast<picoquic_unified_logging_t*>(&kXLogBackend);
+  // Install into the TEXT slot via picoquic's public setter (openmoq/picoquic
+  // landed picoquic_set_unified_log_fns()). Returns -1 only on null args, so
+  // success is guaranteed here given the early-return guard above.
+  picoquic_set_unified_log_fns(quic, PICOQUIC_LOG_SLOT_TEXT, &kXLogBackend);
 }
 
 } // namespace moxygen::openmoq::pico
