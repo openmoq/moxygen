@@ -7,6 +7,7 @@
 #include <folly/logging/xlog.h>
 #include <moxygen/ObjectReceiver.h>
 #include <moxygen/samples/chat/MoQChatClient.h>
+#include <iostream>
 
 #include <folly/init/Init.h>
 #include <folly/io/async/EventBase.h>
@@ -220,7 +221,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQChatClient::subscribe(
     co_return folly::makeUnexpected(
         SubscribeError{
             subscribeReq.requestID,
-            SubscribeErrorCode::TRACK_NOT_EXIST,
+            SubscribeErrorCode::DOES_NOT_EXIST,
             "no such track"});
   }
   if (publisher_) {
