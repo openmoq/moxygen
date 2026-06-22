@@ -424,14 +424,14 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/apply-patches.cmake)
 # forward-compatible no-op until the corresponding upstream shim lands AND
 # the dep's rev pin advances past that merge:
 #   - fizz:     facebookincubator/fizz#168  (LANDED)
-#   - wangle:   facebook/wangle#252         (OPEN)
-#   - mvfst:    facebook/mvfst#456          (OPEN)
+#   - wangle:   facebook/wangle#252         (LANDED)
+#   - mvfst:    facebook/mvfst#456          (LANDED)
 #   - proxygen: afrind WIP, no PR yet       (add PRX_LOGGING_* here when up)
 option(MOXYGEN_LOGGING_FOLLY_XLOG
        "Configure bundled Meta deps (fizz/wangle/mvfst) to use folly XLOG" ON)
 if(MOXYGEN_LOGGING_FOLLY_XLOG)
-    set(FIZZ_LOGGING_FOLLY_LOGGING ON CACHE BOOL "" FORCE)
-    set(WANGLE_LOGGING_FOLLY_LOGGING ON CACHE BOOL "" FORCE)
+    set(FIZZ_LOGGING_BACKEND "XLOG" CACHE STRING "" FORCE)
+    set(WANGLE_LOGGING_BACKEND "XLOG" CACHE STRING "" FORCE)
     set(MVFST_LOGGING_BACKEND "XLOG" CACHE STRING "" FORCE)
 endif()
 
