@@ -313,14 +313,44 @@ FetchContent_Declare(fizz
     GIT_TAG ${_FIZZ_REV}
 )
 
+# Allow overriding wangle repo/rev via -DWANGLE_REPO_OVERRIDE and
+# -DWANGLE_REV_OVERRIDE
+set(WANGLE_REPO_OVERRIDE "" CACHE STRING "Override wangle git repository URL")
+set(WANGLE_REV_OVERRIDE "" CACHE STRING "Override wangle git revision")
+if(WANGLE_REPO_OVERRIDE)
+    set(_WANGLE_REPO "${WANGLE_REPO_OVERRIDE}")
+else()
+    set(_WANGLE_REPO "https://github.com/facebook/wangle.git")
+endif()
+if(WANGLE_REV_OVERRIDE)
+    set(_WANGLE_REV "${WANGLE_REV_OVERRIDE}")
+else()
+    set(_WANGLE_REV "${WANGLE_REV}")
+endif()
+
 FetchContent_Declare(wangle
-    GIT_REPOSITORY https://github.com/facebook/wangle.git
-    GIT_TAG ${WANGLE_REV}
+    GIT_REPOSITORY ${_WANGLE_REPO}
+    GIT_TAG ${_WANGLE_REV}
 )
 
+# Allow overriding mvfst repo/rev via -DMVFST_REPO_OVERRIDE and
+# -DMVFST_REV_OVERRIDE
+set(MVFST_REPO_OVERRIDE "" CACHE STRING "Override mvfst git repository URL")
+set(MVFST_REV_OVERRIDE "" CACHE STRING "Override mvfst git revision")
+if(MVFST_REPO_OVERRIDE)
+    set(_MVFST_REPO "${MVFST_REPO_OVERRIDE}")
+else()
+    set(_MVFST_REPO "https://github.com/facebook/mvfst.git")
+endif()
+if(MVFST_REV_OVERRIDE)
+    set(_MVFST_REV "${MVFST_REV_OVERRIDE}")
+else()
+    set(_MVFST_REV "${MVFST_REV}")
+endif()
+
 FetchContent_Declare(mvfst
-    GIT_REPOSITORY https://github.com/facebook/mvfst.git
-    GIT_TAG ${MVFST_REV}
+    GIT_REPOSITORY ${_MVFST_REPO}
+    GIT_TAG ${_MVFST_REV}
 )
 
 # Allow overriding proxygen repo/rev via -DPROXYGEN_REPO_OVERRIDE and
@@ -387,6 +417,23 @@ macro(find_package PKG_NAME)
 endmacro()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/apply-patches.cmake)
+
+# --- Logging backend for bundled Meta deps (openmoq/moqx#339) ---
+# Drive each dep's logging shim toward folly XLOG so the bundled standalone
+# build produces a homogeneous xlog stack. Each cache var below is a
+# forward-compatible no-op until the corresponding upstream shim lands AND
+# the dep's rev pin advances past that merge:
+#   - fizz:     facebookincubator/fizz#168  (LANDED)
+#   - wangle:   facebook/wangle#252         (LANDED)
+#   - mvfst:    facebook/mvfst#456          (LANDED)
+#   - proxygen: afrind WIP, no PR yet       (add PRX_LOGGING_* here when up)
+option(MOXYGEN_LOGGING_FOLLY_XLOG
+       "Configure bundled Meta deps (fizz/wangle/mvfst) to use folly XLOG" ON)
+if(MOXYGEN_LOGGING_FOLLY_XLOG)
+    set(FIZZ_LOGGING_BACKEND "XLOG" CACHE STRING "" FORCE)
+    set(WANGLE_LOGGING_BACKEND "XLOG" CACHE STRING "" FORCE)
+    set(MVFST_LOGGING_BACKEND "XLOG" CACHE STRING "" FORCE)
+endif()
 
 # When BUNDLE_DEPS or INSTALL_DEPS is ON, build all dep targets so they can be
 # installed. BUNDLE_DEPS additionally prefers static system libs for distribution.
