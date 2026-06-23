@@ -17,7 +17,6 @@
 
 extern "C" {
 #include "picoquic.h"
-#include "picoquic_set_unified_log_fns.h"
 #include "picoquic_unified_log.h"
 }
 
@@ -63,9 +62,13 @@ std::string vformat(const char* fmt, va_list args) {
 }
 
 // ─── per-context callbacks ───────────────────────────────────────────────────
+// Each per-context callback receives `void* log_param` — the value passed to
+// picoquic_register_log_functions(). We pass nullptr (no per-quic state), so
+// log_param is unused.
 
 extern "C" void xlogLogQuicAppMessage(
     picoquic_quic_t* /*quic*/,
+    void* /*log_param*/,
     const picoquic_connection_id_t* cid,
     const char* fmt,
     va_list args) {
@@ -74,6 +77,7 @@ extern "C" void xlogLogQuicAppMessage(
 
 extern "C" void xlogLogQuicPdu(
     picoquic_quic_t* /*quic*/,
+    void* /*log_param*/,
     int receiving,
     uint64_t /*current_time*/,
     uint64_t cid64,
@@ -84,19 +88,31 @@ extern "C" void xlogLogQuicPdu(
              << "stray pdu len=" << packet_length;
 }
 
-extern "C" void xlogLogQuicClose(picoquic_quic_t* /*quic*/) {
+extern "C" void xlogLogQuicClose(
+    picoquic_quic_t* /*quic*/,
+    void* /*log_param*/) {
   // Nothing to release — the XLog sink owns no per-context state.
 }
 
 // ─── per-connection callbacks ────────────────────────────────────────────────
+// Each per-cnx callback receives `void* log_ctx` — the value xlogLogNewConnection
+// seeded into picoquic's per-cnx log_ctx slot. We currently set log_ctx to the
+// cnx pointer itself as a non-null sentinel (NULL would tell the dispatcher to
+// skip this cnx). A follow-up can attach per-cnx state (e.g. MoQ session-id
+// tagger) by allocating a small struct in xlogLogNewConnection and freeing it
+// in xlogLogCloseConnection.
 
-extern "C" void
-xlogLogAppMessage(picoquic_cnx_t* cnx, const char* fmt, va_list args) {
+extern "C" void xlogLogAppMessage(
+    picoquic_cnx_t* cnx,
+    void* /*log_ctx*/,
+    const char* fmt,
+    va_list args) {
   XLOG(INFO) << "[cnx=" << cnxShort(cnx) << "] " << vformat(fmt, args);
 }
 
 extern "C" void xlogLogPdu(
     picoquic_cnx_t* cnx,
+    void* /*log_ctx*/,
     int receiving,
     uint64_t /*current_time*/,
     const struct sockaddr* /*addr_peer*/,
@@ -110,6 +126,7 @@ extern "C" void xlogLogPdu(
 
 extern "C" void xlogLogPacket(
     picoquic_cnx_t* cnx,
+    void* /*log_ctx*/,
     picoquic_path_t* /*path*/,
     int receiving,
     uint64_t /*current_time*/,
@@ -122,6 +139,7 @@ extern "C" void xlogLogPacket(
 
 extern "C" void xlogLogDroppedPacket(
     picoquic_cnx_t* cnx,
+    void* /*log_ctx*/,
     picoquic_path_t* /*path*/,
     struct st_picoquic_packet_header_t* /*ph*/,
     size_t packet_size,
@@ -133,6 +151,7 @@ extern "C" void xlogLogDroppedPacket(
 
 extern "C" void xlogLogBufferedPacket(
     picoquic_cnx_t* cnx,
+    void* /*log_ctx*/,
     picoquic_path_t* /*path*/,
     picoquic_packet_type_enum ptype,
     uint64_t /*current_time*/) {
@@ -142,6 +161,7 @@ extern "C" void xlogLogBufferedPacket(
 
 extern "C" void xlogLogOutgoingPacket(
     picoquic_cnx_t* cnx,
+    void* /*log_ctx*/,
     picoquic_path_t* /*path*/,
     uint8_t* /*bytes*/,
     uint64_t sequence_number,
@@ -156,6 +176,7 @@ extern "C" void xlogLogOutgoingPacket(
 
 extern "C" void xlogLogPacketLost(
     picoquic_cnx_t* cnx,
+    void* /*log_ctx*/,
     picoquic_path_t* /*path*/,
     picoquic_packet_type_enum ptype,
     uint64_t sequence_number,
@@ -171,6 +192,7 @@ extern "C" void xlogLogPacketLost(
 
 extern "C" void xlogLogNegotiatedAlpn(
     picoquic_cnx_t* cnx,
+    void* /*log_ctx*/,
     int is_local,
     uint8_t const* sni,
     size_t sni_len,
@@ -191,6 +213,7 @@ extern "C" void xlogLogNegotiatedAlpn(
 
 extern "C" void xlogLogTransportExtension(
     picoquic_cnx_t* cnx,
+    void* /*log_ctx*/,
     int is_local,
     size_t param_length,
     uint8_t* /*params*/) {
@@ -201,22 +224,37 @@ extern "C" void xlogLogTransportExtension(
 
 extern "C" void xlogLogTlsTicket(
     picoquic_cnx_t* cnx,
+    void* /*log_ctx*/,
     uint8_t* /*ticket*/,
     uint16_t ticket_length) {
   XLOG(DBG2) << "[cnx=" << cnxShort(cnx) << "] "
              << "TLS ticket sz=" << ticket_length;
 }
 
-extern "C" void xlogLogNewConnection(picoquic_cnx_t* cnx) {
+// Lifecycle hook for seeding the per-cnx ctx. NULL *log_ctx tells picoquic's
+// dispatcher to skip every subsequent callback for this cnx — we opt in by
+// stashing a non-null sentinel (the cnx pointer itself).
+extern "C" void xlogLogNewConnection(
+    picoquic_cnx_t* cnx,
+    void* /*log_param*/,
+    void** log_ctx) {
+  if (log_ctx) {
+    *log_ctx = cnx;
+  }
   XLOG(DBG1) << "[cnx=" << cnxShort(cnx) << "] new connection";
 }
 
-extern "C" void xlogLogCloseConnection(picoquic_cnx_t* cnx) {
+extern "C" void xlogLogCloseConnection(
+    picoquic_cnx_t* cnx,
+    void* /*log_ctx*/) {
+  // No per-cnx allocation today, so nothing to free. If log_ctx becomes a
+  // heap-allocated state struct in the future, free it here.
   XLOG(DBG1) << "[cnx=" << cnxShort(cnx) << "] close connection";
 }
 
 extern "C" void xlogLogCcDump(
     picoquic_cnx_t* cnx,
+    void* /*log_ctx*/,
     picoquic_path_t* /*path*/,
     uint64_t /*current_time*/) {
   // Minimal cc-state snapshot. Detailed cc fields are accessible via opaque
@@ -227,9 +265,17 @@ extern "C" void xlogLogCcDump(
 
 // ─── the unified-logging struct (process-lifetime) ───────────────────────────
 
-// Non-const because picoquic_set_unified_log_fns() takes a non-const pointer
-// (matching its internal field type). Process-lifetime storage — never mutated
-// at runtime.
+// Non-const because picoquic_register_log_functions() takes a non-const
+// pointer (the runtime uses the address as a slot-lookup key for the
+// companion picoquic_get_log_params() getter). Process-lifetime storage —
+// never mutated at runtime.
+//
+// log_flush is intentionally nullptr: folly XLOG's async handler drains
+// continuously and sync_level=WARN already escalates important events to
+// synchronous emit on the calling thread. A process-wide LoggerDB flush at
+// every picoquic "sensitive event" call site would crater throughput for
+// negligible durability gain. picoquic's dispatcher gates on
+// (log_flush != NULL), so a null field is the explicit opt-out signal.
 picoquic_unified_logging_t kXLogBackend = {
     // Per-context functions
     .log_quic_app_message = xlogLogQuicAppMessage,
@@ -249,6 +295,7 @@ picoquic_unified_logging_t kXLogBackend = {
     .log_new_connection = xlogLogNewConnection,
     .log_close_connection = xlogLogCloseConnection,
     .log_cc_dump = xlogLogCcDump,
+    .log_flush = nullptr,
 };
 
 } // namespace
@@ -258,10 +305,11 @@ void installPicoQuicXLogSink(picoquic_quic_t* quic) {
     XLOG(ERR) << "installPicoQuicXLogSink: null quic context";
     return;
   }
-  // Install into the TEXT slot via picoquic's public setter (openmoq/picoquic
-  // landed picoquic_set_unified_log_fns()). Returns -1 only on null args, so
-  // success is guaranteed here given the early-return guard above.
-  picoquic_set_unified_log_fns(quic, PICOQUIC_LOG_SLOT_TEXT, &kXLogBackend);
+  // Register into the first free slot of picoquic's log-functions table.
+  // params=nullptr — this sink owns no per-quic state (logging config is
+  // global to folly's LoggerDB). Returns 0 on success, -1 on null args or
+  // full table.
+  picoquic_register_log_functions(quic, &kXLogBackend, /*params=*/nullptr);
 }
 
 } // namespace moxygen::openmoq::pico

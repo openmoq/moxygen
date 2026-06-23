@@ -39,9 +39,8 @@ if(TARGET picohttp-core)
 endif()
 
 # XLog sink: routes picoquic's internal C-side log events into folly XLOG.
-# Implements a 4th picoquic_unified_logging_t and installs it via picoquic's
-# public picoquic_set_unified_log_fns() setter (added by openmoq/picoquic#28).
-# No internal-header dependency.
+# Implements a picoquic_unified_logging_t and registers it via picoquic's
+# generic picoquic_register_log_functions() API. No internal-header dependency.
 #
 # Opt-in: consumers call installPicoQuicXLogSink(quic) explicitly. Doesn't
 # alter any default-path behavior.
