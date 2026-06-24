@@ -54,6 +54,10 @@ DEFINE_uint64(
     delivery_timeout,
     0,
     "Delivery timeout in milliseconds (0 = disabled)");
+DEFINE_uint64(
+    rendezvous_timeout,
+    0,
+    "Rendezvous timeout in milliseconds (0 = disabled, draft 18+ only)");
 DEFINE_bool(
     insecure,
     false,
@@ -106,6 +110,23 @@ SubParams flags2params() {
     return result;
   }
   return result;
+}
+
+void addRendezvousTimeoutParamIfSupported(
+    SubscribeRequest& sub,
+    std::optional<uint64_t> negotiatedVersion) {
+  if (FLAGS_rendezvous_timeout == 0 || !negotiatedVersion.has_value()) {
+    return;
+  }
+  auto majorVersion = getDraftMajorVersion(*negotiatedVersion);
+  if (majorVersion < 18) {
+    return;
+  }
+  sub.params.setMajorVersion(majorVersion);
+  auto insertResult = sub.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::RENDEZVOUS_TIMEOUT),
+      FLAGS_rendezvous_timeout));
+  XCHECK(insertResult.hasValue());
 }
 
 class TextHandler : public ObjectReceiverCallback {
@@ -290,6 +311,9 @@ class MoQTextClient : public Subscriber,
         co_return;
       }
 
+      addRendezvousTimeoutParamIfSupported(
+          sub, moqClient_.getSession()->getNegotiatedVersion());
+
       Publisher::SubscribeResult track;
       if (FLAGS_jafetch || FLAGS_jrfetch) {
         FetchType fetchType = FLAGS_jafetch ? FetchType::ABSOLUTE_JOINING
@@ -444,8 +468,8 @@ int main(int argc, char* argv[]) {
   proxygen::URL url(FLAGS_connect_url);
   std::shared_ptr<MLogger> logger;
   if (!FLAGS_mlog_path.empty()) {
-    logger = std::make_shared<FileMLogger>(VantagePoint::CLIENT);
-    logger->setPath(FLAGS_mlog_path);
+    logger =
+        std::make_shared<FileMLogger>(VantagePoint::CLIENT, FLAGS_mlog_path);
   }
   if (!url.isValid() || !url.hasHost()) {
     XLOG(ERR) << "Invalid url: " << FLAGS_connect_url;
