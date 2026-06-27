@@ -1220,4 +1220,43 @@ TEST_F(MoQForwarderTest, SubscriberDetachedOnForwarderDestruction) {
   subscriber->onPublishOk(pubOk);
 }
 
+// Test: removing the last non-passive subscriber mid-iteration fires onEmpty
+// (passive subscribers still occupy the map), which can destroy the forwarder.
+// forEachSubscriber must not touch the forwarder after that. Repro for the
+// passive-tail use-after-free: the non-passive subscriber is removed during the
+// loop and a passive entry remains to be iterated over a freed forwarder.
+TEST_F(MoQForwarderTest, RemoveLastNonPassiveDuringIterationWithPassiveTail) {
+  auto session = createMockSession();
+
+  auto forwarder = std::make_shared<MoQForwarder>(kFwdTestTrackName);
+  auto callback = std::make_shared<ForwarderDestroyingCallback>(forwarder);
+  forwarder->setCallback(callback);
+
+  // Non-passive subscriber whose objectStream returns a hard error, so it is
+  // removed during forEachSubscriber.
+  auto nonPassiveConsumer = createMockConsumer();
+  EXPECT_CALL(*nonPassiveConsumer, objectStream(_, _, _))
+      .WillOnce(Return(folly::makeUnexpected(
+          MoQPublishError(MoQPublishError::WRITE_ERROR, "transport broken"))));
+  forwarder->addSubscriber(
+      session, /*forward=*/true, nonPassiveConsumer, /*passive=*/false);
+
+  // Passive subscriber that remains in the map after the non-passive is gone.
+  auto passiveConsumer = createMockConsumer();
+  ON_CALL(*passiveConsumer, objectStream(_, _, _))
+      .WillByDefault(Return(folly::makeExpected<MoQPublishError>(folly::unit)));
+  forwarder->addChannelSubscriber(
+      reinterpret_cast<folly::Executor*>(this),
+      /*forward=*/true,
+      passiveConsumer,
+      /*passive=*/true);
+
+  // Fan out an object. The non-passive subscriber errors and is removed; with
+  // only the passive subscriber left, onEmpty fires and destroys the forwarder.
+  // Before the fix, forEachSubscriber then dereferences the freed forwarder.
+  forwarder->objectStream(ObjectHeader(0, 0, 0, 0, 10), test::makeBuf(10));
+
+  EXPECT_EQ(forwarder, nullptr);
+}
+
 } // namespace moxygen::test

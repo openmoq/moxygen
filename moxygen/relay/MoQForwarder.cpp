@@ -443,6 +443,10 @@ void MoQForwarder::removeSubscriber(
 void MoQForwarder::checkAndFireOnEmpty() {
   if (subscribers_.size() == passiveCount_) {
     if (subgroups_.empty()) {
+      if (deferOnEmptyDepth_ > 0) {
+        onEmptyPending_ = true;
+        return;
+      }
       if (callback_) {
         callback_->onEmpty(this);
       }
@@ -589,6 +593,7 @@ MoQForwarder::beginSubgroup(
     uint64_t subgroupID,
     Priority priority,
     BeginSubgroupOptions options) {
+  OnEmptyGuard guard(this);
   updateLargest(groupID, 0);
   SubgroupIdentifier subgroupIdentifier({groupID, subgroupID});
 
@@ -666,6 +671,7 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::objectStream(
     const ObjectHeader& header,
     Payload payload,
     bool lastInGroup) {
+  OnEmptyGuard guard(this);
   updateLargest(header.group, header.id);
   countReceivedObject(header.group);
   return forEachSubscriber([&](const std::shared_ptr<Subscriber>& sub) {
@@ -683,6 +689,7 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::datagram(
     const ObjectHeader& header,
     Payload payload,
     bool lastInGroup) {
+  OnEmptyGuard guard(this);
   updateLargest(header.group, header.id);
   countReceivedObject(header.group);
   return forEachSubscriber([&](const std::shared_ptr<Subscriber>& sub) {
@@ -699,6 +706,7 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::datagram(
 folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::publishDone(
     PublishDone pubDone) {
   XLOG(DBG1) << __func__ << " pubDone reason=" << pubDone.reasonPhrase;
+  OnEmptyGuard guard(this);
   draining_ = true;
   if (callback_) {
     // Signal source termination before draining subscribers, so any owning
@@ -999,6 +1007,7 @@ MoQForwarder::SubgroupForwarder::object(
     Payload payload,
     Extensions extensions,
     bool finSubgroup) {
+  OnEmptyGuard guard(forwarder_);
   if (currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
@@ -1035,6 +1044,7 @@ MoQForwarder::SubgroupForwarder::beginObject(
     Payload initialPayload,
     Extensions extensions) {
   // TODO: use a shared class for object publish state validation
+  OnEmptyGuard guard(forwarder_);
   updateLargest(identifier_.group, objectID);
   if (currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
@@ -1064,6 +1074,7 @@ MoQForwarder::SubgroupForwarder::beginObject(
 
 folly::Expected<folly::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::endOfGroup(uint64_t endOfGroupObjectID) {
+  OnEmptyGuard guard(forwarder_);
   if (currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
@@ -1090,6 +1101,7 @@ MoQForwarder::SubgroupForwarder::endOfGroup(uint64_t endOfGroupObjectID) {
 folly::Expected<folly::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::endOfTrackAndGroup(
     uint64_t endOfTrackObjectID) {
+  OnEmptyGuard guard(forwarder_);
   if (currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
@@ -1119,6 +1131,7 @@ MoQForwarder::SubgroupForwarder::endOfTrackAndGroup(
 
 folly::Expected<folly::Unit, MoQPublishError>
 MoQForwarder::SubgroupForwarder::endOfSubgroup() {
+  OnEmptyGuard guard(forwarder_);
   if (currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Still publishing previous object"));
@@ -1139,6 +1152,7 @@ MoQForwarder::SubgroupForwarder::endOfSubgroup() {
 }
 
 void MoQForwarder::SubgroupForwarder::reset(ResetStreamErrorCode error) {
+  OnEmptyGuard guard(forwarder_);
   forEachSubscriberSubgroup(
       [&](const std::shared_ptr<Subscriber>& sub,
           const std::shared_ptr<SubgroupConsumer>& subgroupConsumer) {
@@ -1152,6 +1166,7 @@ folly::Expected<ObjectPublishStatus, MoQPublishError>
 MoQForwarder::SubgroupForwarder::objectPayload(
     Payload payload,
     bool finSubgroup) {
+  OnEmptyGuard guard(forwarder_);
   if (!currentObjectLength_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Haven't started publishing object"));

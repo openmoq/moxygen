@@ -403,6 +403,28 @@ class MoQForwarder : public TrackConsumer {
   // fires onEmpty callback if so
   void checkAndFireOnEmpty();
 
+  // onEmpty may destroy this forwarder, so a live OnEmptyGuard defers it until
+  // iteration unwinds; the outermost guard re-checks emptiness and fires once.
+  uint32_t deferOnEmptyDepth_{0};
+  bool onEmptyPending_{false};
+  struct OnEmptyGuard {
+    explicit OnEmptyGuard(MoQForwarder* forwarder) : forwarder_(forwarder) {
+      if (forwarder_) {
+        forwarder_->deferOnEmptyDepth_++;
+      }
+    }
+    ~OnEmptyGuard() {
+      if (forwarder_ && --forwarder_->deferOnEmptyDepth_ == 0 &&
+          forwarder_->onEmptyPending_) {
+        forwarder_->onEmptyPending_ = false;
+        forwarder_->checkAndFireOnEmpty();
+      }
+    }
+    OnEmptyGuard(const OnEmptyGuard&) = delete;
+    OnEmptyGuard& operator=(const OnEmptyGuard&) = delete;
+    MoQForwarder* forwarder_;
+  };
+
   // Helper that removes a subscriber given an iterator (avoids lookup)
   void removeSubscriberIt(
       folly::F14FastMap<const void*, std::shared_ptr<Subscriber>>::iterator
