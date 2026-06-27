@@ -5,16 +5,12 @@
  */
 
 #include "moxygen/MoQServer.h"
-#include <folly/Portability.h>
 #include <folly/String.h>
-#include <folly/logging/xlog.h>
-#include <folly/net/NetOps.h>
 #include <proxygen/httpserver/samples/hq/FizzContext.h>
 #include <proxygen/lib/http/session/HQSession.h>
 #include <proxygen/lib/http/webtransport/HTTPWebTransport.h>
 #include <proxygen/lib/http/webtransport/QuicWebTransport.h>
 #include <proxygen/lib/http/webtransport/QuicWtSession.h>
-#include <quic/common/address/QuicSocketAddressBridge.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
 
 #include <utility>
@@ -23,10 +19,6 @@ using namespace quic::samples;
 using namespace proxygen;
 
 namespace moxygen {
-
-namespace {
-constexpr size_t kUdpBufferSize = 1024 * 1024; // 1 MB
-} // namespace
 
 MoQServer::MoQServer(
     std::string cert,
@@ -46,21 +38,21 @@ MoQServer::MoQServer(
               cert,
               key),
           std::move(endpoint),
-          Options{
-              .transportSettings = std::move(transportSettings),
-              .useQuicWtSession = std::move(useQuicWtSession)}) {}
+          std::move(transportSettings),
+          std::move(useQuicWtSession)) {}
 
 MoQServer::MoQServer(
     std::shared_ptr<const fizz::server::FizzServerContext> fizzContext,
     std::string endpoint,
-    Options options)
+    std::optional<quic::TransportSettings> transportSettings,
+    std::function<bool()> useQuicWtSession)
     : MoQServerBase(std::move(endpoint)),
       fizzContext_(std::move(fizzContext)),
-      useQuicWtSession_(std::move(options.useQuicWtSession)) {
+      useQuicWtSession_(std::move(useQuicWtSession)) {
   params_.serverThreads = 1;
   params_.txnTimeout = std::chrono::seconds(60);
-  if (options.transportSettings) {
-    params_.transportSettings = *options.transportSettings;
+  if (transportSettings) {
+    params_.transportSettings = *transportSettings;
   } else {
     // Sensible default values
     params_.transportSettings.defaultCongestionController =
@@ -86,12 +78,9 @@ MoQServer::MoQServer(
   }
 
   // UDP socket buffer sizes
-  params_.udpSendBufferSize = options.udpSendBufferBytes > 0
-      ? options.udpSendBufferBytes
-      : kUdpBufferSize;
-  params_.udpRecvBufferSize = options.udpRecvBufferBytes > 0
-      ? options.udpRecvBufferBytes
-      : kUdpBufferSize;
+  constexpr size_t kUdpBufferSize = 1024 * 1024; // 1 MB
+  params_.udpSendBufferSize = kUdpBufferSize;
+  params_.udpRecvBufferSize = kUdpBufferSize;
 
   // Extract MoQT protocols from the fizz context (filter out "h3")
   std::vector<std::string> quicAlpns;
@@ -102,15 +91,11 @@ MoQServer::MoQServer(
     }
   }
 
+  // Build transport factory and attach per-connection QLogger callback.
   factory_ = std::make_unique<HQServerTransportFactory>(
       params_, [this](HTTPMessage*) { return new Handler(*this); }, nullptr);
-
-  // Configure 0-RTT early data handler with server's default params
-  constexpr uint64_t kDefaultMaxRequestID = 100;
-  constexpr uint64_t kMaxAuthTokenCacheSize = 1024;
-  earlyDataHandler_.setCurrentParams(
-      kDefaultMaxRequestID, kMaxAuthTokenCacheSize);
-  factory_->setDefaultEarlyDataHandler(&earlyDataHandler_);
+  factory_->setQLoggerFactory(
+      [this](quic::VantagePoint vp) { return makeQLogger(vp); });
 
   // Register ALPN handlers for direct QUIC MoQT connections
   XLOG(DBG1) << "MoQServer: Registering ALPN handlers: "
@@ -123,12 +108,12 @@ MoQServer::MoQServer(
 
 void MoQServer::registerAlpnHandler(const std::vector<std::string>& alpns) {
   if (!factory_) {
-    XLOG(DBG1) << "Cannot register ALPN handler: factory not initialized";
+    XLOG(INFO) << "Cannot register ALPN handler: factory not initialized";
     return;
   }
 
   if (hqServer_) {
-    XLOG(DBG1) << "Cannot register ALPN handler: server already started";
+    XLOG(INFO) << "Cannot register ALPN handler: server already started";
     return;
   }
 
@@ -145,24 +130,6 @@ void MoQServer::start(
     const folly::SocketAddress& addr,
     std::vector<folly::EventBase*> evbs) {
   hqServer_->start(addr, std::move(evbs));
-
-  // Warn if the kernel capped our UDP send buffer below what we requested.
-  // Linux doubles the value we set (to account for overhead), so getsockopt
-  // returns 2x the effective buffer size; other platforms report as-is.
-  const int kExpectedSndBuf =
-      static_cast<int>((folly::kIsLinux ? 2 : 1) * params_.udpSendBufferSize);
-  for (int fd : getAllListeningSocketFDs()) {
-    int actual = 0;
-    socklen_t len = sizeof(actual);
-    if (folly::netops::getsockopt(
-            folly::NetworkSocket(fd), SOL_SOCKET, SO_SNDBUF, &actual, &len) ==
-        0) {
-      if (actual < kExpectedSndBuf) {
-        XLOG(WARN) << "UDP send buffer for fd " << fd << " is " << actual
-                   << " bytes (expected " << kExpectedSndBuf << ")";
-      }
-    }
-  }
 }
 
 void MoQServer::stop() {
@@ -189,8 +156,8 @@ void MoQServer::createMoQQuicSession(
   // Capture connection IDs and addresses before moving the socket
   auto clientCid = quicSocket->getClientConnectionId();
   auto serverCid = quicSocket->getServerConnectionId();
-  auto peerAddress = quic::toFollySocketAddress(quicSocket->getPeerAddress());
-  auto localAddress = quic::toFollySocketAddress(quicSocket->getLocalAddress());
+  auto peerAddress = quicSocket->getPeerAddress();
+  auto localAddress = quicSocket->getLocalAddress();
 
   auto qevb = quicSocket->getEventBase();
   const bool useQuicWtSession = useQuicWtSession_ && useQuicWtSession_();
@@ -328,7 +295,7 @@ void MoQServer::Handler::onHeadersComplete(
         negotiatedProtocol = wtProtocol.value();
         XLOG(DBG1) << "WebTransport: Negotiated protocol: " << *wtProtocol;
       } else {
-        XLOG(DBG4) << "Failed to negotiate WebTransport protocol";
+        VLOG(4) << "Failed to negotiate WebTransport protocol";
         resp.setStatusCode(400);
       }
     }
@@ -363,10 +330,8 @@ void MoQServer::Handler::onHeadersComplete(
         if (auto serverCid = quicSocket->getServerConnectionId()) {
           logger->setSrcCid(*serverCid);
         }
-        logger->setPeerAddress(
-            quic::toFollySocketAddress(quicSocket->getPeerAddress()));
-        logger->setLocalAddress(
-            quic::toFollySocketAddress(quicSocket->getLocalAddress()));
+        logger->setPeerAddress(quicSocket->getPeerAddress());
+        logger->setLocalAddress(quicSocket->getLocalAddress());
       }
     }
     clientSession_->setLogger(logger);
