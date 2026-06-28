@@ -24,6 +24,8 @@ class MoQFollyExecutorImpl : public MoQExecutor,
   void scheduleTimeout(
       quic::QuicTimerCallback* callback,
       std::chrono::milliseconds timeout) override;
+
+  folly::Executor::KeepAlive<> getKeepAlive() override;
 };
 
 } // namespace moxygen
