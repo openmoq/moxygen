@@ -32,6 +32,13 @@ class MoQExecutor : public folly::Executor {
   virtual void scheduleTimeout(
       quic::QuicTimerCallback* callback,
       std::chrono::milliseconds timeout) = 0;
+
+  // Token that keeps the backing loop alive while held. Base returns a
+  // non-owning dummy (Executor::keepAliveAcquire() defaults to false); an
+  // EventBase-backed executor overrides this with a real, cross-thread token.
+  virtual folly::Executor::KeepAlive<> getKeepAlive() {
+    return folly::getKeepAliveToken(static_cast<folly::Executor*>(this));
+  }
 };
 
 } // namespace moxygen
