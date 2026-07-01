@@ -18,4 +18,8 @@ void MoQFollyExecutorImpl::scheduleTimeout(
   quic::FollyQuicEventBase::scheduleTimeout(callback, timeout);
 }
 
+folly::Executor::KeepAlive<> MoQFollyExecutorImpl::getKeepAlive() {
+  return folly::getKeepAliveToken(getBackingEventBase());
+}
+
 } // namespace moxygen

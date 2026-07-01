@@ -91,6 +91,14 @@ class MoQServer : public MoQServerBase {
   void setQuicStatsFactory(
       std::unique_ptr<quic::QuicTransportStatsCallbackFactory> factory);
 
+  // Forward a transport-settings override fn to the underlying QuicServer (via
+  // HQServer); it runs per-connection. Call before start(). Any gating (e.g. a
+  // JustKnob) stays in the caller — MoQServer only plumbs the fn through.
+  void setTransportSettingsOverrideFn(
+      quic::QuicServer::TransportSettingsOverrideFn fn) {
+    hqServer_->setTransportSettingsOverrideFn(std::move(fn));
+  }
+
   void stop() override;
 
   // Takeover runtime wrapper methods - forward to underlying QuicServer

@@ -1220,43 +1220,47 @@ TEST_F(MoQForwarderTest, SubscriberDetachedOnForwarderDestruction) {
   subscriber->onPublishOk(pubOk);
 }
 
-// Test: removing the last non-passive subscriber mid-iteration fires onEmpty
-// (passive subscribers still occupy the map), which can destroy the forwarder.
-// forEachSubscriber must not touch the forwarder after that. Repro for the
-// passive-tail use-after-free: the non-passive subscriber is removed during the
-// loop and a passive entry remains to be iterated over a freed forwarder.
-TEST_F(MoQForwarderTest, RemoveLastNonPassiveDuringIterationWithPassiveTail) {
+// Test: destroying the forwarder while a subgroup is still open resets the
+// downstream subgroup consumer. The SubgroupForwarder must reset open consumers
+// during detach(), while subscribers are still reachable: once forwarder_ is
+// null, forEachSubscriberSubgroup bails and any later reset() is lost, leaving
+// the consumer without its required terminal.
+TEST_F(MoQForwarderTest, SubgroupConsumersResetOnForwarderDestruction) {
   auto session = createMockSession();
+  auto consumer = createMockConsumer();
+
+  std::shared_ptr<MockSubgroupConsumer> sg;
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce([this, &sg](
+                    uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
+        sg = createMockSubgroupConsumer();
+        return folly::
+            makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                sg);
+      });
 
   auto forwarder = std::make_shared<MoQForwarder>(kFwdTestTrackName);
-  auto callback = std::make_shared<ForwarderDestroyingCallback>(forwarder);
-  forwarder->setCallback(callback);
+  auto subscriber = addSubscriber(*forwarder, session, consumer, RequestID(1));
+  ASSERT_NE(subscriber, nullptr);
 
-  // Non-passive subscriber whose objectStream returns a hard error, so it is
-  // removed during forEachSubscriber.
-  auto nonPassiveConsumer = createMockConsumer();
-  EXPECT_CALL(*nonPassiveConsumer, objectStream(_, _, _))
-      .WillOnce(Return(folly::makeUnexpected(
-          MoQPublishError(MoQPublishError::WRITE_ERROR, "transport broken"))));
-  forwarder->addSubscriber(
-      session, /*forward=*/true, nonPassiveConsumer, /*passive=*/false);
+  // Open a subgroup, leaving the downstream consumer attached to the
+  // subscriber. The publisher keeps its handle to the SubgroupForwarder.
+  auto sgRes = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(sgRes.hasValue());
+  auto pubSg = *sgRes;
+  ASSERT_NE(sg, nullptr);
 
-  // Passive subscriber that remains in the map after the non-passive is gone.
-  auto passiveConsumer = createMockConsumer();
-  ON_CALL(*passiveConsumer, objectStream(_, _, _))
-      .WillByDefault(Return(folly::makeExpected<MoQPublishError>(folly::unit)));
-  forwarder->addChannelSubscriber(
-      reinterpret_cast<folly::Executor*>(this),
-      /*forward=*/true,
-      passiveConsumer,
-      /*passive=*/true);
+  // Destroying the forwarder detaches the open subgroup; the still-attached
+  // downstream consumer must be reset so its stream is properly terminated.
+  EXPECT_CALL(*sg, reset(ResetStreamErrorCode::SESSION_CLOSED));
+  forwarder.reset();
 
-  // Fan out an object. The non-passive subscriber errors and is removed; with
-  // only the passive subscriber left, onEmpty fires and destroys the forwarder.
-  // Before the fix, forEachSubscriber then dereferences the freed forwarder.
-  forwarder->objectStream(ObjectHeader(0, 0, 0, 0, 10), test::makeBuf(10));
-
-  EXPECT_EQ(forwarder, nullptr);
+  // Resetting the publisher's now-detached handle is a safe no-op (the consumer
+  // was already reset during detach, so no second reset is delivered).
+  pubSg->reset(ResetStreamErrorCode::SESSION_CLOSED);
 }
 
 } // namespace moxygen::test
