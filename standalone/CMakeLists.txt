@@ -577,6 +577,21 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../moxygen moxygen)
 
 moxygen_install_headers(moxygen ${CMAKE_CURRENT_SOURCE_DIR}/../moxygen)
 
+# Regression guard for the per-dependency XLOG category rooting above: drives a
+# short date-server/text-client session and asserts each layer's --logging
+# selector (moxygen=, fizz=, quic.mvfst=, ...) actually scopes to that layer.
+# Needs the sample binaries, so gate on BUILD_SAMPLES as well as BUILD_TESTS.
+if(BUILD_TESTS AND BUILD_SAMPLES)
+  enable_testing()
+  add_test(
+    NAME xlog_category_roots
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/xlog_category_smoke.sh
+            $<TARGET_FILE:moqdateserver> $<TARGET_FILE:moqtextclient>
+  )
+  set_tests_properties(xlog_category_roots PROPERTIES
+    LABELS "logging;smoke" TIMEOUT 120)
+endif()
+
 # =============================================================================
 # Installation (mirrors main CMakeLists.txt)
 # =============================================================================
