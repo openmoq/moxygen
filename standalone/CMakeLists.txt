@@ -465,6 +465,16 @@ if(NOT folly_POPULATED)
     FetchContent_Populate(folly)
     apply_dep_patches(folly "${folly_SOURCE_DIR}")
     set(CMAKE_INSTALL_DIR "lib/cmake/folly" CACHE STRING "" FORCE)
+    # Root this dep's folly XLOG categories at its natural name (folly.*,
+    # fizz.*, quic.mvfst.*, ...) instead of the absolute build path. We do not
+    # own these deps' CMakeLists, so we rewrite __FILE__ from the consumer side
+    # with -fmacro-prefix-map: it strips the FetchContent source root at compile
+    # time, so folly's category derivation yields e.g. folly.logging.xlog.
+    # -fmacro-prefix-map (not -ffile-prefix-map) leaves debug-info paths intact,
+    # stacks across deps without macro-redefinition conflicts, and shortens
+    # __FILE__ *before* folly's own (CMAKE_SOURCE_DIR-scoped, thus ineffective
+    # here) FOLLY_XLOG_STRIP_PREFIXES runs — neutralizing that latent bug too.
+    add_compile_options(-fmacro-prefix-map=${folly_SOURCE_DIR}/=)
     add_subdirectory(${folly_SOURCE_DIR} ${folly_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
@@ -473,6 +483,8 @@ if(NOT fizz_POPULATED)
     FetchContent_Populate(fizz)
     apply_dep_patches(fizz "${fizz_SOURCE_DIR}")
     set(CMAKE_INSTALL_DIR "lib/cmake/fizz" CACHE STRING "" FORCE)
+    # Root fizz XLOG categories at fizz.* (see folly block above).
+    add_compile_options(-fmacro-prefix-map=${fizz_SOURCE_DIR}/=)
     add_subdirectory(${fizz_SOURCE_DIR}/fizz ${fizz_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
@@ -481,6 +493,8 @@ if(NOT wangle_POPULATED)
     FetchContent_Populate(wangle)
     apply_dep_patches(wangle "${wangle_SOURCE_DIR}")
     set(CMAKE_INSTALL_DIR "lib/cmake/wangle" CACHE STRING "" FORCE)
+    # Root wangle XLOG categories at wangle.* (see folly block above).
+    add_compile_options(-fmacro-prefix-map=${wangle_SOURCE_DIR}/=)
     add_subdirectory(${wangle_SOURCE_DIR}/wangle ${wangle_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
@@ -489,6 +503,9 @@ if(NOT mvfst_POPULATED)
     FetchContent_Populate(mvfst)
     apply_dep_patches(mvfst "${mvfst_SOURCE_DIR}")
     # mvfst uses CMAKE_INSTALL_MODULE_DIR, not CMAKE_INSTALL_DIR — no conflict
+    # mvfst's tree is rooted at quic/; map it under quic.mvfst.* (the documented
+    # category) rather than colliding with picoquic at a bare quic.* root.
+    add_compile_options(-fmacro-prefix-map=${mvfst_SOURCE_DIR}/quic/=quic/mvfst/)
     add_subdirectory(${mvfst_SOURCE_DIR} ${mvfst_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
@@ -497,6 +514,8 @@ if(NOT proxygen_POPULATED)
     FetchContent_Populate(proxygen)
     apply_dep_patches(proxygen "${proxygen_SOURCE_DIR}")
     set(CMAKE_INSTALL_DIR "lib/cmake/proxygen" CACHE STRING "" FORCE)
+    # Root proxygen XLOG categories at proxygen.* (see folly block above).
+    add_compile_options(-fmacro-prefix-map=${proxygen_SOURCE_DIR}/=)
     add_subdirectory(${proxygen_SOURCE_DIR} ${proxygen_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
@@ -547,6 +566,13 @@ if(BUILD_TESTS)
 endif()
 
 # Include moxygen's main CMakeLists.txt
+# Root moxygen XLOG categories at moxygen.* from the consumer side too, so
+# moxygen=DBG4 works in this build immediately — independent of whether
+# moxygen's own FOLLY_XLOG_STRIP_PREFIXES fix has landed/synced yet. Resolve the
+# root to an absolute, ..-free path so it matches the compiler's __FILE__.
+get_filename_component(_MOXYGEN_ROOT
+  "${CMAKE_CURRENT_SOURCE_DIR}/../moxygen" ABSOLUTE)
+add_compile_options(-fmacro-prefix-map=${_MOXYGEN_ROOT}/=)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../moxygen moxygen)
 
 moxygen_install_headers(moxygen ${CMAKE_CURRENT_SOURCE_DIR}/../moxygen)
