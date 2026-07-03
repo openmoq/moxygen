@@ -793,7 +793,8 @@ MoQFrameParser::parseIntParam(
     folly::io::Cursor& cursor,
     size_t& length,
     uint64_t version,
-    uint64_t key) const noexcept {
+    uint64_t key,
+    ParamsType paramsType) const noexcept {
   Parameter p;
   p.key = key;
   auto res = decodeVarint(cursor, length);
@@ -805,6 +806,13 @@ MoQFrameParser::parseIntParam(
   p.asUint64 = res->first;
 
   if (!isIntParamValid(version, p.key, p.asUint64)) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+
+  if (paramsType == ParamsType::Request &&
+      getDraftMajorVersion(version) <= 16 &&
+      key == folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT) &&
+      p.asUint64 == 0) {
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   return p;
@@ -831,7 +839,7 @@ MoQFrameParser::parseV18ParamValue(
       return Parameter(key, static_cast<uint64_t>(value));
     }
     case ParamValueEncoding::Varint:
-      return parseIntParam(cursor, length, version, key);
+      return parseIntParam(cursor, length, version, key, paramsType);
     case ParamValueEncoding::Location: {
       auto loc = parseAbsoluteLocation(cursor, length);
       if (!loc) {
@@ -901,7 +909,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseParams(
           key !=
               folly::to_underlying(
                   TrackRequestParamKey::AUTHORIZATION_TOKEN)))) {
-      res = parseIntParam(cursor, length, version, key);
+      res = parseIntParam(cursor, length, version, key, paramsType);
     } else if (
         key == folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT)) {
       if (getDraftMajorVersion(version) < 15) {
@@ -4730,6 +4738,12 @@ void MoQFrameWriter::writeParamValue(
           folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT) ||
       param.key ==
           folly::to_underlying(TrackRequestParamKey::MAX_CACHE_DURATION)) {
+    XCHECK(
+        param.key !=
+            folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT) ||
+        param.asUint64 != 0 || !version_.has_value() ||
+        getDraftMajorVersion(*version_) >= 17)
+        << "Cannot write a DELIVERY_TIMEOUT of 0 for draft versions <= 16";
     writeVarint(writeBuf, param.asUint64, size, error);
   } else if ((param.key & 0x01) == 0) {
     writeVarint(writeBuf, param.asUint64, size, error);

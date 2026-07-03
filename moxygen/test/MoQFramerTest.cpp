@@ -680,6 +680,35 @@ TEST(MoQFramerTest, ParseClientSetupWithUnknownAndSupportedVersions) {
   EXPECT_EQ(it->asString, "/foo/bar");
 }
 
+TEST(MoQFramerTest, Draft16AllowsZeroMaxRequestIDSetupParam) {
+  folly::IOBufQueue payloadBuf{folly::IOBufQueue::cacheChainLength()};
+  size_t payloadSize = 0;
+  bool error = false;
+
+  for (auto value :
+       {uint64_t{1},
+        folly::to_underlying(SetupKey::MAX_REQUEST_ID),
+        uint64_t{0}}) {
+    writeVarint(payloadBuf, value, payloadSize, error);
+  }
+  ASSERT_FALSE(error);
+
+  auto payload = payloadBuf.move();
+  for (auto parseSetup :
+       {&MoQFrameParser::parseClientSetup, &MoQFrameParser::parseServerSetup}) {
+    MoQFrameParser parser;
+    parser.initializeVersion(kVersionDraft16);
+    folly::io::Cursor cursor(payload.get());
+    auto result = (parser.*parseSetup)(cursor, payloadSize);
+    ASSERT_TRUE(result.hasValue());
+    ASSERT_EQ(result->params.size(), 1);
+    EXPECT_EQ(
+        result->params.at(0).key,
+        folly::to_underlying(SetupKey::MAX_REQUEST_ID));
+    EXPECT_EQ(result->params.at(0).asUint64, 0);
+  }
+}
+
 TEST(MoQFramerTest, ParseClientSetupWithOnlyUnsupportedVersionsFails) {
   auto [buf, len] = makeLegacyClientSetupFrame({kVersionDraft03});
   folly::io::Cursor cursor(buf.get());
@@ -1313,6 +1342,81 @@ TEST_P(MoQFramerTest, ParseTrackStatus) {
         folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT));
     EXPECT_EQ(parseResult->params.at(1).asUint64, 999);
   }
+}
+
+// A DELIVERY_TIMEOUT of 0 ("no timeout") is only valid from draft 17 onward.
+// Drafts <= 16 must reject a received 0 with PROTOCOL_VIOLATION and must not
+// write one. (Draft 18 acceptance is covered by the session-level tests.)
+static std::unique_ptr<folly::IOBuf> encodeTrackStatusWithDeliveryTimeout(
+    uint64_t writerVersion,
+    uint64_t deliveryTimeout) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(writerVersion);
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  TrackStatus ts =
+      TrackStatus::make(FullTrackName({TrackNamespace({"hello"}), "world"}));
+  ts.locType = LocationType::LargestObject;
+  ts.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
+      deliveryTimeout));
+  EXPECT_TRUE(writer.writeTrackStatus(writeBuf, ts).hasValue());
+  return writeBuf.move();
+}
+
+TEST(MoQFramerDeliveryTimeoutTest, Draft16RejectsZeroOnParse) {
+  // Encode with a draft-17 writer (which permits 0 and shares draft 16's
+  // parameter wire format), then confirm a draft-16 parser rejects it.
+  auto bytes = encodeTrackStatusWithDeliveryTimeout(kVersionDraft17, 0);
+
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft16);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+
+  folly::io::Cursor cursor(bytes.get());
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  ASSERT_EQ(frameType->first, folly::to_underlying(FrameType::TRACK_STATUS));
+  auto frameLen = cursor.readBE<uint16_t>();
+  auto parseResult = parser.parseTrackStatus(cursor, frameLen);
+  ASSERT_TRUE(parseResult.hasError());
+  EXPECT_EQ(parseResult.error(), ErrorCode::PROTOCOL_VIOLATION);
+}
+
+TEST(MoQFramerDeliveryTimeoutTest, Draft17AcceptsZeroOnParse) {
+  auto bytes = encodeTrackStatusWithDeliveryTimeout(kVersionDraft17, 0);
+
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft17);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+
+  folly::io::Cursor cursor(bytes.get());
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  ASSERT_EQ(frameType->first, folly::to_underlying(FrameType::TRACK_STATUS));
+  auto frameLen = cursor.readBE<uint16_t>();
+  auto parseResult = parser.parseTrackStatus(cursor, frameLen);
+  ASSERT_TRUE(parseResult.hasValue());
+  EXPECT_EQ(parseResult->params.size(), 1);
+  EXPECT_EQ(
+      parseResult->params.at(0).key,
+      folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT));
+  EXPECT_EQ(parseResult->params.at(0).asUint64, 0);
+}
+
+TEST(MoQFramerDeliveryTimeoutDeathTest, Draft16WriteZeroDies) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft16);
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  TrackStatus ts =
+      TrackStatus::make(FullTrackName({TrackNamespace({"hello"}), "world"}));
+  ts.locType = LocationType::LargestObject;
+  ts.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT), 0));
+  EXPECT_DEATH(
+      writer.writeTrackStatus(writeBuf, ts),
+      "Cannot write a DELIVERY_TIMEOUT of 0 for draft versions <= 16");
 }
 
 TEST_P(MoQFramerTest, ParseTrackStatusOk) {

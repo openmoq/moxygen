@@ -496,7 +496,8 @@ class MoQFrameParser {
       folly::io::Cursor& cursor,
       size_t& length,
       uint64_t version,
-      uint64_t key) const noexcept;
+      uint64_t key,
+      ParamsType paramsType) const noexcept;
 
   folly::Expected<std::optional<Parameter>, ErrorCode> parseV18ParamValue(
       folly::io::Cursor& cursor,
