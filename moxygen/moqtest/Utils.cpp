@@ -173,7 +173,7 @@ std::vector<Extension> getExtensions(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count();
-    extensions.push_back(Extension{kTimestampExtensionType, timestampMs});
+    extensions.emplace_back(kTimestampExtensionType, timestampMs);
   }
   return extensions;
 }
