@@ -15,18 +15,18 @@ class MoQDeliveryTimeoutManagerTest : public ::testing::Test {
   MoQDeliveryTimeoutManager manager_;
 };
 
-// Test 1: Verify that effective timeout is min(upstream, downstream)
+// Test 1: Verify that effective timeout is min(publisher, subscriber)
 TEST_F(MoQDeliveryTimeoutManagerTest, EffectiveTimeoutIsMinimum) {
-  manager_.setUpstreamTimeout(1000ms);
-  manager_.setDownstreamTimeout(500ms);
+  manager_.setPublisherTimeout(1000ms);
+  manager_.setSubscriberTimeout(500ms);
 
   auto effective = manager_.getEffectiveTimeout();
   ASSERT_TRUE(effective.has_value());
   EXPECT_EQ(effective.value(), 500ms);
 
   // Swap values - effective should now be 1000ms
-  manager_.setUpstreamTimeout(500ms);
-  manager_.setDownstreamTimeout(1000ms);
+  manager_.setPublisherTimeout(500ms);
+  manager_.setSubscriberTimeout(1000ms);
 
   effective = manager_.getEffectiveTimeout();
   ASSERT_TRUE(effective.has_value());
@@ -45,26 +45,26 @@ TEST_F(MoQDeliveryTimeoutManagerTest, CallbackInvokedOnChange) {
       });
 
   // First set should trigger callback
-  manager_.setUpstreamTimeout(1000ms);
+  manager_.setPublisherTimeout(1000ms);
   EXPECT_EQ(callbackCount, 1);
   ASSERT_TRUE(lastValue.has_value());
   EXPECT_EQ(lastValue.value(), 1000ms);
 
-  // Setting downstream lower should trigger callback with new min
-  manager_.setDownstreamTimeout(500ms);
+  // Setting subscriber lower should trigger callback with new min
+  manager_.setSubscriberTimeout(500ms);
   EXPECT_EQ(callbackCount, 2);
   ASSERT_TRUE(lastValue.has_value());
   EXPECT_EQ(lastValue.value(), 500ms);
 
-  // Setting downstream higher (but still < upstream) should change effective
-  manager_.setDownstreamTimeout(800ms);
+  // Setting subscriber higher (but still < publisher) should change effective
+  manager_.setSubscriberTimeout(800ms);
   EXPECT_EQ(callbackCount, 3); // Changed from 500ms to 800ms
   ASSERT_TRUE(lastValue.has_value());
   EXPECT_EQ(lastValue.value(), 800ms);
 
-  // Setting downstream even higher (above upstream) should change effective to
-  // upstream
-  manager_.setDownstreamTimeout(1500ms);
+  // Setting subscriber even higher (above publisher) should change effective to
+  // publisher
+  manager_.setSubscriberTimeout(1500ms);
   EXPECT_EQ(callbackCount, 4); // Changed from 800ms to 1000ms
   ASSERT_TRUE(lastValue.has_value());
   EXPECT_EQ(lastValue.value(), 1000ms);
@@ -79,16 +79,16 @@ TEST_F(MoQDeliveryTimeoutManagerTest, CallbackNotInvokedWhenNoChange) {
         callbackCount++;
       });
 
-  manager_.setUpstreamTimeout(1000ms);
-  manager_.setDownstreamTimeout(500ms);
+  manager_.setPublisherTimeout(1000ms);
+  manager_.setSubscriberTimeout(500ms);
   EXPECT_EQ(callbackCount, 2); // Two changes so far
 
-  // Setting upstream to higher value shouldn't change effective (still 500ms)
-  manager_.setUpstreamTimeout(2000ms);
+  // Setting publisher to higher value shouldn't change effective (still 500ms)
+  manager_.setPublisherTimeout(2000ms);
   EXPECT_EQ(callbackCount, 2); // No new callback
 
-  // Setting downstream to same value shouldn't trigger callback
-  manager_.setDownstreamTimeout(500ms);
+  // Setting subscriber to same value shouldn't trigger callback
+  manager_.setSubscriberTimeout(500ms);
   EXPECT_EQ(callbackCount, 2); // No new callback
 }
 
@@ -103,8 +103,8 @@ TEST_F(MoQDeliveryTimeoutManagerTest, SingleTimeoutSource) {
         lastValue = newTimeout;
       });
 
-  // Only upstream set
-  manager_.setUpstreamTimeout(1000ms);
+  // Only publisher set
+  manager_.setPublisherTimeout(1000ms);
   EXPECT_EQ(callbackCount, 1);
   ASSERT_TRUE(lastValue.has_value());
   EXPECT_EQ(lastValue.value(), 1000ms);

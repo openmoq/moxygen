@@ -5,6 +5,7 @@
  */
 
 #include <folly/coro/Task.h>
+#include "moxygen/MoQTrackProperties.h"
 #include "moxygen/test/MoQSessionTestCommon.h"
 
 using namespace moxygen;
@@ -865,6 +866,80 @@ CO_TEST_P_X(MoQSessionTest, PublishOkWithoutDeliveryTimeout) {
     }
   }
   EXPECT_FALSE(foundDeliveryTimeout);
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    MoQSessionTest,
+    PublishDeliveryTimeoutUsesMinOfPublisherAndSubscriber) {
+  auto* recordingExec = dynamic_cast<RecordingMoQExecutor*>(MoQExecutor_.get());
+  EXPECT_NE(recordingExec, nullptr);
+  if (!recordingExec) {
+    co_return;
+  }
+  co_await setupMoQSessionForPublish(initialMaxRequestID_);
+
+  constexpr uint64_t kPublisherTimeoutMs = 50;
+  constexpr uint64_t kSubscriberTimeoutMs = 60000;
+
+  PublishRequest pub{
+      RequestID(0),
+      FullTrackName{TrackNamespace{{"test"}}, "test-track"},
+      TrackAlias(100),
+      GroupOrder::Default,
+      AbsoluteLocation{0, 100},
+      true,
+  };
+  setPublisherDeliveryTimeout(
+      pub, std::chrono::milliseconds(kPublisherTimeoutMs));
+
+  // Server replies with a much larger subscriber delivery timeout.
+  EXPECT_CALL(*serverSubscriber, publish(_, _))
+      .WillOnce([](const PublishRequest& p, auto) -> Subscriber::PublishResult {
+        auto consumer =
+            std::make_shared<testing::NiceMock<MockTrackConsumer>>();
+        ON_CALL(*consumer, setTrackAlias(_))
+            .WillByDefault(
+                testing::Return(
+                    folly::Expected<folly::Unit, MoQPublishError>(
+                        folly::unit)));
+        ON_CALL(*consumer, publishDone(_))
+            .WillByDefault(testing::Return(folly::unit));
+        PublishOk ok{
+            p.requestID,
+            true,
+            128,
+            GroupOrder::Default,
+            LocationType::LargestObject,
+            std::nullopt,
+            std::make_optional(uint64_t(0))};
+        ok.params.insertParam(
+            {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
+             kSubscriberTimeoutMs});
+        return Subscriber::PublishConsumerAndReplyTask{
+            std::static_pointer_cast<TrackConsumer>(consumer),
+            folly::coro::makeTask<folly::Expected<PublishOk, PublishError>>(
+                std::move(ok))};
+      });
+
+  auto result = clientSession_->publish(std::move(pub), makePublishHandle());
+  EXPECT_TRUE(result.hasValue());
+  auto consumer = result.value().consumer;
+  EXPECT_TRUE((co_await std::move(result.value().reply)).hasValue());
+  co_await rescheduleN(5); // let PUBLISH_OK (subscriber timeout) be applied
+
+  auto sgp = consumer->beginSubgroup(0, 0, 0).value();
+  clientWt_->writeHandles.rbegin()->second->setImmediateDelivery(false);
+  recordingExec->scheduledTimeouts.clear();
+  EXPECT_TRUE(sgp->object(0, moxygen::test::makeBuf(10)).hasValue());
+
+  // The armed timeout must derive from the min (publisher, 50ms), not the 60s
+  // subscriber value.
+  EXPECT_FALSE(recordingExec->scheduledTimeouts.empty());
+  for (auto timeout : recordingExec->scheduledTimeouts) {
+    EXPECT_LT(timeout, std::chrono::milliseconds(kSubscriberTimeoutMs));
+  }
 
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }

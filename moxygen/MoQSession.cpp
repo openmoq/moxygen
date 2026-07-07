@@ -1095,9 +1095,9 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
           onDeliveryTimeoutChanged(std::move(newTimeout));
         });
 
-    // Initialize with downstream timeout by default
+    // Initialize with the subscriber timeout by default
     if (deliveryTimeout.has_value()) {
-      deliveryTimeoutManager_.setDownstreamTimeout(*deliveryTimeout);
+      deliveryTimeoutManager_.setSubscriberTimeout(*deliveryTimeout);
     }
   }
 
@@ -1198,10 +1198,10 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
         requestUpdate.params, *session_->getNegotiatedVersion());
     if (timeoutValue.has_value() && *timeoutValue > 0) {
       XLOG(DBG6)
-          << "MoQSession::TrackPublisherImpl::handleRequestUpdate: SETTING downstream timeout"
+          << "MoQSession::TrackPublisherImpl::handleRequestUpdate: SETTING subscriber timeout"
           << " timeout=" << *timeoutValue << "ms"
           << " requestID=" << existingRequestID;
-      deliveryTimeoutManager_.setDownstreamTimeout(
+      deliveryTimeoutManager_.setSubscriberTimeout(
           std::chrono::milliseconds(*timeoutValue));
     } else {
       XLOG(DBG6)
@@ -1268,8 +1268,15 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     auto timeoutValue = MoQSession::getDeliveryTimeoutIfPresent(
         publishOk.params, *session_->getNegotiatedVersion());
     if (timeoutValue.has_value() && *timeoutValue > 0) {
-      deliveryTimeoutManager_.setDownstreamTimeout(
+      deliveryTimeoutManager_.setSubscriberTimeout(
           std::chrono::milliseconds(*timeoutValue));
+    }
+  }
+
+  void publishSent(const PublishRequest& publish) {
+    auto timeout = getPublisherDeliveryTimeout(publish);
+    if (timeout.has_value() && timeout->count() > 0) {
+      deliveryTimeoutManager_.setPublisherTimeout(*timeout);
     }
   }
 
@@ -1281,7 +1288,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     setGroupOrder(subscribeOk.groupOrder);
     auto timeout = getPublisherDeliveryTimeout(subscribeOk);
     if (timeout.has_value() && timeout->count() > 0) {
-      deliveryTimeoutManager_.setUpstreamTimeout(*timeout);
+      deliveryTimeoutManager_.setPublisherTimeout(*timeout);
     }
   }
 
@@ -5357,10 +5364,6 @@ Subscriber::PublishResult MoQSession::publish(
         pub, MOQTByteStringType::STRING_VALUE, ControlMessageType::CREATED);
   }
 
-  // Extract delivery timeout from publish extensions
-  auto deliveryTimeout = getPublisherDeliveryTimeout(pub);
-
-  // Create TrackConsumer for the publisher to write data
   auto trackPublisher = std::make_shared<TrackPublisherImpl>(
       this,
       pub.fullTrackName,
@@ -5370,8 +5373,10 @@ Subscriber::PublishResult MoQSession::publish(
       pub.groupOrder,
       *negotiatedVersion_,
       moqSettings_.bufferingThresholds.perSubscription,
-      pub.forward,
-      deliveryTimeout);
+      pub.forward);
+
+  // Record the publisher's advertised delivery timeout as the publisher source.
+  trackPublisher->publishSent(pub);
 
   // Set publishHandle in trackPublisher so it can cancel on unsubscribes
   trackPublisher->setSubscriptionHandle(std::move(handle));
