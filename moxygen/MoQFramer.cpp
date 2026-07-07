@@ -133,6 +133,21 @@ bool isIntParamValid(uint64_t version, uint64_t key, uint64_t value) {
   return true;
 }
 
+// Draft <= 16 forbids a DELIVERY_TIMEOUT of 0
+folly::Expected<folly::Unit, moxygen::ErrorCode>
+validateDeliveryTimeoutExtension(
+    const moxygen::Extensions& extensions,
+    uint64_t version) {
+  if (moxygen::getDraftMajorVersion(version) <= 16) {
+    auto val =
+        extensions.getIntExtension(moxygen::kDeliveryTimeoutExtensionType);
+    if (val && *val == 0) {
+      return folly::makeUnexpected(moxygen::ErrorCode::PROTOCOL_VIOLATION);
+    }
+  }
+  return folly::unit;
+}
+
 std::vector<moxygen::Parameter> sortParamsByKey(
     std::vector<moxygen::Parameter> params) {
   std::sort(
@@ -2217,6 +2232,13 @@ folly::Expected<SubscribeOk, ErrorCode> MoQFrameParser::parseSubscribeOk(
     }
   }
 
+  if (auto res =
+          validateDeliveryTimeoutExtension(subscribeOk.extensions, *version_);
+      !res) {
+    XLOG(DBG4) << "parseSubscribeOk: invalid DELIVERY_TIMEOUT extension";
+    return folly::makeUnexpected(res.error());
+  }
+
   return subscribeOk;
 }
 
@@ -2448,6 +2470,13 @@ folly::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
     if (go) {
       publish.groupOrder = static_cast<GroupOrder>(*go);
     }
+  }
+
+  if (auto validateRes =
+          validateDeliveryTimeoutExtension(publish.extensions, *version_);
+      !validateRes) {
+    XLOG(DBG4) << "parsePublish: invalid DELIVERY_TIMEOUT extension";
+    return folly::makeUnexpected(validateRes.error());
   }
 
   return publish;

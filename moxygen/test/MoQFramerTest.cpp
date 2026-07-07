@@ -1419,6 +1419,35 @@ TEST(MoQFramerDeliveryTimeoutDeathTest, Draft16WriteZeroDies) {
       "Cannot write a DELIVERY_TIMEOUT of 0 for draft versions <= 16");
 }
 
+TEST(MoQFramerDeliveryTimeoutTest, Draft16RejectsZeroExtensionOnParse) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft17);
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  SubscribeOk subscribeOk;
+  subscribeOk.requestID = RequestID(1);
+  subscribeOk.trackAlias = TrackAlias(1);
+  subscribeOk.expires = std::chrono::milliseconds(0);
+  subscribeOk.groupOrder = GroupOrder::OldestFirst;
+  subscribeOk.largest = AbsoluteLocation{0, 0};
+  setPublisherDeliveryTimeout(subscribeOk, std::chrono::milliseconds(0));
+  ASSERT_TRUE(writer.writeSubscribeOk(writeBuf, subscribeOk).hasValue());
+  auto bytes = writeBuf.move();
+
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft16);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+
+  folly::io::Cursor cursor(bytes.get());
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  ASSERT_EQ(frameType->first, folly::to_underlying(FrameType::SUBSCRIBE_OK));
+  auto frameLen = cursor.readBE<uint16_t>();
+  auto parseResult = parser.parseSubscribeOk(cursor, frameLen);
+  ASSERT_TRUE(parseResult.hasError());
+  EXPECT_EQ(parseResult.error(), ErrorCode::PROTOCOL_VIOLATION);
+}
+
 TEST_P(MoQFramerTest, ParseTrackStatusOk) {
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
   TrackStatusOk trackStatusOk;
