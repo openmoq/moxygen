@@ -130,3 +130,38 @@ TEST_F(MoQDeliveryTimeoutManagerTest, NoTimeoutSources) {
   // No callback should have been invoked
   EXPECT_EQ(callbackCount, 0);
 }
+
+TEST_F(MoQDeliveryTimeoutManagerTest, ZeroSourceIsIgnoredInMinimum) {
+  manager_.setPublisherTimeout(0ms);
+  manager_.setSubscriberTimeout(500ms);
+  EXPECT_EQ(manager_.getEffectiveTimeout(), std::optional(500ms));
+
+  // Symmetric case: zero subscriber is ignored too.
+  manager_.setPublisherTimeout(800ms);
+  manager_.setSubscriberTimeout(0ms);
+  EXPECT_EQ(manager_.getEffectiveTimeout(), std::optional(800ms));
+}
+
+TEST_F(MoQDeliveryTimeoutManagerTest, ZeroClearsPreviousValue) {
+  manager_.setSubscriberTimeout(500ms);
+  EXPECT_EQ(manager_.getEffectiveTimeout(), std::optional(500ms));
+
+  manager_.setSubscriberTimeout(0ms);
+  EXPECT_FALSE(manager_.getEffectiveTimeout().has_value());
+}
+
+TEST_F(MoQDeliveryTimeoutManagerTest, ClearingFiresCallbackWithNoValue) {
+  std::optional<std::chrono::milliseconds> lastValue = 1ms;
+  int callbackCount = 0;
+  manager_.setOnChangeCallback(
+      [&](const std::optional<std::chrono::milliseconds>& newTimeout) {
+        callbackCount++;
+        lastValue = newTimeout;
+      });
+
+  manager_.setPublisherTimeout(500ms);
+  manager_.setPublisherTimeout(0ms);
+
+  EXPECT_EQ(callbackCount, 2);
+  EXPECT_FALSE(lastValue.has_value());
+}

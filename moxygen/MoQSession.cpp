@@ -363,24 +363,32 @@ class StreamPublisherImpl
   }
 
   void setDeliveryTimeout(std::optional<std::chrono::milliseconds> timeout) {
-    if (timeout.has_value() && timeout->count() > 0) {
-      if (deliveryTimer_) {
-        XLOG(DBG6)
-            << "MoQSession::SubgroupPublisher::setDeliveryTimeout: CALLING deliveryTimer->setDeliveryTimeout"
-            << " timeout=" << timeout->count() << "ms";
-        deliveryTimer_->setDeliveryTimeout(*timeout);
-      } else {
-        XLOG(DBG6)
-            << "MoQSession::SubgroupPublisher::setDeliveryTimeout: No timer exists, ignoring timeout update"
-            << " timeout=" << timeout->count() << "ms";
-      }
+    if (!deliveryTimer_) {
+      XLOG(DBG6)
+          << "MoQSession::SubgroupPublisher::setDeliveryTimeout: No timer exists, ignoring timeout update";
+      return;
     }
+    if (!timeout.has_value()) {
+      XLOG(DBG6)
+          << "MoQSession::SubgroupPublisher::setDeliveryTimeout: Disabling delivery timeout";
+      deliveryTimeoutActive_ = false;
+      deliveryTimer_->cancelAllTimers();
+      return;
+    }
+    CHECK_NE(timeout.value().count(), 0)
+        << "MoQSession::SubgroupPublisher::setDeliveryTimeout must not be called with a value of 0";
+    XLOG(DBG6)
+        << "MoQSession::SubgroupPublisher::setDeliveryTimeout: CALLING deliveryTimer->setDeliveryTimeout"
+        << " timeout=" << timeout->count() << "ms";
+    deliveryTimeoutActive_ = true;
+    deliveryTimer_->setDeliveryTimeout(*timeout);
   }
 
  private:
   std::shared_ptr<MLogger> logger_;
   std::shared_ptr<DeliveryCallback> deliveryCallback_;
   std::unique_ptr<MoQDeliveryTimer> deliveryTimer_;
+  bool deliveryTimeoutActive_{false};
 
   // Track objects and their end offsets for delivery callbacks
   struct ObjectDeliveryInfo {
@@ -517,6 +525,7 @@ StreamPublisherImpl::StreamPublisherImpl(
               this->reset(errorCode);
             }
           });
+      deliveryTimeoutActive_ = true;
     } else {
       XLOG(ERR) << "MoQSession::StreamPublisherImpl: No executor available. "
                    "Delivery timeout was not set.";
@@ -802,8 +811,9 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::objectImpl(
     }
   }
 
-  // Start delivery timeout timer when object begins being sent to stream
-  if (deliveryTimer_) {
+  // Start delivery timeout timer when object begins being sent to stream. A 0
+  // ("no timeout") value leaves deliveryTimeoutActive_ false, so no timer arms.
+  if (deliveryTimer_ && deliveryTimeoutActive_) {
     deliveryTimer_->startTimer(objectID, publisher_->getTransportInfo().srtt);
   }
 
@@ -839,8 +849,9 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::beginObject(
   }
   header_.status = ObjectStatus::NORMAL;
 
-  // Start delivery timeout timer when object begins being sent to stream
-  if (deliveryTimer_) {
+  // Start delivery timeout timer when object begins being sent to stream. A 0
+  // ("no timeout") value leaves deliveryTimeoutActive_ false, so no timer arms.
+  if (deliveryTimer_ && deliveryTimeoutActive_) {
     deliveryTimer_->startTimer(objectID, publisher_->getTransportInfo().srtt);
   }
 
@@ -1196,7 +1207,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     // Update delivery timeout if present
     auto timeoutValue = MoQSession::getDeliveryTimeoutIfPresent(
         requestUpdate.params, *session_->getNegotiatedVersion());
-    if (timeoutValue.has_value() && *timeoutValue > 0) {
+    if (timeoutValue.has_value() && shouldApplyDeliveryTimeout(*timeoutValue)) {
       XLOG(DBG6)
           << "MoQSession::TrackPublisherImpl::handleRequestUpdate: SETTING subscriber timeout"
           << " timeout=" << *timeoutValue << "ms"
@@ -1205,7 +1216,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
           std::chrono::milliseconds(*timeoutValue));
     } else {
       XLOG(DBG6)
-          << "MoQSession::TrackPublisherImpl::handleRequestUpdate: No delivery timeout in params or timeout=0"
+          << "MoQSession::TrackPublisherImpl::handleRequestUpdate: No delivery timeout in params or ignored timeout=0"
           << " requestID=" << existingRequestID;
     }
 
@@ -1264,10 +1275,17 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     }
   }
 
+  // Draft 18+ treats a DELIVERY_TIMEOUT of 0 as an explicit "no timeout" that
+  // clears any previously-negotiated value,
+  bool shouldApplyDeliveryTimeout(uint64_t timeoutMs) const {
+    return timeoutMs > 0 ||
+        getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 18;
+  }
+
   void onPublishOk(const PublishOk& publishOk) {
     auto timeoutValue = MoQSession::getDeliveryTimeoutIfPresent(
         publishOk.params, *session_->getNegotiatedVersion());
-    if (timeoutValue.has_value() && *timeoutValue > 0) {
+    if (timeoutValue.has_value() && shouldApplyDeliveryTimeout(*timeoutValue)) {
       deliveryTimeoutManager_.setSubscriberTimeout(
           std::chrono::milliseconds(*timeoutValue));
     }
@@ -1275,7 +1293,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
 
   void publishSent(const PublishRequest& publish) {
     auto timeout = getPublisherDeliveryTimeout(publish);
-    if (timeout.has_value() && timeout->count() > 0) {
+    if (timeout.has_value() && shouldApplyDeliveryTimeout(timeout->count())) {
       deliveryTimeoutManager_.setPublisherTimeout(*timeout);
     }
   }
@@ -1287,7 +1305,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     setTrackAlias(subscribeOk.trackAlias);
     setGroupOrder(subscribeOk.groupOrder);
     auto timeout = getPublisherDeliveryTimeout(subscribeOk);
-    if (timeout.has_value() && timeout->count() > 0) {
+    if (timeout.has_value() && shouldApplyDeliveryTimeout(timeout->count())) {
       deliveryTimeoutManager_.setPublisherTimeout(*timeout);
     }
   }
@@ -1794,13 +1812,9 @@ void MoQSession::TrackPublisherImpl::onDeliveryTimeoutChanged(
                                  : "none")
       << " requestID=" << requestID_ << " subgroups.size=" << subgroups_.size();
 
-  if (!newTimeout.has_value()) {
-    return;
-  }
-
   // Propagate to all existing subgroups
   for (const auto& [_, subgroupPublisher] : subgroups_) {
-    subgroupPublisher->setDeliveryTimeout(*newTimeout);
+    subgroupPublisher->setDeliveryTimeout(newTimeout);
   }
 }
 

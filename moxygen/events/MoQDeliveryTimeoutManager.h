@@ -37,7 +37,7 @@ class MoQDeliveryTimeoutManager {
   // Set publisher timeout (automatically triggers callback if effective
   // changes)
   void setPublisherTimeout(std::chrono::milliseconds timeout) {
-    publisherTimeout_ = timeout;
+    publisherTimeout_ = toTimeoutSource(timeout);
     notifyIfChanged();
   }
 
@@ -51,7 +51,7 @@ class MoQDeliveryTimeoutManager {
         << (subscriberTimeout_.has_value()
                 ? std::to_string(subscriberTimeout_->count()) + "ms"
                 : "none");
-    subscriberTimeout_ = timeout;
+    subscriberTimeout_ = toTimeoutSource(timeout);
     notifyIfChanged();
   }
 
@@ -70,6 +70,17 @@ class MoQDeliveryTimeoutManager {
   }
 
  private:
+  // A timeout of 0 means "no timeout" (draft 18+): such a source imposes no
+  // constraint and is dropped from the min() computation. A non-zero value is
+  // kept as-is.
+  static std::optional<std::chrono::milliseconds> toTimeoutSource(
+      std::chrono::milliseconds timeout) {
+    if (timeout.count() == 0) {
+      return std::nullopt;
+    }
+    return timeout;
+  }
+
   // Individual timeout sources
   std::optional<std::chrono::milliseconds> publisherTimeout_;
   std::optional<std::chrono::milliseconds> subscriberTimeout_;
