@@ -1095,6 +1095,170 @@ TEST_F(MoQRelayTest, SubscribeNamespaceEmptyPrefixAllowedV16) {
   removeSession(session);
 }
 
+TEST_F(MoQRelayTest, SubscribeEmptyNamespaceRejectedPreV18) {
+  // draft-16 still rejects: zero-field namespaces are a draft-18 feature.
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft16)));
+
+  SubscribeRequest sub;
+  sub.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+  sub.requestID = RequestID(0);
+  sub.locType = LocationType::LargestObject;
+  auto consumer = createMockConsumer();
+
+  withSessionContext(session, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->subscribe(std::move(sub), consumer), exec_.get());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().errorCode, SubscribeErrorCode::DOES_NOT_EXIST);
+    EXPECT_EQ(res.error().reasonPhrase, "namespace required");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, SubscribeEmptyNamespaceAcceptedV18) {
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft18)));
+
+  SubscribeRequest sub;
+  sub.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+  sub.requestID = RequestID(0);
+  sub.locType = LocationType::LargestObject;
+  auto consumer = createMockConsumer();
+
+  withSessionContext(session, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->subscribe(std::move(sub), consumer), exec_.get());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().reasonPhrase, "no such namespace or track");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, FetchEmptyNamespaceRejectedPreV18) {
+  // draft-16 still rejects: zero-field namespaces are a draft-18 feature.
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft16)));
+
+  Fetch fetch;
+  fetch.requestID = RequestID(0);
+  fetch.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+
+  withSessionContext(session, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->fetch(
+            std::move(fetch), std::shared_ptr<FetchConsumer>(nullptr)),
+        exec_.get());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().errorCode, FetchErrorCode::DOES_NOT_EXIST);
+    EXPECT_EQ(res.error().reasonPhrase, "namespace required");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, FetchEmptyNamespaceAcceptedV18) {
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft18)));
+
+  Fetch fetch;
+  fetch.requestID = RequestID(0);
+  fetch.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+
+  withSessionContext(session, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->fetch(
+            std::move(fetch), std::shared_ptr<FetchConsumer>(nullptr)),
+        exec_.get());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().reasonPhrase, "no upstream for fetch");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, TrackStatusEmptyNamespaceRejectedPreV18) {
+  // draft-16 still rejects: zero-field namespaces are a draft-18 feature.
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft16)));
+
+  TrackStatus trackStatus;
+  trackStatus.requestID = RequestID(0);
+  trackStatus.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+
+  withSessionContext(session, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->trackStatus(trackStatus), exec_.get());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().errorCode, TrackStatusErrorCode::DOES_NOT_EXIST);
+    EXPECT_EQ(res.error().reasonPhrase, "namespace required");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, TrackStatusEmptyNamespaceAcceptedV18) {
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft18)));
+
+  TrackStatus trackStatus;
+  trackStatus.requestID = RequestID(0);
+  trackStatus.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+
+  withSessionContext(session, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->trackStatus(trackStatus), exec_.get());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().reasonPhrase, "no such namespace or track");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, PublishEmptyNamespaceRejectedPreV18) {
+  // An empty allowed prefix lets the empty namespace pass the prefix check so
+  // the empty-namespace guard is the one under test. draft-16 still rejects:
+  // zero-field namespaces are a draft-18 feature.
+  relay_->setAllowedNamespacePrefix(TrackNamespace{{}});
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft16)));
+
+  PublishRequest pub;
+  pub.requestID = RequestID(0);
+  pub.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+
+  withSessionContext(session, [&]() {
+    auto res = relay_->publish(std::move(pub), createMockSubscriptionHandle());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().errorCode, PublishErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(res.error().reasonPhrase, "namespace required");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, PublishEmptyNamespaceAcceptedV18) {
+  relay_->setAllowedNamespacePrefix(TrackNamespace{{}});
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft18)));
+
+  auto consumer =
+      doPublish(session, FullTrackName{TrackNamespace{{}}, "track1"});
+  EXPECT_NE(consumer, nullptr);
+
+  removeSession(session);
+}
+
 // ============================================================
 // Extensions Tests
 // ============================================================

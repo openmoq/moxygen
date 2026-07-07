@@ -103,6 +103,8 @@ class MoQRelay : public Publisher,
 
   void onPublishDoneImpl(const FullTrackName& ftn);
 
+  static bool emptyNamespaceAllowed();
+
   struct NamespaceNode : public Subscriber::PublishNamespaceHandle {
     explicit NamespaceNode(MoQRelay& relay, NamespaceNode* parent = nullptr)
         : relay_(relay), parent_(parent) {}

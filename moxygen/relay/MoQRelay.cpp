@@ -435,7 +435,7 @@ Subscriber::PublishResult MoQRelay::publish(
             pub.requestID, PublishErrorCode::UNINTERESTED, "bad namespace"});
   }
 
-  if (pub.fullTrackName.trackNamespace.empty()) {
+  if (pub.fullTrackName.trackNamespace.empty() && !emptyNamespaceAllowed()) {
     return folly::makeUnexpected(PublishError(
         {pub.requestID,
          PublishErrorCode::INTERNAL_ERROR,
@@ -993,13 +993,20 @@ MoQRelay::PublishState MoQRelay::findPublishState(const FullTrackName& ftn) {
   return state;
 }
 
+bool MoQRelay::emptyNamespaceAllowed() {
+  auto session = MoQSession::getRequestSession();
+  auto negotiatedVersion = session->getNegotiatedVersion();
+  XCHECK(negotiatedVersion.has_value());
+  return getDraftMajorVersion(*negotiatedVersion) >= 18;
+}
+
 folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     SubscribeRequest subReq,
     std::shared_ptr<TrackConsumer> consumer) {
   auto session = MoQSession::getRequestSession();
 
   // check auth / get trackNamespace
-  if (subReq.fullTrackName.trackNamespace.empty()) {
+  if (subReq.fullTrackName.trackNamespace.empty() && !emptyNamespaceAllowed()) {
     // message error?
     co_return folly::makeUnexpected(SubscribeError(
         {subReq.requestID,
@@ -1379,7 +1386,7 @@ folly::coro::Task<Publisher::FetchResult> MoQRelay::fetch(
 
   // check auth
   // get trackNamespace
-  if (fetch.fullTrackName.trackNamespace.empty()) {
+  if (fetch.fullTrackName.trackNamespace.empty() && !emptyNamespaceAllowed()) {
     co_return folly::makeUnexpected(FetchError(
         {fetch.requestID,
          FetchErrorCode::DOES_NOT_EXIST,
@@ -1449,7 +1456,8 @@ folly::coro::Task<Publisher::TrackStatusResult> MoQRelay::trackStatus(
     TrackStatus trackStatus) {
   XLOG(DBG1) << __func__ << " ftn=" << trackStatus.fullTrackName;
 
-  if (trackStatus.fullTrackName.trackNamespace.empty()) {
+  if (trackStatus.fullTrackName.trackNamespace.empty() &&
+      !emptyNamespaceAllowed()) {
     co_return folly::makeUnexpected(TrackStatusError(
         {trackStatus.requestID,
          TrackStatusErrorCode::DOES_NOT_EXIST,
