@@ -402,6 +402,7 @@ void MoQRelaySession::cleanupRelayState() {
   }
   subscribeNamespaceHandles_.clear();
   legacySubscribeNamespaceToReqId_.clear();
+  requestUpdateReplyContexts_.clear();
 
   // Draft 18+: drop subscribeTracks handles too.
   for (auto& subTracks : subscribeTracksHandles_) {
@@ -445,8 +446,7 @@ void MoQRelaySession::onRequestUpdate(RequestUpdate requestUpdate) {
         requestUpdateError(
             RequestError{
                 requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
-            existingRequestID,
-            /*terminateExistingRequest=*/false);
+            existingRequestID);
         return;
       }
       if (closeSessionIfRequestIDInvalid(
@@ -471,8 +471,7 @@ void MoQRelaySession::onRequestUpdate(RequestUpdate requestUpdate) {
         requestUpdateError(
             RequestError{
                 requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
-            existingRequestID,
-            /*terminateExistingRequest=*/false);
+            existingRequestID);
         return;
       }
       if (closeSessionIfRequestIDInvalid(
@@ -590,6 +589,51 @@ void MoQRelaySession::handleSubscribeNamespaceRequestUpdate(
                 }
               })))
       .start();
+}
+
+ReplyContext* MoQRelaySession::getRequestUpdateReplyContext(
+    RequestID existingRequestID) {
+  auto it = requestUpdateReplyContexts_.find(existingRequestID);
+  if (it != requestUpdateReplyContexts_.end()) {
+    return it->second.get();
+  }
+  return MoQSession::getRequestUpdateReplyContext(existingRequestID);
+}
+
+void MoQRelaySession::terminateRequestUpdateOnError(
+    RequestID existingRequestID,
+    const SubscribeUpdateError& requestError) {
+  const bool isSubNs = subscribeNamespaceHandles_.contains(existingRequestID);
+  const bool isPubNs = publishNamespaceHandles_.contains(existingRequestID);
+  const bool isSubTracks = subscribeTracksHandles_.contains(existingRequestID);
+  if (!isSubNs && !isPubNs && !isSubTracks) {
+    // SUBSCRIBE / PUBLISH / FETCH: PUBLISH_DONE(UPDATE_FAILED) or stream reset.
+    MoQSession::terminateRequestUpdateOnError(existingRequestID, requestError);
+    return;
+  }
+
+  // SUBSCRIBE_NAMESPACE / PUBLISH_NAMESPACE / SUBSCRIBE_TRACKS. On draft <18
+  // these ride the shared control stream with no bidi to close; the
+  // REQUEST_ERROR already went out there, so there is nothing more to do (and
+  // no subscription-style state to tear down).
+  auto it = requestUpdateReplyContexts_.find(existingRequestID);
+  if (it == requestUpdateReplyContexts_.end()) {
+    return;
+  }
+  // Draft 18+: FIN the request's bidi to close it (REQUEST_ERROR was already
+  // written by requestUpdateError), then tear it down via the same path a
+  // peer-initiated close would take (which also erases the reply context).
+  it->second->flushFinal();
+  if (isSubNs) {
+    onUnsubscribeNamespace(
+        UnsubscribeNamespace{existingRequestID, std::nullopt});
+  } else if (isPubNs) {
+    PublishNamespaceDone done;
+    done.requestID = existingRequestID;
+    onPublishNamespaceDone(std::move(done));
+  } else {
+    onSubscribeTracksStreamClosed(existingRequestID);
+  }
 }
 
 // PublishNamespace publisher methods
@@ -980,6 +1024,10 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
     auto publishNamespaceOkMsg = handle->publishNamespaceOk();
     publishNamespaceOk(publishNamespaceOkMsg, *replyContext);
     publishNamespaceHandles_[publishNamespace.requestID] = std::move(handle);
+    if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
+      // Retain the bidi reply context so a failed REQUEST_UPDATE can close it.
+      requestUpdateReplyContexts_[publishNamespace.requestID] = replyContext;
+    }
     if (getDraftMajorVersion(*getNegotiatedVersion()) < 16) {
       // Legacy: also store NS->RequestID mapping for lookups
       legacySubscriberNamespaceToReqId_[publishNamespace.trackNamespace] =
@@ -1028,6 +1076,7 @@ void MoQRelaySession::publishNamespaceCancel(
 
   if (annCan.requestID.has_value()) {
     publishNamespaceHandles_.erase(*annCan.requestID);
+    requestUpdateReplyContexts_.erase(*annCan.requestID);
   }
   retireRequestID(/*signalWriteLoop=*/false);
 
@@ -1080,6 +1129,7 @@ void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone unAnn) {
   }
   handle = std::move(it->second);
   publishNamespaceHandles_.erase(it);
+  requestUpdateReplyContexts_.erase(reqId);
 
   // Common action
   handle->publishNamespaceDone();
@@ -1361,10 +1411,18 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
   } else {
     auto handle = std::move(subAnnResult->value());
     auto subAnnOk = handle->subscribeNamespaceOk();
+    std::shared_ptr<ReplyContext> replyContext;
+    if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
+      // Retain the bidi reply context so a failed REQUEST_UPDATE can close it.
+      replyContext = subNsReply->replyContext();
+    }
     subscribeNamespaceOk(subAnnOk, std::move(subNsReply));
 
     // Store by RequestID (primary key)
     subscribeNamespaceHandles_[subAnn.requestID] = std::move(handle);
+    if (replyContext) {
+      requestUpdateReplyContexts_[subAnn.requestID] = std::move(replyContext);
+    }
     if (getDraftMajorVersion(*getNegotiatedVersion()) < 15) {
       // Legacy: also store NS->RequestID mapping for lookups
       legacySubscribeNamespaceToReqId_[subAnn.trackNamespacePrefix] =
@@ -1443,6 +1501,7 @@ void MoQRelaySession::onUnsubscribeNamespace(UnsubscribeNamespace unsub) {
   setRequestSession();
   handle->unsubscribeNamespace();
   subscribeNamespaceHandles_.erase(requestID);
+  requestUpdateReplyContexts_.erase(requestID);
 
   retireRequestID(/*signalWriteLoop=*/true);
 }
@@ -1650,6 +1709,11 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeTracks(
   }
   auto handle = std::move(subTracksResult->value());
   auto subTracksOk = handle->subscribeTracksOk();
+  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
+    // Retain the bidi reply context so a failed REQUEST_UPDATE can close it.
+    requestUpdateReplyContexts_[subTracks.requestID] =
+        subTracksReply->replyContext();
+  }
   subscribeTracksOk(subTracksOk, std::move(subTracksReply));
   subscribeTracksHandles_[subTracks.requestID] = std::move(handle);
 }
@@ -1672,6 +1736,7 @@ void MoQRelaySession::onSubscribeTracksStreamClosed(RequestID requestID) {
   // NOT_SUPPORTED, app errors, exceptions) never insert a handle, and
   // without retiring the credit here the peer's request-ID budget would
   // leak by one for every rejected SUBSCRIBE_TRACKS.
+  requestUpdateReplyContexts_.erase(requestID);
   auto it = subscribeTracksHandles_.find(requestID);
   if (it != subscribeTracksHandles_.end()) {
     auto handle = std::move(it->second);

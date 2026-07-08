@@ -125,6 +125,17 @@ class MoQRelaySession : public MoQSession {
   // Override to handle ANNOUNCE and SUBSCRIBE_ANNOUNCES updates
   void onRequestUpdate(RequestUpdate requestUpdate) override;
 
+  // Route REQUEST_UPDATE responses for namespace requests to their own bidi
+  // reply context (draft 18+); other requests fall back to the base.
+  ReplyContext* getRequestUpdateReplyContext(
+      RequestID existingRequestID) override;
+
+  // A failed SUBSCRIBE_NAMESPACE / PUBLISH_NAMESPACE update closes the
+  // request's bidi stream; other request types fall back to the base.
+  void terminateRequestUpdateOnError(
+      RequestID existingRequestID,
+      const SubscribeUpdateError& requestError) override;
+
   // REQUEST_UPDATE handlers for announcement types - take handles directly
   void handlePublishNamespaceRequestUpdate(
       RequestUpdate requestUpdate,
@@ -213,6 +224,11 @@ class MoQRelaySession : public MoQSession {
       std::shared_ptr<Publisher::SubscribeNamespaceHandle>,
       RequestID::hash>
       subscribeNamespaceHandles_;
+  // Draft 18+: reply context for each responder-side namespace or
+  // SUBSCRIBE_TRACKS request's bidi stream, so a failed REQUEST_UPDATE can send
+  // REQUEST_ERROR and close it.
+  folly::F14FastMap<RequestID, std::shared_ptr<ReplyContext>, RequestID::hash>
+      requestUpdateReplyContexts_;
   // Draft 18+
   folly::F14FastMap<
       RequestID,

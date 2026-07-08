@@ -3996,8 +3996,7 @@ void MoQSession::onRequestUpdate(RequestUpdate requestUpdate) {
     requestUpdateError(
         RequestError{
             requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
-        existingRequestID,
-        /*terminateExistingRequest=*/false);
+        existingRequestID);
     return;
   }
 
@@ -5793,12 +5792,17 @@ void MoQSession::requestUpdateError(
               << existingRequestID << " sess=" << this;
   }
 
-  if (!terminateExistingRequest) {
-    return;
+  if (terminateExistingRequest) {
+    // Tear down the failed request (regardless of REQUEST_ERROR write success).
+    terminateRequestUpdateOnError(existingRequestID, requestError);
   }
+}
 
-  // Terminate subscription with PUBLISH_DONE (UPDATE_FAILED)
-  // and clean up publisher state (regardless of REQUEST_ERROR write success)
+void MoQSession::terminateRequestUpdateOnError(
+    RequestID existingRequestID,
+    const SubscribeUpdateError& requestError) {
+  // Terminate subscription with PUBLISH_DONE (UPDATE_FAILED) and clean up
+  // publisher state; for a FETCH terminatePublish resets the FETCH data stream.
   auto it = pubTracks_.find(existingRequestID);
   if (it != pubTracks_.end()) {
     PublishDone pubDone{

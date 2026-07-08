@@ -102,9 +102,17 @@ CO_TEST_P_X(
     co_return;
   }
 
+  // A drain-rejected REQUEST_UPDATE is unsuccessful, so per spec the publisher
+  // MUST also terminate the subscription with PUBLISH_DONE(UPDATE_FAILED).
   std::optional<PublishDoneStatusCode> publishDoneStatusCode;
   folly::coro::Baton publishDone;
-  expectTrackEndedPublishDone(publishDoneStatusCode, publishDone);
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
+      .WillOnce(
+          [&publishDoneStatusCode, &publishDone](const PublishDone& done) {
+            publishDoneStatusCode = done.statusCode;
+            publishDone.post();
+            return folly::Expected<folly::Unit, MoQPublishError>(folly::unit);
+          });
 
   // GOAWAY sets draining_; use drain() directly so the client can still send
   // REQUEST_UPDATE and exercise the peer-side rejection path.
@@ -129,16 +137,8 @@ CO_TEST_P_X(
     EXPECT_EQ(result.error().requestID, RequestID(getRequestIDMultiplier()));
     EXPECT_EQ(result.error().errorCode, RequestErrorCode::GOING_AWAY);
   }
-  EXPECT_FALSE(publishDoneStatusCode.has_value());
-  if (publishDoneStatusCode.has_value()) {
-    clientSession_->close(SessionCloseErrorCode::NO_ERROR);
-    co_return;
-  }
-
-  subscription.serverConsumer->publishDone(
-      getTrackEndedPublishDone(subscription.subscribeRequest.requestID));
   co_await publishDone;
-  EXPECT_EQ(publishDoneStatusCode, PublishDoneStatusCode::TRACK_ENDED);
+  EXPECT_EQ(publishDoneStatusCode, PublishDoneStatusCode::UPDATE_FAILED);
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
@@ -726,6 +726,189 @@ CO_TEST_P_X(MoQSessionTest, FetchRequestUpdateNullSessionAfterAwait) {
   co_await folly::coro::co_reschedule_on_current_executor;
 
   heldFetchConsumer.reset();
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// =============================================================================
+// Namespace REQUEST_UPDATE tests
+// =============================================================================
+
+// A failed REQUEST_UPDATE for a SUBSCRIBE_NAMESPACE must close the request's
+// bidi stream. The responder sends REQUEST_ERROR, FINs its write half, and
+// tears down the subscription (draft 18+).
+CO_TEST_P_X(Draft18Test, SubscribeNamespaceRequestUpdateFailureClosesBidi) {
+  co_await setupMoQSession();
+
+  std::shared_ptr<MockSubscribeNamespaceHandle> serverHandle;
+  RequestID serverRequestID{0};
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillOnce(
+          [&](auto subAnn, auto /*handler*/)
+              -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+            serverRequestID = subAnn.requestID;
+            serverHandle = std::make_shared<MockSubscribeNamespaceHandle>(
+                SubscribeNamespaceOk(
+                    {.requestID = subAnn.requestID,
+                     .requestSpecificParams = {}}));
+            co_return serverHandle;
+          });
+
+  auto subNsResult = co_await clientSession_->subscribeNamespace(
+      getSubscribeNamespace(), nullptr);
+  EXPECT_FALSE(subNsResult.hasError());
+
+  // The SUBSCRIBE_NAMESPACE bidi is the first client-initiated bidi (id 0).
+  // Capture the responder's write half up front: the fake client cannot send
+  // namespace updates, so it will tear the stream down once it sees the
+  // unsolicited REQUEST_ERROR — we assert on the responder's FIN, which happens
+  // first, via the retained handle.
+  auto serverBidi = serverWt_->writeHandles.at(0);
+
+  // The application rejects the update, so the responder must tear it down.
+  folly::coro::Baton updateHandled;
+  EXPECT_CALL(*serverHandle, requestUpdateCalled(_))
+      .WillOnce([&](const RequestUpdate&) { updateHandled.post(); });
+  EXPECT_CALL(*serverHandle, requestUpdateResult())
+      .WillOnce(
+          testing::Return(
+              folly::makeUnexpected(
+                  RequestError{
+                      serverRequestID,
+                      RequestErrorCode::NOT_SUPPORTED,
+                      "namespace updates unsupported"})));
+  folly::coro::Baton unsubscribed;
+  EXPECT_CALL(*serverHandle, unsubscribeNamespace()).WillOnce([&] {
+    unsubscribed.post();
+  });
+
+  RequestUpdate update;
+  update.existingRequestID = serverRequestID;
+  update.requestID = RequestID(getRequestIDMultiplier());
+  update.priority = kDefaultPriority + 1;
+  update.forward = true;
+  auto* cb =
+      static_cast<MoQControlCodec::ControlCallback*>(serverSession_.get());
+  cb->onRequestUpdate(std::move(update));
+
+  co_await updateHandled;
+  co_await unsubscribed;
+
+  // The responder FINs its write half to close the bidi.
+  EXPECT_TRUE(serverBidi->fin_);
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// A failed REQUEST_UPDATE for a PUBLISH_NAMESPACE must close the request's bidi
+// stream. The responder sends REQUEST_ERROR, FINs its write half, and tears
+// down the announcement (draft 18+).
+CO_TEST_P_X(Draft18Test, PublishNamespaceRequestUpdateFailureClosesBidi) {
+  co_await setupMoQSession();
+
+  std::shared_ptr<MockPublishNamespaceHandle> serverHandle;
+  RequestID serverRequestID{0};
+  EXPECT_CALL(*serverSubscriber, publishNamespace(_, _))
+      .WillOnce(
+          [&](auto ann, auto /*cb*/)
+              -> folly::coro::Task<Subscriber::PublishNamespaceResult> {
+            serverRequestID = ann.requestID;
+            serverHandle =
+                std::make_shared<MockPublishNamespaceHandle>(PublishNamespaceOk(
+                    {.requestID = ann.requestID, .requestSpecificParams = {}}));
+            co_return Subscriber::PublishNamespaceResult(serverHandle);
+          });
+
+  auto annResult =
+      co_await clientSession_->publishNamespace(getPublishNamespace());
+  EXPECT_FALSE(annResult.hasError());
+
+  // The PUBLISH_NAMESPACE bidi is the first client-initiated bidi (id 0).
+  // Capture the responder's write half up front (see the SUBSCRIBE_NAMESPACE
+  // test for why).
+  auto serverBidi = serverWt_->writeHandles.at(0);
+
+  folly::coro::Baton updateHandled;
+  EXPECT_CALL(*serverHandle, requestUpdateCalled(_))
+      .WillOnce([&](const RequestUpdate&) { updateHandled.post(); });
+  EXPECT_CALL(*serverHandle, requestUpdateResult())
+      .WillOnce(
+          testing::Return(
+              folly::makeUnexpected(
+                  RequestError{
+                      serverRequestID,
+                      RequestErrorCode::NOT_SUPPORTED,
+                      "namespace updates unsupported"})));
+  folly::coro::Baton done;
+  EXPECT_CALL(*serverHandle, publishNamespaceDone()).WillOnce([&] {
+    done.post();
+  });
+
+  RequestUpdate update;
+  update.existingRequestID = serverRequestID;
+  update.requestID = RequestID(getRequestIDMultiplier());
+  update.priority = kDefaultPriority + 1;
+  update.forward = true;
+  auto* cb =
+      static_cast<MoQControlCodec::ControlCallback*>(serverSession_.get());
+  cb->onRequestUpdate(std::move(update));
+
+  co_await updateHandled;
+  co_await done;
+
+  // The responder FINs its write half to close the bidi.
+  EXPECT_TRUE(serverBidi->fin_);
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// A failed REQUEST_UPDATE for a SUBSCRIBE_TRACKS must close the request's bidi
+// stream. SUBSCRIBE_TRACKS has no updatable state, so the responder rejects the
+// update with REQUEST_ERROR(NOT_SUPPORTED), FINs its write half, and tears down
+// the handle (draft 18+).
+CO_TEST_P_X(Draft18Test, SubscribeTracksRequestUpdateFailureClosesBidi) {
+  co_await setupMoQSession();
+
+  std::shared_ptr<MockSubscribeTracksHandle> serverHandle;
+  RequestID serverRequestID{0};
+  EXPECT_CALL(*serverPublisher, subscribeTracks(_, _))
+      .WillOnce(
+          [&](auto subTracks, auto /*publishBlockedHandle*/)
+              -> folly::coro::Task<Publisher::SubscribeTracksResult> {
+            serverRequestID = subTracks.requestID;
+            serverHandle =
+                std::make_shared<MockSubscribeTracksHandle>(SubscribeTracksOk(
+                    {.requestID = subTracks.requestID,
+                     .requestSpecificParams = {}}));
+            co_return serverHandle;
+          });
+
+  auto result = co_await clientSession_->subscribeTracks(getSubscribeTracks());
+  EXPECT_FALSE(result.hasError());
+
+  // The SUBSCRIBE_TRACKS bidi is the first client-initiated bidi (id 0).
+  // Capture the responder's write half up front (see the namespace tests).
+  auto serverBidi = serverWt_->writeHandles.at(0);
+
+  // No updatable state → the responder rejects the update and tears down.
+  folly::coro::Baton unsubscribed;
+  EXPECT_CALL(*serverHandle, unsubscribeTracks()).WillOnce([&] {
+    unsubscribed.post();
+  });
+
+  RequestUpdate update;
+  update.existingRequestID = serverRequestID;
+  update.requestID = RequestID(getRequestIDMultiplier());
+  update.priority = kDefaultPriority + 1;
+  update.forward = true;
+  auto* cb =
+      static_cast<MoQControlCodec::ControlCallback*>(serverSession_.get());
+  cb->onRequestUpdate(std::move(update));
+
+  co_await unsubscribed;
+
+  // The responder FINs its write half to close the bidi.
+  EXPECT_TRUE(serverBidi->fin_);
+
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 

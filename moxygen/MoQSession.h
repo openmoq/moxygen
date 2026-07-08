@@ -76,6 +76,10 @@ class SubNSReply {
     folly::assume_unreachable();
   }
 
+  const std::shared_ptr<ReplyContext>& replyContext() const {
+    return replyContext_;
+  }
+
  protected:
   MoQFrameWriter& moqFrameWriter_;
   std::shared_ptr<ReplyContext> replyContext_;
@@ -96,6 +100,10 @@ class MessageReply {
 
   virtual WriteResult ok(const RequestOk& okMsg);
   virtual WriteResult error(const SubscribeTracksError& errorMsg);
+
+  const std::shared_ptr<ReplyContext>& replyContext() const {
+    return replyContext_;
+  }
 
  protected:
   MoQFrameWriter& moqFrameWriter_;
@@ -871,13 +879,23 @@ class MoQSession : public Subscriber,
       RequestID existingRequestID,
       bool terminateExistingRequest = true);
 
+  // Tear down the request whose REQUEST_UPDATE failed. For SUBSCRIBE/PUBLISH
+  // tracks this terminates the subscription with PUBLISH_DONE(UPDATE_FAILED)
+  // and resets its subgroups; for FETCH it resets the FETCH data stream.
+  // MoQRelaySession overrides this to close the bidi stream of a failed
+  // SUBSCRIBE_NAMESPACE / PUBLISH_NAMESPACE update.
+  virtual void terminateRequestUpdateOnError(
+      RequestID existingRequestID,
+      const SubscribeUpdateError& requestError);
+
   // REQUEST_UPDATE ok response - available for subclass handlers
   void requestUpdateOk(const RequestOk& requestOk, RequestID existingRequestID);
 
   // Returns the reply context for REQUEST_UPDATE responses: the responder's
   // bidi reply context in draft 18+, otherwise the shared control stream.
   // Returns nullptr only when the request can no longer be found.
-  ReplyContext* getRequestUpdateReplyContext(RequestID existingRequestID);
+  virtual ReplyContext* getRequestUpdateReplyContext(
+      RequestID existingRequestID);
 
   // REQUEST_UPDATE handler (protected for subclass access)
   void onRequestUpdate(RequestUpdate requestUpdate) override;
