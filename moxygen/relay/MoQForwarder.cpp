@@ -269,6 +269,15 @@ folly::Expected<SubscribeRange, FetchError> MoQForwarder::resolveJoiningFetch(
             FetchErrorCode::INTERNAL_ERROR,
             "Incorrect RequestID for Track"});
   }
+  if (!subIt->second->shouldForward) {
+    XLOG(ERR) << "Joining Fetch for non-forwarding subscription requestID="
+              << subIt->second->requestID;
+    return folly::makeUnexpected(
+        FetchError{
+            RequestID(0),
+            FetchErrorCode::INVALID_RANGE,
+            "Joining Fetch requires a forwarding subscription"});
+  }
   if (!subIt->second->subscribeOk().largest) {
     // No content exists, fetch error
     // Relay caller verifies upstream SubscribeOK has been processed before

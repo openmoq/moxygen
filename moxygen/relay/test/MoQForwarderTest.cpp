@@ -1263,4 +1263,28 @@ TEST_F(MoQForwarderTest, SubgroupConsumersResetOnForwarderDestruction) {
   pubSg->reset(ResetStreamErrorCode::SESSION_CLOSED);
 }
 
+// Test: A Joining Fetch is only permitted when the associated subscription is
+// in Forward State 1. Against a non-forwarding subscription it must be rejected
+// with a request-level INVALID_RANGE error rather than a session error.
+TEST_F(MoQForwarderTest, JoiningFetchNonForwardingSubscriptionIsRequestError) {
+  auto forwarder = std::make_shared<MoQForwarder>(
+      kFwdTestTrackName, AbsoluteLocation{10, 5});
+  auto session = createMockSession();
+
+  SubscribeRequest sub;
+  sub.fullTrackName = kFwdTestTrackName;
+  sub.requestID = RequestID(2);
+  sub.locType = LocationType::LargestObject;
+  sub.forward = false;
+  auto subscriber =
+      forwarder->addSubscriber(session, sub, createMockConsumer());
+  ASSERT_NE(subscriber, nullptr);
+  ASSERT_FALSE(subscriber->shouldForward);
+
+  JoiningFetch joining(RequestID(2), 2, FetchType::RELATIVE_JOINING);
+  auto res = forwarder->resolveJoiningFetch(session, joining);
+  ASSERT_TRUE(res.hasError());
+  EXPECT_EQ(res.error().errorCode, FetchErrorCode::INVALID_RANGE);
+}
+
 } // namespace moxygen::test
