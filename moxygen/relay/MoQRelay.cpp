@@ -543,7 +543,13 @@ Subscriber::PublishResult MoQRelay::publish(
       nSubscribers++;
       auto exec = outSession->getExecutor();
       co_withExecutor(
-          exec, publishToSession(outSession, forwarder, info.forward))
+          exec,
+          publishToSession(
+              outSession,
+              forwarder,
+              info.forward,
+              info.trackNamespacePrefix,
+              info.publishBlockedHandle))
           .start();
     }
   }
@@ -569,23 +575,49 @@ Subscriber::PublishResult MoQRelay::publish(
           kLocationMax.group})};
 }
 
+void MoQRelay::publishBlockedToTracksSubscriber(
+    const TrackNamespace& trackNamespacePrefix,
+    const FullTrackName& ftn,
+    const std::shared_ptr<Publisher::PublishBlockedHandle>&
+        publishBlockedHandle) const {
+  if (!publishBlockedHandle ||
+      !ftn.trackNamespace.startsWith(trackNamespacePrefix)) {
+    return;
+  }
+  const auto& ns = ftn.trackNamespace.trackNamespace;
+  TrackNamespace suffix(
+      std::vector<std::string>(
+          ns.begin() + trackNamespacePrefix.size(), ns.end()));
+  publishBlockedHandle->publishBlocked(suffix, ftn.trackName);
+}
+
 folly::coro::Task<void> MoQRelay::publishToSession(
     std::shared_ptr<MoQSession> session,
     std::shared_ptr<MoQForwarder> forwarder,
-    bool forward) {
+    bool forward,
+    TrackNamespace trackNamespacePrefix,
+    std::shared_ptr<Publisher::PublishBlockedHandle> publishBlockedHandle) {
+  const auto fullTrackName = forwarder->fullTrackName();
   auto subscriber = forwarder->addSubscriber(session, forward);
   if (!subscriber) {
     XLOG(ERR) << "Subscribe failed: addSubscriber returned null for "
-              << forwarder->fullTrackName();
+              << fullTrackName;
     co_return;
   }
-  XLOG(DBG4) << "added subscriber for ftn=" << forwarder->fullTrackName();
+  XLOG(DBG4) << "added subscriber for ftn=" << fullTrackName;
   auto guard = folly::makeGuard([subscriber] { subscriber->unsubscribe(); });
 
   auto pubInitial =
       session->publish(subscriber->getPublishRequest(), subscriber);
   if (pubInitial.hasError()) {
-    XLOG(ERR) << "Publish failed err=" << pubInitial.error().reasonPhrase;
+    const auto& publishError = pubInitial.error();
+    XLOG(ERR) << "Publish failed err=" << publishError.reasonPhrase;
+    if (publishError.webTransportError &&
+        *publishError.webTransportError ==
+            proxygen::WebTransport::ErrorCode::STREAM_CREATION_ERROR) {
+      publishBlockedToTracksSubscriber(
+          trackNamespacePrefix, fullTrackName, publishBlockedHandle);
+    }
     co_return;
   }
   subscriber->trackConsumer = std::move(pubInitial->consumer);
@@ -716,6 +748,7 @@ MoQRelay::subscribeNamespace(
           subNs.forward,
           effectiveOptions,
           namespacePublishHandle,
+          /*publishBlockedHandle=*/nullptr,
           subNs.trackNamespacePrefix});
 
   // If this is the first content added to this node, notify parent
@@ -851,7 +884,7 @@ class MoQRelay::TracksSubscription : public Publisher::SubscribeTracksHandle {
 
 folly::coro::Task<Publisher::SubscribeTracksResult> MoQRelay::subscribeTracks(
     SubscribeTracks subTracks,
-    std::shared_ptr<PublishBlockedHandle> /*publishBlockedHandle*/) {
+    std::shared_ptr<PublishBlockedHandle> publishBlockedHandle) {
   XLOG(DBG1) << __func__ << " nsp=" << subTracks.trackNamespacePrefix;
 
   auto session = MoQSession::getRequestSession();
@@ -886,6 +919,7 @@ folly::coro::Task<Publisher::SubscribeTracksResult> MoQRelay::subscribeTracks(
           // options is unused for this tree.
           SubscribeNamespaceOptions::PUBLISH,
           /*namespacePublishHandle=*/nullptr,
+          std::move(publishBlockedHandle),
           subTracks.trackNamespacePrefix});
   if (wasEmpty && tracksNode->parent_) {
     tracksNode->parent_->incrementActiveChildren();
@@ -918,7 +952,11 @@ folly::coro::Task<Publisher::SubscribeTracksResult> MoQRelay::subscribeTracks(
       co_withExecutor(
           exec,
           publishToSession(
-              session, subscriptionIt->second.forwarder, subTracks.forward))
+              session,
+              subscriptionIt->second.forwarder,
+              subTracks.forward,
+              subTracks.trackNamespacePrefix,
+              tracksNode->sessions.at(session).publishBlockedHandle))
           .start();
     }
     for (auto& nextNodeIt : pubNode->children) {

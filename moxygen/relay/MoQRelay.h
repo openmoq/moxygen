@@ -13,7 +13,7 @@
 #include "moxygen/relay/MoQForwarder.h"
 #include "moxygen/util/TimedBaton.h"
 
-#include <folly/container/F14Set.h>
+#include <folly/container/F14Map.h>
 
 namespace moxygen {
 
@@ -141,13 +141,14 @@ class MoQRelay : public Publisher,
     // Maps a track name to a the session performing the PUBLISH
     folly::F14FastMap<std::string, std::shared_ptr<MoQSession>> publishes;
 
-    // Info stored per SUBSCRIBE_NAMESPACE subscriber
     struct NamespaceSubscriberInfo {
       bool forward{true};
       SubscribeNamespaceOptions options{SubscribeNamespaceOptions::BOTH};
       // Handle for sending NAMESPACE / NAMESPACE_DONE on the bidi stream
       // (draft 16+). Null for draft <= 15.
       std::shared_ptr<Publisher::NamespacePublishHandle> namespacePublishHandle;
+      // Draft 18+ only: handle for SUBSCRIBE_TRACKS response-stream followups.
+      std::shared_ptr<Publisher::PublishBlockedHandle> publishBlockedHandle;
       // The namespace prefix this subscriber used for SUBSCRIBE_NAMESPACE
       TrackNamespace trackNamespacePrefix;
     };
@@ -261,7 +262,16 @@ class MoQRelay : public Publisher,
   folly::coro::Task<void> publishToSession(
       std::shared_ptr<MoQSession> session,
       std::shared_ptr<MoQForwarder> forwarder,
-      bool forward);
+      bool forward,
+      TrackNamespace trackNamespacePrefix = {},
+      std::shared_ptr<Publisher::PublishBlockedHandle> publishBlockedHandle =
+          nullptr);
+
+  void publishBlockedToTracksSubscriber(
+      const TrackNamespace& trackNamespacePrefix,
+      const FullTrackName& ftn,
+      const std::shared_ptr<Publisher::PublishBlockedHandle>&
+          publishBlockedHandle) const;
 
   folly::coro::Task<void> doSubscribeUpdate(
       std::shared_ptr<Publisher::SubscriptionHandle> handle,
