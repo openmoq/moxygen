@@ -481,6 +481,30 @@ void MoQRelaySession::onRequestUpdate(RequestUpdate requestUpdate) {
       handleSubscribeNamespaceRequestUpdate(requestUpdate, subAnnIt->second);
       return;
     }
+
+    // Check subscribeTracksHandles_ for SUBSCRIBE_TRACKS
+    auto subTracksIt = subscribeTracksHandles_.find(existingRequestID);
+    if (subTracksIt != subscribeTracksHandles_.end()) {
+      if (closeSessionIfRequestIDInvalid(requestID, false, true)) {
+        return;
+      }
+      if (shouldRejectNewPeerRequestDueToGoaway()) {
+        XLOG(DBG1)
+            << "Rejecting subscribeTracks request update, GOAWAY/draining sess="
+            << this;
+        requestUpdateError(
+            RequestError{
+                requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
+            existingRequestID);
+        return;
+      }
+      if (closeSessionIfRequestIDInvalid(
+              existingRequestID, false, false, false)) {
+        return;
+      }
+      handleSubscribeTracksRequestUpdate(requestUpdate, subTracksIt->second);
+      return;
+    }
   }
 
   // Delegate to base class for all other cases
@@ -634,6 +658,57 @@ void MoQRelaySession::terminateRequestUpdateOnError(
   } else {
     onSubscribeTracksStreamClosed(existingRequestID);
   }
+}
+
+void MoQRelaySession::handleSubscribeTracksRequestUpdate(
+    RequestUpdate requestUpdate,
+    std::shared_ptr<Publisher::SubscribeTracksHandle> subscribeTracksHandle) {
+  XLOG(DBG1) << __func__ << " requestID=" << requestUpdate.existingRequestID
+             << " sess=" << this;
+
+  auto existingRequestID = requestUpdate.existingRequestID;
+  auto updateRequestID = requestUpdate.requestID;
+
+  // Handle asynchronously with shared ownership to prevent use-after-free
+  co_withExecutor(
+      getExecutor(),
+      co_withCancellation(
+          cancellationSource_.getToken(),
+          folly::coro::co_invoke(
+              [this,
+               subscribeTracksHandle = std::move(subscribeTracksHandle),
+               update = std::move(requestUpdate),
+               existingRequestID,
+               updateRequestID]() mutable -> folly::coro::Task<void> {
+                co_await folly::coro::co_safe_point;
+                // Call the handle's requestUpdate
+                auto updateResult = co_await co_awaitTry(co_withCancellation(
+                    cancellationSource_.getToken(),
+                    subscribeTracksHandle->requestUpdate(std::move(update))));
+
+                // Only send responses for v15+
+                if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
+                  if (updateResult.hasException()) {
+                    XLOG(ERR) << "Exception in requestUpdate ex="
+                              << updateResult.exception().what();
+                    requestUpdateError(
+                        RequestError{
+                            updateRequestID,
+                            RequestErrorCode::INTERNAL_ERROR,
+                            "Exception in requestUpdate"},
+                        existingRequestID);
+                  } else if (updateResult->hasError()) {
+                    auto updateErr = updateResult->error();
+                    requestUpdateError(updateErr, existingRequestID);
+                  } else {
+                    RequestOk requestOk{
+                        .requestID = updateRequestID,
+                        .requestSpecificParams = {}};
+                    requestUpdateOk(requestOk, existingRequestID);
+                  }
+                }
+              })))
+      .start();
 }
 
 // PublishNamespace publisher methods
@@ -1088,8 +1163,8 @@ void MoQRelaySession::publishNamespaceCancel(
 void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone unAnn) {
   MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onPublishNamespaceDone);
 
-  // Set up request context so publishNamespaceDone() can identify this session.
-  // This is needed because MoQRelay::publishNamespaceDone() uses
+  // Set up request context so publishNamespaceDone() can identify this
+  // session. This is needed because MoQRelay::publishNamespaceDone() uses
   // getRequestSession() to verify ownership.
   folly::RequestContextScopeGuard guard;
   setRequestSession();
@@ -1515,8 +1590,9 @@ class NoopNamespacePublishHandle : public Publisher::NamespacePublishHandle {
   void namespaceDoneMsg(const TrackNamespace&) override {}
 };
 
-// Adapts a SUBSCRIBE_NAMESPACE handle to the SUBSCRIBE_TRACKS handle interface
-// for the draft 16-17 fallback, so callers see a uniform return type.
+// Adapts a SUBSCRIBE_NAMESPACE handle to the SUBSCRIBE_TRACKS handle
+// interface for the draft 16-17 fallback, so callers see a uniform return
+// type.
 class NamespaceBackedSubscribeTracksHandle
     : public Publisher::SubscribeTracksHandle {
  public:

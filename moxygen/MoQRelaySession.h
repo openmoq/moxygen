@@ -144,6 +144,9 @@ class MoQRelaySession : public MoQSession {
       RequestUpdate requestUpdate,
       std::shared_ptr<Publisher::SubscribeNamespaceHandle>
           subscribeNamespaceHandle);
+  void handleSubscribeTracksRequestUpdate(
+      RequestUpdate requestUpdate,
+      std::shared_ptr<Publisher::SubscribeTracksHandle> subscribeTracksHandle);
 
   // Internal publishNamespace handling methods
   folly::coro::Task<void> handleSubscribeNamespace(
