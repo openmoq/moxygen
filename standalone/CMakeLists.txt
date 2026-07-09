@@ -568,11 +568,17 @@ endif()
 # Include moxygen's main CMakeLists.txt
 # Root moxygen XLOG categories at moxygen.* from the consumer side too, so
 # moxygen=DBG4 works in this build immediately — independent of whether
-# moxygen's own FOLLY_XLOG_STRIP_PREFIXES fix has landed/synced yet. Resolve the
-# root to an absolute, ..-free path so it matches the compiler's __FILE__.
-get_filename_component(_MOXYGEN_ROOT
-  "${CMAKE_CURRENT_SOURCE_DIR}/../moxygen" ABSOLUTE)
-add_compile_options(-fmacro-prefix-map=${_MOXYGEN_ROOT}/=)
+# moxygen's own FOLLY_XLOG_STRIP_PREFIXES fix has landed/synced yet.
+#
+# Strip the moxygen REPO ROOT (this dir's parent), NOT the inner source dir:
+# sources live at <repo>/moxygen/MoQSession.cpp, so stripping <repo>/ leaves
+# moxygen/MoQSession.cpp -> category moxygen.MoQSession (and openmoq/... ->
+# openmoq.*). Stripping <repo>/moxygen/ instead would leave a bare
+# MoQSession.cpp -> category "MoQSession", which moxygen= never matches.
+# Resolve to an absolute, ..-free path so it matches the compiler's __FILE__.
+get_filename_component(_MOXYGEN_REPO_ROOT
+  "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+add_compile_options(-fmacro-prefix-map=${_MOXYGEN_REPO_ROOT}/=)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../moxygen moxygen)
 
 moxygen_install_headers(moxygen ${CMAKE_CURRENT_SOURCE_DIR}/../moxygen)
