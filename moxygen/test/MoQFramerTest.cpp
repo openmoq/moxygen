@@ -1864,6 +1864,30 @@ TEST(MoQFramerTest, SubscribeUpdateDraft15ForwardUnset) {
   EXPECT_FALSE(parseResult->forward.has_value());
 }
 
+// The TRACK_NAMESPACE_PREFIX parameter carries a Track Namespace tuple (§2.4.1)
+// in its value; encode and decode must round-trip (draft 18+).
+TEST(MoQFramerTest, TrackNamespacePrefixParamRoundTrip) {
+  const TrackNamespace prefix(std::vector<std::string>{"foo", "bar"});
+  auto param =
+      MoQFrameWriter::encodeTrackNamespacePrefixParam(prefix, kVersionDraft18);
+  EXPECT_EQ(
+      param.key,
+      folly::to_underlying(TrackRequestParamKey::TRACK_NAMESPACE_PREFIX));
+
+  auto decoded = MoQFrameParser::parseTrackNamespacePrefixParam(
+      param.asString, kVersionDraft18);
+  ASSERT_TRUE(decoded.hasValue());
+  EXPECT_EQ(*decoded, prefix);
+}
+
+// A value that is not a valid Track Namespace tuple must fail to decode (here
+// the tuple claims 5 elements but carries no element data).
+TEST(MoQFramerTest, TrackNamespacePrefixParamMalformed) {
+  auto decoded = MoQFrameParser::parseTrackNamespacePrefixParam(
+      std::string("\x05", 1), kVersionDraft18);
+  EXPECT_TRUE(decoded.hasError());
+}
+
 TEST_P(MoQFramerTest, OddExtensionLengthVarintBoundary) {
   // This verifies that for odd-type extensions (length-prefixed), the length
   // varint size is computed from the extension payload length, not from

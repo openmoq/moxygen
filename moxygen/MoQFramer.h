@@ -317,6 +317,13 @@ class MoQFrameParser {
     return version_;
   }
 
+  // Decode a TRACK_NAMESPACE_PREFIX parameter value (a Track Namespace tuple,
+  // §2.4.1) into a TrackNamespace for the given negotiated version. Used by
+  // consumers of REQUEST_UPDATE (e.g. the relay) that receive the prefix as a
+  // generic parameter in the message's parameter list.
+  static folly::Expected<TrackNamespace, ErrorCode>
+  parseTrackNamespacePrefixParam(const std::string& value, uint64_t version);
+
   // Version-aware varint decode. Dispatches to QUIC varint on drafts <17 and
   // MoQ varint on drafts >=17. The dispatch flag is cached in
   // `initializeVersion` so this stays a single load + branch. The default cap
@@ -751,6 +758,14 @@ class MoQFrameWriter {
   std::optional<uint64_t> getVersion() const {
     return version_;
   }
+
+  // Encode a TrackNamespace as a TRACK_NAMESPACE_PREFIX parameter (a Track
+  // Namespace tuple value, §2.4.1) for the given negotiated version. The
+  // resulting parameter can be added to a REQUEST_UPDATE's parameter list to
+  // update an established SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS prefix.
+  static Parameter encodeTrackNamespacePrefixParam(
+      const TrackNamespace& trackNamespacePrefix,
+      uint64_t version);
 
   // Version-aware varint encoded-size query. Returns the number of bytes the
   // minimal encoding of `value` would consume, or sets `error` and returns 0

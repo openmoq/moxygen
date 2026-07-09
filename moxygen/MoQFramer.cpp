@@ -3870,6 +3870,47 @@ MoQFrameParser::parseNamespaceTuple(folly::io::Cursor& cursor, size_t& length)
   return items;
 }
 
+/*static*/ folly::Expected<TrackNamespace, ErrorCode>
+MoQFrameParser::parseTrackNamespacePrefixParam(
+    const std::string& value,
+    uint64_t version) {
+  XCHECK_GE(getDraftMajorVersion(version), 18u);
+  MoQFrameParser parser;
+  parser.initializeVersion(version);
+  auto buf = folly::IOBuf::wrapBufferAsValue(value.data(), value.size());
+  folly::io::Cursor cursor(&buf);
+  size_t length = value.size();
+  auto tuple = parser.parseNamespaceTuple(cursor, length);
+  if (!tuple) {
+    return folly::makeUnexpected(tuple.error());
+  }
+  if (length != 0) {
+    XLOG(DBG4) << "parseTrackNamespacePrefixParam: trailing bytes in value";
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+  return TrackNamespace(std::move(tuple.value()));
+}
+
+/*static*/ Parameter MoQFrameWriter::encodeTrackNamespacePrefixParam(
+    const TrackNamespace& trackNamespacePrefix,
+    uint64_t version) {
+  XCHECK_GE(getDraftMajorVersion(version), 18u);
+  MoQFrameWriter writer;
+  writer.initializeVersion(version);
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  size_t size = 0;
+  bool error = false;
+  writer.writeTrackNamespace(buf, trackNamespacePrefix, size, error);
+  XCHECK(!error)
+      << "encodeTrackNamespacePrefixParam: failed to encode namespace";
+  auto tuple = buf.move();
+  std::string value =
+      tuple ? tuple->moveToFbString().toStdString() : std::string();
+  return Parameter(
+      folly::to_underlying(TrackRequestParamKey::TRACK_NAMESPACE_PREFIX),
+      value);
+}
+
 //// Transforms /////
 TrackStatusOk RequestOk::toTrackStatusOk() const {
   TrackStatusOk trackStatusOk;
