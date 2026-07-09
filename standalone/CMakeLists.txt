@@ -577,19 +577,27 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../moxygen moxygen)
 
 moxygen_install_headers(moxygen ${CMAKE_CURRENT_SOURCE_DIR}/../moxygen)
 
-# Regression guard for the per-dependency XLOG category rooting above: drives a
-# short date-server/text-client session and asserts each layer's --logging
-# selector (moxygen=, fizz=, quic.mvfst=, ...) actually scopes to that layer.
+# Regression guard for the per-layer XLOG category rooting above: drives short
+# date-server/text-client (mvfst) and, when built, pico relay/client (picoquic)
+# sessions and asserts each layer's --logging selector (moxygen=, fizz=, wangle=,
+# quic.mvfst=, proxygen=, folly=, quic.picoquic=) actually scopes to that layer.
 # Needs the sample binaries, so gate on BUILD_SAMPLES as well as BUILD_TESTS.
 if(BUILD_TESTS AND BUILD_SAMPLES)
   enable_testing()
+  # The pico sample binaries only exist under BUILD_PICOQUIC; pass them when they
+  # do so the test also covers quic.picoquic, otherwise it skips that layer.
+  set(_pico_args "")
+  if(TARGET pico_evb_relay_server AND TARGET pico_evb_text_client)
+    set(_pico_args
+        $<TARGET_FILE:pico_evb_relay_server> $<TARGET_FILE:pico_evb_text_client>)
+  endif()
   add_test(
     NAME xlog_category_roots
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/xlog_category_smoke.sh
-            $<TARGET_FILE:moqdateserver> $<TARGET_FILE:moqtextclient>
+            $<TARGET_FILE:moqdateserver> $<TARGET_FILE:moqtextclient> ${_pico_args}
   )
   set_tests_properties(xlog_category_roots PROPERTIES
-    LABELS "logging;smoke" TIMEOUT 120)
+    LABELS "logging;smoke" TIMEOUT 180)
 endif()
 
 # =============================================================================
