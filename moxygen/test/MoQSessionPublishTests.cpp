@@ -590,6 +590,74 @@ CO_TEST_P_X(Draft18Test, PublishBidiForwardsPublishDone) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
+CO_TEST_P_X(Draft18Test, PublishBidiCreateTransportErrorIsInternalError) {
+  co_await setupMoQSessionForPublish(initialMaxRequestID_);
+
+  clientWt_->setNextCreateBidiStreamError(
+      proxygen::WebTransport::ErrorCode::GENERIC_ERROR);
+
+  PublishRequest pub{
+      RequestID(0),
+      FullTrackName{TrackNamespace{{"test"}}, "test-track"},
+      TrackAlias(100),
+      GroupOrder::Default,
+      AbsoluteLocation{0, 100},
+      true,
+  };
+
+  auto publishResult =
+      clientSession_->publish(std::move(pub), makePublishHandle());
+  EXPECT_TRUE(publishResult.hasError());
+  if (!publishResult.hasError()) {
+    co_return;
+  }
+  const auto& publishError = publishResult.error();
+  EXPECT_EQ(publishError.errorCode, PublishErrorCode::INTERNAL_ERROR);
+  EXPECT_TRUE(publishError.webTransportError.has_value());
+  if (!publishError.webTransportError.has_value()) {
+    co_return;
+  }
+  EXPECT_EQ(
+      *publishError.webTransportError,
+      proxygen::WebTransport::ErrorCode::GENERIC_ERROR);
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(Draft18Test, PublishBidiCreateStreamCreationErrorIsInternalError) {
+  co_await setupMoQSessionForPublish(initialMaxRequestID_);
+
+  clientWt_->setNextCreateBidiStreamError(
+      proxygen::WebTransport::ErrorCode::STREAM_CREATION_ERROR);
+
+  PublishRequest pub{
+      RequestID(0),
+      FullTrackName{TrackNamespace{{"test"}}, "test-track"},
+      TrackAlias(100),
+      GroupOrder::Default,
+      AbsoluteLocation{0, 100},
+      true,
+  };
+
+  auto publishResult =
+      clientSession_->publish(std::move(pub), makePublishHandle());
+  EXPECT_TRUE(publishResult.hasError());
+  if (!publishResult.hasError()) {
+    co_return;
+  }
+  const auto& publishError = publishResult.error();
+  EXPECT_EQ(publishError.errorCode, PublishErrorCode::INTERNAL_ERROR);
+  EXPECT_TRUE(publishError.webTransportError.has_value());
+  if (!publishError.webTransportError.has_value()) {
+    co_return;
+  }
+  EXPECT_EQ(
+      *publishError.webTransportError,
+      proxygen::WebTransport::ErrorCode::STREAM_CREATION_ERROR);
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, PublishDataArrivesBeforePublishOk) {
   co_await setupMoQSessionForPublish(initialMaxRequestID_);
 

@@ -3046,8 +3046,7 @@ void MoQSession::failPendingRequestOnEarlyClose(
   }
 }
 
-folly::Expected<std::shared_ptr<BidiStreamControl>, std::string>
-MoQSession::sendRequest(
+MoQSession::SendRequestResult MoQSession::sendRequest(
     folly::IOBufQueue& writeBuf,
     FrameType okType,
     std::vector<FrameType> postTerminal,
@@ -3059,7 +3058,8 @@ MoQSession::sendRequest(
     auto bidiStream = wt_->createBidiStream();
     if (!bidiStream) {
       XLOG(ERR) << "Failed to create bidi stream sess=" << this;
-      return folly::makeUnexpected(std::string("Failed to create bidi stream"));
+      return folly::makeUnexpected(
+          SendRequestError{bidiStream.error(), "Failed to create bidi stream"});
     }
     bidiStream->writeHandle->writeStreamData(
         writeBuf.move(), /*fin=*/false, nullptr);
@@ -5132,7 +5132,7 @@ folly::coro::Task<MoQSession::TrackStatusResult> MoQSession::trackStatus(
         TrackStatusError{
             reqID,
             TrackStatusErrorCode::INTERNAL_ERROR,
-            std::move(sendResult.error())});
+            std::move(sendResult.error().reasonPhrase)});
   }
   auto control = std::move(sendResult.value());
   // No REQUEST_UPDATE channel for TRACK_STATUS — FIN now.
@@ -5366,11 +5366,15 @@ Subscriber::PublishResult MoQSession::publish(
             ResetStreamErrorCode::CANCELLED);
       });
   if (sendResult.hasError()) {
+    auto sendError = std::move(sendResult.error());
     return folly::makeUnexpected(
         PublishError{
             pub.requestID,
             PublishErrorCode::INTERNAL_ERROR,
-            std::move(sendResult.error())});
+            std::move(sendError.reasonPhrase),
+            std::nullopt,
+            std::nullopt,
+            std::move(sendError.webTransportError)});
   }
   if (logger_) {
     logger_->logPublish(
@@ -5571,7 +5575,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
     SubscribeError subscribeError = {
         reqID,
         SubscribeErrorCode::INTERNAL_ERROR,
-        std::move(sendResult.error())};
+        std::move(sendResult.error().reasonPhrase)};
     MOQ_SUBSCRIBER_STATS(
         subscriberStatsCallback_, onSubscribeError, subscribeError.errorCode);
     co_return folly::makeUnexpected(subscribeError);
@@ -6026,7 +6030,9 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
       });
   if (sendResult.hasError()) {
     FetchError fetchError = {
-        reqID, FetchErrorCode::INTERNAL_ERROR, std::move(sendResult.error())};
+        reqID,
+        FetchErrorCode::INTERNAL_ERROR,
+        std::move(sendResult.error().reasonPhrase)};
     MOQ_SUBSCRIBER_STATS(
         subscriberStatsCallback_, onFetchError, fetchError.errorCode);
     co_return folly::makeUnexpected(fetchError);

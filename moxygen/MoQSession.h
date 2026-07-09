@@ -588,6 +588,14 @@ class MoQSession : public Subscriber,
   std::shared_ptr<ReplyContext> makeReplyContext(
       std::shared_ptr<BidiStreamControl> control);
 
+  struct SendRequestError {
+    std::optional<proxygen::WebTransport::ErrorCode> webTransportError;
+    std::string reasonPhrase;
+  };
+
+  using SendRequestResult =
+      folly::Expected<std::shared_ptr<BidiStreamControl>, SendRequestError>;
+
   // Send a serialized request. In draft >= minBidiDraftVersion, opens a
   // bidi stream and starts a read loop; otherwise appends to the control
   // stream. Returns the control (null on the control-stream path).
@@ -597,7 +605,7 @@ class MoQSession : public Subscriber,
   // caller's typed `okType` or `REQUEST_ERROR`. `postTerminal` lists any
   // frames the peer may send after the terminal (e.g. PUBLISH_DONE on a
   // SUBSCRIBE).
-  folly::Expected<std::shared_ptr<BidiStreamControl>, std::string> sendRequest(
+  SendRequestResult sendRequest(
       folly::IOBufQueue& writeBuf,
       FrameType okType,
       std::vector<FrameType> postTerminal,

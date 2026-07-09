@@ -10,6 +10,7 @@
 #include <folly/hash/Hash.h>
 #include <folly/io/IOBuf.h>
 #include <folly/logging/xlog.h>
+#include <proxygen/lib/http/webtransport/WebTransport.h>
 #include <algorithm>
 #include <limits>
 #include <optional>
@@ -1403,6 +1404,8 @@ struct RequestError {
   std::optional<std::chrono::milliseconds> retryInterval = std::nullopt;
   // Draft 18+: present only when errorCode == REDIRECT.
   std::optional<Redirect> redirect = std::nullopt;
+  std::optional<proxygen::WebTransport::ErrorCode> webTransportError =
+      std::nullopt;
 };
 
 // Type aliases for backward compatibility

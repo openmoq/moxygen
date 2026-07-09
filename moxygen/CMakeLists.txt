@@ -25,6 +25,7 @@ moxygen_add_library(moxygen_moq_types
     Folly::folly_hash_hash
     Folly::folly_io_iobuf
     Folly::folly_logging_logging
+    proxygen::proxygen_http_webtransport
 )
 
 moxygen_add_library(moxygen_moq_varint

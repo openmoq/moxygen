@@ -690,7 +690,7 @@ MoQRelaySession::publishNamespace(
     co_return folly::makeUnexpected(PublishNamespaceError(
         {ann.requestID,
          PublishNamespaceErrorCode::INTERNAL_ERROR,
-         std::move(sendResult.error())}));
+         std::move(sendResult.error().reasonPhrase)}));
   }
   auto control = sendResult.value();
   auto replyCtx = makeReplyContext(control);
@@ -1243,7 +1243,7 @@ MoQRelaySession::subscribeNamespace(
     co_return folly::makeUnexpected(SubscribeNamespaceError(
         {RequestID(0),
          SubscribeNamespaceErrorCode::INTERNAL_ERROR,
-         std::move(sendResult.error())}));
+         std::move(sendResult.error().reasonPhrase)}));
   }
 
   if (logger_) {
@@ -1604,7 +1604,7 @@ MoQRelaySession::subscribeTracks(
     co_return folly::makeUnexpected(SubscribeTracksError(
         {RequestID(0),
          SubscribeTracksErrorCode::INTERNAL_ERROR,
-         std::move(sendResult.error())}));
+         std::move(sendResult.error().reasonPhrase)}));
   }
 
   auto contract = folly::coro::makePromiseContract<
