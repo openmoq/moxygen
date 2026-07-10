@@ -216,12 +216,48 @@ class MoQRelay : public Publisher,
           std::shared_ptr<MoQSession>,
           NamespaceNode::NamespaceSubscriberInfo>>* sessions);
 
-  bool hasOverlappingTracksSubscription(
-      const TrackNamespace& trackNamespacePrefix,
+  // Generic per-session prefix-overlap check within a subscriber tree
+  // (SUBSCRIBE_NAMESPACE or SUBSCRIBE_TRACKS).
+  bool hasOverlappingSubscription(
+      const NamespaceNode& root,
+      const TrackNamespace& prefix,
       std::shared_ptr<MoQSession> session) const;
-  bool hasTracksSubscriptionInSubtree(
+  bool hasSessionInSubtree(
       const NamespaceNode& node,
       std::shared_ptr<MoQSession> session) const;
+
+  // Draft §10.9.2: move an established SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS
+  // registration to a new Track Namespace Prefix within its subscriber tree,
+  // enforcing the per-session overlap restriction. Returns PREFIX_OVERLAP and
+  // leaves the original registration intact if the new prefix overlaps another
+  // active subscription of the same type in the session.
+  folly::Expected<folly::Unit, RequestErrorCode> updateSubscriptionPrefix(
+      NamespaceNode& root,
+      const TrackNamespace& oldPrefix,
+      const TrackNamespace& newPrefix,
+      const std::shared_ptr<MoQSession>& session);
+  folly::Expected<folly::Unit, RequestErrorCode> updateTracksSubscriptionPrefix(
+      const TrackNamespace& oldPrefix,
+      const TrackNamespace& newPrefix,
+      const std::shared_ptr<MoQSession>& session);
+  folly::Expected<folly::Unit, RequestErrorCode>
+  updateNamespaceSubscriptionPrefix(
+      const TrackNamespace& oldPrefix,
+      const TrackNamespace& newPrefix,
+      const std::shared_ptr<MoQSession>& session);
+  // Selects which subscriber tree a prefix update applies to.
+  enum class PrefixUpdateKind { Tracks, Namespace };
+  // Shared REQUEST_UPDATE prefix-change handling for the SUBSCRIBE_TRACKS and
+  // SUBSCRIBE_NAMESPACE handles: extracts and decodes the
+  // TRACK_NAMESPACE_PREFIX parameter, closes the session on a malformed tuple
+  // (§2.4.1), and moves the registration (which backfills newly-matched
+  // content). Returns the new prefix on success or a per-request error to relay
+  // back to the peer.
+  folly::Expected<TrackNamespace, RequestError> updatePrefixFromRequest(
+      const RequestUpdate& reqUpdate,
+      const TrackNamespace& currentPrefix,
+      const std::shared_ptr<MoQSession>& session,
+      PrefixUpdateKind kind);
 
   struct RelaySubscription {
     RelaySubscription(
@@ -266,6 +302,36 @@ class MoQRelay : public Publisher,
       TrackNamespace trackNamespacePrefix = {},
       std::shared_ptr<Publisher::PublishBlockedHandle> publishBlockedHandle =
           nullptr);
+
+  // Emit PUBLISH to `session` for every already-published track matching
+  // `prefix`. Tracks under `skipUnderPrefix` are skipped -- they are already
+  // being forwarded to this session via a prior prefix, so re-publishing would
+  // emit a duplicate PUBLISH. Used by the initial SUBSCRIBE_TRACKS (no skip)
+  // and by REQUEST_UPDATE prefix moves (skip the outgoing prefix's subtree).
+  void publishExistingMatchingTracks(
+      const std::shared_ptr<MoQSession>& session,
+      const TrackNamespace& prefix,
+      bool forward,
+      const std::shared_ptr<Publisher::PublishBlockedHandle>&
+          publishBlockedHandle,
+      const TrackNamespace* skipUnderPrefix = nullptr);
+
+  // Namespace-tree analog of publishExistingMatchingTracks: replays existing
+  // PUBLISH_NAMESPACEs and matching PUBLISHes under `prefix` to a
+  // SUBSCRIBE_NAMESPACE subscriber, honoring `options` and draft version.
+  // Tracks/namespaces under `skipUnderPrefix` are skipped -- already delivered
+  // via a prior prefix. Used by the initial SUBSCRIBE_NAMESPACE (no skip) and
+  // by REQUEST_UPDATE prefix moves (skip the outgoing prefix's subtree).
+  void publishExistingMatchingNamespaces(
+      const std::shared_ptr<MoQSession>& session,
+      const TrackNamespace& prefix,
+      bool forward,
+      SubscribeNamespaceOptions options,
+      const std::shared_ptr<Publisher::NamespacePublishHandle>&
+          namespacePublishHandle,
+      RequestID requestID,
+      uint64_t negotiatedVersion,
+      const TrackNamespace* skipUnderPrefix = nullptr);
 
   void publishBlockedToTracksSubscriber(
       const TrackNamespace& trackNamespacePrefix,

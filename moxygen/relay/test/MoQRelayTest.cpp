@@ -3037,4 +3037,281 @@ TEST_F(
   removeSession(publisher);
 }
 
+// Builds a REQUEST_UPDATE carrying a new Track Namespace Prefix (draft 18+),
+// as the generic TRACK_NAMESPACE_PREFIX parameter.
+static RequestUpdate makeTrackNamespacePrefixUpdate(
+    const TrackNamespace& newPrefix) {
+  RequestUpdate update;
+  update.params.setMajorVersion(getDraftMajorVersion(kVersionDraft18));
+  update.params.insertParam(
+      MoQFrameWriter::encodeTrackNamespacePrefixParam(
+          newPrefix, kVersionDraft18));
+  return update;
+}
+
+// Draft §10.9.2: a REQUEST_UPDATE with a new Track Namespace Prefix moves an
+// established SUBSCRIBE_TRACKS registration. Future publishes match the new
+// prefix; the old prefix no longer matches.
+TEST_F(MoQRelayTracksTest, RequestUpdateMovesTracksPrefix) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  setupPublishSucceeds(subscriber);
+
+  const TrackNamespace oldPrefix{{"test", "a"}};
+  const TrackNamespace newPrefix{{"test", "b"}};
+  auto handle = doSubscribeTracks(subscriber, oldPrefix);
+  ASSERT_NE(handle, nullptr);
+
+  auto update = makeTrackNamespacePrefixUpdate(newPrefix);
+  auto res = withSessionContext(subscriber, [&]() {
+    return folly::coro::blockingWait(
+        handle->requestUpdate(update), exec_.get());
+  });
+  ASSERT_TRUE(res.hasValue());
+
+  // A publish under the NEW prefix is forwarded.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(1);
+  doPublish(publisher, FullTrackName{newPrefix, "t"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+
+  // A publish under the OLD prefix is not.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(0);
+  doPublish(publisher, FullTrackName{oldPrefix, "t2"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
+// Draft §10.9.2: moving a SUBSCRIBE_TRACKS prefix must immediately PUBLISH
+// tracks that ALREADY exist under the new prefix, not just future ones. Here
+// test/b/t is published while the subscriber is still on prefix test/a; the
+// update to test/b must backfill it.
+TEST_F(MoQRelayTracksTest, RequestUpdateBackfillsExistingTracksUnderNewPrefix) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  setupPublishSucceeds(subscriber);
+
+  const TrackNamespace oldPrefix{{"test", "a"}};
+  const TrackNamespace newPrefix{{"test", "b"}};
+  auto handle = doSubscribeTracks(subscriber, oldPrefix);
+  ASSERT_NE(handle, nullptr);
+
+  // A track exists under the (future) new prefix before the update. It does not
+  // match test/a, so the subscriber is not published to yet.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(0);
+  doPublish(publisher, FullTrackName{newPrefix, "t"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+
+  // Moving the prefix to test/b must publish the already-existing test/b/t.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(1);
+  auto update = makeTrackNamespacePrefixUpdate(newPrefix);
+  auto res = withSessionContext(subscriber, [&]() {
+    return folly::coro::blockingWait(
+        handle->requestUpdate(update), exec_.get());
+  });
+  ASSERT_TRUE(res.hasValue());
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
+// The same backfill applies to SUBSCRIBE_NAMESPACE (draft §10.9.2): moving the
+// prefix must immediately PUBLISH tracks that already exist under the new
+// prefix. test/b/t is published while the subscriber is on prefix test/a; the
+// update to test/b must backfill it.
+TEST_F(
+    MoQRelayTracksTest,
+    RequestUpdateBackfillsExistingPublishesForNamespace) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  setupPublishSucceeds(subscriber);
+
+  const TrackNamespace oldPrefix{{"test", "a"}};
+  const TrackNamespace newPrefix{{"test", "b"}};
+  auto handle = doSubscribeNamespace(subscriber, oldPrefix);
+  ASSERT_NE(handle, nullptr);
+
+  // A track exists under the (future) new prefix before the update. It does not
+  // match test/a, so the subscriber is not published to yet.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(0);
+  doPublish(publisher, FullTrackName{newPrefix, "t"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+
+  // Moving the prefix to test/b must publish the already-existing test/b/t.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(1);
+  auto update = makeTrackNamespacePrefixUpdate(newPrefix);
+  auto res = withSessionContext(subscriber, [&]() {
+    return folly::coro::blockingWait(
+        handle->requestUpdate(update), exec_.get());
+  });
+  ASSERT_TRUE(res.hasValue());
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
+// Widening a SUBSCRIBE_TRACKS prefix (test/b -> test) must backfill the
+// newly-covered track (test/a/t) WITHOUT re-publishing a track already
+// forwarded under the old prefix (test/b/t): the skipUnderPrefix guard skips
+// the old-prefix subtree, so exactly one new PUBLISH goes out.
+TEST_F(MoQRelayTracksTest, RequestUpdateWidenPrefixDoesNotDuplicatePublish) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  setupPublishSucceeds(subscriber);
+
+  const TrackNamespace oldPrefix{{"test", "b"}};
+  const TrackNamespace otherPrefix{{"test", "a"}};
+  const TrackNamespace newPrefix{{"test"}};
+  auto handle = doSubscribeTracks(subscriber, oldPrefix);
+  ASSERT_NE(handle, nullptr);
+
+  // test/b/t matches the current prefix and is forwarded now; test/a/t does
+  // not.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(1);
+  doPublish(publisher, FullTrackName{oldPrefix, "t"});
+  doPublish(publisher, FullTrackName{otherPrefix, "t"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+
+  // Widening to test covers test/a/t (new) and test/b/t (already forwarded).
+  // Only test/a/t must be published; test/b/t must not be re-published.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(1);
+  auto update = makeTrackNamespacePrefixUpdate(newPrefix);
+  auto res = withSessionContext(subscriber, [&]() {
+    return folly::coro::blockingWait(
+        handle->requestUpdate(update), exec_.get());
+  });
+  ASSERT_TRUE(res.hasValue());
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
+// Updating a SUBSCRIBE_TRACKS prefix onto one overlapping another active
+// SUBSCRIBE_TRACKS in the same session is rejected with PREFIX_OVERLAP, and the
+// original registration is left intact (a subsequent non-overlapping update
+// from the same handle succeeds, proving rollback).
+TEST_F(
+    MoQRelayTracksTest,
+    RequestUpdateTracksPrefixOverlapRejectedAndRolledBack) {
+  auto session = createV18Session();
+  const TrackNamespace prefixA{{"test", "a"}};
+  const TrackNamespace prefixB{{"test", "b"}};
+  const TrackNamespace prefixC{{"test", "c"}};
+  auto handleA = doSubscribeTracks(session, prefixA);
+  ASSERT_NE(handleA, nullptr);
+  doSubscribeTracks(session, prefixC);
+
+  auto toC = makeTrackNamespacePrefixUpdate(prefixC);
+  auto res = withSessionContext(session, [&]() {
+    return folly::coro::blockingWait(handleA->requestUpdate(toC), exec_.get());
+  });
+  ASSERT_TRUE(res.hasError());
+  EXPECT_EQ(res.error().errorCode, SubscribeTracksErrorCode::PREFIX_OVERLAP);
+
+  auto toB = makeTrackNamespacePrefixUpdate(prefixB);
+  auto res2 = withSessionContext(session, [&]() {
+    return folly::coro::blockingWait(handleA->requestUpdate(toB), exec_.get());
+  });
+  EXPECT_TRUE(res2.hasValue());
+
+  removeSession(session);
+}
+
+// The same prefix-update overlap enforcement + rollback applies to
+// SUBSCRIBE_NAMESPACE (draft §10.9.2).
+TEST_F(
+    MoQRelayTracksTest,
+    RequestUpdateNamespacePrefixOverlapRejectedAndRolledBack) {
+  auto session = createV18Session();
+  const TrackNamespace prefixA{{"test", "a"}};
+  const TrackNamespace prefixB{{"test", "b"}};
+  const TrackNamespace prefixC{{"test", "c"}};
+  auto handleA = doSubscribeNamespace(session, prefixA);
+  ASSERT_NE(handleA, nullptr);
+  doSubscribeNamespace(session, prefixC);
+
+  auto toC = makeTrackNamespacePrefixUpdate(prefixC);
+  auto res = withSessionContext(session, [&]() {
+    return folly::coro::blockingWait(handleA->requestUpdate(toC), exec_.get());
+  });
+  ASSERT_TRUE(res.hasError());
+  EXPECT_EQ(res.error().errorCode, SubscribeNamespaceErrorCode::PREFIX_OVERLAP);
+
+  auto toB = makeTrackNamespacePrefixUpdate(prefixB);
+  auto res2 = withSessionContext(session, [&]() {
+    return folly::coro::blockingWait(handleA->requestUpdate(toB), exec_.get());
+  });
+  EXPECT_TRUE(res2.hasValue());
+
+  removeSession(session);
+}
+
+// A SUBSCRIBE_NAMESPACE from a session that already has one at an overlapping
+// prefix (exact / ancestor / descendant) is rejected with PREFIX_OVERLAP — the
+// same subscribe-time restriction SUBSCRIBE_TRACKS already enforces.
+TEST_F(MoQRelayTracksTest, OverlappingSubscribeNamespaceRejected) {
+  auto session = createV18Session();
+  const TrackNamespace base{{"a", "b"}};
+  const TrackNamespace ancestor{{"a"}};
+  const TrackNamespace descendant{{"a", "b", "c"}};
+
+  auto baseHandle = doSubscribeNamespace(session, base);
+  ASSERT_NE(baseHandle, nullptr);
+
+  auto trySubscribeNamespace = [&](const TrackNamespace& prefix) {
+    SubscribeNamespace subNs;
+    subNs.trackNamespacePrefix = prefix;
+    return withSessionContext(session, [&]() {
+      return folly::coro::blockingWait(
+          relay_->subscribeNamespace(std::move(subNs), nullptr), exec_.get());
+    });
+  };
+
+  const std::vector<std::pair<std::string, TrackNamespace>> overlaps{
+      {"exact", base},
+      {"ancestor", ancestor},
+      {"descendant", descendant},
+  };
+  for (const auto& [label, prefix] : overlaps) {
+    SCOPED_TRACE(label);
+    auto res = trySubscribeNamespace(prefix);
+    ASSERT_TRUE(res.hasError());
+    EXPECT_EQ(
+        res.error().errorCode, SubscribeNamespaceErrorCode::PREFIX_OVERLAP);
+  }
+
+  // The check is per-session: a different session may use an overlapping
+  // prefix.
+  auto otherSession = createV18Session();
+  auto otherHandle = doSubscribeNamespace(otherSession, base);
+  EXPECT_NE(otherHandle, nullptr);
+
+  removeSession(session);
+  removeSession(otherSession);
+}
+
 } // namespace moxygen::test
