@@ -161,7 +161,9 @@ if [ -n "$PICO_SRV" ] && [ -x "$PICO_SRV" ] && [ -n "$PICO_CLI" ] && [ -x "$PICO
       echo "PASS  openmoq.transport.pico=DBG9 excludes the sink (override applied → quic.picoquic)"
     fi
   else
-    echo "SKIP  quic.picoquic: sink emitted no DBG at root (picoquic not on XLOG, or no handshake)"
+    # Expected today: installPicoQuicXLogSink() has no callers, so the sink
+    # never emits. Auto-activates once that is wired — tracked in #318.
+    echo "SKIP  quic.picoquic: sink emitted no DBG at root — installer unwired (openmoq/moxygen#318)"
   fi
 else
   echo "SKIP  quic.picoquic: pico sample binaries not built (BUILD_PICOQUIC off) or openssl absent"
