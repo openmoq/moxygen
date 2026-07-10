@@ -69,14 +69,6 @@ assert_scoping() {
     fi
   done
 
-  # DISCOVERY: dump the DBG-level (V) source files this session actually emits at
-  # root DBG9, so markers are chosen from reality instead of guessed. Only V-level
-  # files are targetable by a per-layer selector.
-  echo "== INVENTORY[$runner] DBG-level files at root DBG9 =="
-  grep -E '^V[0-9]' <<<"$root_out" \
-    | grep -oE '[A-Za-z_][A-Za-z_0-9]*\.(cpp|h):[0-9]+' | sed -E 's/:[0-9]+$//' \
-    | sort | uniq -c | sort -rn | sed 's/^/    /'
-
   # One run per active layer: assert its own marker is present AND every other
   # active layer's marker is absent (that exclusion is the proof of scoping, and
   # catches category collisions like a bare quic.* shared by mvfst and picoquic).
@@ -115,9 +107,26 @@ run_mvfst() {
   cat "$log"
 }
 
+# moxygen, fizz, and quic.mvfst are actively verified here — the date-server MoQ-
+# over-QUIC session exercises all three (confirmed via a CI inventory dump).
+#
+# wangle, proxygen, and folly are listed for completeness but SKIP today, for
+# structural reasons rather than wrong markers (each confirmed against the CI
+# inventory — these files simply never appear):
+#   - proxygen: still on the glog backend in this build (standalone sets
+#     fizz/wangle/mvfst to XLOG but not proxygen — no XLOG backend option yet),
+#     so it emits nothing into a folly category. proxygen= is inert until it
+#     moves to XLOG.
+#   - wangle:   on XLOG, but Acceptor/ConnectionManager only fire behind a TCP
+#     HTTP acceptor (e.g. the moqx admin server). The MoQ-over-QUIC path here
+#     never touches wangle.
+#   - folly:    folly's own XLOG usage is sparse (folly is last in the
+#     migration); a short session emits none at DBG.
+# They stay in the list so they auto-activate if a future build/session
+# exercises them; the SKIP is honest, never a false pass.
 declare -A MVFST_MARK=(
   [moxygen]='MoQSession\.cpp|MoQForwarder\.cpp'
-  [fizz]='AeadTokenCipher\.cpp|FizzServer|Fizz.*\.cpp'
+  [fizz]='AeadTokenCipher\.cpp|RecordLayer\.cpp|FizzServer|Fizz.*\.cpp'
   [quic.mvfst]='QuicServer\.cpp|QuicTransport'
   [wangle]='Acceptor\.cpp|ConnectionManager\.cpp'
   [proxygen]='HQSession|HTTPTransaction|HQ.*Session'
@@ -155,11 +164,6 @@ if [ -n "$PICO_SRV" ] && [ -x "$PICO_SRV" ] && [ -n "$PICO_CLI" ] && [ -x "$PICO
   # the override took effect. Marker is the sink's __FILE__ (shown by glog fmt).
   echo "── picoquic transport ──"
   root_pico="$(run_pico 'DBG9')"
-  echo "== INVENTORY[pico] all source files at root DBG9 (any output ⇒ handshake happened) =="
-  grep -oE '[A-Za-z_][A-Za-z_0-9]*\.(c|cpp|h):[0-9]+' <<<"$root_pico" | sed -E 's/:[0-9]+$//' \
-    | sort | uniq -c | sort -rn | sed 's/^/    /'
-  pico_lines=$(printf '%s\n' "$root_pico" | wc -l)
-  echo "    (total pico server stderr lines: $pico_lines)"
   if has_dbg 'PicoQuicXLogSink\.cpp' <<<"$root_pico"; then
     if has_dbg 'PicoQuicXLogSink\.cpp' <<<"$(run_pico 'quic.picoquic=DBG9')"; then
       echo "PASS  quic.picoquic=DBG9 selects /PicoQuicXLogSink.cpp/"
@@ -183,10 +187,4 @@ else
 fi
 
 [ "$fail" -eq 0 ] && echo "OK: per-layer XLOG category filtering verified"
-
-# >>> DISCOVERY ROUND (temporary): force a non-zero exit so ctest's
-# --output-on-failure surfaces the INVENTORY dumps above in the CI log. Revert
-# this block (restore `exit "$fail"`) once the wangle/proxygen/folly markers are
-# corrected from the observed inventory.
-echo ">>> DISCOVERY ROUND: forcing failure to surface inventory (temporary) <<<"
-exit 1
+exit "$fail"
