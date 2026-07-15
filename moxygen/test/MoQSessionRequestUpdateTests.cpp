@@ -1121,10 +1121,83 @@ CO_TEST_P_X(Draft18Test, PublishNamespaceRequestUpdateFailureClosesBidi) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
+// Draft section 10.9.2: a subscriber moves an established SUBSCRIBE_TRACKS to a
+// new Track Namespace Prefix by sending a REQUEST_UPDATE carrying the
+// TRACK_NAMESPACE_PREFIX parameter. This drives the update end-to-end over the
+// wire: the client handle sends it, the responder decodes the new prefix, and
+// the REQUEST_OK round-trips back to the client (draft 18+).
+CO_TEST_P_X(Draft18Test, SubscribeTracksRequestUpdatePrefixRoundTrip) {
+  co_await setupMoQSession();
+
+  std::shared_ptr<MockSubscribeTracksHandle> serverHandle;
+  RequestID serverRequestID{0};
+  EXPECT_CALL(*serverPublisher, subscribeTracks(_, _))
+      .WillOnce(
+          [&](auto subTracks, auto /*publishBlockedHandle*/)
+              -> folly::coro::Task<Publisher::SubscribeTracksResult> {
+            serverRequestID = subTracks.requestID;
+            serverHandle =
+                std::make_shared<MockSubscribeTracksHandle>(SubscribeTracksOk(
+                    {.requestID = subTracks.requestID,
+                     .requestSpecificParams = {}}));
+            co_return serverHandle;
+          });
+
+  auto result = co_await clientSession_->subscribeTracks(getSubscribeTracks());
+  EXPECT_FALSE(result.hasError());
+  if (result.hasError()) {
+    co_return;
+  }
+  auto handle = result.value();
+
+  const TrackNamespace newPrefix{{"foo", "bar"}};
+
+  // The client send path records the subscriber-side REQUEST_UPDATE stat.
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate());
+
+  folly::coro::Baton updateHandled;
+  EXPECT_CALL(*serverHandle, requestUpdateCalled(_))
+      .WillOnce([&](const RequestUpdate& update) {
+        // The responder receives the new prefix as the TRACK_NAMESPACE_PREFIX
+        // parameter and can decode it back to newPrefix.
+        bool foundPrefix = false;
+        TrackNamespace decodedPrefix;
+        for (const auto& param : update.params) {
+          if (param.key ==
+              folly::to_underlying(
+                  TrackRequestParamKey::TRACK_NAMESPACE_PREFIX)) {
+            auto decoded = MoQFrameParser::parseTrackNamespacePrefixParam(
+                param.asString, kVersionDraft18);
+            EXPECT_FALSE(decoded.hasError());
+            if (!decoded.hasError()) {
+              decodedPrefix = decoded.value();
+              foundPrefix = true;
+            }
+            break;
+          }
+        }
+        EXPECT_TRUE(foundPrefix);
+        EXPECT_EQ(decodedPrefix, newPrefix);
+        updateHandled.post();
+      });
+  EXPECT_CALL(*serverHandle, requestUpdateResult())
+      .WillOnce(testing::Return(RequestOk{.requestID = serverRequestID}));
+
+  RequestUpdate update;
+  update.params.setMajorVersion(getDraftMajorVersion(kVersionDraft18));
+  update.params.insertParam(
+      MoQFrameWriter::encodeTrackNamespacePrefixParam(
+          newPrefix, kVersionDraft18));
+  auto updateResult = co_await handle->requestUpdate(std::move(update));
+  co_await updateHandled;
+  EXPECT_TRUE(updateResult.hasValue());
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 // A failed REQUEST_UPDATE for a SUBSCRIBE_TRACKS must close the request's bidi
-// stream. SUBSCRIBE_TRACKS has no updatable state, so the responder rejects the
-// update with REQUEST_ERROR(NOT_SUPPORTED), FINs its write half, and tears down
-// the handle (draft 18+).
+// stream: the responder rejects it with REQUEST_ERROR, FINs its write half, and
+// tears down the handle (draft 18+).
 CO_TEST_P_X(Draft18Test, SubscribeTracksRequestUpdateFailureClosesBidi) {
   co_await setupMoQSession();
 

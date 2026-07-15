@@ -235,11 +235,19 @@ class MoQRelaySession::SubscribeTracksHandle
 
   folly::coro::Task<RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) override {
-    co_return folly::makeUnexpected(
-        RequestError{
-            reqUpdate.requestID,
-            RequestErrorCode::NOT_SUPPORTED,
-            "REQUEST_UPDATE not supported for SUBSCRIBE_TRACKS"});
+    auto session = session_.lock();
+    if (!session) {
+      co_return folly::makeUnexpected(
+          RequestError{
+              reqUpdate.requestID,
+              RequestErrorCode::INTERNAL_ERROR,
+              "SUBSCRIBE_TRACKS subscription no longer active"});
+    }
+    // Forward the update to the peer on this subscription's own bidi stream.
+    // The new prefix is carried in reqUpdate.params and decoded by the
+    // responder; this side is a pure forwarder.
+    co_return co_await session->sendRequestUpdateOnBidi(
+        std::move(reqUpdate), subscribeTracksOk_->requestID, control_);
   }
 
  private:
