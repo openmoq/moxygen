@@ -236,10 +236,14 @@ class MoQRelay : public Publisher,
       const TrackNamespace& oldPrefix,
       const TrackNamespace& newPrefix,
       const std::shared_ptr<MoQSession>& session);
+  // `forward`, when set, updates the Forwarding State applied to future
+  // matching subscriptions (it is applied before backfilling newly-matched
+  // tracks so they honor the new state); existing subscriptions are unaffected.
   folly::Expected<folly::Unit, RequestErrorCode> updateTracksSubscriptionPrefix(
       const TrackNamespace& oldPrefix,
       const TrackNamespace& newPrefix,
-      const std::shared_ptr<MoQSession>& session);
+      const std::shared_ptr<MoQSession>& session,
+      std::optional<bool> forward = std::nullopt);
   folly::Expected<folly::Unit, RequestErrorCode>
   updateNamespaceSubscriptionPrefix(
       const TrackNamespace& oldPrefix,
@@ -247,12 +251,15 @@ class MoQRelay : public Publisher,
       const std::shared_ptr<MoQSession>& session);
   // Selects which subscriber tree a prefix update applies to.
   enum class PrefixUpdateKind { Tracks, Namespace };
-  // Shared REQUEST_UPDATE prefix-change handling for the SUBSCRIBE_TRACKS and
+  // Shared REQUEST_UPDATE handling for the SUBSCRIBE_TRACKS and
   // SUBSCRIBE_NAMESPACE handles: extracts and decodes the
   // TRACK_NAMESPACE_PREFIX parameter, closes the session on a malformed tuple
   // (§2.4.1), and moves the registration (which backfills newly-matched
-  // content). Returns the new prefix on success or a per-request error to relay
-  // back to the peer.
+  // content). For SUBSCRIBE_TRACKS it also applies the FORWARD parameter, which
+  // updates the Forwarding State on future matching subscriptions (existing
+  // subscriptions are unaffected) and may appear with or without a prefix
+  // change. Returns the (possibly unchanged) prefix on success or a per-request
+  // error to relay back to the peer.
   folly::Expected<TrackNamespace, RequestError> updatePrefixFromRequest(
       const RequestUpdate& reqUpdate,
       const TrackNamespace& currentPrefix,

@@ -1195,6 +1195,58 @@ CO_TEST_P_X(Draft18Test, SubscribeTracksRequestUpdatePrefixRoundTrip) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
+// A subscriber can update the SUBSCRIBE_TRACKS Forwarding State end-to-end by
+// sending a REQUEST_UPDATE carrying a FORWARD value; the responder receives it
+// and the REQUEST_OK round-trips back (draft 18+).
+CO_TEST_P_X(Draft18Test, SubscribeTracksRequestUpdateForwardRoundTrip) {
+  co_await setupMoQSession();
+
+  std::shared_ptr<MockSubscribeTracksHandle> serverHandle;
+  RequestID serverRequestID{0};
+  EXPECT_CALL(*serverPublisher, subscribeTracks(_, _))
+      .WillOnce(
+          [&](auto subTracks, auto /*publishBlockedHandle*/)
+              -> folly::coro::Task<Publisher::SubscribeTracksResult> {
+            serverRequestID = subTracks.requestID;
+            serverHandle =
+                std::make_shared<MockSubscribeTracksHandle>(SubscribeTracksOk(
+                    {.requestID = subTracks.requestID,
+                     .requestSpecificParams = {}}));
+            co_return serverHandle;
+          });
+
+  auto result = co_await clientSession_->subscribeTracks(getSubscribeTracks());
+  EXPECT_FALSE(result.hasError());
+  if (result.hasError()) {
+    co_return;
+  }
+  auto handle = result.value();
+
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate());
+
+  folly::coro::Baton updateHandled;
+  EXPECT_CALL(*serverHandle, requestUpdateCalled(_))
+      .WillOnce([&](const RequestUpdate& update) {
+        // The FORWARD value round-trips as the update's forward field.
+        EXPECT_TRUE(update.forward.has_value());
+        if (update.forward.has_value()) {
+          EXPECT_FALSE(*update.forward);
+        }
+        updateHandled.post();
+      });
+  EXPECT_CALL(*serverHandle, requestUpdateResult())
+      .WillOnce(testing::Return(RequestOk{.requestID = serverRequestID}));
+
+  RequestUpdate update;
+  update.params.setMajorVersion(getDraftMajorVersion(kVersionDraft18));
+  update.forward = false;
+  auto updateResult = co_await handle->requestUpdate(std::move(update));
+  co_await updateHandled;
+  EXPECT_TRUE(updateResult.hasValue());
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 // A failed REQUEST_UPDATE for a SUBSCRIBE_TRACKS must close the request's bidi
 // stream: the responder rejects it with REQUEST_ERROR, FINs its write half, and
 // tears down the handle (draft 18+).

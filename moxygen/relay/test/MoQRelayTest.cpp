@@ -3314,4 +3314,91 @@ TEST_F(MoQRelayTracksTest, OverlappingSubscribeNamespaceRejected) {
   removeSession(otherSession);
 }
 
+// A REQUEST_UPDATE for SUBSCRIBE_TRACKS carrying only a FORWARD value updates
+// the Forwarding State applied to future matching subscriptions (the prefix is
+// unchanged). A track published after the update is forwarded with the new
+// state; PublishRequest.forward reflects it.
+TEST_F(MoQRelayTracksTest, RequestUpdateChangesTracksForward) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  setupPublishSucceeds(subscriber);
+
+  const TrackNamespace prefix{{"test", "a"}};
+  auto handle = doSubscribeTracks(subscriber, prefix);
+  ASSERT_NE(handle, nullptr);
+
+  // Before the update, a matching publish is forwarded (forward defaults true).
+  EXPECT_CALL(
+      *subscriber, publish(testing::Field(&PublishRequest::forward, true), _))
+      .Times(1);
+  doPublish(publisher, FullTrackName{prefix, "t1"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+
+  // A FORWARD-only update (no TRACK_NAMESPACE_PREFIX) turns forwarding off.
+  RequestUpdate update;
+  update.forward = false;
+  auto res = withSessionContext(subscriber, [&]() {
+    return folly::coro::blockingWait(
+        handle->requestUpdate(update), exec_.get());
+  });
+  ASSERT_TRUE(res.hasValue());
+
+  // A track published under the same prefix after the update is forwarded with
+  // the new forward=false state.
+  EXPECT_CALL(
+      *subscriber, publish(testing::Field(&PublishRequest::forward, false), _))
+      .Times(1);
+  doPublish(publisher, FullTrackName{prefix, "t2"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
+// A combined REQUEST_UPDATE that moves the prefix AND sets FORWARD applies the
+// new Forwarding State to the moved registration: a track already published
+// under the new prefix is backfilled with the new forward value.
+TEST_F(MoQRelayTracksTest, RequestUpdateTracksForwardAppliesToBackfill) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  setupPublishSucceeds(subscriber);
+
+  const TrackNamespace oldPrefix{{"test", "a"}};
+  const TrackNamespace newPrefix{{"test", "b"}};
+  auto handle = doSubscribeTracks(subscriber, oldPrefix);
+  ASSERT_NE(handle, nullptr);
+
+  // A track exists under the future new prefix; it does not match test/a yet.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(0);
+  doPublish(publisher, FullTrackName{newPrefix, "t"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+
+  // Move to test/b AND set forward=false in one update. The backfilled test/b/t
+  // must be published with the new forward=false state.
+  auto update = makeTrackNamespacePrefixUpdate(newPrefix);
+  update.forward = false;
+  EXPECT_CALL(
+      *subscriber, publish(testing::Field(&PublishRequest::forward, false), _))
+      .Times(1);
+  auto res = withSessionContext(subscriber, [&]() {
+    return folly::coro::blockingWait(
+        handle->requestUpdate(update), exec_.get());
+  });
+  ASSERT_TRUE(res.hasValue());
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
 } // namespace moxygen::test

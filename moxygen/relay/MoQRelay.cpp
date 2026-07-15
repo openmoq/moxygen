@@ -1220,7 +1220,8 @@ folly::Expected<folly::Unit, RequestErrorCode>
 MoQRelay::updateTracksSubscriptionPrefix(
     const TrackNamespace& oldPrefix,
     const TrackNamespace& newPrefix,
-    const std::shared_ptr<MoQSession>& session) {
+    const std::shared_ptr<MoQSession>& session,
+    std::optional<bool> forward) {
   auto res = updateSubscriptionPrefix(
       tracksSubscriberRoot_, oldPrefix, newPrefix, session);
   if (res.hasError()) {
@@ -1232,6 +1233,11 @@ MoQRelay::updateTracksSubscriptionPrefix(
   if (auto node = findTracksSubscriberNode(newPrefix)) {
     auto it = node->sessions.find(session);
     if (it != node->sessions.end()) {
+      // Apply the new Forwarding State (if the update carried one) before
+      // backfilling, so tracks newly matched by newPrefix honor it.
+      if (forward.has_value()) {
+        it->second.forward = *forward;
+      }
       publishExistingMatchingTracks(
           session,
           newPrefix,
@@ -1284,9 +1290,14 @@ folly::Expected<TrackNamespace, RequestError> MoQRelay::updatePrefixFromRequest(
     const std::shared_ptr<MoQSession>& session,
     PrefixUpdateKind kind) {
   const bool tracks = kind == PrefixUpdateKind::Tracks;
-  // The only updatable state on SUBSCRIBE_TRACKS / SUBSCRIBE_NAMESPACE is the
-  // Track Namespace Prefix (draft §10.9.2), carried in the
-  // TRACK_NAMESPACE_PREFIX parameter.
+  // SUBSCRIBE_TRACKS / SUBSCRIBE_NAMESPACE carry the Track Namespace Prefix
+  // (draft §10.9.2) in the TRACK_NAMESPACE_PREFIX parameter. A SUBSCRIBE_TRACKS
+  // update may additionally carry a FORWARD value, updating the Forwarding
+  // State on future matching subscriptions (existing subscriptions unaffected);
+  // the parser already validated it to be 0 or 1. FORWARD is not defined for
+  // SUBSCRIBE_NAMESPACE updates, so it is ignored there.
+  const std::optional<bool> forward = tracks ? reqUpdate.forward : std::nullopt;
+
   const auto prefixKey =
       folly::to_underlying(TrackRequestParamKey::TRACK_NAMESPACE_PREFIX);
   const std::string* prefixValue = nullptr;
@@ -1297,12 +1308,23 @@ folly::Expected<TrackNamespace, RequestError> MoQRelay::updatePrefixFromRequest(
     }
   }
   if (!prefixValue) {
+    // No prefix change. A SUBSCRIBE_TRACKS FORWARD-only update just moves the
+    // stored Forwarding State in place; anything else has nothing to update.
+    if (forward.has_value()) {
+      if (auto node = findTracksSubscriberNode(currentPrefix)) {
+        auto it = node->sessions.find(session);
+        if (it != node->sessions.end()) {
+          it->second.forward = *forward;
+        }
+      }
+      return currentPrefix;
+    }
     return folly::makeUnexpected(
         RequestError{
             reqUpdate.requestID,
             RequestErrorCode::NOT_SUPPORTED,
             tracks ? "REQUEST_UPDATE for SUBSCRIBE_TRACKS requires a "
-                     "TRACK_NAMESPACE_PREFIX"
+                     "TRACK_NAMESPACE_PREFIX or FORWARD"
                    : "REQUEST_UPDATE for SUBSCRIBE_NAMESPACE requires a "
                      "TRACK_NAMESPACE_PREFIX"});
   }
@@ -1330,8 +1352,12 @@ folly::Expected<TrackNamespace, RequestError> MoQRelay::updatePrefixFromRequest(
             "Malformed TRACK_NAMESPACE_PREFIX"});
   }
   auto newPrefix = std::move(decoded.value());
+  // On a combined prefix + FORWARD update, the new Forwarding State is applied
+  // inside updateTracksSubscriptionPrefix after the move succeeds (so it is not
+  // applied if the move is rejected for overlap) and before the backfill.
   auto res = tracks
-      ? updateTracksSubscriptionPrefix(currentPrefix, newPrefix, session)
+      ? updateTracksSubscriptionPrefix(
+            currentPrefix, newPrefix, session, forward)
       : updateNamespaceSubscriptionPrefix(currentPrefix, newPrefix, session);
   if (res.hasError()) {
     return folly::makeUnexpected(

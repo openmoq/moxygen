@@ -187,7 +187,7 @@ class Publisher {
   // the caller can use to unsubscribe from the tracks or to send a
   // REQUEST_UPDATE. The updatable per-request state is the Track Namespace
   // Prefix (draft section 10.9.2), carried in the TRACK_NAMESPACE_PREFIX
-  // parameter.
+  // parameter and the Forward Parameter (draft section 10.2.17)
   class SubscribeTracksHandle {
    public:
     SubscribeTracksHandle() = default;
