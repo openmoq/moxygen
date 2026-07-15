@@ -103,6 +103,19 @@ class BidiStreamControl {
     return responseIDQueue_;
   }
 
+  // Set by the read loop when it exits (peer FIN/RST, error, or cancel). The
+  // read loop is the only place REQUEST_OK / REQUEST_ERROR is processed, so
+  // once it has exited no response can ever arrive on this stream again.
+  void markReadLoopExited() {
+    readLoopExited_ = true;
+  }
+
+  // True once the read loop has exited: a sender must not register a new
+  // pending REQUEST_UPDATE on this stream, since nothing would ever fulfill it.
+  bool readLoopExited() const {
+    return readLoopExited_;
+  }
+
  private:
   void onPeerStopSending();
   // Null the write handle and drop its cancel callback after we close it.
@@ -119,6 +132,7 @@ class BidiStreamControl {
   std::optional<folly::CancellationCallback> writeCancelCb_;
   std::deque<RequestID> responseIDQueue_;
   bool finIsCancellation_{true};
+  bool readLoopExited_{false};
 };
 
 // ReplyContext that writes to the bidi reply stream wrapped by a

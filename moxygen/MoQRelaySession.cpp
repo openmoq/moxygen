@@ -165,11 +165,28 @@ class MoQRelaySession::SubscribeNamespaceHandle
 
   folly::coro::Task<RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) override {
-    co_return folly::makeUnexpected(
-        RequestError{
-            reqUpdate.requestID,
-            RequestErrorCode::NOT_SUPPORTED,
-            "REQUEST_UPDATE not supported for SUBSCRIBE_NAMESPACE"});
+    if (!session_) {
+      co_return folly::makeUnexpected(
+          RequestError{
+              reqUpdate.requestID,
+              RequestErrorCode::INTERNAL_ERROR,
+              "SUBSCRIBE_NAMESPACE subscription no longer active"});
+    }
+    // Updating a SUBSCRIBE_NAMESPACE via REQUEST_UPDATE only exists at draft
+    // 16+; earlier drafts have no such message for it.
+    auto version = session_->getNegotiatedVersion();
+    if (!version || getDraftMajorVersion(*version) < 16) {
+      co_return folly::makeUnexpected(
+          RequestError{
+              reqUpdate.requestID,
+              RequestErrorCode::NOT_SUPPORTED,
+              "REQUEST_UPDATE for SUBSCRIBE_NAMESPACE requires draft 16+"});
+    }
+    // Forward the update to the peer on this subscription's own bidi stream.
+    // The prefix (or other mutable state) is carried in reqUpdate.params and
+    // decoded by the responder; this side is a pure forwarder.
+    co_return co_await session_->sendRequestUpdateOnBidi(
+        std::move(reqUpdate), subscribeNamespaceOk_->requestID, control_);
   }
 
  private:
@@ -560,6 +577,98 @@ void MoQRelaySession::handlePublishNamespaceRequestUpdate(
                 }
               })))
       .start();
+}
+
+folly::coro::Task<folly::Expected<RequestOk, RequestError>>
+MoQRelaySession::sendRequestUpdateOnBidi(
+    RequestUpdate reqUpdate,
+    RequestID existingRequestID,
+    std::shared_ptr<BidiStreamControl> control) {
+  if (isClosed()) {
+    co_return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::INTERNAL_ERROR,
+            "Session closed"});
+  }
+  if (shouldFailNewLocalRequestDueToGoaway()) {
+    co_return folly::makeUnexpected(
+        RequestError{
+            peekNextRequestID(),
+            RequestErrorCode::GOING_AWAY,
+            "Session received GOAWAY"});
+  }
+  auto version = getNegotiatedVersion();
+  if (!version) {
+    co_return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::INTERNAL_ERROR,
+            "No negotiated version"});
+  }
+  // Draft 18+ carries the update on the subscription's own bidi request stream.
+  // Pre-18 there are no per-request bidi streams, so it rides the shared
+  // control stream instead; the REQUEST_OK / REQUEST_ERROR reply comes back
+  // there too (getRequestUpdateReplyContext falls back to the control stream
+  // pre-18) and is correlated by the on-wire requestID.
+  const bool onBidi = getDraftMajorVersion(*version) >= 18;
+  auto* writeHandle = control ? control->writeHandle() : nullptr;
+  // onBidi needs a live request stream for the reply to come back on. A null
+  // write handle (peer STOP_SENDING / local close) or a read loop that has
+  // already exited (peer FIN/RST processed before this call) means no
+  // REQUEST_OK / REQUEST_ERROR can ever arrive, so registering a pending below
+  // would dangle forever. Fail fast instead. Race-free: nothing between here
+  // and the co_await at the end suspends, so the read loop cannot exit in the
+  // gap after this check passes.
+  if (onBidi && (!writeHandle || control->readLoopExited())) {
+    co_return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::INTERNAL_ERROR,
+            "No request stream for REQUEST_UPDATE"});
+  }
+
+  reqUpdate.existingRequestID = existingRequestID;
+  reqUpdate.requestID = getNextRequestID();
+
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  auto writeRes = moqFrameWriter_.writeRequestUpdate(buf, reqUpdate);
+  if (!writeRes) {
+    XLOG(ERR) << "writeRequestUpdate failed sess=" << this;
+    co_return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::INTERNAL_ERROR,
+            "writeRequestUpdate failed"});
+  }
+
+  if (logger_) {
+    logger_->logSubscribeUpdate(reqUpdate);
+  }
+  MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onRequestUpdate);
+
+  // Register the pending state before writing so the REQUEST_OK / REQUEST_ERROR
+  // response can never race ahead of the promise. onRequestOk /
+  // handleSubscribeUpdateOkFromRequestOk (and setError for REQUEST_ERROR) route
+  // the response back to this promise.
+  auto contract = folly::coro::makePromiseContract<
+      folly::Expected<RequestOk, RequestError>>();
+  pendingRequests_.emplace(
+      reqUpdate.requestID,
+      PendingRequestState::makeRequestUpdate(std::move(contract.first)));
+
+  if (onBidi) {
+    // Draft 18+: REQUEST_OK / REQUEST_ERROR carry no requestID on the wire; the
+    // response codec correlates them FIFO from this queue.
+    control->responseIDQueue().push_back(reqUpdate.requestID);
+    writeHandle->writeStreamData(buf.move(), /*fin=*/false, nullptr);
+  } else {
+    // Pre-draft-18: ride the shared control stream.
+    controlWriteBuf_.append(buf.move());
+    controlWriteEvent_.signal();
+  }
+
+  co_return co_await std::move(contract.second);
 }
 
 void MoQRelaySession::handleSubscribeNamespaceRequestUpdate(

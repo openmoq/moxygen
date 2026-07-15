@@ -799,6 +799,266 @@ CO_TEST_P_X(Draft18Test, SubscribeNamespaceRequestUpdateFailureClosesBidi) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
+// Draft section 10.9.2: a subscriber moves an established SUBSCRIBE_NAMESPACE
+// to a new Track Namespace Prefix by sending a REQUEST_UPDATE carrying the
+// TRACK_NAMESPACE_PREFIX parameter. This drives the update end-to-end over the
+// wire: the client handle sends it, the responder decodes the new prefix, and
+// the REQUEST_OK round-trips back to the client (draft 18+).
+CO_TEST_P_X(Draft18Test, SubscribeNamespaceRequestUpdatePrefixRoundTrip) {
+  co_await setupMoQSession();
+
+  std::shared_ptr<MockSubscribeNamespaceHandle> serverHandle;
+  RequestID serverRequestID{0};
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillOnce(
+          [&](auto subAnn, auto /*handler*/)
+              -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+            serverRequestID = subAnn.requestID;
+            serverHandle = std::make_shared<MockSubscribeNamespaceHandle>(
+                SubscribeNamespaceOk(
+                    {.requestID = subAnn.requestID,
+                     .requestSpecificParams = {}}));
+            co_return serverHandle;
+          });
+
+  auto subNsResult = co_await clientSession_->subscribeNamespace(
+      getSubscribeNamespace(), nullptr);
+  EXPECT_FALSE(subNsResult.hasError());
+  if (subNsResult.hasError()) {
+    co_return;
+  }
+  auto handle = subNsResult.value();
+
+  const TrackNamespace newPrefix{{"foo", "bar"}};
+
+  // The client send path records the subscriber-side REQUEST_UPDATE stat.
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate());
+
+  folly::coro::Baton updateHandled;
+  EXPECT_CALL(*serverHandle, requestUpdateCalled(_))
+      .WillOnce([&](const RequestUpdate& update) {
+        // The responder receives the new prefix as the TRACK_NAMESPACE_PREFIX
+        // parameter and can decode it back to newPrefix.
+        bool foundPrefix = false;
+        TrackNamespace decodedPrefix;
+        for (const auto& param : update.params) {
+          if (param.key ==
+              folly::to_underlying(
+                  TrackRequestParamKey::TRACK_NAMESPACE_PREFIX)) {
+            auto decoded = MoQFrameParser::parseTrackNamespacePrefixParam(
+                param.asString, kVersionDraft18);
+            EXPECT_FALSE(decoded.hasError());
+            if (!decoded.hasError()) {
+              decodedPrefix = decoded.value();
+              foundPrefix = true;
+            }
+            break;
+          }
+        }
+        EXPECT_TRUE(foundPrefix);
+        EXPECT_EQ(decodedPrefix, newPrefix);
+        updateHandled.post();
+      });
+  EXPECT_CALL(*serverHandle, requestUpdateResult())
+      .WillOnce(testing::Return(RequestOk{.requestID = serverRequestID}));
+
+  RequestUpdate update;
+  update.params.setMajorVersion(getDraftMajorVersion(kVersionDraft18));
+  update.params.insertParam(
+      MoQFrameWriter::encodeTrackNamespacePrefixParam(
+          newPrefix, kVersionDraft18));
+  auto updateResult = co_await handle->requestUpdate(std::move(update));
+  co_await updateHandled;
+  EXPECT_TRUE(updateResult.hasValue());
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// A SUBSCRIBE_NAMESPACE REQUEST_UPDATE must also round-trip at draft 16/17
+// (the TRACK_NAMESPACE_PREFIX parameter is draft-18-only, so this drives a
+// plain update). Pre-draft-18 there are no per-request bidi streams, so the
+// update and its REQUEST_OK both ride the shared control stream and correlate
+// by the on-wire requestID. This guards that pre-18 control-stream path (draft
+// 18+ instead rides the subscription's own bidi).
+CO_TEST_P_X(PreDraft18Test, SubscribeNamespaceRequestUpdateRoundTrip) {
+  co_await setupMoQSession();
+  const auto version = *clientSession_->getNegotiatedVersion();
+  if (getDraftMajorVersion(version) < 16) {
+    // REQUEST_UPDATE for SUBSCRIBE_NAMESPACE only exists at draft 16+.
+    co_return;
+  }
+
+  std::shared_ptr<MockSubscribeNamespaceHandle> serverHandle;
+  RequestID serverRequestID{0};
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillOnce(
+          [&](auto subAnn, auto /*handler*/)
+              -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+            serverRequestID = subAnn.requestID;
+            serverHandle = std::make_shared<MockSubscribeNamespaceHandle>(
+                SubscribeNamespaceOk(
+                    {.requestID = subAnn.requestID,
+                     .requestSpecificParams = {}}));
+            co_return serverHandle;
+          });
+
+  auto subNsResult = co_await clientSession_->subscribeNamespace(
+      getSubscribeNamespace(), nullptr);
+  EXPECT_FALSE(subNsResult.hasError());
+  if (subNsResult.hasError()) {
+    co_return;
+  }
+  auto handle = subNsResult.value();
+
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate());
+
+  folly::coro::Baton updateHandled;
+  EXPECT_CALL(*serverHandle, requestUpdateCalled(_))
+      .WillOnce([&](const RequestUpdate& update) {
+        EXPECT_EQ(update.priority, kDefaultPriority + 1);
+        updateHandled.post();
+      });
+  EXPECT_CALL(*serverHandle, requestUpdateResult())
+      .WillOnce(testing::Return(RequestOk{.requestID = serverRequestID}));
+
+  RequestUpdate update;
+  update.params.setMajorVersion(getDraftMajorVersion(version));
+  update.priority = kDefaultPriority + 1;
+  update.forward = true;
+  auto updateResult = co_await handle->requestUpdate(std::move(update));
+  co_await updateHandled;
+  EXPECT_TRUE(updateResult.hasValue());
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// A SUBSCRIBE_NAMESPACE REQUEST_UPDATE rides the subscription's own bidi under
+// its own request ID (not the stream's SUBSCRIBE_NAMESPACE id). If the peer
+// closes that bidi before replying, the update's awaiting coroutine must fail
+// rather than hang — the stream-close path has to fail every in-flight update
+// queued on the stream, not just its primary request (draft 18+).
+CO_TEST_P_X(
+    Draft18Test,
+    SubscribeNamespaceRequestUpdateFailsOnPeerResetWithoutReply) {
+  co_await setupMoQSession();
+
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillOnce(
+          [&](auto subAnn, auto /*handler*/)
+              -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+            co_return std::make_shared<MockSubscribeNamespaceHandle>(
+                SubscribeNamespaceOk(
+                    {.requestID = subAnn.requestID,
+                     .requestSpecificParams = {}}));
+          });
+
+  auto subNsResult = co_await clientSession_->subscribeNamespace(
+      getSubscribeNamespace(), nullptr);
+  EXPECT_FALSE(subNsResult.hasError());
+  if (subNsResult.hasError()) {
+    co_return;
+  }
+  auto handle = subNsResult.value();
+
+  // Hold the update on the wire so the peer never replies to it. The
+  // SUBSCRIBE_NAMESPACE bidi is the first client-initiated bidi (id 0), and
+  // this is the client's write half.
+  clientWt_->writeHandles.at(0)->setImmediateDelivery(false);
+
+  // onRequestUpdate fires in the send path just before the coroutine suspends
+  // awaiting the reply, so it is a stable point at which to close the stream.
+  folly::coro::Baton updateSent;
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate()).WillOnce([&] {
+    updateSent.post();
+  });
+
+  std::optional<RequestErrorCode> errorCode;
+  folly::coro::Baton done;
+  folly::coro::co_withExecutor(
+      MoQExecutor_.get(),
+      folly::coro::co_invoke([&]() -> folly::coro::Task<void> {
+        RequestUpdate update;
+        update.params.setMajorVersion(getDraftMajorVersion(kVersionDraft18));
+        update.params.insertParam(
+            MoQFrameWriter::encodeTrackNamespacePrefixParam(
+                TrackNamespace{{"foo", "bar"}}, kVersionDraft18));
+        auto result = co_await handle->requestUpdate(std::move(update));
+        if (result.hasError()) {
+          errorCode = result.error().errorCode;
+        }
+        done.post();
+      }))
+      .start();
+
+  co_await updateSent;
+  // Peer RESETs the SUBSCRIBE_NAMESPACE bidi (the client's read half) without
+  // ever sending REQUEST_OK / REQUEST_ERROR for the update.
+  serverWt_->writeHandles.at(0)->resetStream(
+      folly::to_underlying(ResetStreamErrorCode::CANCELLED));
+
+  co_await done;
+  EXPECT_TRUE(errorCode.has_value());
+  if (errorCode.has_value()) {
+    EXPECT_EQ(*errorCode, RequestErrorCode::INTERNAL_ERROR);
+  }
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// Same hang guard as above, opposite ordering: the peer RESETs the
+// SUBSCRIBE_NAMESPACE bidi *before* any REQUEST_UPDATE is sent, so the stream's
+// read loop has already exited by the time requestUpdate() runs. Nothing would
+// ever drain a pending registered on the dead stream, so the send path must
+// fail fast rather than register a doomed pending and hang (draft 18+).
+CO_TEST_P_X(
+    Draft18Test,
+    SubscribeNamespaceRequestUpdateFailsWhenStreamAlreadyReset) {
+  co_await setupMoQSession();
+
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillOnce(
+          [&](auto subAnn, auto /*handler*/)
+              -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+            co_return std::make_shared<MockSubscribeNamespaceHandle>(
+                SubscribeNamespaceOk(
+                    {.requestID = subAnn.requestID,
+                     .requestSpecificParams = {}}));
+          });
+
+  auto subNsResult = co_await clientSession_->subscribeNamespace(
+      getSubscribeNamespace(), nullptr);
+  EXPECT_FALSE(subNsResult.hasError());
+  if (subNsResult.hasError()) {
+    co_return;
+  }
+  auto handle = subNsResult.value();
+
+  // Peer RESETs the SUBSCRIBE_NAMESPACE bidi (the client's read half) with no
+  // update in flight, then let the client's read loop resume, process the RST,
+  // and exit. After this the stream can no longer carry a REQUEST_OK /
+  // REQUEST_ERROR reply.
+  serverWt_->writeHandles.at(0)->resetStream(
+      folly::to_underlying(ResetStreamErrorCode::CANCELLED));
+  co_await rescheduleN(4);
+
+  // The send path bails out before recording the stat or writing to the wire,
+  // since the stream is already dead.
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate()).Times(0);
+
+  RequestUpdate update;
+  update.params.setMajorVersion(getDraftMajorVersion(kVersionDraft18));
+  update.params.insertParam(
+      MoQFrameWriter::encodeTrackNamespacePrefixParam(
+          TrackNamespace{{"foo", "bar"}}, kVersionDraft18));
+  auto result = co_await handle->requestUpdate(std::move(update));
+  EXPECT_TRUE(result.hasError());
+  if (result.hasError()) {
+    EXPECT_EQ(result.error().errorCode, RequestErrorCode::INTERNAL_ERROR);
+  }
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 // A failed REQUEST_UPDATE for a PUBLISH_NAMESPACE must close the request's bidi
 // stream. The responder sends REQUEST_ERROR, FINs its write half, and tears
 // down the announcement (draft 18+).

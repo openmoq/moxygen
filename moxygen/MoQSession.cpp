@@ -2997,6 +2997,12 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
       XLOG(DBG3) << "End of stream id=" << streamId << " sess=" << this;
     }
   }
+  // Once the read loop exits, no REQUEST_OK / REQUEST_ERROR can be delivered on
+  // this stream again, so a sender must not register a new pending here. Marked
+  // before the fail-pending block below so both close paths agree.
+  if (control) {
+    control->markReadLoopExited();
+  }
   // TODO: close session on control exit.
   // On read-loop exit, fire responder close (RST always; FIN when
   // finIsCancellation) and fail any still-pending sender request. Both
@@ -3011,6 +3017,17 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
     if (control->requestID().has_value()) {
       // No-op if the terminal reply already resolved + erased the pending.
       failPendingRequestOnEarlyClose(*control->requestID(), exceptionalExit);
+    }
+    // Draft 18+: REQUEST_UPDATEs sent on this stream are tracked in
+    // pendingRequests_ under their own request IDs (queued in
+    // responseIDQueue_), not the stream's primary request ID, so the fail above
+    // does not cover them. Fail each still-pending update so a requestUpdate()
+    // awaiting its REQUEST_OK / REQUEST_ERROR does not hang when the peer
+    // closes the stream first.
+    auto& responseIDQueue = control->responseIDQueue();
+    while (!responseIDQueue.empty()) {
+      failPendingRequestOnEarlyClose(responseIDQueue.front(), exceptionalExit);
+      responseIDQueue.pop_front();
     }
     // Sender (bidiCallback==null) mirrors peer FIN with our FIN: "done
     // updating the request". No-op if write half already closed.
