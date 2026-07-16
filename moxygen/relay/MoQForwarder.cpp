@@ -12,9 +12,7 @@ namespace moxygen {
 
 namespace {
 // Returns true if error should tombstone subgroup rather than remove
-// subscription. Soft errors like CANCELLED (from STOP_SENDING or delivery
-// timeout) should only prevent reopening the subgroup, not terminate the
-// entire subscription.
+// subscription.
 bool isSoftError(const MoQPublishError& err) {
   switch (err.code) {
     case MoQPublishError::CANCELLED: // STOP_SENDING, stream reset, delivery
@@ -27,6 +25,16 @@ bool isSoftError(const MoQPublishError& err) {
     case MoQPublishError::MALFORMED_TRACK: // Protocol violation
     default:
       return false;
+  }
+}
+
+void clearTombstonedSubgroups(MoQForwarder::Subscriber& sub) {
+  for (auto it = sub.subgroups.begin(); it != sub.subgroups.end();) {
+    if (!it->second) {
+      it = sub.subgroups.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 } // namespace
@@ -459,7 +467,8 @@ void MoQForwarder::handleSubgroupError(
              << " subgroup=" << subgroupId.subgroup;
 
   if (isSoftError(err)) {
-    // Tombstone the subgroup by setting to nullptr - don't reopen it.
+    // Tombstone the subgroup by setting to nullptr. A later forward 0->1
+    // update can renew interest and clear the tombstone.
     // Per the SubgroupConsumer API contract, returning an error implicitly
     // resets the consumer, so no explicit reset() call is needed.
     auto it = sub.subgroups.find(subgroupId);
@@ -492,22 +501,27 @@ MoQForwarder::beginSubgroup(
   // This can happen if a publisher opens multiple streams with the same
   // group/subgroup (e.g., after a network issue or client bug).
   // Reset any active downstream consumers and replace the forwarder.
-  // If no consumers were active (all already stop_sending'd), return CANCELLED
-  // to propagate the signal back to the publisher.
+  // If no consumers were active and no subscriber can reopen the subgroup,
+  // return CANCELLED to propagate the signal back to the publisher.
   auto existingIt = subgroups_.find(subgroupIdentifier);
   if (existingIt != subgroups_.end()) {
     bool anyReset = false;
+    bool anyReopenCandidate = false;
     for (auto& [sess, sub] : subscribers_) {
       auto it = sub->subgroups.find(subgroupIdentifier);
       if (it != sub->subgroups.end() && it->second) {
         it->second->reset(ResetStreamErrorCode::CANCELLED);
         sub->subgroups.erase(it);
         anyReset = true;
+      } else if (
+          it == sub->subgroups.end() && sub->trackConsumer &&
+          checkRange(*sub) && sub->checkShouldForward()) {
+        anyReopenCandidate = true;
       }
     }
     existingIt->second->detach();
     subgroups_.erase(existingIt);
-    if (!anyReset) {
+    if (!anyReset && !anyReopenCandidate) {
       XLOG(WARN) << "beginSubgroup: duplicate group=" << groupID
                  << " subgroup=" << subgroupID
                  << " - no active consumers, returning CANCELLED";
@@ -779,7 +793,13 @@ MoQForwarder::Subscriber::requestUpdate(RequestUpdate requestUpdate) {
   if (forwarder) {
     // Only update forward state if explicitly provided (per draft 15+)
     if (requestUpdate.forward.has_value()) {
+      const auto wasForwarding = shouldForward;
       updateForwardState(*requestUpdate.forward);
+      if (!wasForwarding && shouldForward) {
+        // Clearing out the "tombstoned" entry allows us to reopen the
+        // subgroup.
+        clearTombstonedSubgroups(*this);
+      }
     }
     // Only update new group request if provided
     forwarder->tryProcessNewGroupRequest(requestUpdate.params);
