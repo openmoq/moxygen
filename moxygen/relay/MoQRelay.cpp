@@ -760,15 +760,15 @@ MoQRelay::subscribeNamespace(
             "Overlapping SUBSCRIBE_NAMESPACE exists in this session"});
   }
 
-  auto nodePtr = findNamespaceNode(
+  auto subscribedNode = findNamespaceNode(
       subNs.trackNamespacePrefix, /*createMissingNodes=*/true);
 
   SubscribeNamespaceOptions effectiveOptions;
   effectiveOptions = subNs.options;
 
   // Check if this is the first session subscriber for this node
-  bool wasEmpty = !nodePtr->hasLocalSessions();
-  nodePtr->sessions.emplace(
+  bool wasEmpty = !subscribedNode->hasLocalSessions();
+  subscribedNode->sessions.emplace(
       session,
       NamespaceNode::NamespaceSubscriberInfo{
           subNs.forward,
@@ -778,13 +778,14 @@ MoQRelay::subscribeNamespace(
           subNs.trackNamespacePrefix});
 
   // If this is the first content added to this node, notify parent
-  if (wasEmpty && nodePtr->hasLocalSessions() && nodePtr->parent_) {
-    nodePtr->parent_->incrementActiveChildren();
+  if (wasEmpty && subscribedNode->hasLocalSessions() &&
+      subscribedNode->parent_) {
+    subscribedNode->parent_->incrementActiveChildren();
   }
 
   // Find all nested PublishNamespaces/Publishes and forward
   std::deque<std::tuple<TrackNamespace, std::shared_ptr<NamespaceNode>>> nodes{
-      {subNs.trackNamespacePrefix, nodePtr}};
+      {subNs.trackNamespacePrefix, subscribedNode}};
   auto exec = session->getExecutor();
   while (!nodes.empty()) {
     auto [prefix, nodePtr] = std::move(*nodes.begin());
