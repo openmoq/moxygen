@@ -949,7 +949,7 @@ CO_TEST_P_X(
   co_await setupMoQSessionForPublish(initialMaxRequestID_);
 
   constexpr uint64_t kPublisherTimeoutMs = 50;
-  constexpr uint64_t kSubscriberTimeoutMs = 60000;
+  static constexpr uint64_t kSubscriberTimeoutMs = 60000;
 
   PublishRequest pub{
       RequestID(0),
