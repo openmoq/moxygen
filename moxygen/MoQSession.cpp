@@ -363,24 +363,32 @@ class StreamPublisherImpl
   }
 
   void setDeliveryTimeout(std::optional<std::chrono::milliseconds> timeout) {
-    if (timeout.has_value() && timeout->count() > 0) {
-      if (deliveryTimer_) {
-        XLOG(DBG6)
-            << "MoQSession::SubgroupPublisher::setDeliveryTimeout: CALLING deliveryTimer->setDeliveryTimeout"
-            << " timeout=" << timeout->count() << "ms";
-        deliveryTimer_->setDeliveryTimeout(*timeout);
-      } else {
-        XLOG(DBG6)
-            << "MoQSession::SubgroupPublisher::setDeliveryTimeout: No timer exists, ignoring timeout update"
-            << " timeout=" << timeout->count() << "ms";
-      }
+    if (!deliveryTimer_) {
+      XLOG(DBG6)
+          << "MoQSession::SubgroupPublisher::setDeliveryTimeout: No timer exists, ignoring timeout update";
+      return;
     }
+    if (!timeout.has_value()) {
+      XLOG(DBG6)
+          << "MoQSession::SubgroupPublisher::setDeliveryTimeout: Disabling delivery timeout";
+      deliveryTimeoutActive_ = false;
+      deliveryTimer_->cancelAllTimers();
+      return;
+    }
+    CHECK_NE(timeout.value().count(), 0)
+        << "MoQSession::SubgroupPublisher::setDeliveryTimeout must not be called with a value of 0";
+    XLOG(DBG6)
+        << "MoQSession::SubgroupPublisher::setDeliveryTimeout: CALLING deliveryTimer->setDeliveryTimeout"
+        << " timeout=" << timeout->count() << "ms";
+    deliveryTimeoutActive_ = true;
+    deliveryTimer_->setDeliveryTimeout(*timeout);
   }
 
  private:
   std::shared_ptr<MLogger> logger_;
   std::shared_ptr<DeliveryCallback> deliveryCallback_;
   std::unique_ptr<MoQDeliveryTimer> deliveryTimer_;
+  bool deliveryTimeoutActive_{false};
 
   // Track objects and their end offsets for delivery callbacks
   struct ObjectDeliveryInfo {
@@ -517,6 +525,7 @@ StreamPublisherImpl::StreamPublisherImpl(
               this->reset(errorCode);
             }
           });
+      deliveryTimeoutActive_ = true;
     } else {
       XLOG(ERR) << "MoQSession::StreamPublisherImpl: No executor available. "
                    "Delivery timeout was not set.";
@@ -802,8 +811,9 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::objectImpl(
     }
   }
 
-  // Start delivery timeout timer when object begins being sent to stream
-  if (deliveryTimer_) {
+  // Start delivery timeout timer when object begins being sent to stream. A 0
+  // ("no timeout") value leaves deliveryTimeoutActive_ false, so no timer arms.
+  if (deliveryTimer_ && deliveryTimeoutActive_) {
     deliveryTimer_->startTimer(objectID, publisher_->getTransportInfo().srtt);
   }
 
@@ -839,8 +849,9 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::beginObject(
   }
   header_.status = ObjectStatus::NORMAL;
 
-  // Start delivery timeout timer when object begins being sent to stream
-  if (deliveryTimer_) {
+  // Start delivery timeout timer when object begins being sent to stream. A 0
+  // ("no timeout") value leaves deliveryTimeoutActive_ false, so no timer arms.
+  if (deliveryTimer_ && deliveryTimeoutActive_) {
     deliveryTimer_->startTimer(objectID, publisher_->getTransportInfo().srtt);
   }
 
@@ -1095,9 +1106,9 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
           onDeliveryTimeoutChanged(std::move(newTimeout));
         });
 
-    // Initialize with downstream timeout by default
+    // Initialize with the subscriber timeout by default
     if (deliveryTimeout.has_value()) {
-      deliveryTimeoutManager_.setDownstreamTimeout(*deliveryTimeout);
+      deliveryTimeoutManager_.setSubscriberTimeout(*deliveryTimeout);
     }
   }
 
@@ -1196,16 +1207,16 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     // Update delivery timeout if present
     auto timeoutValue = MoQSession::getDeliveryTimeoutIfPresent(
         requestUpdate.params, *session_->getNegotiatedVersion());
-    if (timeoutValue.has_value() && *timeoutValue > 0) {
+    if (timeoutValue.has_value() && shouldApplyDeliveryTimeout(*timeoutValue)) {
       XLOG(DBG6)
-          << "MoQSession::TrackPublisherImpl::handleRequestUpdate: SETTING downstream timeout"
+          << "MoQSession::TrackPublisherImpl::handleRequestUpdate: SETTING subscriber timeout"
           << " timeout=" << *timeoutValue << "ms"
           << " requestID=" << existingRequestID;
-      deliveryTimeoutManager_.setDownstreamTimeout(
+      deliveryTimeoutManager_.setSubscriberTimeout(
           std::chrono::milliseconds(*timeoutValue));
     } else {
       XLOG(DBG6)
-          << "MoQSession::TrackPublisherImpl::handleRequestUpdate: No delivery timeout in params or timeout=0"
+          << "MoQSession::TrackPublisherImpl::handleRequestUpdate: No delivery timeout in params or ignored timeout=0"
           << " requestID=" << existingRequestID;
     }
 
@@ -1264,12 +1275,26 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     }
   }
 
+  // Draft 18+ treats a DELIVERY_TIMEOUT of 0 as an explicit "no timeout" that
+  // clears any previously-negotiated value,
+  bool shouldApplyDeliveryTimeout(uint64_t timeoutMs) const {
+    return timeoutMs > 0 ||
+        getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 18;
+  }
+
   void onPublishOk(const PublishOk& publishOk) {
     auto timeoutValue = MoQSession::getDeliveryTimeoutIfPresent(
         publishOk.params, *session_->getNegotiatedVersion());
-    if (timeoutValue.has_value() && *timeoutValue > 0) {
-      deliveryTimeoutManager_.setDownstreamTimeout(
+    if (timeoutValue.has_value() && shouldApplyDeliveryTimeout(*timeoutValue)) {
+      deliveryTimeoutManager_.setSubscriberTimeout(
           std::chrono::milliseconds(*timeoutValue));
+    }
+  }
+
+  void publishSent(const PublishRequest& publish) {
+    auto timeout = getPublisherDeliveryTimeout(publish);
+    if (timeout.has_value() && shouldApplyDeliveryTimeout(timeout->count())) {
+      deliveryTimeoutManager_.setPublisherTimeout(*timeout);
     }
   }
 
@@ -1280,8 +1305,8 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     setTrackAlias(subscribeOk.trackAlias);
     setGroupOrder(subscribeOk.groupOrder);
     auto timeout = getPublisherDeliveryTimeout(subscribeOk);
-    if (timeout.has_value() && timeout->count() > 0) {
-      deliveryTimeoutManager_.setUpstreamTimeout(*timeout);
+    if (timeout.has_value() && shouldApplyDeliveryTimeout(timeout->count())) {
+      deliveryTimeoutManager_.setPublisherTimeout(*timeout);
     }
   }
 
@@ -1787,13 +1812,9 @@ void MoQSession::TrackPublisherImpl::onDeliveryTimeoutChanged(
                                  : "none")
       << " requestID=" << requestID_ << " subgroups.size=" << subgroups_.size();
 
-  if (!newTimeout.has_value()) {
-    return;
-  }
-
   // Propagate to all existing subgroups
   for (const auto& [_, subgroupPublisher] : subgroups_) {
-    subgroupPublisher->setDeliveryTimeout(*newTimeout);
+    subgroupPublisher->setDeliveryTimeout(newTimeout);
   }
 }
 
@@ -2976,6 +2997,12 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
       XLOG(DBG3) << "End of stream id=" << streamId << " sess=" << this;
     }
   }
+  // Once the read loop exits, no REQUEST_OK / REQUEST_ERROR can be delivered on
+  // this stream again, so a sender must not register a new pending here. Marked
+  // before the fail-pending block below so both close paths agree.
+  if (control) {
+    control->markReadLoopExited();
+  }
   // TODO: close session on control exit.
   // On read-loop exit, fire responder close (RST always; FIN when
   // finIsCancellation) and fail any still-pending sender request. Both
@@ -2990,6 +3017,17 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
     if (control->requestID().has_value()) {
       // No-op if the terminal reply already resolved + erased the pending.
       failPendingRequestOnEarlyClose(*control->requestID(), exceptionalExit);
+    }
+    // Draft 18+: REQUEST_UPDATEs sent on this stream are tracked in
+    // pendingRequests_ under their own request IDs (queued in
+    // responseIDQueue_), not the stream's primary request ID, so the fail above
+    // does not cover them. Fail each still-pending update so a requestUpdate()
+    // awaiting its REQUEST_OK / REQUEST_ERROR does not hang when the peer
+    // closes the stream first.
+    auto& responseIDQueue = control->responseIDQueue();
+    while (!responseIDQueue.empty()) {
+      failPendingRequestOnEarlyClose(responseIDQueue.front(), exceptionalExit);
+      responseIDQueue.pop_front();
     }
     // Sender (bidiCallback==null) mirrors peer FIN with our FIN: "done
     // updating the request". No-op if write half already closed.
@@ -3025,8 +3063,7 @@ void MoQSession::failPendingRequestOnEarlyClose(
   }
 }
 
-folly::Expected<std::shared_ptr<BidiStreamControl>, std::string>
-MoQSession::sendRequest(
+MoQSession::SendRequestResult MoQSession::sendRequest(
     folly::IOBufQueue& writeBuf,
     FrameType okType,
     std::vector<FrameType> postTerminal,
@@ -3038,7 +3075,8 @@ MoQSession::sendRequest(
     auto bidiStream = wt_->createBidiStream();
     if (!bidiStream) {
       XLOG(ERR) << "Failed to create bidi stream sess=" << this;
-      return folly::makeUnexpected(std::string("Failed to create bidi stream"));
+      return folly::makeUnexpected(
+          SendRequestError{bidiStream.error(), "Failed to create bidi stream"});
     }
     bidiStream->writeHandle->writeStreamData(
         writeBuf.move(), /*fin=*/false, nullptr);
@@ -3975,8 +4013,7 @@ void MoQSession::onRequestUpdate(RequestUpdate requestUpdate) {
     requestUpdateError(
         RequestError{
             requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
-        existingRequestID,
-        /*terminateExistingRequest=*/false);
+        existingRequestID);
     return;
   }
 
@@ -5112,7 +5149,7 @@ folly::coro::Task<MoQSession::TrackStatusResult> MoQSession::trackStatus(
         TrackStatusError{
             reqID,
             TrackStatusErrorCode::INTERNAL_ERROR,
-            std::move(sendResult.error())});
+            std::move(sendResult.error().reasonPhrase)});
   }
   auto control = std::move(sendResult.value());
   // No REQUEST_UPDATE channel for TRACK_STATUS — FIN now.
@@ -5346,21 +5383,21 @@ Subscriber::PublishResult MoQSession::publish(
             ResetStreamErrorCode::CANCELLED);
       });
   if (sendResult.hasError()) {
+    auto sendError = std::move(sendResult.error());
     return folly::makeUnexpected(
         PublishError{
             pub.requestID,
             PublishErrorCode::INTERNAL_ERROR,
-            std::move(sendResult.error())});
+            std::move(sendError.reasonPhrase),
+            std::nullopt,
+            std::nullopt,
+            std::move(sendError.webTransportError)});
   }
   if (logger_) {
     logger_->logPublish(
         pub, MOQTByteStringType::STRING_VALUE, ControlMessageType::CREATED);
   }
 
-  // Extract delivery timeout from publish extensions
-  auto deliveryTimeout = getPublisherDeliveryTimeout(pub);
-
-  // Create TrackConsumer for the publisher to write data
   auto trackPublisher = std::make_shared<TrackPublisherImpl>(
       this,
       pub.fullTrackName,
@@ -5370,8 +5407,10 @@ Subscriber::PublishResult MoQSession::publish(
       pub.groupOrder,
       *negotiatedVersion_,
       moqSettings_.bufferingThresholds.perSubscription,
-      pub.forward,
-      deliveryTimeout);
+      pub.forward);
+
+  // Record the publisher's advertised delivery timeout as the publisher source.
+  trackPublisher->publishSent(pub);
 
   // Set publishHandle in trackPublisher so it can cancel on unsubscribes
   trackPublisher->setSubscriptionHandle(std::move(handle));
@@ -5553,7 +5592,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
     SubscribeError subscribeError = {
         reqID,
         SubscribeErrorCode::INTERNAL_ERROR,
-        std::move(sendResult.error())};
+        std::move(sendResult.error().reasonPhrase)};
     MOQ_SUBSCRIBER_STATS(
         subscriberStatsCallback_, onSubscribeError, subscribeError.errorCode);
     co_return folly::makeUnexpected(subscribeError);
@@ -5774,12 +5813,17 @@ void MoQSession::requestUpdateError(
               << existingRequestID << " sess=" << this;
   }
 
-  if (!terminateExistingRequest) {
-    return;
+  if (terminateExistingRequest) {
+    // Tear down the failed request (regardless of REQUEST_ERROR write success).
+    terminateRequestUpdateOnError(existingRequestID, requestError);
   }
+}
 
-  // Terminate subscription with PUBLISH_DONE (UPDATE_FAILED)
-  // and clean up publisher state (regardless of REQUEST_ERROR write success)
+void MoQSession::terminateRequestUpdateOnError(
+    RequestID existingRequestID,
+    const SubscribeUpdateError& requestError) {
+  // Terminate subscription with PUBLISH_DONE (UPDATE_FAILED) and clean up
+  // publisher state; for a FETCH terminatePublish resets the FETCH data stream.
   auto it = pubTracks_.find(existingRequestID);
   if (it != pubTracks_.end()) {
     PublishDone pubDone{
@@ -6003,7 +6047,9 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
       });
   if (sendResult.hasError()) {
     FetchError fetchError = {
-        reqID, FetchErrorCode::INTERNAL_ERROR, std::move(sendResult.error())};
+        reqID,
+        FetchErrorCode::INTERNAL_ERROR,
+        std::move(sendResult.error().reasonPhrase)};
     MOQ_SUBSCRIBER_STATS(
         subscriberStatsCallback_, onFetchError, fetchError.errorCode);
     co_return folly::makeUnexpected(fetchError);

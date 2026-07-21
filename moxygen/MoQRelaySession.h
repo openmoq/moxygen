@@ -125,6 +125,17 @@ class MoQRelaySession : public MoQSession {
   // Override to handle ANNOUNCE and SUBSCRIBE_ANNOUNCES updates
   void onRequestUpdate(RequestUpdate requestUpdate) override;
 
+  // Route REQUEST_UPDATE responses for namespace requests to their own bidi
+  // reply context (draft 18+); other requests fall back to the base.
+  ReplyContext* getRequestUpdateReplyContext(
+      RequestID existingRequestID) override;
+
+  // A failed SUBSCRIBE_NAMESPACE / PUBLISH_NAMESPACE update closes the
+  // request's bidi stream; other request types fall back to the base.
+  void terminateRequestUpdateOnError(
+      RequestID existingRequestID,
+      const SubscribeUpdateError& requestError) override;
+
   // REQUEST_UPDATE handlers for announcement types - take handles directly
   void handlePublishNamespaceRequestUpdate(
       RequestUpdate requestUpdate,
@@ -133,6 +144,25 @@ class MoQRelaySession : public MoQSession {
       RequestUpdate requestUpdate,
       std::shared_ptr<Publisher::SubscribeNamespaceHandle>
           subscribeNamespaceHandle);
+  void handleSubscribeTracksRequestUpdate(
+      RequestUpdate requestUpdate,
+      std::shared_ptr<Publisher::SubscribeTracksHandle> subscribeTracksHandle);
+
+  // Draft 16+: send a REQUEST_UPDATE for a locally-initiated
+  // SUBSCRIBE_NAMESPACE (or SUBSCRIBE_TRACKS) and await the REQUEST_OK /
+  // REQUEST_ERROR. Draft 18+ sends it on the subscription's own bidi request
+  // stream (correlated FIFO via the stream's responseIDQueue); pre-18 there are
+  // no per-request bidi streams, so it rides the shared control stream and is
+  // correlated by the on-wire requestID. The base MoQSession::requestUpdate
+  // only targets SUBSCRIBE / FETCH requests, so namespace-style requests need
+  // their own send path. Allocates the update's requestID and reuses the base
+  // REQUEST_UPDATE response routing (onRequestOk ->
+  // handleSubscribeUpdateOkFromRequestOk).
+  folly::coro::Task<folly::Expected<RequestOk, RequestError>>
+  sendRequestUpdateOnBidi(
+      RequestUpdate reqUpdate,
+      RequestID existingRequestID,
+      std::shared_ptr<BidiStreamControl> control);
 
   // Internal publishNamespace handling methods
   folly::coro::Task<void> handleSubscribeNamespace(
@@ -213,6 +243,11 @@ class MoQRelaySession : public MoQSession {
       std::shared_ptr<Publisher::SubscribeNamespaceHandle>,
       RequestID::hash>
       subscribeNamespaceHandles_;
+  // Draft 18+: reply context for each responder-side namespace or
+  // SUBSCRIBE_TRACKS request's bidi stream, so a failed REQUEST_UPDATE can send
+  // REQUEST_ERROR and close it.
+  folly::F14FastMap<RequestID, std::shared_ptr<ReplyContext>, RequestID::hash>
+      requestUpdateReplyContexts_;
   // Draft 18+
   folly::F14FastMap<
       RequestID,

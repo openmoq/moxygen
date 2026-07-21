@@ -209,10 +209,8 @@ class MoQTextClient : public Subscriber,
     }
   }
 
-  // Sync helper: accept an incoming namespace announcement and return a handle
-  // keeping the publishNamespace subscription alive. Called both from the
-  // Subscriber::publishNamespace() coroutine interface (server-initiated) and
-  // from namespaceMsg() (draft 16+ NAMESPACE message on the bidi stream).
+  // Accept a server-initiated PUBLISH_NAMESPACE from Subscriber::
+  // publishNamespace() and return a handle that keeps the subscription alive.
   std::shared_ptr<PublishNamespaceHandle> acceptPublishNamespace(
       const TrackNamespace& ns,
       RequestID requestID) {
@@ -221,30 +219,6 @@ class MoQTextClient : public Subscriber,
         .requestID = requestID, .requestSpecificParams = {}});
     pubNsHandles_.push_back(handle); // keep alive so subscription persists
     return handle;
-  }
-
-  folly::coro::Task<MoQSession::SubscribeNamespaceResult> subscribeNamespace(
-      SubscribeNamespace subAnn) {
-    // Bridge NAMESPACE messages (draft 16+ bidi stream) to
-    // acceptPublishNamespace so the relay will PUBLISH data to us for each
-    // announced namespace.
-    struct NamespaceHandle : Publisher::NamespacePublishHandle {
-      explicit NamespaceHandle(std::weak_ptr<MoQTextClient> client)
-          : client_(std::move(client)) {}
-      void namespaceMsg(const TrackNamespace& suffix) override {
-        if (auto c = client_.lock()) {
-          c->acceptPublishNamespace(suffix, RequestID(0));
-        }
-      }
-      void namespaceDoneMsg(const TrackNamespace&) override {}
-      std::weak_ptr<MoQTextClient> client_;
-    };
-    auto res = co_await moqClient_.getSession()->subscribeNamespace(
-        subAnn, std::make_shared<NamespaceHandle>(weak_from_this()));
-    if (res.hasValue()) {
-      subscribeNamespaceHandle_ = res.value();
-    }
-    co_return res;
   }
 
   // Response To PUBLISH
@@ -290,12 +264,15 @@ class MoQTextClient : public Subscriber,
           alpns);
 
       if (FLAGS_publish) {
-        SubscribeNamespace subAnn{
+        SubscribeTracks subTracks{
             sub.requestID,
             sub.fullTrackName.trackNamespace,
             true /* forward */,
             sub.params};
-        co_await subscribeNamespace(subAnn);
+        auto res = co_await moqClient_.getSession()->subscribeTracks(subTracks);
+        if (res.hasValue()) {
+          subscribeTracksHandle_ = res.value();
+        }
 
         if (FLAGS_unsubscribe) {
           co_await folly::coro::sleep(
@@ -450,8 +427,7 @@ class MoQTextClient : public Subscriber,
           ObjectReceiver::SUBSCRIBE,
           subTextHandler_)};
   std::shared_ptr<ObjectReceiver> fetchTextReceiver_;
-  std::shared_ptr<Publisher::SubscribeNamespaceHandle>
-      subscribeNamespaceHandle_;
+  std::shared_ptr<Publisher::SubscribeTracksHandle> subscribeTracksHandle_;
   std::vector<std::shared_ptr<Publisher::SubscriptionHandle>> subHandles_;
   // Keeps publishNamespace handles alive so subscriptions are not cancelled.
   std::vector<std::shared_ptr<PublishNamespaceHandle>> pubNsHandles_;

@@ -104,7 +104,7 @@ std::string getErrorMessage(int code) {
     case -6:
       return "Other exception occurred";
     case -7:
-      return "SubscribeNamespace failed";
+      return "SubscribeTracks failed";
     default:
       return "Unknown error";
   }
@@ -303,18 +303,17 @@ class PyMoQSubscriber : public Subscriber,
           alpns);
 
       if (options_.publish) {
-        // Publish mode - SubscribeNamespace
-        SubscribeNamespace subAnn{
+        // Publish mode - SubscribeTracks (falls back to SUBSCRIBE_NAMESPACE
+        // with the PUBLISH option on drafts < 18).
+        SubscribeTracks subTracks{
             sub.requestID,
             sub.fullTrackName.trackNamespace,
             true /* forward */,
-            sub.params,
-            {} /* options */};
-        auto res = co_await moqClient_.getSession()->subscribeNamespace(
-            subAnn, nullptr);
+            sub.params};
+        auto res = co_await moqClient_.getSession()->subscribeTracks(subTracks);
         if (!res.hasValue()) {
           auto& error = res.error();
-          std::cerr << "SubscribeNamespace failed with error:" << std::endl;
+          std::cerr << "SubscribeTracks failed with error:" << std::endl;
           std::cerr << "  - Error Code: "
                     << folly::to_underlying(error.errorCode) << " ("
                     << requestErrorCodeToString(error.errorCode) << ")"
@@ -324,7 +323,7 @@ class PyMoQSubscriber : public Subscriber,
           moqClient_.shutdown();
           co_return -7;
         }
-        subscribeNamespaceHandle_ = res.value();
+        subscribeTracksHandle_ = res.value();
 
         if (options_.unsubscribe) {
           co_await folly::coro::sleep(
@@ -434,8 +433,7 @@ class PyMoQSubscriber : public Subscriber,
   MoQClientOptions options_;
   std::shared_ptr<PyObjectHandler> handler_;
   std::shared_ptr<ObjectReceiver> subReceiver_;
-  std::shared_ptr<Publisher::SubscribeNamespaceHandle>
-      subscribeNamespaceHandle_;
+  std::shared_ptr<Publisher::SubscribeTracksHandle> subscribeTracksHandle_;
   std::vector<std::shared_ptr<Publisher::SubscriptionHandle>> subHandles_;
 };
 

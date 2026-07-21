@@ -163,16 +163,6 @@ class MoQTextClientMobile
       : moqClient_(std::make_unique<MoQClientMobile>(evb, std::move(url))),
         fullTrackName_(std::move(ftn)) {}
 
-  folly::coro::Task<MoQSession::SubscribeNamespaceResult> subscribeNamespace(
-      SubscribeNamespace subAnn) {
-    auto res =
-        co_await moqClient_->moqSession_->subscribeNamespace(subAnn, nullptr);
-    if (res.hasValue()) {
-      subscribeNamespaceHandle_ = res.value();
-    }
-    co_return res;
-  }
-
   // Response To PUBLISH
   PublishResult publish(
       PublishRequest pub,
@@ -216,12 +206,15 @@ class MoQTextClientMobile
           alpns);
 
       if (FLAGS_publish) {
-        SubscribeNamespace subAnn{
+        SubscribeTracks subTracks{
             sub.requestID,
             sub.fullTrackName.trackNamespace,
             true /* forward */,
             sub.params};
-        co_await subscribeNamespace(subAnn);
+        auto res = co_await moqClient_->moqSession_->subscribeTracks(subTracks);
+        if (res.hasValue()) {
+          subscribeTracksHandle_ = res.value();
+        }
 
         if (FLAGS_unsubscribe) {
           co_await folly::coro::sleep(
@@ -375,8 +368,7 @@ class MoQTextClientMobile
           ObjectReceiver::SUBSCRIBE,
           subTextHandler_)};
   std::shared_ptr<ObjectReceiver> fetchTextReceiver_;
-  std::shared_ptr<Publisher::SubscribeNamespaceHandle>
-      subscribeNamespaceHandle_;
+  std::shared_ptr<Publisher::SubscribeTracksHandle> subscribeTracksHandle_;
   std::vector<std::shared_ptr<Publisher::SubscriptionHandle>> subHandles_;
 };
 } // namespace

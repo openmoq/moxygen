@@ -7,6 +7,7 @@
 #include "moxygen/relay/MoQRelay.h"
 #include <folly/logging/xlog.h>
 #include "moxygen/MoQFilters.h"
+#include "moxygen/MoQFramer.h"
 #include "moxygen/MoQTrackProperties.h"
 
 namespace {
@@ -91,7 +92,7 @@ std::shared_ptr<MoQRelay::NamespaceNode> MoQRelay::findInTree(
   return nodePtr;
 }
 
-bool MoQRelay::hasTracksSubscriptionInSubtree(
+bool MoQRelay::hasSessionInSubtree(
     const NamespaceNode& root,
     std::shared_ptr<MoQSession> session) const {
   std::vector<const NamespaceNode*> nodesToVisit{&root};
@@ -108,16 +109,17 @@ bool MoQRelay::hasTracksSubscriptionInSubtree(
   return false;
 }
 
-bool MoQRelay::hasOverlappingTracksSubscription(
-    const TrackNamespace& trackNamespacePrefix,
+bool MoQRelay::hasOverlappingSubscription(
+    const NamespaceNode& root,
+    const TrackNamespace& prefix,
     std::shared_ptr<MoQSession> session) const {
-  const NamespaceNode* node = &tracksSubscriberRoot_;
-  for (size_t i = 0; i < trackNamespacePrefix.size(); i++) {
+  const NamespaceNode* node = &root;
+  for (size_t i = 0; i < prefix.size(); i++) {
     // Nodes visited before the target prefix are strict ancestors.
     if (node->sessions.find(session) != node->sessions.end()) {
       return true;
     }
-    auto it = node->children.find(trackNamespacePrefix[i]);
+    auto it = node->children.find(prefix[i]);
     if (it == node->children.end()) {
       return false;
     }
@@ -125,7 +127,7 @@ bool MoQRelay::hasOverlappingTracksSubscription(
   }
 
   // The target subtree covers exact-prefix and descendant registrations.
-  return hasTracksSubscriptionInSubtree(*node, std::move(session));
+  return hasSessionInSubtree(*node, std::move(session));
 }
 
 folly::coro::Task<Subscriber::PublishNamespaceResult>
@@ -435,7 +437,7 @@ Subscriber::PublishResult MoQRelay::publish(
             pub.requestID, PublishErrorCode::UNINTERESTED, "bad namespace"});
   }
 
-  if (pub.fullTrackName.trackNamespace.empty()) {
+  if (pub.fullTrackName.trackNamespace.empty() && !emptyNamespaceAllowed()) {
     return folly::makeUnexpected(PublishError(
         {pub.requestID,
          PublishErrorCode::INTERNAL_ERROR,
@@ -543,7 +545,13 @@ Subscriber::PublishResult MoQRelay::publish(
       nSubscribers++;
       auto exec = outSession->getExecutor();
       co_withExecutor(
-          exec, publishToSession(outSession, forwarder, info.forward))
+          exec,
+          publishToSession(
+              outSession,
+              forwarder,
+              info.forward,
+              info.trackNamespacePrefix,
+              info.publishBlockedHandle))
           .start();
     }
   }
@@ -569,23 +577,49 @@ Subscriber::PublishResult MoQRelay::publish(
           kLocationMax.group})};
 }
 
+void MoQRelay::publishBlockedToTracksSubscriber(
+    const TrackNamespace& trackNamespacePrefix,
+    const FullTrackName& ftn,
+    const std::shared_ptr<Publisher::PublishBlockedHandle>&
+        publishBlockedHandle) const {
+  if (!publishBlockedHandle ||
+      !ftn.trackNamespace.startsWith(trackNamespacePrefix)) {
+    return;
+  }
+  const auto& ns = ftn.trackNamespace.trackNamespace;
+  TrackNamespace suffix(
+      std::vector<std::string>(
+          ns.begin() + trackNamespacePrefix.size(), ns.end()));
+  publishBlockedHandle->publishBlocked(suffix, ftn.trackName);
+}
+
 folly::coro::Task<void> MoQRelay::publishToSession(
     std::shared_ptr<MoQSession> session,
     std::shared_ptr<MoQForwarder> forwarder,
-    bool forward) {
+    bool forward,
+    TrackNamespace trackNamespacePrefix,
+    std::shared_ptr<Publisher::PublishBlockedHandle> publishBlockedHandle) {
+  const auto fullTrackName = forwarder->fullTrackName();
   auto subscriber = forwarder->addSubscriber(session, forward);
   if (!subscriber) {
     XLOG(ERR) << "Subscribe failed: addSubscriber returned null for "
-              << forwarder->fullTrackName();
+              << fullTrackName;
     co_return;
   }
-  XLOG(DBG4) << "added subscriber for ftn=" << forwarder->fullTrackName();
+  XLOG(DBG4) << "added subscriber for ftn=" << fullTrackName;
   auto guard = folly::makeGuard([subscriber] { subscriber->unsubscribe(); });
 
   auto pubInitial =
       session->publish(subscriber->getPublishRequest(), subscriber);
   if (pubInitial.hasError()) {
-    XLOG(ERR) << "Publish failed err=" << pubInitial.error().reasonPhrase;
+    const auto& publishError = pubInitial.error();
+    XLOG(ERR) << "Publish failed err=" << publishError.reasonPhrase;
+    if (publishError.webTransportError &&
+        *publishError.webTransportError ==
+            proxygen::WebTransport::ErrorCode::STREAM_CREATION_ERROR) {
+      publishBlockedToTracksSubscriber(
+          trackNamespacePrefix, fullTrackName, publishBlockedHandle);
+    }
     co_return;
   }
   subscriber->trackConsumer = std::move(pubInitial->consumer);
@@ -630,11 +664,23 @@ class MoQRelay::NamespaceSubscription
 
   folly::coro::Task<RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) override {
-    co_return folly::makeUnexpected(
-        RequestError{
-            reqUpdate.requestID,
-            RequestErrorCode::NOT_SUPPORTED,
-            "REQUEST_UPDATE not supported for relay SUBSCRIBE_NAMESPACE"});
+    if (!relay_ || !session_) {
+      co_return folly::makeUnexpected(
+          RequestError{
+              reqUpdate.requestID,
+              RequestErrorCode::INTERNAL_ERROR,
+              "SUBSCRIBE_NAMESPACE subscription no longer active"});
+    }
+    auto newPrefix = relay_->updatePrefixFromRequest(
+        reqUpdate,
+        trackNamespacePrefix_,
+        session_,
+        MoQRelay::PrefixUpdateKind::Namespace);
+    if (newPrefix.hasError()) {
+      co_return folly::makeUnexpected(newPrefix.error());
+    }
+    trackNamespacePrefix_ = std::move(newPrefix.value());
+    co_return RequestOk{reqUpdate.requestID};
   }
 
  private:
@@ -702,30 +748,44 @@ MoQRelay::subscribeNamespace(
             SubscribeNamespaceErrorCode::NAMESPACE_PREFIX_UNKNOWN,
             "empty"});
   }
-  auto nodePtr = findNamespaceNode(
+
+  // Per-session overlap restriction: the prefix must not share a common prefix
+  // with another active SUBSCRIBE_NAMESPACE in the same session.
+  if (hasOverlappingSubscription(
+          publishNamespaceRoot_, subNs.trackNamespacePrefix, session)) {
+    co_return folly::makeUnexpected(
+        SubscribeNamespaceError{
+            subNs.requestID,
+            SubscribeNamespaceErrorCode::PREFIX_OVERLAP,
+            "Overlapping SUBSCRIBE_NAMESPACE exists in this session"});
+  }
+
+  auto subscribedNode = findNamespaceNode(
       subNs.trackNamespacePrefix, /*createMissingNodes=*/true);
 
   SubscribeNamespaceOptions effectiveOptions;
   effectiveOptions = subNs.options;
 
   // Check if this is the first session subscriber for this node
-  bool wasEmpty = !nodePtr->hasLocalSessions();
-  nodePtr->sessions.emplace(
+  bool wasEmpty = !subscribedNode->hasLocalSessions();
+  subscribedNode->sessions.emplace(
       session,
       NamespaceNode::NamespaceSubscriberInfo{
           subNs.forward,
           effectiveOptions,
           namespacePublishHandle,
+          /*publishBlockedHandle=*/nullptr,
           subNs.trackNamespacePrefix});
 
   // If this is the first content added to this node, notify parent
-  if (wasEmpty && nodePtr->hasLocalSessions() && nodePtr->parent_) {
-    nodePtr->parent_->incrementActiveChildren();
+  if (wasEmpty && subscribedNode->hasLocalSessions() &&
+      subscribedNode->parent_) {
+    subscribedNode->parent_->incrementActiveChildren();
   }
 
   // Find all nested PublishNamespaces/Publishes and forward
   std::deque<std::tuple<TrackNamespace, std::shared_ptr<NamespaceNode>>> nodes{
-      {subNs.trackNamespacePrefix, nodePtr}};
+      {subNs.trackNamespacePrefix, subscribedNode}};
   auto exec = session->getExecutor();
   while (!nodes.empty()) {
     auto [prefix, nodePtr] = std::move(*nodes.begin());
@@ -785,6 +845,76 @@ MoQRelay::subscribeNamespace(
       subNs.trackNamespacePrefix);
 }
 
+void MoQRelay::publishExistingMatchingNamespaces(
+    const std::shared_ptr<MoQSession>& session,
+    const TrackNamespace& prefix,
+    bool forward,
+    SubscribeNamespaceOptions options,
+    const std::shared_ptr<Publisher::NamespacePublishHandle>&
+        namespacePublishHandle,
+    RequestID requestID,
+    uint64_t negotiatedVersion,
+    const TrackNamespace* skipUnderPrefix) {
+  auto exec = session->getExecutor();
+  std::deque<std::tuple<TrackNamespace, std::shared_ptr<NamespaceNode>>> nodes;
+  if (auto nodePtr = findNamespaceNode(
+          prefix, /*createMissingNodes=*/false, MatchType::Exact)) {
+    nodes.emplace_back(prefix, nodePtr);
+  }
+  while (!nodes.empty()) {
+    auto [nodePrefix, nodePtr] = std::move(*nodes.begin());
+    nodes.pop_front();
+    // The subtree under skipUnderPrefix was already delivered via the outgoing
+    // prefix; skipping it avoids a duplicate NAMESPACE / PUBLISH.
+    if (skipUnderPrefix && nodePrefix.startsWith(*skipUnderPrefix)) {
+      continue;
+    }
+    if (nodePtr->sourceSession && nodePtr->sourceSession != session) {
+      if (getDraftMajorVersion(negotiatedVersion) >= 16) {
+        if (options == SubscribeNamespaceOptions::NAMESPACE ||
+            options == SubscribeNamespaceOptions::BOTH) {
+          // Compute the suffix: nodePrefix minus prefix.
+          TrackNamespace suffix(
+              std::vector<std::string>(
+                  nodePrefix.trackNamespace.begin() + prefix.size(),
+                  nodePrefix.trackNamespace.end()));
+          namespacePublishHandle->namespaceMsg(suffix);
+        }
+      } else {
+        // TODO: Auth/params
+        co_withExecutor(
+            exec,
+            publishNamespaceToSession(
+                session, {requestID, nodePrefix}, nodePtr))
+            .start();
+      }
+    }
+    for (auto& publishEntry : nodePtr->publishes) {
+      auto& publishSession = publishEntry.second;
+      FullTrackName ftn{nodePrefix, publishEntry.first};
+      auto subscriptionIt = subscriptions_.find(ftn);
+      if (subscriptionIt == subscriptions_.end()) {
+        XLOG(ERR) << "Invalid state, no subscription for publish ftn=" << ftn;
+        continue;
+      }
+      auto& forwarder = subscriptionIt->second.forwarder;
+      if (getDraftMajorVersion(negotiatedVersion) <= 15 ||
+          (options == SubscribeNamespaceOptions::BOTH ||
+           options == SubscribeNamespaceOptions::PUBLISH)) {
+        if (publishSession != session) {
+          co_withExecutor(exec, publishToSession(session, forwarder, forward))
+              .start();
+        }
+      }
+    }
+    for (auto& nextNodeIt : nodePtr->children) {
+      TrackNamespace childPrefix(nodePrefix);
+      childPrefix.append(nextNodeIt.first);
+      nodes.emplace_back(std::forward_as_tuple(childPrefix, nextNodeIt.second));
+    }
+  }
+}
+
 void MoQRelay::unsubscribeNamespace(
     const TrackNamespace& trackNamespacePrefix,
     std::shared_ptr<MoQSession> session) {
@@ -836,11 +966,23 @@ class MoQRelay::TracksSubscription : public Publisher::SubscribeTracksHandle {
 
   folly::coro::Task<RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) override {
-    co_return folly::makeUnexpected(
-        RequestError{
-            reqUpdate.requestID,
-            RequestErrorCode::NOT_SUPPORTED,
-            "REQUEST_UPDATE not supported for relay SUBSCRIBE_TRACKS"});
+    if (!relay_ || !session_) {
+      co_return folly::makeUnexpected(
+          RequestError{
+              reqUpdate.requestID,
+              RequestErrorCode::INTERNAL_ERROR,
+              "SUBSCRIBE_TRACKS subscription no longer active"});
+    }
+    auto newPrefix = relay_->updatePrefixFromRequest(
+        reqUpdate,
+        trackNamespacePrefix_,
+        session_,
+        MoQRelay::PrefixUpdateKind::Tracks);
+    if (newPrefix.hasError()) {
+      co_return folly::makeUnexpected(newPrefix.error());
+    }
+    trackNamespacePrefix_ = std::move(newPrefix.value());
+    co_return RequestOk{reqUpdate.requestID};
   }
 
  private:
@@ -851,7 +993,7 @@ class MoQRelay::TracksSubscription : public Publisher::SubscribeTracksHandle {
 
 folly::coro::Task<Publisher::SubscribeTracksResult> MoQRelay::subscribeTracks(
     SubscribeTracks subTracks,
-    std::shared_ptr<PublishBlockedHandle> /*publishBlockedHandle*/) {
+    std::shared_ptr<PublishBlockedHandle> publishBlockedHandle) {
   XLOG(DBG1) << __func__ << " nsp=" << subTracks.trackNamespacePrefix;
 
   auto session = MoQSession::getRequestSession();
@@ -865,8 +1007,8 @@ folly::coro::Task<Publisher::SubscribeTracksResult> MoQRelay::subscribeTracks(
             "SUBSCRIBE_TRACKS requires draft 18+"});
   }
 
-  if (hasOverlappingTracksSubscription(
-          subTracks.trackNamespacePrefix, session)) {
+  if (hasOverlappingSubscription(
+          tracksSubscriberRoot_, subTracks.trackNamespacePrefix, session)) {
     co_return folly::makeUnexpected(
         SubscribeTracksError{
             subTracks.requestID,
@@ -886,6 +1028,7 @@ folly::coro::Task<Publisher::SubscribeTracksResult> MoQRelay::subscribeTracks(
           // options is unused for this tree.
           SubscribeNamespaceOptions::PUBLISH,
           /*namespacePublishHandle=*/nullptr,
+          std::move(publishBlockedHandle),
           subTracks.trackNamespacePrefix});
   if (wasEmpty && tracksNode->parent_) {
     tracksNode->parent_->incrementActiveChildren();
@@ -918,7 +1061,11 @@ folly::coro::Task<Publisher::SubscribeTracksResult> MoQRelay::subscribeTracks(
       co_withExecutor(
           exec,
           publishToSession(
-              session, subscriptionIt->second.forwarder, subTracks.forward))
+              session,
+              subscriptionIt->second.forwarder,
+              subTracks.forward,
+              subTracks.trackNamespacePrefix,
+              tracksNode->sessions.at(session).publishBlockedHandle))
           .start();
     }
     for (auto& nextNodeIt : pubNode->children) {
@@ -934,6 +1081,56 @@ folly::coro::Task<Publisher::SubscribeTracksResult> MoQRelay::subscribeTracks(
       std::move(session),
       std::move(subTracksOk),
       subTracks.trackNamespacePrefix);
+}
+
+void MoQRelay::publishExistingMatchingTracks(
+    const std::shared_ptr<MoQSession>& session,
+    const TrackNamespace& prefix,
+    bool forward,
+    const std::shared_ptr<Publisher::PublishBlockedHandle>&
+        publishBlockedHandle,
+    const TrackNamespace* skipUnderPrefix) {
+  auto exec = session->getExecutor();
+  std::deque<std::tuple<TrackNamespace, std::shared_ptr<NamespaceNode>>> nodes;
+  if (auto pubNode = findNamespaceNode(
+          prefix, /*createMissingNodes=*/false, MatchType::Exact)) {
+    nodes.emplace_back(prefix, pubNode);
+  }
+  while (!nodes.empty()) {
+    auto [nodePrefix, pubNode] = std::move(*nodes.begin());
+    nodes.pop_front();
+    // The subtree under skipUnderPrefix is already forwarded to this session
+    // (it matched the outgoing prefix); skipping it avoids a duplicate PUBLISH.
+    if (skipUnderPrefix && nodePrefix.startsWith(*skipUnderPrefix)) {
+      continue;
+    }
+    for (auto& publishEntry : pubNode->publishes) {
+      auto& publishSession = publishEntry.second;
+      FullTrackName ftn{nodePrefix, publishEntry.first};
+      auto subscriptionIt = subscriptions_.find(ftn);
+      if (subscriptionIt == subscriptions_.end()) {
+        continue;
+      }
+      if (publishSession == session) {
+        // Don't echo the subscriber's own published tracks back to them.
+        continue;
+      }
+      co_withExecutor(
+          exec,
+          publishToSession(
+              session,
+              subscriptionIt->second.forwarder,
+              forward,
+              prefix,
+              publishBlockedHandle))
+          .start();
+    }
+    for (auto& nextNodeIt : pubNode->children) {
+      TrackNamespace childPrefix(nodePrefix);
+      childPrefix.append(nextNodeIt.first);
+      nodes.emplace_back(std::forward_as_tuple(childPrefix, nextNodeIt.second));
+    }
+  }
 }
 
 void MoQRelay::unsubscribeTracks(
@@ -955,6 +1152,223 @@ void MoQRelay::unsubscribeTracks(
       !trackNamespacePrefix.trackNamespace.empty()) {
     nodePtr->parent_->tryPruneChild(trackNamespacePrefix.trackNamespace.back());
   }
+}
+
+folly::Expected<folly::Unit, RequestErrorCode>
+MoQRelay::updateSubscriptionPrefix(
+    NamespaceNode& root,
+    const TrackNamespace& oldPrefix,
+    const TrackNamespace& newPrefix,
+    const std::shared_ptr<MoQSession>& session) {
+  XLOG(DBG1) << __func__ << " old=" << oldPrefix << " new=" << newPrefix;
+
+  // Detach the existing registration first so the overlap check below does not
+  // treat this subscription as conflicting with itself.
+  auto oldNode = findInTree(
+      root,
+      oldPrefix,
+      /*createMissingNodes=*/false,
+      MatchType::Exact,
+      /*sessions=*/nullptr);
+  if (!oldNode) {
+    return folly::makeUnexpected(RequestErrorCode::INTERNAL_ERROR);
+  }
+  auto oldIt = oldNode->sessions.find(session);
+  if (oldIt == oldNode->sessions.end()) {
+    return folly::makeUnexpected(RequestErrorCode::INTERNAL_ERROR);
+  }
+  // Copy the subscriber info so it can be re-registered (rollback or move).
+  auto info = oldIt->second;
+  bool hadLocalContent = oldNode->hasLocalSessions();
+  oldNode->sessions.erase(oldIt);
+  if (hadLocalContent && !oldNode->shouldKeep() && oldNode->parent_ &&
+      !oldPrefix.trackNamespace.empty()) {
+    oldNode->parent_->tryPruneChild(oldPrefix.trackNamespace.back());
+  }
+
+  auto reinsert = [&](const TrackNamespace& prefix,
+                      NamespaceNode::NamespaceSubscriberInfo subInfo) {
+    auto node = findInTree(
+        root,
+        prefix,
+        /*createMissingNodes=*/true,
+        MatchType::Exact,
+        /*sessions=*/nullptr);
+    bool wasEmpty = !node->hasLocalSessions();
+    subInfo.trackNamespacePrefix = prefix;
+    node->sessions.emplace(session, std::move(subInfo));
+    if (wasEmpty && node->hasLocalSessions() && node->parent_) {
+      node->parent_->incrementActiveChildren();
+    }
+  };
+
+  if (hasOverlappingSubscription(root, newPrefix, session)) {
+    // Reject and restore the original registration; per spec the update has no
+    // effect on the existing subscription.
+    reinsert(oldPrefix, std::move(info));
+    return folly::makeUnexpected(RequestErrorCode::PREFIX_OVERLAP);
+  }
+
+  // Re-target future matching to the new prefix. Already-active downstream
+  // subscriptions under the old prefix are left untouched; replaying content
+  // newly covered by the new prefix is the caller's responsibility (see
+  // updateTracksSubscriptionPrefix).
+  reinsert(newPrefix, std::move(info));
+  return folly::unit;
+}
+
+folly::Expected<folly::Unit, RequestErrorCode>
+MoQRelay::updateTracksSubscriptionPrefix(
+    const TrackNamespace& oldPrefix,
+    const TrackNamespace& newPrefix,
+    const std::shared_ptr<MoQSession>& session,
+    std::optional<bool> forward) {
+  auto res = updateSubscriptionPrefix(
+      tracksSubscriberRoot_, oldPrefix, newPrefix, session);
+  if (res.hasError()) {
+    return res;
+  }
+  // The registration now covers newPrefix; emit PUBLISH for already-published
+  // tracks newly matched by it (skipping the oldPrefix subtree, whose tracks
+  // are still forwarded), mirroring the initial SUBSCRIBE_TRACKS backfill.
+  if (auto node = findTracksSubscriberNode(newPrefix)) {
+    auto it = node->sessions.find(session);
+    if (it != node->sessions.end()) {
+      // Apply the new Forwarding State (if the update carried one) before
+      // backfilling, so tracks newly matched by newPrefix honor it.
+      if (forward.has_value()) {
+        it->second.forward = *forward;
+      }
+      publishExistingMatchingTracks(
+          session,
+          newPrefix,
+          it->second.forward,
+          it->second.publishBlockedHandle,
+          &oldPrefix);
+    }
+  }
+  return folly::unit;
+}
+
+folly::Expected<folly::Unit, RequestErrorCode>
+MoQRelay::updateNamespaceSubscriptionPrefix(
+    const TrackNamespace& oldPrefix,
+    const TrackNamespace& newPrefix,
+    const std::shared_ptr<MoQSession>& session) {
+  auto res = updateSubscriptionPrefix(
+      publishNamespaceRoot_, oldPrefix, newPrefix, session);
+  if (res.hasError()) {
+    return res;
+  }
+  // The registration now covers newPrefix; replay existing PUBLISH_NAMESPACEs
+  // and matching PUBLISHes newly matched by it (skipping the oldPrefix subtree,
+  // already delivered), mirroring the initial SUBSCRIBE_NAMESPACE backfill.
+  auto negotiatedVersion = session->getNegotiatedVersion();
+  if (negotiatedVersion) {
+    if (auto node = findNamespaceNode(newPrefix)) {
+      auto it = node->sessions.find(session);
+      if (it != node->sessions.end()) {
+        publishExistingMatchingNamespaces(
+            session,
+            newPrefix,
+            it->second.forward,
+            it->second.options,
+            it->second.namespacePublishHandle,
+            // A prefix update carrying TRACK_NAMESPACE_PREFIX is draft 18+, so
+            // the requestID-based (draft <=15) replay path is never taken here.
+            /*requestID=*/RequestID(0),
+            *negotiatedVersion,
+            &oldPrefix);
+      }
+    }
+  }
+  return folly::unit;
+}
+
+folly::Expected<TrackNamespace, RequestError> MoQRelay::updatePrefixFromRequest(
+    const RequestUpdate& reqUpdate,
+    const TrackNamespace& currentPrefix,
+    const std::shared_ptr<MoQSession>& session,
+    PrefixUpdateKind kind) {
+  const bool tracks = kind == PrefixUpdateKind::Tracks;
+  // SUBSCRIBE_TRACKS / SUBSCRIBE_NAMESPACE carry the Track Namespace Prefix
+  // (draft §10.9.2) in the TRACK_NAMESPACE_PREFIX parameter. A SUBSCRIBE_TRACKS
+  // update may additionally carry a FORWARD value, updating the Forwarding
+  // State on future matching subscriptions (existing subscriptions unaffected);
+  // the parser already validated it to be 0 or 1. FORWARD is not defined for
+  // SUBSCRIBE_NAMESPACE updates, so it is ignored there.
+  const std::optional<bool> forward = tracks ? reqUpdate.forward : std::nullopt;
+
+  const auto prefixKey =
+      folly::to_underlying(TrackRequestParamKey::TRACK_NAMESPACE_PREFIX);
+  const std::string* prefixValue = nullptr;
+  for (const auto& param : reqUpdate.params) {
+    if (param.key == prefixKey) {
+      prefixValue = &param.asString;
+      break;
+    }
+  }
+  if (!prefixValue) {
+    // No prefix change. A SUBSCRIBE_TRACKS FORWARD-only update just moves the
+    // stored Forwarding State in place; anything else has nothing to update.
+    if (forward.has_value()) {
+      if (auto node = findTracksSubscriberNode(currentPrefix)) {
+        auto it = node->sessions.find(session);
+        if (it != node->sessions.end()) {
+          it->second.forward = *forward;
+        }
+      }
+      return currentPrefix;
+    }
+    return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::NOT_SUPPORTED,
+            tracks ? "REQUEST_UPDATE for SUBSCRIBE_TRACKS requires a "
+                     "TRACK_NAMESPACE_PREFIX or FORWARD"
+                   : "REQUEST_UPDATE for SUBSCRIBE_NAMESPACE requires a "
+                     "TRACK_NAMESPACE_PREFIX"});
+  }
+  auto version = session->getNegotiatedVersion();
+  if (!version) {
+    return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::INTERNAL_ERROR,
+            "No negotiated version"});
+  }
+  auto decoded =
+      MoQFrameParser::parseTrackNamespacePrefixParam(*prefixValue, *version);
+  if (decoded.hasError()) {
+    // A malformed Track Namespace tuple (a zero-length field or more than 32
+    // fields, §2.4.1) is a session-fatal protocol violation, not a per-request
+    // error.
+    XLOG(ERR) << "Malformed TRACK_NAMESPACE_PREFIX in REQUEST_UPDATE, closing "
+              << "session sess=" << session.get();
+    session->close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+    return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::MALFORMED_TRACK,
+            "Malformed TRACK_NAMESPACE_PREFIX"});
+  }
+  auto newPrefix = std::move(decoded.value());
+  // On a combined prefix + FORWARD update, the new Forwarding State is applied
+  // inside updateTracksSubscriptionPrefix after the move succeeds (so it is not
+  // applied if the move is rejected for overlap) and before the backfill.
+  auto res = tracks
+      ? updateTracksSubscriptionPrefix(
+            currentPrefix, newPrefix, session, forward)
+      : updateNamespaceSubscriptionPrefix(currentPrefix, newPrefix, session);
+  if (res.hasError()) {
+    return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            res.error(),
+            tracks ? "Overlapping SUBSCRIBE_TRACKS exists in this session"
+                   : "Overlapping SUBSCRIBE_NAMESPACE exists in this session"});
+  }
+  return newPrefix;
 }
 
 std::shared_ptr<MoQSession> MoQRelay::findPublishNamespaceSession(
@@ -993,13 +1407,20 @@ MoQRelay::PublishState MoQRelay::findPublishState(const FullTrackName& ftn) {
   return state;
 }
 
+bool MoQRelay::emptyNamespaceAllowed() {
+  auto session = MoQSession::getRequestSession();
+  auto negotiatedVersion = session->getNegotiatedVersion();
+  XCHECK(negotiatedVersion.has_value());
+  return getDraftMajorVersion(*negotiatedVersion) >= 18;
+}
+
 folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     SubscribeRequest subReq,
     std::shared_ptr<TrackConsumer> consumer) {
   auto session = MoQSession::getRequestSession();
 
   // check auth / get trackNamespace
-  if (subReq.fullTrackName.trackNamespace.empty()) {
+  if (subReq.fullTrackName.trackNamespace.empty() && !emptyNamespaceAllowed()) {
     // message error?
     co_return folly::makeUnexpected(SubscribeError(
         {subReq.requestID,
@@ -1379,7 +1800,7 @@ folly::coro::Task<Publisher::FetchResult> MoQRelay::fetch(
 
   // check auth
   // get trackNamespace
-  if (fetch.fullTrackName.trackNamespace.empty()) {
+  if (fetch.fullTrackName.trackNamespace.empty() && !emptyNamespaceAllowed()) {
     co_return folly::makeUnexpected(FetchError(
         {fetch.requestID,
          FetchErrorCode::DOES_NOT_EXIST,
@@ -1449,7 +1870,8 @@ folly::coro::Task<Publisher::TrackStatusResult> MoQRelay::trackStatus(
     TrackStatus trackStatus) {
   XLOG(DBG1) << __func__ << " ftn=" << trackStatus.fullTrackName;
 
-  if (trackStatus.fullTrackName.trackNamespace.empty()) {
+  if (trackStatus.fullTrackName.trackNamespace.empty() &&
+      !emptyNamespaceAllowed()) {
     co_return folly::makeUnexpected(TrackStatusError(
         {trackStatus.requestID,
          TrackStatusErrorCode::DOES_NOT_EXIST,

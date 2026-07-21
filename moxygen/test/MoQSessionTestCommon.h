@@ -20,6 +20,7 @@
 #include <moxygen/relay/MoQRelayClient.h>
 #include "moxygen/MoQSession.h"
 
+#include <quic/common/events/QuicTimer.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
 #include <moxygen/test/Mocks.h>
 #include <moxygen/test/TestHelpers.h>
@@ -29,6 +30,22 @@
 #include <string_view>
 
 namespace moxygen { namespace test {
+
+// MoQExecutor that records the timeout durations passed to scheduleTimeout
+class RecordingMoQExecutor : public MoQFollyExecutorImpl {
+ public:
+  explicit RecordingMoQExecutor(folly::EventBase* evb)
+      : MoQFollyExecutorImpl(evb) {}
+
+  void scheduleTimeout(
+      quic::QuicTimerCallback* callback,
+      std::chrono::milliseconds timeout) override {
+    scheduledTimeouts.push_back(timeout);
+    MoQFollyExecutorImpl::scheduleTimeout(callback, timeout);
+  }
+
+  std::vector<std::chrono::milliseconds> scheduledTimeouts;
+};
 
 // Constants
 extern const size_t kTestMaxRequestID;

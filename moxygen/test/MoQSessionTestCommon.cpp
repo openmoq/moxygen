@@ -183,7 +183,7 @@ void TestTimeoutCallback::timeoutExpired() noexcept {
 void MoQSessionTest::SetUp() {
   // Schedule timeout to crash test if it hangs
   eventBase_.timer().scheduleTimeout(&testTimeout_, std::chrono::seconds(10));
-  MoQExecutor_ = std::make_shared<MoQFollyExecutorImpl>(&eventBase_);
+  MoQExecutor_ = std::make_shared<RecordingMoQExecutor>(&eventBase_);
   std::tie(clientWt_, serverWt_) =
       proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
   clientSession_ = std::make_shared<MoQRelaySession>(

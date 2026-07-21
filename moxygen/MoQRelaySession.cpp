@@ -165,11 +165,28 @@ class MoQRelaySession::SubscribeNamespaceHandle
 
   folly::coro::Task<RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) override {
-    co_return folly::makeUnexpected(
-        RequestError{
-            reqUpdate.requestID,
-            RequestErrorCode::NOT_SUPPORTED,
-            "REQUEST_UPDATE not supported for SUBSCRIBE_NAMESPACE"});
+    if (!session_) {
+      co_return folly::makeUnexpected(
+          RequestError{
+              reqUpdate.requestID,
+              RequestErrorCode::INTERNAL_ERROR,
+              "SUBSCRIBE_NAMESPACE subscription no longer active"});
+    }
+    // Updating a SUBSCRIBE_NAMESPACE via REQUEST_UPDATE only exists at draft
+    // 16+; earlier drafts have no such message for it.
+    auto version = session_->getNegotiatedVersion();
+    if (!version || getDraftMajorVersion(*version) < 16) {
+      co_return folly::makeUnexpected(
+          RequestError{
+              reqUpdate.requestID,
+              RequestErrorCode::NOT_SUPPORTED,
+              "REQUEST_UPDATE for SUBSCRIBE_NAMESPACE requires draft 16+"});
+    }
+    // Forward the update to the peer on this subscription's own bidi stream.
+    // The prefix (or other mutable state) is carried in reqUpdate.params and
+    // decoded by the responder; this side is a pure forwarder.
+    co_return co_await session_->sendRequestUpdateOnBidi(
+        std::move(reqUpdate), subscribeNamespaceOk_->requestID, control_);
   }
 
  private:
@@ -218,11 +235,19 @@ class MoQRelaySession::SubscribeTracksHandle
 
   folly::coro::Task<RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) override {
-    co_return folly::makeUnexpected(
-        RequestError{
-            reqUpdate.requestID,
-            RequestErrorCode::NOT_SUPPORTED,
-            "REQUEST_UPDATE not supported for SUBSCRIBE_TRACKS"});
+    auto session = session_.lock();
+    if (!session) {
+      co_return folly::makeUnexpected(
+          RequestError{
+              reqUpdate.requestID,
+              RequestErrorCode::INTERNAL_ERROR,
+              "SUBSCRIBE_TRACKS subscription no longer active"});
+    }
+    // Forward the update to the peer on this subscription's own bidi stream.
+    // The new prefix is carried in reqUpdate.params and decoded by the
+    // responder; this side is a pure forwarder.
+    co_return co_await session->sendRequestUpdateOnBidi(
+        std::move(reqUpdate), subscribeTracksOk_->requestID, control_);
   }
 
  private:
@@ -402,6 +427,7 @@ void MoQRelaySession::cleanupRelayState() {
   }
   subscribeNamespaceHandles_.clear();
   legacySubscribeNamespaceToReqId_.clear();
+  requestUpdateReplyContexts_.clear();
 
   // Draft 18+: drop subscribeTracks handles too.
   for (auto& subTracks : subscribeTracksHandles_) {
@@ -445,8 +471,7 @@ void MoQRelaySession::onRequestUpdate(RequestUpdate requestUpdate) {
         requestUpdateError(
             RequestError{
                 requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
-            existingRequestID,
-            /*terminateExistingRequest=*/false);
+            existingRequestID);
         return;
       }
       if (closeSessionIfRequestIDInvalid(
@@ -471,8 +496,7 @@ void MoQRelaySession::onRequestUpdate(RequestUpdate requestUpdate) {
         requestUpdateError(
             RequestError{
                 requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
-            existingRequestID,
-            /*terminateExistingRequest=*/false);
+            existingRequestID);
         return;
       }
       if (closeSessionIfRequestIDInvalid(
@@ -480,6 +504,30 @@ void MoQRelaySession::onRequestUpdate(RequestUpdate requestUpdate) {
         return;
       }
       handleSubscribeNamespaceRequestUpdate(requestUpdate, subAnnIt->second);
+      return;
+    }
+
+    // Check subscribeTracksHandles_ for SUBSCRIBE_TRACKS
+    auto subTracksIt = subscribeTracksHandles_.find(existingRequestID);
+    if (subTracksIt != subscribeTracksHandles_.end()) {
+      if (closeSessionIfRequestIDInvalid(requestID, false, true)) {
+        return;
+      }
+      if (shouldRejectNewPeerRequestDueToGoaway()) {
+        XLOG(DBG1)
+            << "Rejecting subscribeTracks request update, GOAWAY/draining sess="
+            << this;
+        requestUpdateError(
+            RequestError{
+                requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
+            existingRequestID);
+        return;
+      }
+      if (closeSessionIfRequestIDInvalid(
+              existingRequestID, false, false, false)) {
+        return;
+      }
+      handleSubscribeTracksRequestUpdate(requestUpdate, subTracksIt->second);
       return;
     }
   }
@@ -539,6 +587,98 @@ void MoQRelaySession::handlePublishNamespaceRequestUpdate(
       .start();
 }
 
+folly::coro::Task<folly::Expected<RequestOk, RequestError>>
+MoQRelaySession::sendRequestUpdateOnBidi(
+    RequestUpdate reqUpdate,
+    RequestID existingRequestID,
+    std::shared_ptr<BidiStreamControl> control) {
+  if (isClosed()) {
+    co_return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::INTERNAL_ERROR,
+            "Session closed"});
+  }
+  if (shouldFailNewLocalRequestDueToGoaway()) {
+    co_return folly::makeUnexpected(
+        RequestError{
+            peekNextRequestID(),
+            RequestErrorCode::GOING_AWAY,
+            "Session received GOAWAY"});
+  }
+  auto version = getNegotiatedVersion();
+  if (!version) {
+    co_return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::INTERNAL_ERROR,
+            "No negotiated version"});
+  }
+  // Draft 18+ carries the update on the subscription's own bidi request stream.
+  // Pre-18 there are no per-request bidi streams, so it rides the shared
+  // control stream instead; the REQUEST_OK / REQUEST_ERROR reply comes back
+  // there too (getRequestUpdateReplyContext falls back to the control stream
+  // pre-18) and is correlated by the on-wire requestID.
+  const bool onBidi = getDraftMajorVersion(*version) >= 18;
+  auto* writeHandle = control ? control->writeHandle() : nullptr;
+  // onBidi needs a live request stream for the reply to come back on. A null
+  // write handle (peer STOP_SENDING / local close) or a read loop that has
+  // already exited (peer FIN/RST processed before this call) means no
+  // REQUEST_OK / REQUEST_ERROR can ever arrive, so registering a pending below
+  // would dangle forever. Fail fast instead. Race-free: nothing between here
+  // and the co_await at the end suspends, so the read loop cannot exit in the
+  // gap after this check passes.
+  if (onBidi && (!writeHandle || control->readLoopExited())) {
+    co_return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::INTERNAL_ERROR,
+            "No request stream for REQUEST_UPDATE"});
+  }
+
+  reqUpdate.existingRequestID = existingRequestID;
+  reqUpdate.requestID = getNextRequestID();
+
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  auto writeRes = moqFrameWriter_.writeRequestUpdate(buf, reqUpdate);
+  if (!writeRes) {
+    XLOG(ERR) << "writeRequestUpdate failed sess=" << this;
+    co_return folly::makeUnexpected(
+        RequestError{
+            reqUpdate.requestID,
+            RequestErrorCode::INTERNAL_ERROR,
+            "writeRequestUpdate failed"});
+  }
+
+  if (logger_) {
+    logger_->logSubscribeUpdate(reqUpdate);
+  }
+  MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onRequestUpdate);
+
+  // Register the pending state before writing so the REQUEST_OK / REQUEST_ERROR
+  // response can never race ahead of the promise. onRequestOk /
+  // handleSubscribeUpdateOkFromRequestOk (and setError for REQUEST_ERROR) route
+  // the response back to this promise.
+  auto contract = folly::coro::makePromiseContract<
+      folly::Expected<RequestOk, RequestError>>();
+  pendingRequests_.emplace(
+      reqUpdate.requestID,
+      PendingRequestState::makeRequestUpdate(std::move(contract.first)));
+
+  if (onBidi) {
+    // Draft 18+: REQUEST_OK / REQUEST_ERROR carry no requestID on the wire; the
+    // response codec correlates them FIFO from this queue.
+    control->responseIDQueue().push_back(reqUpdate.requestID);
+    writeHandle->writeStreamData(buf.move(), /*fin=*/false, nullptr);
+  } else {
+    // Pre-draft-18: ride the shared control stream.
+    controlWriteBuf_.append(buf.move());
+    controlWriteEvent_.signal();
+  }
+
+  co_return co_await std::move(contract.second);
+}
+
 void MoQRelaySession::handleSubscribeNamespaceRequestUpdate(
     RequestUpdate requestUpdate,
     std::shared_ptr<Publisher::SubscribeNamespaceHandle>
@@ -566,6 +706,102 @@ void MoQRelaySession::handleSubscribeNamespaceRequestUpdate(
                     cancellationSource_.getToken(),
                     subscribeNamespaceHandle->requestUpdate(
                         std::move(update))));
+
+                // Only send responses for v15+
+                if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
+                  if (updateResult.hasException()) {
+                    XLOG(ERR) << "Exception in requestUpdate ex="
+                              << updateResult.exception().what();
+                    requestUpdateError(
+                        RequestError{
+                            updateRequestID,
+                            RequestErrorCode::INTERNAL_ERROR,
+                            "Exception in requestUpdate"},
+                        existingRequestID);
+                  } else if (updateResult->hasError()) {
+                    auto updateErr = updateResult->error();
+                    requestUpdateError(updateErr, existingRequestID);
+                  } else {
+                    RequestOk requestOk{
+                        .requestID = updateRequestID,
+                        .requestSpecificParams = {}};
+                    requestUpdateOk(requestOk, existingRequestID);
+                  }
+                }
+              })))
+      .start();
+}
+
+ReplyContext* MoQRelaySession::getRequestUpdateReplyContext(
+    RequestID existingRequestID) {
+  auto it = requestUpdateReplyContexts_.find(existingRequestID);
+  if (it != requestUpdateReplyContexts_.end()) {
+    return it->second.get();
+  }
+  return MoQSession::getRequestUpdateReplyContext(existingRequestID);
+}
+
+void MoQRelaySession::terminateRequestUpdateOnError(
+    RequestID existingRequestID,
+    const SubscribeUpdateError& requestError) {
+  const bool isSubNs = subscribeNamespaceHandles_.contains(existingRequestID);
+  const bool isPubNs = publishNamespaceHandles_.contains(existingRequestID);
+  const bool isSubTracks = subscribeTracksHandles_.contains(existingRequestID);
+  if (!isSubNs && !isPubNs && !isSubTracks) {
+    // SUBSCRIBE / PUBLISH / FETCH: PUBLISH_DONE(UPDATE_FAILED) or stream reset.
+    MoQSession::terminateRequestUpdateOnError(existingRequestID, requestError);
+    return;
+  }
+
+  // SUBSCRIBE_NAMESPACE / PUBLISH_NAMESPACE / SUBSCRIBE_TRACKS. On draft <18
+  // these ride the shared control stream with no bidi to close; the
+  // REQUEST_ERROR already went out there, so there is nothing more to do (and
+  // no subscription-style state to tear down).
+  auto it = requestUpdateReplyContexts_.find(existingRequestID);
+  if (it == requestUpdateReplyContexts_.end()) {
+    return;
+  }
+  // Draft 18+: FIN the request's bidi to close it (REQUEST_ERROR was already
+  // written by requestUpdateError), then tear it down via the same path a
+  // peer-initiated close would take (which also erases the reply context).
+  it->second->flushFinal();
+  if (isSubNs) {
+    onUnsubscribeNamespace(
+        UnsubscribeNamespace{existingRequestID, std::nullopt});
+  } else if (isPubNs) {
+    PublishNamespaceDone done;
+    done.requestID = existingRequestID;
+    onPublishNamespaceDone(std::move(done));
+  } else {
+    onSubscribeTracksStreamClosed(existingRequestID);
+  }
+}
+
+void MoQRelaySession::handleSubscribeTracksRequestUpdate(
+    RequestUpdate requestUpdate,
+    std::shared_ptr<Publisher::SubscribeTracksHandle> subscribeTracksHandle) {
+  XLOG(DBG1) << __func__ << " requestID=" << requestUpdate.existingRequestID
+             << " sess=" << this;
+
+  auto existingRequestID = requestUpdate.existingRequestID;
+  auto updateRequestID = requestUpdate.requestID;
+
+  // Handle asynchronously with shared ownership to prevent use-after-free
+  co_withExecutor(
+      getExecutor(),
+      co_withCancellation(
+          cancellationSource_.getToken(),
+          folly::coro::co_invoke(
+              [this,
+               subscribeTracksHandle = std::move(subscribeTracksHandle),
+               update = std::move(requestUpdate),
+               existingRequestID,
+               updateRequestID]() mutable -> folly::coro::Task<void> {
+                co_await folly::coro::co_safe_point;
+                // Call the handle's requestUpdate
+                auto updateResult = co_await co_awaitTry(co_withCancellation(
+                    cancellationSource_.getToken(),
+                    subscribeTracksHandle->requestUpdate(std::move(update))));
 
                 // Only send responses for v15+
                 if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
@@ -646,7 +882,7 @@ MoQRelaySession::publishNamespace(
     co_return folly::makeUnexpected(PublishNamespaceError(
         {ann.requestID,
          PublishNamespaceErrorCode::INTERNAL_ERROR,
-         std::move(sendResult.error())}));
+         std::move(sendResult.error().reasonPhrase)}));
   }
   auto control = sendResult.value();
   auto replyCtx = makeReplyContext(control);
@@ -980,6 +1216,10 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
     auto publishNamespaceOkMsg = handle->publishNamespaceOk();
     publishNamespaceOk(publishNamespaceOkMsg, *replyContext);
     publishNamespaceHandles_[publishNamespace.requestID] = std::move(handle);
+    if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
+      // Retain the bidi reply context so a failed REQUEST_UPDATE can close it.
+      requestUpdateReplyContexts_[publishNamespace.requestID] = replyContext;
+    }
     if (getDraftMajorVersion(*getNegotiatedVersion()) < 16) {
       // Legacy: also store NS->RequestID mapping for lookups
       legacySubscriberNamespaceToReqId_[publishNamespace.trackNamespace] =
@@ -1028,6 +1268,7 @@ void MoQRelaySession::publishNamespaceCancel(
 
   if (annCan.requestID.has_value()) {
     publishNamespaceHandles_.erase(*annCan.requestID);
+    requestUpdateReplyContexts_.erase(*annCan.requestID);
   }
   retireRequestID(/*signalWriteLoop=*/false);
 
@@ -1039,8 +1280,8 @@ void MoQRelaySession::publishNamespaceCancel(
 void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone unAnn) {
   MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onPublishNamespaceDone);
 
-  // Set up request context so publishNamespaceDone() can identify this session.
-  // This is needed because MoQRelay::publishNamespaceDone() uses
+  // Set up request context so publishNamespaceDone() can identify this
+  // session. This is needed because MoQRelay::publishNamespaceDone() uses
   // getRequestSession() to verify ownership.
   folly::RequestContextScopeGuard guard;
   setRequestSession();
@@ -1080,6 +1321,7 @@ void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone unAnn) {
   }
   handle = std::move(it->second);
   publishNamespaceHandles_.erase(it);
+  requestUpdateReplyContexts_.erase(reqId);
 
   // Common action
   handle->publishNamespaceDone();
@@ -1193,7 +1435,7 @@ MoQRelaySession::subscribeNamespace(
     co_return folly::makeUnexpected(SubscribeNamespaceError(
         {RequestID(0),
          SubscribeNamespaceErrorCode::INTERNAL_ERROR,
-         std::move(sendResult.error())}));
+         std::move(sendResult.error().reasonPhrase)}));
   }
 
   if (logger_) {
@@ -1361,10 +1603,18 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
   } else {
     auto handle = std::move(subAnnResult->value());
     auto subAnnOk = handle->subscribeNamespaceOk();
+    std::shared_ptr<ReplyContext> replyContext;
+    if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
+      // Retain the bidi reply context so a failed REQUEST_UPDATE can close it.
+      replyContext = subNsReply->replyContext();
+    }
     subscribeNamespaceOk(subAnnOk, std::move(subNsReply));
 
     // Store by RequestID (primary key)
     subscribeNamespaceHandles_[subAnn.requestID] = std::move(handle);
+    if (replyContext) {
+      requestUpdateReplyContexts_[subAnn.requestID] = std::move(replyContext);
+    }
     if (getDraftMajorVersion(*getNegotiatedVersion()) < 15) {
       // Legacy: also store NS->RequestID mapping for lookups
       legacySubscribeNamespaceToReqId_[subAnn.trackNamespacePrefix] =
@@ -1443,6 +1693,7 @@ void MoQRelaySession::onUnsubscribeNamespace(UnsubscribeNamespace unsub) {
   setRequestSession();
   handle->unsubscribeNamespace();
   subscribeNamespaceHandles_.erase(requestID);
+  requestUpdateReplyContexts_.erase(requestID);
 
   retireRequestID(/*signalWriteLoop=*/true);
 }
@@ -1456,8 +1707,9 @@ class NoopNamespacePublishHandle : public Publisher::NamespacePublishHandle {
   void namespaceDoneMsg(const TrackNamespace&) override {}
 };
 
-// Adapts a SUBSCRIBE_NAMESPACE handle to the SUBSCRIBE_TRACKS handle interface
-// for the draft 16-17 fallback, so callers see a uniform return type.
+// Adapts a SUBSCRIBE_NAMESPACE handle to the SUBSCRIBE_TRACKS handle
+// interface for the draft 16-17 fallback, so callers see a uniform return
+// type.
 class NamespaceBackedSubscribeTracksHandle
     : public Publisher::SubscribeTracksHandle {
  public:
@@ -1545,7 +1797,7 @@ MoQRelaySession::subscribeTracks(
     co_return folly::makeUnexpected(SubscribeTracksError(
         {RequestID(0),
          SubscribeTracksErrorCode::INTERNAL_ERROR,
-         std::move(sendResult.error())}));
+         std::move(sendResult.error().reasonPhrase)}));
   }
 
   auto contract = folly::coro::makePromiseContract<
@@ -1650,6 +1902,11 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeTracks(
   }
   auto handle = std::move(subTracksResult->value());
   auto subTracksOk = handle->subscribeTracksOk();
+  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
+    // Retain the bidi reply context so a failed REQUEST_UPDATE can close it.
+    requestUpdateReplyContexts_[subTracks.requestID] =
+        subTracksReply->replyContext();
+  }
   subscribeTracksOk(subTracksOk, std::move(subTracksReply));
   subscribeTracksHandles_[subTracks.requestID] = std::move(handle);
 }
@@ -1672,6 +1929,7 @@ void MoQRelaySession::onSubscribeTracksStreamClosed(RequestID requestID) {
   // NOT_SUPPORTED, app errors, exceptions) never insert a handle, and
   // without retiring the credit here the peer's request-ID budget would
   // leak by one for every rejected SUBSCRIBE_TRACKS.
+  requestUpdateReplyContexts_.erase(requestID);
   auto it = subscribeTracksHandles_.find(requestID);
   if (it != subscribeTracksHandles_.end()) {
     auto handle = std::move(it->second);

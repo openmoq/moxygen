@@ -76,6 +76,10 @@ class SubNSReply {
     folly::assume_unreachable();
   }
 
+  const std::shared_ptr<ReplyContext>& replyContext() const {
+    return replyContext_;
+  }
+
  protected:
   MoQFrameWriter& moqFrameWriter_;
   std::shared_ptr<ReplyContext> replyContext_;
@@ -96,6 +100,10 @@ class MessageReply {
 
   virtual WriteResult ok(const RequestOk& okMsg);
   virtual WriteResult error(const SubscribeTracksError& errorMsg);
+
+  const std::shared_ptr<ReplyContext>& replyContext() const {
+    return replyContext_;
+  }
 
  protected:
   MoQFrameWriter& moqFrameWriter_;
@@ -580,6 +588,14 @@ class MoQSession : public Subscriber,
   std::shared_ptr<ReplyContext> makeReplyContext(
       std::shared_ptr<BidiStreamControl> control);
 
+  struct SendRequestError {
+    std::optional<proxygen::WebTransport::ErrorCode> webTransportError;
+    std::string reasonPhrase;
+  };
+
+  using SendRequestResult =
+      folly::Expected<std::shared_ptr<BidiStreamControl>, SendRequestError>;
+
   // Send a serialized request. In draft >= minBidiDraftVersion, opens a
   // bidi stream and starts a read loop; otherwise appends to the control
   // stream. Returns the control (null on the control-stream path).
@@ -589,7 +605,7 @@ class MoQSession : public Subscriber,
   // caller's typed `okType` or `REQUEST_ERROR`. `postTerminal` lists any
   // frames the peer may send after the terminal (e.g. PUBLISH_DONE on a
   // SUBSCRIBE).
-  folly::Expected<std::shared_ptr<BidiStreamControl>, std::string> sendRequest(
+  SendRequestResult sendRequest(
       folly::IOBufQueue& writeBuf,
       FrameType okType,
       std::vector<FrameType> postTerminal,
@@ -871,13 +887,23 @@ class MoQSession : public Subscriber,
       RequestID existingRequestID,
       bool terminateExistingRequest = true);
 
+  // Tear down the request whose REQUEST_UPDATE failed. For SUBSCRIBE/PUBLISH
+  // tracks this terminates the subscription with PUBLISH_DONE(UPDATE_FAILED)
+  // and resets its subgroups; for FETCH it resets the FETCH data stream.
+  // MoQRelaySession overrides this to close the bidi stream of a failed
+  // SUBSCRIBE_NAMESPACE / PUBLISH_NAMESPACE update.
+  virtual void terminateRequestUpdateOnError(
+      RequestID existingRequestID,
+      const SubscribeUpdateError& requestError);
+
   // REQUEST_UPDATE ok response - available for subclass handlers
   void requestUpdateOk(const RequestOk& requestOk, RequestID existingRequestID);
 
   // Returns the reply context for REQUEST_UPDATE responses: the responder's
   // bidi reply context in draft 18+, otherwise the shared control stream.
   // Returns nullptr only when the request can no longer be found.
-  ReplyContext* getRequestUpdateReplyContext(RequestID existingRequestID);
+  virtual ReplyContext* getRequestUpdateReplyContext(
+      RequestID existingRequestID);
 
   // REQUEST_UPDATE handler (protected for subclass access)
   void onRequestUpdate(RequestUpdate requestUpdate) override;

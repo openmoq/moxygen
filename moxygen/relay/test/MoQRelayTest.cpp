@@ -1095,6 +1095,170 @@ TEST_F(MoQRelayTest, SubscribeNamespaceEmptyPrefixAllowedV16) {
   removeSession(session);
 }
 
+TEST_F(MoQRelayTest, SubscribeEmptyNamespaceRejectedPreV18) {
+  // draft-16 still rejects: zero-field namespaces are a draft-18 feature.
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft16)));
+
+  SubscribeRequest sub;
+  sub.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+  sub.requestID = RequestID(0);
+  sub.locType = LocationType::LargestObject;
+  auto consumer = createMockConsumer();
+
+  withSessionContext(session, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->subscribe(std::move(sub), consumer), exec_.get());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().errorCode, SubscribeErrorCode::DOES_NOT_EXIST);
+    EXPECT_EQ(res.error().reasonPhrase, "namespace required");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, SubscribeEmptyNamespaceAcceptedV18) {
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft18)));
+
+  SubscribeRequest sub;
+  sub.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+  sub.requestID = RequestID(0);
+  sub.locType = LocationType::LargestObject;
+  auto consumer = createMockConsumer();
+
+  withSessionContext(session, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->subscribe(std::move(sub), consumer), exec_.get());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().reasonPhrase, "no such namespace or track");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, FetchEmptyNamespaceRejectedPreV18) {
+  // draft-16 still rejects: zero-field namespaces are a draft-18 feature.
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft16)));
+
+  Fetch fetch;
+  fetch.requestID = RequestID(0);
+  fetch.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+
+  withSessionContext(session, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->fetch(
+            std::move(fetch), std::shared_ptr<FetchConsumer>(nullptr)),
+        exec_.get());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().errorCode, FetchErrorCode::DOES_NOT_EXIST);
+    EXPECT_EQ(res.error().reasonPhrase, "namespace required");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, FetchEmptyNamespaceAcceptedV18) {
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft18)));
+
+  Fetch fetch;
+  fetch.requestID = RequestID(0);
+  fetch.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+
+  withSessionContext(session, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->fetch(
+            std::move(fetch), std::shared_ptr<FetchConsumer>(nullptr)),
+        exec_.get());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().reasonPhrase, "no upstream for fetch");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, TrackStatusEmptyNamespaceRejectedPreV18) {
+  // draft-16 still rejects: zero-field namespaces are a draft-18 feature.
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft16)));
+
+  TrackStatus trackStatus;
+  trackStatus.requestID = RequestID(0);
+  trackStatus.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+
+  withSessionContext(session, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->trackStatus(trackStatus), exec_.get());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().errorCode, TrackStatusErrorCode::DOES_NOT_EXIST);
+    EXPECT_EQ(res.error().reasonPhrase, "namespace required");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, TrackStatusEmptyNamespaceAcceptedV18) {
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft18)));
+
+  TrackStatus trackStatus;
+  trackStatus.requestID = RequestID(0);
+  trackStatus.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+
+  withSessionContext(session, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->trackStatus(trackStatus), exec_.get());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().reasonPhrase, "no such namespace or track");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, PublishEmptyNamespaceRejectedPreV18) {
+  // An empty allowed prefix lets the empty namespace pass the prefix check so
+  // the empty-namespace guard is the one under test. draft-16 still rejects:
+  // zero-field namespaces are a draft-18 feature.
+  relay_->setAllowedNamespacePrefix(TrackNamespace{{}});
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft16)));
+
+  PublishRequest pub;
+  pub.requestID = RequestID(0);
+  pub.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
+
+  withSessionContext(session, [&]() {
+    auto res = relay_->publish(std::move(pub), createMockSubscriptionHandle());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().errorCode, PublishErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(res.error().reasonPhrase, "namespace required");
+  });
+
+  removeSession(session);
+}
+
+TEST_F(MoQRelayTest, PublishEmptyNamespaceAcceptedV18) {
+  relay_->setAllowedNamespacePrefix(TrackNamespace{{}});
+  auto session = createMockSession();
+  ON_CALL(*session, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft18)));
+
+  auto consumer =
+      doPublish(session, FullTrackName{TrackNamespace{{}}, "track1"});
+  EXPECT_NE(consumer, nullptr);
+
+  removeSession(session);
+}
+
 // ============================================================
 // Extensions Tests
 // ============================================================
@@ -2596,6 +2760,18 @@ TEST_F(MoQRelayTest, SubscribeSecondForwardingSubscriberSingleRequestUpdate) {
 
 class MoQRelayTracksTest : public MoQRelayTest {
  protected:
+  class RecordingPublishBlockedHandle : public Publisher::PublishBlockedHandle {
+   public:
+    void publishBlocked(
+        const TrackNamespace& trackNamespaceSuffix,
+        const std::string& trackName) override {
+      publishBlockedMessages.push_back(
+          PublishBlocked{trackNamespaceSuffix, trackName});
+    }
+
+    std::vector<PublishBlocked> publishBlockedMessages;
+  };
+
   // Like createMockSession() but reports draft 18 for the negotiated version.
   std::shared_ptr<MockMoQSession> createV18Session() {
     auto session = std::make_shared<NiceMock<MockMoQSession>>(exec_);
@@ -2607,11 +2783,14 @@ class MoQRelayTracksTest : public MoQRelayTest {
 
   Publisher::SubscribeTracksResult subscribeTracks(
       std::shared_ptr<MoQSession> session,
-      const TrackNamespace& nsPrefix) {
+      const TrackNamespace& nsPrefix,
+      std::shared_ptr<Publisher::PublishBlockedHandle> publishBlockedHandle =
+          nullptr) {
     SubscribeTracks subTracks;
     subTracks.trackNamespacePrefix = nsPrefix;
     return withSessionContext(session, [&]() {
-      auto task = relay_->subscribeTracks(std::move(subTracks));
+      auto task = relay_->subscribeTracks(
+          std::move(subTracks), std::move(publishBlockedHandle));
       return folly::coro::blockingWait(std::move(task), exec_.get());
     });
   }
@@ -2620,8 +2799,11 @@ class MoQRelayTracksTest : public MoQRelayTest {
   // path. The handle is tracked for cleanup in the per-session state.
   std::shared_ptr<Publisher::SubscribeTracksHandle> doSubscribeTracks(
       std::shared_ptr<MoQSession> session,
-      const TrackNamespace& nsPrefix) {
-    auto res = subscribeTracks(session, nsPrefix);
+      const TrackNamespace& nsPrefix,
+      std::shared_ptr<Publisher::PublishBlockedHandle> publishBlockedHandle =
+          nullptr) {
+    auto res =
+        subscribeTracks(session, nsPrefix, std::move(publishBlockedHandle));
     EXPECT_TRUE(res.hasValue());
     if (!res.hasValue()) {
       return nullptr;
@@ -2630,6 +2812,16 @@ class MoQRelayTracksTest : public MoQRelayTest {
     auto handle = *res;
     cleanupHandles_.push_back(handle);
     return handle;
+  }
+
+  PublishError makeStreamCreationPublishError() const {
+    return PublishError{
+        RequestID(0),
+        PublishErrorCode::INTERNAL_ERROR,
+        "stream limit",
+        std::nullopt,
+        std::nullopt,
+        proxygen::WebTransport::ErrorCode::STREAM_CREATION_ERROR};
   }
 
   void TearDown() override {
@@ -2692,6 +2884,72 @@ TEST_F(MoQRelayTracksTest, NewPublishFanoutToTracksSubscriber) {
   removeSession(publisher);
 }
 
+TEST_F(MoQRelayTracksTest, NewPublishFanoutPublishBlockedOnStreamLimit) {
+  auto subscriber = createV18Session();
+  auto publisher1 = createMockSession();
+  auto publishBlockedHandle = std::make_shared<RecordingPublishBlockedHandle>();
+
+  doSubscribeTracks(subscriber, kAllowedPrefix, publishBlockedHandle);
+
+  EXPECT_CALL(*subscriber, publish(_, _))
+      .Times(1)
+      .WillOnce(
+          Return(folly::makeUnexpected(makeStreamCreationPublishError())));
+
+  doPublish(publisher1, kTestTrackName);
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  ASSERT_EQ(publishBlockedHandle->publishBlockedMessages.size(), 1);
+  EXPECT_EQ(
+      publishBlockedHandle->publishBlockedMessages[0].trackNamespaceSuffix,
+      TrackNamespace(std::vector<std::string>{"namespace"}));
+  EXPECT_EQ(
+      publishBlockedHandle->publishBlockedMessages[0].trackName, "track1");
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+
+  removeSession(publisher1);
+  for (int i = 0; i < 3; i++) {
+    exec_->drive();
+  }
+
+  auto publisher2 = createMockSession();
+  EXPECT_CALL(*subscriber, publish(_, _))
+      .Times(1)
+      .WillOnce(
+          Return(folly::makeUnexpected(makeStreamCreationPublishError())));
+  doPublish(publisher2, kTestTrackName);
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  ASSERT_EQ(publishBlockedHandle->publishBlockedMessages.size(), 2);
+  EXPECT_EQ(
+      publishBlockedHandle->publishBlockedMessages[1].trackNamespaceSuffix,
+      TrackNamespace(std::vector<std::string>{"namespace"}));
+  EXPECT_EQ(
+      publishBlockedHandle->publishBlockedMessages[1].trackName, "track1");
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+  removeSession(publisher2);
+  for (int i = 0; i < 3; i++) {
+    exec_->drive();
+  }
+
+  auto publisher3 = createMockSession();
+  setupPublishSucceeds(subscriber);
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(1);
+  doPublish(publisher3, kTestTrackName);
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  EXPECT_EQ(publishBlockedHandle->publishBlockedMessages.size(), 2);
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+  removeSession(subscriber);
+  removeSession(publisher3);
+}
+
 // Draft 18 section 10.19: a SUBSCRIBE_TRACKS from a session that already has a
 // registration at an exact / ancestor / descendant prefix is rejected with
 // PREFIX_OVERLAP. The first SUBSCRIBE_TRACKS for any of those prefixes
@@ -2745,6 +3003,400 @@ TEST_F(MoQRelayTracksTest, ExistingPublishEchoedToNewTracksSubscriber) {
   }
 
   ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
+TEST_F(
+    MoQRelayTracksTest,
+    ExistingPublishEchoedToNewTracksSubscriberPublishBlockedOnStreamLimit) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  auto publishBlockedHandle = std::make_shared<RecordingPublishBlockedHandle>();
+
+  doPublish(publisher, kTestTrackName);
+
+  EXPECT_CALL(*subscriber, publish(_, _))
+      .Times(1)
+      .WillOnce(
+          Return(folly::makeUnexpected(makeStreamCreationPublishError())));
+  doSubscribeTracks(subscriber, kAllowedPrefix, publishBlockedHandle);
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  ASSERT_EQ(publishBlockedHandle->publishBlockedMessages.size(), 1);
+  EXPECT_EQ(
+      publishBlockedHandle->publishBlockedMessages[0].trackNamespaceSuffix,
+      TrackNamespace(std::vector<std::string>{"namespace"}));
+  EXPECT_EQ(
+      publishBlockedHandle->publishBlockedMessages[0].trackName, "track1");
+
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
+// Builds a REQUEST_UPDATE carrying a new Track Namespace Prefix (draft 18+),
+// as the generic TRACK_NAMESPACE_PREFIX parameter.
+static RequestUpdate makeTrackNamespacePrefixUpdate(
+    const TrackNamespace& newPrefix) {
+  RequestUpdate update;
+  update.params.setMajorVersion(getDraftMajorVersion(kVersionDraft18));
+  update.params.insertParam(
+      MoQFrameWriter::encodeTrackNamespacePrefixParam(
+          newPrefix, kVersionDraft18));
+  return update;
+}
+
+// Draft §10.9.2: a REQUEST_UPDATE with a new Track Namespace Prefix moves an
+// established SUBSCRIBE_TRACKS registration. Future publishes match the new
+// prefix; the old prefix no longer matches.
+TEST_F(MoQRelayTracksTest, RequestUpdateMovesTracksPrefix) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  setupPublishSucceeds(subscriber);
+
+  const TrackNamespace oldPrefix{{"test", "a"}};
+  const TrackNamespace newPrefix{{"test", "b"}};
+  auto handle = doSubscribeTracks(subscriber, oldPrefix);
+  ASSERT_NE(handle, nullptr);
+
+  auto update = makeTrackNamespacePrefixUpdate(newPrefix);
+  auto res = withSessionContext(subscriber, [&]() {
+    return folly::coro::blockingWait(
+        handle->requestUpdate(update), exec_.get());
+  });
+  ASSERT_TRUE(res.hasValue());
+
+  // A publish under the NEW prefix is forwarded.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(1);
+  doPublish(publisher, FullTrackName{newPrefix, "t"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+
+  // A publish under the OLD prefix is not.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(0);
+  doPublish(publisher, FullTrackName{oldPrefix, "t2"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
+// Draft §10.9.2: moving a SUBSCRIBE_TRACKS prefix must immediately PUBLISH
+// tracks that ALREADY exist under the new prefix, not just future ones. Here
+// test/b/t is published while the subscriber is still on prefix test/a; the
+// update to test/b must backfill it.
+TEST_F(MoQRelayTracksTest, RequestUpdateBackfillsExistingTracksUnderNewPrefix) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  setupPublishSucceeds(subscriber);
+
+  const TrackNamespace oldPrefix{{"test", "a"}};
+  const TrackNamespace newPrefix{{"test", "b"}};
+  auto handle = doSubscribeTracks(subscriber, oldPrefix);
+  ASSERT_NE(handle, nullptr);
+
+  // A track exists under the (future) new prefix before the update. It does not
+  // match test/a, so the subscriber is not published to yet.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(0);
+  doPublish(publisher, FullTrackName{newPrefix, "t"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+
+  // Moving the prefix to test/b must publish the already-existing test/b/t.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(1);
+  auto update = makeTrackNamespacePrefixUpdate(newPrefix);
+  auto res = withSessionContext(subscriber, [&]() {
+    return folly::coro::blockingWait(
+        handle->requestUpdate(update), exec_.get());
+  });
+  ASSERT_TRUE(res.hasValue());
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
+// The same backfill applies to SUBSCRIBE_NAMESPACE (draft §10.9.2): moving the
+// prefix must immediately PUBLISH tracks that already exist under the new
+// prefix. test/b/t is published while the subscriber is on prefix test/a; the
+// update to test/b must backfill it.
+TEST_F(
+    MoQRelayTracksTest,
+    RequestUpdateBackfillsExistingPublishesForNamespace) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  setupPublishSucceeds(subscriber);
+
+  const TrackNamespace oldPrefix{{"test", "a"}};
+  const TrackNamespace newPrefix{{"test", "b"}};
+  auto handle = doSubscribeNamespace(subscriber, oldPrefix);
+  ASSERT_NE(handle, nullptr);
+
+  // A track exists under the (future) new prefix before the update. It does not
+  // match test/a, so the subscriber is not published to yet.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(0);
+  doPublish(publisher, FullTrackName{newPrefix, "t"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+
+  // Moving the prefix to test/b must publish the already-existing test/b/t.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(1);
+  auto update = makeTrackNamespacePrefixUpdate(newPrefix);
+  auto res = withSessionContext(subscriber, [&]() {
+    return folly::coro::blockingWait(
+        handle->requestUpdate(update), exec_.get());
+  });
+  ASSERT_TRUE(res.hasValue());
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
+// Widening a SUBSCRIBE_TRACKS prefix (test/b -> test) must backfill the
+// newly-covered track (test/a/t) WITHOUT re-publishing a track already
+// forwarded under the old prefix (test/b/t): the skipUnderPrefix guard skips
+// the old-prefix subtree, so exactly one new PUBLISH goes out.
+TEST_F(MoQRelayTracksTest, RequestUpdateWidenPrefixDoesNotDuplicatePublish) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  setupPublishSucceeds(subscriber);
+
+  const TrackNamespace oldPrefix{{"test", "b"}};
+  const TrackNamespace otherPrefix{{"test", "a"}};
+  const TrackNamespace newPrefix{{"test"}};
+  auto handle = doSubscribeTracks(subscriber, oldPrefix);
+  ASSERT_NE(handle, nullptr);
+
+  // test/b/t matches the current prefix and is forwarded now; test/a/t does
+  // not.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(1);
+  doPublish(publisher, FullTrackName{oldPrefix, "t"});
+  doPublish(publisher, FullTrackName{otherPrefix, "t"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+
+  // Widening to test covers test/a/t (new) and test/b/t (already forwarded).
+  // Only test/a/t must be published; test/b/t must not be re-published.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(1);
+  auto update = makeTrackNamespacePrefixUpdate(newPrefix);
+  auto res = withSessionContext(subscriber, [&]() {
+    return folly::coro::blockingWait(
+        handle->requestUpdate(update), exec_.get());
+  });
+  ASSERT_TRUE(res.hasValue());
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
+// Updating a SUBSCRIBE_TRACKS prefix onto one overlapping another active
+// SUBSCRIBE_TRACKS in the same session is rejected with PREFIX_OVERLAP, and the
+// original registration is left intact (a subsequent non-overlapping update
+// from the same handle succeeds, proving rollback).
+TEST_F(
+    MoQRelayTracksTest,
+    RequestUpdateTracksPrefixOverlapRejectedAndRolledBack) {
+  auto session = createV18Session();
+  const TrackNamespace prefixA{{"test", "a"}};
+  const TrackNamespace prefixB{{"test", "b"}};
+  const TrackNamespace prefixC{{"test", "c"}};
+  auto handleA = doSubscribeTracks(session, prefixA);
+  ASSERT_NE(handleA, nullptr);
+  doSubscribeTracks(session, prefixC);
+
+  auto toC = makeTrackNamespacePrefixUpdate(prefixC);
+  auto res = withSessionContext(session, [&]() {
+    return folly::coro::blockingWait(handleA->requestUpdate(toC), exec_.get());
+  });
+  ASSERT_TRUE(res.hasError());
+  EXPECT_EQ(res.error().errorCode, SubscribeTracksErrorCode::PREFIX_OVERLAP);
+
+  auto toB = makeTrackNamespacePrefixUpdate(prefixB);
+  auto res2 = withSessionContext(session, [&]() {
+    return folly::coro::blockingWait(handleA->requestUpdate(toB), exec_.get());
+  });
+  EXPECT_TRUE(res2.hasValue());
+
+  removeSession(session);
+}
+
+// The same prefix-update overlap enforcement + rollback applies to
+// SUBSCRIBE_NAMESPACE (draft §10.9.2).
+TEST_F(
+    MoQRelayTracksTest,
+    RequestUpdateNamespacePrefixOverlapRejectedAndRolledBack) {
+  auto session = createV18Session();
+  const TrackNamespace prefixA{{"test", "a"}};
+  const TrackNamespace prefixB{{"test", "b"}};
+  const TrackNamespace prefixC{{"test", "c"}};
+  auto handleA = doSubscribeNamespace(session, prefixA);
+  ASSERT_NE(handleA, nullptr);
+  doSubscribeNamespace(session, prefixC);
+
+  auto toC = makeTrackNamespacePrefixUpdate(prefixC);
+  auto res = withSessionContext(session, [&]() {
+    return folly::coro::blockingWait(handleA->requestUpdate(toC), exec_.get());
+  });
+  ASSERT_TRUE(res.hasError());
+  EXPECT_EQ(res.error().errorCode, SubscribeNamespaceErrorCode::PREFIX_OVERLAP);
+
+  auto toB = makeTrackNamespacePrefixUpdate(prefixB);
+  auto res2 = withSessionContext(session, [&]() {
+    return folly::coro::blockingWait(handleA->requestUpdate(toB), exec_.get());
+  });
+  EXPECT_TRUE(res2.hasValue());
+
+  removeSession(session);
+}
+
+// A SUBSCRIBE_NAMESPACE from a session that already has one at an overlapping
+// prefix (exact / ancestor / descendant) is rejected with PREFIX_OVERLAP — the
+// same subscribe-time restriction SUBSCRIBE_TRACKS already enforces.
+TEST_F(MoQRelayTracksTest, OverlappingSubscribeNamespaceRejected) {
+  auto session = createV18Session();
+  const TrackNamespace base{{"a", "b"}};
+  const TrackNamespace ancestor{{"a"}};
+  const TrackNamespace descendant{{"a", "b", "c"}};
+
+  auto baseHandle = doSubscribeNamespace(session, base);
+  ASSERT_NE(baseHandle, nullptr);
+
+  auto trySubscribeNamespace = [&](const TrackNamespace& prefix) {
+    SubscribeNamespace subNs;
+    subNs.trackNamespacePrefix = prefix;
+    return withSessionContext(session, [&]() {
+      return folly::coro::blockingWait(
+          relay_->subscribeNamespace(std::move(subNs), nullptr), exec_.get());
+    });
+  };
+
+  const std::vector<std::pair<std::string, TrackNamespace>> overlaps{
+      {"exact", base},
+      {"ancestor", ancestor},
+      {"descendant", descendant},
+  };
+  for (const auto& [label, prefix] : overlaps) {
+    SCOPED_TRACE(label);
+    auto res = trySubscribeNamespace(prefix);
+    ASSERT_TRUE(res.hasError());
+    EXPECT_EQ(
+        res.error().errorCode, SubscribeNamespaceErrorCode::PREFIX_OVERLAP);
+  }
+
+  // The check is per-session: a different session may use an overlapping
+  // prefix.
+  auto otherSession = createV18Session();
+  auto otherHandle = doSubscribeNamespace(otherSession, base);
+  EXPECT_NE(otherHandle, nullptr);
+
+  removeSession(session);
+  removeSession(otherSession);
+}
+
+// A REQUEST_UPDATE for SUBSCRIBE_TRACKS carrying only a FORWARD value updates
+// the Forwarding State applied to future matching subscriptions (the prefix is
+// unchanged). A track published after the update is forwarded with the new
+// state; PublishRequest.forward reflects it.
+TEST_F(MoQRelayTracksTest, RequestUpdateChangesTracksForward) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  setupPublishSucceeds(subscriber);
+
+  const TrackNamespace prefix{{"test", "a"}};
+  auto handle = doSubscribeTracks(subscriber, prefix);
+  ASSERT_NE(handle, nullptr);
+
+  // Before the update, a matching publish is forwarded (forward defaults true).
+  EXPECT_CALL(
+      *subscriber, publish(testing::Field(&PublishRequest::forward, true), _))
+      .Times(1);
+  doPublish(publisher, FullTrackName{prefix, "t1"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+
+  // A FORWARD-only update (no TRACK_NAMESPACE_PREFIX) turns forwarding off.
+  RequestUpdate update;
+  update.forward = false;
+  auto res = withSessionContext(subscriber, [&]() {
+    return folly::coro::blockingWait(
+        handle->requestUpdate(update), exec_.get());
+  });
+  ASSERT_TRUE(res.hasValue());
+
+  // A track published under the same prefix after the update is forwarded with
+  // the new forward=false state.
+  EXPECT_CALL(
+      *subscriber, publish(testing::Field(&PublishRequest::forward, false), _))
+      .Times(1);
+  doPublish(publisher, FullTrackName{prefix, "t2"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
+  removeSession(subscriber);
+  removeSession(publisher);
+}
+
+// A combined REQUEST_UPDATE that moves the prefix AND sets FORWARD applies the
+// new Forwarding State to the moved registration: a track already published
+// under the new prefix is backfilled with the new forward value.
+TEST_F(MoQRelayTracksTest, RequestUpdateTracksForwardAppliesToBackfill) {
+  auto subscriber = createV18Session();
+  auto publisher = createMockSession();
+  setupPublishSucceeds(subscriber);
+
+  const TrackNamespace oldPrefix{{"test", "a"}};
+  const TrackNamespace newPrefix{{"test", "b"}};
+  auto handle = doSubscribeTracks(subscriber, oldPrefix);
+  ASSERT_NE(handle, nullptr);
+
+  // A track exists under the future new prefix; it does not match test/a yet.
+  EXPECT_CALL(*subscriber, publish(_, _)).Times(0);
+  doPublish(publisher, FullTrackName{newPrefix, "t"});
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+  ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(subscriber.get()));
+
+  // Move to test/b AND set forward=false in one update. The backfilled test/b/t
+  // must be published with the new forward=false state.
+  auto update = makeTrackNamespacePrefixUpdate(newPrefix);
+  update.forward = false;
+  EXPECT_CALL(
+      *subscriber, publish(testing::Field(&PublishRequest::forward, false), _))
+      .Times(1);
+  auto res = withSessionContext(subscriber, [&]() {
+    return folly::coro::blockingWait(
+        handle->requestUpdate(update), exec_.get());
+  });
+  ASSERT_TRUE(res.hasValue());
+  for (int i = 0; i < 5; i++) {
+    exec_->drive();
+  }
+
   removeSession(subscriber);
   removeSession(publisher);
 }

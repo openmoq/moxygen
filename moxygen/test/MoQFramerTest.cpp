@@ -1419,6 +1419,35 @@ TEST(MoQFramerDeliveryTimeoutDeathTest, Draft16WriteZeroDies) {
       "Cannot write a DELIVERY_TIMEOUT of 0 for draft versions <= 16");
 }
 
+TEST(MoQFramerDeliveryTimeoutTest, Draft16RejectsZeroExtensionOnParse) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft17);
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  SubscribeOk subscribeOk;
+  subscribeOk.requestID = RequestID(1);
+  subscribeOk.trackAlias = TrackAlias(1);
+  subscribeOk.expires = std::chrono::milliseconds(0);
+  subscribeOk.groupOrder = GroupOrder::OldestFirst;
+  subscribeOk.largest = AbsoluteLocation{0, 0};
+  setPublisherDeliveryTimeout(subscribeOk, std::chrono::milliseconds(0));
+  ASSERT_TRUE(writer.writeSubscribeOk(writeBuf, subscribeOk).hasValue());
+  auto bytes = writeBuf.move();
+
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft16);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+
+  folly::io::Cursor cursor(bytes.get());
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  ASSERT_EQ(frameType->first, folly::to_underlying(FrameType::SUBSCRIBE_OK));
+  auto frameLen = cursor.readBE<uint16_t>();
+  auto parseResult = parser.parseSubscribeOk(cursor, frameLen);
+  ASSERT_TRUE(parseResult.hasError());
+  EXPECT_EQ(parseResult.error(), ErrorCode::PROTOCOL_VIOLATION);
+}
+
 TEST_P(MoQFramerTest, ParseTrackStatusOk) {
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
   TrackStatusOk trackStatusOk;
@@ -1833,6 +1862,30 @@ TEST(MoQFramerTest, SubscribeUpdateDraft15ForwardUnset) {
   EXPECT_EQ(parseResult->priority, kDefaultPriority);
   // Verify forward field is NOT set (preserves existing state per draft 15+)
   EXPECT_FALSE(parseResult->forward.has_value());
+}
+
+// The TRACK_NAMESPACE_PREFIX parameter carries a Track Namespace tuple (§2.4.1)
+// in its value; encode and decode must round-trip (draft 18+).
+TEST(MoQFramerTest, TrackNamespacePrefixParamRoundTrip) {
+  const TrackNamespace prefix(std::vector<std::string>{"foo", "bar"});
+  auto param =
+      MoQFrameWriter::encodeTrackNamespacePrefixParam(prefix, kVersionDraft18);
+  EXPECT_EQ(
+      param.key,
+      folly::to_underlying(TrackRequestParamKey::TRACK_NAMESPACE_PREFIX));
+
+  auto decoded = MoQFrameParser::parseTrackNamespacePrefixParam(
+      param.asString, kVersionDraft18);
+  ASSERT_TRUE(decoded.hasValue());
+  EXPECT_EQ(*decoded, prefix);
+}
+
+// A value that is not a valid Track Namespace tuple must fail to decode (here
+// the tuple claims 5 elements but carries no element data).
+TEST(MoQFramerTest, TrackNamespacePrefixParamMalformed) {
+  auto decoded = MoQFrameParser::parseTrackNamespacePrefixParam(
+      std::string("\x05", 1), kVersionDraft18);
+  EXPECT_TRUE(decoded.hasError());
 }
 
 TEST_P(MoQFramerTest, OddExtensionLengthVarintBoundary) {

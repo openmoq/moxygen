@@ -16,7 +16,7 @@ namespace moxygen {
 
 /**
  * Manages delivery timeout from multiple sources and computes the effective
- * timeout as min(upstream, downstream).
+ * timeout as min(publisher, subscriber).
  *
  * When the effective timeout changes, automatically invokes a registered
  * callback to notify the owner.
@@ -34,44 +34,56 @@ class MoQDeliveryTimeoutManager {
     onChangeCallback_ = std::move(callback);
   }
 
-  // Set upstream timeout (automatically triggers callback if effective changes)
-  void setUpstreamTimeout(std::chrono::milliseconds timeout) {
-    upstreamTimeout_ = timeout;
+  // Set publisher timeout (automatically triggers callback if effective
+  // changes)
+  void setPublisherTimeout(std::chrono::milliseconds timeout) {
+    publisherTimeout_ = toTimeoutSource(timeout);
     notifyIfChanged();
   }
 
-  // Set downstream timeout (automatically triggers callback if effective
+  // Set subscriber timeout (automatically triggers callback if effective
   // changes)
-  void setDownstreamTimeout(std::chrono::milliseconds timeout) {
+  void setSubscriberTimeout(std::chrono::milliseconds timeout) {
     XLOG(DBG6)
-        << "MoQDeliveryTimeoutManager::setDownstreamTimeout: SETTING downstream timeout"
+        << "MoQDeliveryTimeoutManager::setSubscriberTimeout: SETTING subscriber timeout"
         << " timeout=" << timeout.count() << "ms"
-        << " previousDownstream="
-        << (downstreamTimeout_.has_value()
-                ? std::to_string(downstreamTimeout_->count()) + "ms"
+        << " previousSubscriber="
+        << (subscriberTimeout_.has_value()
+                ? std::to_string(subscriberTimeout_->count()) + "ms"
                 : "none");
-    downstreamTimeout_ = timeout;
+    subscriberTimeout_ = toTimeoutSource(timeout);
     notifyIfChanged();
   }
 
   // Get effective timeout as min of available sources
   std::optional<std::chrono::milliseconds> getEffectiveTimeout() const {
-    if (upstreamTimeout_ && downstreamTimeout_) {
-      return std::min(*upstreamTimeout_, *downstreamTimeout_);
+    if (publisherTimeout_ && subscriberTimeout_) {
+      return std::min(*publisherTimeout_, *subscriberTimeout_);
     }
-    if (upstreamTimeout_) {
-      return upstreamTimeout_;
+    if (publisherTimeout_) {
+      return publisherTimeout_;
     }
-    if (downstreamTimeout_) {
-      return downstreamTimeout_;
+    if (subscriberTimeout_) {
+      return subscriberTimeout_;
     }
     return std::nullopt;
   }
 
  private:
+  // A timeout of 0 means "no timeout" (draft 18+): such a source imposes no
+  // constraint and is dropped from the min() computation. A non-zero value is
+  // kept as-is.
+  static std::optional<std::chrono::milliseconds> toTimeoutSource(
+      std::chrono::milliseconds timeout) {
+    if (timeout.count() == 0) {
+      return std::nullopt;
+    }
+    return timeout;
+  }
+
   // Individual timeout sources
-  std::optional<std::chrono::milliseconds> upstreamTimeout_;
-  std::optional<std::chrono::milliseconds> downstreamTimeout_;
+  std::optional<std::chrono::milliseconds> publisherTimeout_;
+  std::optional<std::chrono::milliseconds> subscriberTimeout_;
 
   // Cached effective timeout for change detection
   mutable std::optional<std::chrono::milliseconds> lastEffectiveTimeout_;

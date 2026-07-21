@@ -136,6 +136,21 @@ bool isIntParamValid(uint64_t version, uint64_t key, uint64_t value) {
   return true;
 }
 
+// Draft <= 16 forbids a DELIVERY_TIMEOUT of 0
+folly::Expected<folly::Unit, moxygen::ErrorCode>
+validateDeliveryTimeoutExtension(
+    const moxygen::Extensions& extensions,
+    uint64_t version) {
+  if (moxygen::getDraftMajorVersion(version) <= 16) {
+    auto val =
+        extensions.getIntExtension(moxygen::kDeliveryTimeoutExtensionType);
+    if (val && *val == 0) {
+      return folly::makeUnexpected(moxygen::ErrorCode::PROTOCOL_VIOLATION);
+    }
+  }
+  return folly::unit;
+}
+
 std::vector<moxygen::Parameter> sortParamsByKey(
     std::vector<moxygen::Parameter> params) {
   std::sort(
@@ -2288,6 +2303,13 @@ folly::Expected<SubscribeOk, ErrorCode> MoQFrameParser::parseSubscribeOk(
     }
   }
 
+  if (auto res =
+          validateDeliveryTimeoutExtension(subscribeOk.extensions, *version_);
+      !res) {
+    XLOG(DBG4) << "parseSubscribeOk: invalid DELIVERY_TIMEOUT extension";
+    return folly::makeUnexpected(res.error());
+  }
+
   return subscribeOk;
 }
 
@@ -2519,6 +2541,13 @@ folly::Expected<PublishRequest, ErrorCode> MoQFrameParser::parsePublish(
     if (go) {
       publish.groupOrder = static_cast<GroupOrder>(*go);
     }
+  }
+
+  if (auto validateRes =
+          validateDeliveryTimeoutExtension(publish.extensions, *version_);
+      !validateRes) {
+    XLOG(DBG4) << "parsePublish: invalid DELIVERY_TIMEOUT extension";
+    return folly::makeUnexpected(validateRes.error());
   }
 
   return publish;
@@ -3910,6 +3939,47 @@ MoQFrameParser::parseNamespaceTuple(folly::io::Cursor& cursor, size_t& length)
     items.emplace_back(std::move(res.value()));
   }
   return items;
+}
+
+/*static*/ folly::Expected<TrackNamespace, ErrorCode>
+MoQFrameParser::parseTrackNamespacePrefixParam(
+    const std::string& value,
+    uint64_t version) {
+  XCHECK_GE(getDraftMajorVersion(version), 18u);
+  MoQFrameParser parser;
+  parser.initializeVersion(version);
+  auto buf = folly::IOBuf::wrapBufferAsValue(value.data(), value.size());
+  folly::io::Cursor cursor(&buf);
+  size_t length = value.size();
+  auto tuple = parser.parseNamespaceTuple(cursor, length);
+  if (!tuple) {
+    return folly::makeUnexpected(tuple.error());
+  }
+  if (length != 0) {
+    XLOG(DBG4) << "parseTrackNamespacePrefixParam: trailing bytes in value";
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+  return TrackNamespace(std::move(tuple.value()));
+}
+
+/*static*/ Parameter MoQFrameWriter::encodeTrackNamespacePrefixParam(
+    const TrackNamespace& trackNamespacePrefix,
+    uint64_t version) {
+  XCHECK_GE(getDraftMajorVersion(version), 18u);
+  MoQFrameWriter writer;
+  writer.initializeVersion(version);
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  size_t size = 0;
+  bool error = false;
+  writer.writeTrackNamespace(buf, trackNamespacePrefix, size, error);
+  XCHECK(!error)
+      << "encodeTrackNamespacePrefixParam: failed to encode namespace";
+  auto tuple = buf.move();
+  std::string value =
+      tuple ? tuple->moveToFbString().toStdString() : std::string();
+  return Parameter(
+      folly::to_underlying(TrackRequestParamKey::TRACK_NAMESPACE_PREFIX),
+      value);
 }
 
 //// Transforms /////

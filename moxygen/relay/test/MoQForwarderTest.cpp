@@ -23,10 +23,11 @@ const FullTrackName kFwdTestTrackName{kFwdTestNamespace, "track1"};
 
 class MoQForwarderTest : public ::testing::Test {
  protected:
-  std::shared_ptr<MockMoQSession> createMockSession() {
+  std::shared_ptr<MockMoQSession> createMockSession(
+      uint64_t version = kVersionDraftCurrent) {
     auto session = std::make_shared<NiceMock<MockMoQSession>>();
     ON_CALL(*session, getNegotiatedVersion())
-        .WillByDefault(Return(std::optional<uint64_t>(kVersionDraftCurrent)));
+        .WillByDefault(Return(std::optional<uint64_t>(version)));
     return session;
   }
 
@@ -76,6 +77,30 @@ class MoQForwarderTest : public ::testing::Test {
     return forwarder.addSubscriber(
         std::move(session), sub, std::move(consumer));
   }
+
+  AssertionResult applyForwardUpdate(
+      const std::shared_ptr<MoQForwarder::Subscriber>& subscriber,
+      RequestID requestID,
+      bool forward) {
+    RequestUpdate update;
+    update.requestID = requestID;
+    update.existingRequestID = RequestID(1);
+    update.forward = forward;
+    auto res = folly::coro::blockingWait(subscriber->requestUpdate(update));
+    if (!res.hasValue()) {
+      return AssertionFailure() << "REQUEST_UPDATE failed";
+    }
+    return AssertionSuccess();
+  }
+
+  AssertionResult pauseAndResumeForwarding(
+      const std::shared_ptr<MoQForwarder::Subscriber>& subscriber) {
+    auto pauseRes = applyForwardUpdate(subscriber, RequestID(2), false);
+    if (!pauseRes) {
+      return pauseRes;
+    }
+    return applyForwardUpdate(subscriber, RequestID(3), true);
+  }
 };
 
 namespace {
@@ -108,6 +133,31 @@ auto makeNGRParams(uint64_t val) {
   upd.params.insertParam(Parameter(
       folly::to_underlying(TrackRequestParamKey::NEW_GROUP_REQUEST), val));
   return upd.params;
+}
+
+auto subgroupConsumerResult(std::shared_ptr<SubgroupConsumer> subgroup) {
+  return folly::
+      makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+          std::move(subgroup));
+}
+
+auto stopSendingError() {
+  return folly::makeUnexpected(
+      MoQPublishError(MoQPublishError::CANCELLED, "STOP_SENDING"));
+}
+
+void expectBeginSubgroups(
+    MockTrackConsumer& consumer,
+    std::shared_ptr<SubgroupConsumer> first,
+    std::shared_ptr<SubgroupConsumer> second) {
+  EXPECT_CALL(consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce(Return(subgroupConsumerResult(std::move(first))))
+      .WillOnce(Return(subgroupConsumerResult(std::move(second))));
+}
+
+void expectStopSending(MockSubgroupConsumer& subgroup, uint64_t objectID) {
+  EXPECT_CALL(subgroup, object(objectID, _, _, false))
+      .WillOnce(Return(stopSendingError()));
 }
 
 } // namespace
@@ -573,6 +623,88 @@ TEST_F(MoQForwarderTest, SubscribeUpdateStartLocationCanDecrease) {
 
   EXPECT_EQ(subscriber->range.start, (AbsoluteLocation{5, 0}))
       << "Start location should be updated to {5, 0}";
+}
+
+TEST_F(
+    MoQForwarderTest,
+    RequestUpdateForwardResumeReopensTombstonedSubgroupDraft18) {
+  auto forwarder = std::make_shared<MoQForwarder>(kFwdTestTrackName);
+  auto consumer = createMockConsumer();
+  auto sg1 = createMockSubgroupConsumer();
+  auto sg2 = createMockSubgroupConsumer();
+
+  expectBeginSubgroups(*consumer, sg1, sg2);
+  expectStopSending(*sg1, 0);
+  EXPECT_CALL(*sg2, object(1, _, _, false)).WillOnce(Return(folly::unit));
+
+  auto subscriber = addSubscriber(
+      *forwarder, createMockSession(kVersionDraft18), consumer, RequestID(1));
+  ASSERT_NE(subscriber, nullptr);
+
+  auto subgroupRes = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroupRes.hasValue());
+  auto subgroup = *subgroupRes;
+
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+  ASSERT_TRUE(pauseAndResumeForwarding(subscriber));
+
+  EXPECT_TRUE(subgroup->object(1, test::makeBuf(10)).hasValue());
+  subgroup->reset(ResetStreamErrorCode::SESSION_CLOSED);
+}
+
+TEST_F(
+    MoQForwarderTest,
+    RequestUpdateForwardResumeAllowsDuplicateSubgroupDraft18) {
+  auto forwarder = std::make_shared<MoQForwarder>(kFwdTestTrackName);
+  auto consumer = createMockConsumer();
+  auto sg1 = createMockSubgroupConsumer();
+  auto sg2 = createMockSubgroupConsumer();
+
+  expectBeginSubgroups(*consumer, sg1, sg2);
+  expectStopSending(*sg1, 0);
+
+  auto subscriber = addSubscriber(
+      *forwarder, createMockSession(kVersionDraft18), consumer, RequestID(1));
+  ASSERT_NE(subscriber, nullptr);
+
+  auto subgroup1Res = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroup1Res.hasValue());
+  auto subgroup1 = *subgroup1Res;
+
+  EXPECT_TRUE(subgroup1->object(0, test::makeBuf(10)).hasValue());
+  ASSERT_TRUE(pauseAndResumeForwarding(subscriber));
+
+  auto subgroup2Res = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroup2Res.hasValue());
+  EXPECT_NE(subgroup1, *subgroup2Res);
+  EXPECT_TRUE((*subgroup2Res)->endOfSubgroup().hasValue());
+}
+
+TEST_F(
+    MoQForwarderTest,
+    RequestUpdateForwardResumeReopensTombstonedSubgroupPreDraft18) {
+  auto forwarder = std::make_shared<MoQForwarder>(kFwdTestTrackName);
+  auto consumer = createMockConsumer();
+  auto sg1 = createMockSubgroupConsumer();
+  auto sg2 = createMockSubgroupConsumer();
+
+  expectBeginSubgroups(*consumer, sg1, sg2);
+  expectStopSending(*sg1, 0);
+  EXPECT_CALL(*sg2, object(1, _, _, false)).WillOnce(Return(folly::unit));
+
+  auto subscriber = addSubscriber(
+      *forwarder, createMockSession(kVersionDraft17), consumer, RequestID(1));
+  ASSERT_NE(subscriber, nullptr);
+
+  auto subgroupRes = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroupRes.hasValue());
+  auto subgroup = *subgroupRes;
+
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+  ASSERT_TRUE(pauseAndResumeForwarding(subscriber));
+
+  EXPECT_TRUE(subgroup->object(1, test::makeBuf(10)).hasValue());
+  subgroup->reset(ResetStreamErrorCode::SESSION_CLOSED);
 }
 
 // Test: Subgroup is tombstoned after CANCELLED error (soft error), keeping the
@@ -1261,6 +1393,30 @@ TEST_F(MoQForwarderTest, SubgroupConsumersResetOnForwarderDestruction) {
   // Resetting the publisher's now-detached handle is a safe no-op (the consumer
   // was already reset during detach, so no second reset is delivered).
   pubSg->reset(ResetStreamErrorCode::SESSION_CLOSED);
+}
+
+// Test: A Joining Fetch is only permitted when the associated subscription is
+// in Forward State 1. Against a non-forwarding subscription it must be rejected
+// with a request-level INVALID_RANGE error rather than a session error.
+TEST_F(MoQForwarderTest, JoiningFetchNonForwardingSubscriptionIsRequestError) {
+  auto forwarder = std::make_shared<MoQForwarder>(
+      kFwdTestTrackName, AbsoluteLocation{10, 5});
+  auto session = createMockSession();
+
+  SubscribeRequest sub;
+  sub.fullTrackName = kFwdTestTrackName;
+  sub.requestID = RequestID(2);
+  sub.locType = LocationType::LargestObject;
+  sub.forward = false;
+  auto subscriber =
+      forwarder->addSubscriber(session, sub, createMockConsumer());
+  ASSERT_NE(subscriber, nullptr);
+  ASSERT_FALSE(subscriber->shouldForward);
+
+  JoiningFetch joining(RequestID(2), 2, FetchType::RELATIVE_JOINING);
+  auto res = forwarder->resolveJoiningFetch(session, joining);
+  ASSERT_TRUE(res.hasError());
+  EXPECT_EQ(res.error().errorCode, FetchErrorCode::INVALID_RANGE);
 }
 
 } // namespace moxygen::test

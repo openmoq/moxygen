@@ -172,7 +172,8 @@ void MoQServer::stop() {
   hqServer_.reset();
 }
 
-void MoQServer::rejectNewConnections(std::function<bool()> rejectFn) {
+void MoQServer::rejectNewConnections(
+    std::function<bool(const quic::SocketAddress&)> rejectFn) {
   if (hqServer_) {
     hqServer_->rejectNewConnections(std::move(rejectFn));
   }
