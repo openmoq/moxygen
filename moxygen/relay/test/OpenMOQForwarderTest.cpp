@@ -284,6 +284,102 @@ TEST_F(OpenMOQForwarderTest, DuplicateChannelSubscriberSameExecIsNoOp) {
   EXPECT_EQ(forwarder->numForwardingSubscribers(), 1u);
 }
 
+// Test: Once all real subscribers have tombstoned a subgroup, duplicate
+// beginSubgroup returns CANCELLED - a passive observer's reset doesn't mask it.
+TEST_F(OpenMOQForwarderTest, PassiveResetDoesNotMaskDuplicateSubgroupCancel) {
+  auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
+  auto realSession = createMockSession();
+  auto passiveSession = createMockSession();
+  auto realConsumer = createMockConsumer();
+  auto passiveConsumer = createMockConsumer();
+
+  std::shared_ptr<MockSubgroupConsumer> realSg;
+  EXPECT_CALL(*realConsumer, beginSubgroup(0, 0, _, _))
+      .WillOnce(
+          [this, &realSg](uint64_t, uint64_t, uint8_t, BeginSubgroupOptions) {
+            realSg = createMockSubgroupConsumer();
+            // Simulate stop_sending: soft error tombstones the subgroup.
+            EXPECT_CALL(*realSg, object(0, _, _, false))
+                .WillOnce(Return(
+                    folly::makeUnexpected(MoQPublishError(
+                        MoQPublishError::CANCELLED, "STOP_SENDING"))));
+            return folly::makeExpected<
+                MoQPublishError,
+                std::shared_ptr<SubgroupConsumer>>(realSg);
+          });
+
+  std::shared_ptr<MockSubgroupConsumer> passiveSg;
+  EXPECT_CALL(*passiveConsumer, beginSubgroup(0, 0, _, _))
+      .WillOnce([this, &passiveSg](
+                    uint64_t, uint64_t, uint8_t, BeginSubgroupOptions) {
+        passiveSg = createMockSubgroupConsumer();
+        EXPECT_CALL(*passiveSg, object(0, _, _, false))
+            .WillOnce(Return(folly::unit));
+        // The duplicate resets the passive observer's stale consumer...
+        EXPECT_CALL(*passiveSg, reset(ResetStreamErrorCode::CANCELLED));
+        return folly::
+            makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                passiveSg);
+      });
+
+  auto realHandle =
+      addSubscriber(*forwarder, realSession, realConsumer, RequestID(1));
+  ASSERT_NE(realHandle, nullptr);
+  auto passiveHandle = forwarder->addSubscriber(
+      passiveSession, /*forward=*/true, passiveConsumer, /*passive=*/true);
+  ASSERT_NE(passiveHandle, nullptr);
+
+  auto pubSg = forwarder->beginSubgroup(0, 0, 0).value();
+  EXPECT_TRUE(pubSg->object(0, test::makeBuf(4)).hasValue());
+
+  // ...but must not count toward anyReset: CANCELLED propagates.
+  auto dupRes = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(dupRes.hasError());
+  EXPECT_EQ(dupRes.error().code, MoQPublishError::CANCELLED);
+}
+
+// Test: A passive subscriber with no subgroup state is not a reopen candidate.
+TEST_F(OpenMOQForwarderTest, PassiveDoesNotCountAsReopenCandidate) {
+  auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
+  auto realSession = createMockSession();
+  auto passiveSession = createMockSession();
+  auto realConsumer = createMockConsumer();
+  auto passiveConsumer = createMockConsumer();
+
+  std::shared_ptr<MockSubgroupConsumer> realSg;
+  EXPECT_CALL(*realConsumer, beginSubgroup(0, 0, _, _))
+      .WillOnce(
+          [this, &realSg](uint64_t, uint64_t, uint8_t, BeginSubgroupOptions) {
+            realSg = createMockSubgroupConsumer();
+            EXPECT_CALL(*realSg, object(0, _, _, false))
+                .WillOnce(Return(
+                    folly::makeUnexpected(MoQPublishError(
+                        MoQPublishError::CANCELLED, "STOP_SENDING"))));
+            return folly::makeExpected<
+                MoQPublishError,
+                std::shared_ptr<SubgroupConsumer>>(realSg);
+          });
+  // The passive observer joins after the subgroup's objects were delivered
+  // (object delivery lazily opens subgroups for earlier joiners), so it has
+  // no subgroup entry; it must not be offered the duplicate subgroup.
+  EXPECT_CALL(*passiveConsumer, beginSubgroup(_, _, _, _)).Times(0);
+
+  auto realHandle =
+      addSubscriber(*forwarder, realSession, realConsumer, RequestID(1));
+  ASSERT_NE(realHandle, nullptr);
+
+  auto pubSg = forwarder->beginSubgroup(0, 0, 0).value();
+  EXPECT_TRUE(pubSg->object(0, test::makeBuf(4)).hasValue());
+
+  auto passiveHandle = forwarder->addSubscriber(
+      passiveSession, /*forward=*/true, passiveConsumer, /*passive=*/true);
+  ASSERT_NE(passiveHandle, nullptr);
+
+  auto dupRes = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(dupRes.hasError());
+  EXPECT_EQ(dupRes.error().code, MoQPublishError::CANCELLED);
+}
+
 TEST_F(OpenMOQForwarderTest, ChannelSubscriberDrainsWhenSubgroupsOpen) {
   auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
   auto consumer = createMockConsumer();
