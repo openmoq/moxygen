@@ -310,6 +310,9 @@ enum class SetupKey : uint64_t {
   MOQT_IMPLEMENTATION = 7
 };
 
+constexpr uint64_t kDefaultMaxRequestID = 100;
+constexpr uint64_t kDefaultMaxAuthTokenCacheSize = 1024;
+
 enum class AliasType : uint8_t {
   DELETE_ALIAS = 0x0,
   REGISTER = 0x1,

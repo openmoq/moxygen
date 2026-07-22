@@ -15,6 +15,7 @@
 #include <proxygen/lib/http/webtransport/QuicWebTransport.h>
 #include <proxygen/lib/http/webtransport/QuicWtSession.h>
 #include <quic/common/address/QuicSocketAddressBridge.h>
+#include <moxygen/MoQTypes.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
 
 #include <utility>
@@ -108,10 +109,8 @@ MoQServer::MoQServer(
       [this](quic::VantagePoint vp) { return makeQLogger(vp); });
 
   // Configure 0-RTT early data handler with server's default params
-  constexpr uint64_t kDefaultMaxRequestID = 100;
-  constexpr uint64_t kMaxAuthTokenCacheSize = 1024;
   earlyDataHandler_.setCurrentParams(
-      kDefaultMaxRequestID, kMaxAuthTokenCacheSize);
+      kDefaultMaxRequestID, kDefaultMaxAuthTokenCacheSize);
   factory_->setDefaultEarlyDataHandler(&earlyDataHandler_);
 
   // Register ALPN handlers for direct QUIC MoQT connections
