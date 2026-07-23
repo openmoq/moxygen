@@ -104,11 +104,10 @@ class MoQRelaySession::PublisherPublishNamespaceHandle
 
   folly::coro::Task<RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) override {
-    co_return folly::makeUnexpected(
-        RequestError{
-            reqUpdate.requestID,
-            RequestErrorCode::NOT_SUPPORTED,
-            "REQUEST_UPDATE not supported for PUBLISH_NAMESPACE"});
+    co_return folly::makeUnexpected(RequestError{
+        reqUpdate.requestID,
+        RequestErrorCode::NOT_SUPPORTED,
+        "REQUEST_UPDATE not supported for PUBLISH_NAMESPACE"});
   }
 
  private:
@@ -166,21 +165,19 @@ class MoQRelaySession::SubscribeNamespaceHandle
   folly::coro::Task<RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) override {
     if (!session_) {
-      co_return folly::makeUnexpected(
-          RequestError{
-              reqUpdate.requestID,
-              RequestErrorCode::INTERNAL_ERROR,
-              "SUBSCRIBE_NAMESPACE subscription no longer active"});
+      co_return folly::makeUnexpected(RequestError{
+          reqUpdate.requestID,
+          RequestErrorCode::INTERNAL_ERROR,
+          "SUBSCRIBE_NAMESPACE subscription no longer active"});
     }
     // Updating a SUBSCRIBE_NAMESPACE via REQUEST_UPDATE only exists at draft
     // 16+; earlier drafts have no such message for it.
     auto version = session_->getNegotiatedVersion();
     if (!version || getDraftMajorVersion(*version) < 16) {
-      co_return folly::makeUnexpected(
-          RequestError{
-              reqUpdate.requestID,
-              RequestErrorCode::NOT_SUPPORTED,
-              "REQUEST_UPDATE for SUBSCRIBE_NAMESPACE requires draft 16+"});
+      co_return folly::makeUnexpected(RequestError{
+          reqUpdate.requestID,
+          RequestErrorCode::NOT_SUPPORTED,
+          "REQUEST_UPDATE for SUBSCRIBE_NAMESPACE requires draft 16+"});
     }
     // Forward the update to the peer on this subscription's own bidi stream.
     // The prefix (or other mutable state) is carried in reqUpdate.params and
@@ -237,11 +234,10 @@ class MoQRelaySession::SubscribeTracksHandle
       RequestUpdate reqUpdate) override {
     auto session = session_.lock();
     if (!session) {
-      co_return folly::makeUnexpected(
-          RequestError{
-              reqUpdate.requestID,
-              RequestErrorCode::INTERNAL_ERROR,
-              "SUBSCRIBE_TRACKS subscription no longer active"});
+      co_return folly::makeUnexpected(RequestError{
+          reqUpdate.requestID,
+          RequestErrorCode::INTERNAL_ERROR,
+          "SUBSCRIBE_TRACKS subscription no longer active"});
     }
     // Forward the update to the peer on this subscription's own bidi stream.
     // The new prefix is carried in reqUpdate.params and decoded by the
@@ -593,26 +589,23 @@ MoQRelaySession::sendRequestUpdateOnBidi(
     RequestID existingRequestID,
     std::shared_ptr<BidiStreamControl> control) {
   if (isClosed()) {
-    co_return folly::makeUnexpected(
-        RequestError{
-            reqUpdate.requestID,
-            RequestErrorCode::INTERNAL_ERROR,
-            "Session closed"});
+    co_return folly::makeUnexpected(RequestError{
+        reqUpdate.requestID,
+        RequestErrorCode::INTERNAL_ERROR,
+        "Session closed"});
   }
   if (shouldFailNewLocalRequestDueToGoaway()) {
-    co_return folly::makeUnexpected(
-        RequestError{
-            peekNextRequestID(),
-            RequestErrorCode::GOING_AWAY,
-            "Session received GOAWAY"});
+    co_return folly::makeUnexpected(RequestError{
+        peekNextRequestID(),
+        RequestErrorCode::GOING_AWAY,
+        "Session received GOAWAY"});
   }
   auto version = getNegotiatedVersion();
   if (!version) {
-    co_return folly::makeUnexpected(
-        RequestError{
-            reqUpdate.requestID,
-            RequestErrorCode::INTERNAL_ERROR,
-            "No negotiated version"});
+    co_return folly::makeUnexpected(RequestError{
+        reqUpdate.requestID,
+        RequestErrorCode::INTERNAL_ERROR,
+        "No negotiated version"});
   }
   // Draft 18+ carries the update on the subscription's own bidi request stream.
   // Pre-18 there are no per-request bidi streams, so it rides the shared
@@ -629,11 +622,10 @@ MoQRelaySession::sendRequestUpdateOnBidi(
   // and the co_await at the end suspends, so the read loop cannot exit in the
   // gap after this check passes.
   if (onBidi && (!writeHandle || control->readLoopExited())) {
-    co_return folly::makeUnexpected(
-        RequestError{
-            reqUpdate.requestID,
-            RequestErrorCode::INTERNAL_ERROR,
-            "No request stream for REQUEST_UPDATE"});
+    co_return folly::makeUnexpected(RequestError{
+        reqUpdate.requestID,
+        RequestErrorCode::INTERNAL_ERROR,
+        "No request stream for REQUEST_UPDATE"});
   }
 
   reqUpdate.existingRequestID = existingRequestID;
@@ -643,11 +635,10 @@ MoQRelaySession::sendRequestUpdateOnBidi(
   auto writeRes = moqFrameWriter_.writeRequestUpdate(buf, reqUpdate);
   if (!writeRes) {
     XLOG(ERR) << "writeRequestUpdate failed sess=" << this;
-    co_return folly::makeUnexpected(
-        RequestError{
-            reqUpdate.requestID,
-            RequestErrorCode::INTERNAL_ERROR,
-            "writeRequestUpdate failed"});
+    co_return folly::makeUnexpected(RequestError{
+        reqUpdate.requestID,
+        RequestErrorCode::INTERNAL_ERROR,
+        "writeRequestUpdate failed"});
   }
 
   if (logger_) {
@@ -888,8 +879,8 @@ MoQRelaySession::publishNamespace(
   auto replyCtx = makeReplyContext(control);
   auto contract = folly::coro::makePromiseContract<
       folly::Expected<PublishNamespaceOk, PublishNamespaceError>>();
-  auto pending = MoQRelayPendingRequestState::makePublishNamespace(
-      PendingPublishNamespace{
+  auto pending =
+      MoQRelayPendingRequestState::makePublishNamespace(PendingPublishNamespace{
           trackNamespace, // Use saved copy instead of ann.trackNamespace
           std::move(contract.first),
           std::move(publishNamespaceCallback)});
@@ -1341,7 +1332,7 @@ class SubNsStreamCallback : public MoQControlCodec::ControlCallback {
   }
 
   void onNamespace(Namespace ns) override {
-    namespacePublishHandle_->namespaceMsg(ns.trackNamespaceSuffix);
+    namespacePublishHandle_->namespaceMsg(ns);
   }
 
   void onNamespaceDone(NamespaceDone namespaceDone) override {
@@ -1543,14 +1534,18 @@ class MoQNamespacePublishHandle : public Publisher::NamespacePublishHandle {
     moqFrameWriter_.initializeVersion(negotiatedVersion);
   }
 
-  void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) override {
-    Namespace ns;
-    ns.trackNamespaceSuffix = trackNamespaceSuffix;
+  void namespaceMsg(const Namespace& ns) override {
     auto writeResult = subNsReply_->namespaceMsg(ns);
     if (!writeResult) {
       XLOG(ERR) << "writeNamespace failed";
       return;
     }
+  }
+
+  void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) override {
+    Namespace ns;
+    ns.trackNamespaceSuffix = trackNamespaceSuffix;
+    namespaceMsg(ns);
   }
 
   void namespaceDoneMsg(const TrackNamespace& trackNamespaceSuffix) override {
@@ -1724,11 +1719,10 @@ class NamespaceBackedSubscribeTracksHandle
 
   folly::coro::Task<RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) override {
-    co_return folly::makeUnexpected(
-        RequestError{
-            reqUpdate.requestID,
-            RequestErrorCode::NOT_SUPPORTED,
-            "REQUEST_UPDATE not supported"});
+    co_return folly::makeUnexpected(RequestError{
+        reqUpdate.requestID,
+        RequestErrorCode::NOT_SUPPORTED,
+        "REQUEST_UPDATE not supported"});
   }
 
  private:
