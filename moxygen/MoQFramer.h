@@ -40,6 +40,14 @@ folly::Expected<std::string, ErrorCode> parseFixedString(
     folly::io::Cursor& cursor,
     size_t& length);
 
+folly::Expected<std::string, ErrorCode> encodeRelayHopPath(
+    const std::vector<uint64_t>& hopPath,
+    uint64_t version) noexcept;
+
+folly::Expected<std::vector<uint64_t>, ErrorCode> decodeRelayHopPath(
+    std::string_view encoded,
+    uint64_t version) noexcept;
+
 inline StreamType getSubgroupStreamType(
     uint64_t version,
     SubgroupIDFormat format,
@@ -317,6 +325,10 @@ class MoQFrameParser {
     return version_;
   }
 
+  void setRelayHopsNegotiated(bool negotiated) noexcept {
+    relayHopsNegotiated_ = negotiated;
+  }
+
   // Decode a TRACK_NAMESPACE_PREFIX parameter value (a Track Namespace tuple,
   // §2.4.1) into a TrackNamespace for the given negotiated version. Used by
   // consumers of REQUEST_UPDATE (e.g. the relay) that receive the prefix as a
@@ -530,6 +542,7 @@ class MoQFrameParser {
 
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
+  bool relayHopsNegotiated_{false};
   MoQTokenCache* tokenCache_{nullptr};
   mutable std::optional<uint64_t> previousObjectID_;
   // Context for FETCH object delta encoding (draft-15+)
@@ -762,6 +775,10 @@ class MoQFrameWriter {
     return version_;
   }
 
+  void setRelayHopsNegotiated(bool negotiated) noexcept {
+    relayHopsNegotiated_ = negotiated;
+  }
+
   // Encode a TrackNamespace as a TRACK_NAMESPACE_PREFIX parameter (a Track
   // Namespace tuple value, §2.4.1) for the given negotiated version. The
   // resulting parameter can be added to a REQUEST_UPDATE's parameter list to
@@ -924,6 +941,7 @@ class MoQFrameWriter {
 
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
+  bool relayHopsNegotiated_{false};
   mutable std::optional<uint64_t> previousObjectID_;
   // Context for FETCH object delta encoding (draft-15+)
   mutable std::optional<uint64_t> previousFetchGroup_;

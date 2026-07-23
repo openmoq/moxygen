@@ -307,11 +307,15 @@ enum class SetupKey : uint64_t {
   AUTHORIZATION_TOKEN = 3,
   MAX_AUTH_TOKEN_CACHE_SIZE = 4,
   AUTHORITY = 5,
-  MOQT_IMPLEMENTATION = 7
+  MOQT_IMPLEMENTATION = 7,
+  RELAY_HOPS = 0x40B55,
 };
 
 constexpr uint64_t kDefaultMaxRequestID = 100;
 constexpr uint64_t kDefaultMaxAuthTokenCacheSize = 1024;
+constexpr uint64_t kMaxRelayHopID = (uint64_t{1} << 62) - 1;
+
+uint64_t generateRelayHopID();
 
 enum class AliasType : uint8_t {
   DELETE_ALIAS = 0x0,
@@ -496,7 +500,8 @@ struct TrackFilter {
   TrackFilter(uint64_t pt, uint64_t ms) : propertyType(pt), maxSelected(ms) {}
 
   bool operator==(const TrackFilter& other) const {
-    return propertyType == other.propertyType && maxSelected == other.maxSelected;
+    return propertyType == other.propertyType &&
+        maxSelected == other.maxSelected;
   }
 };
 
@@ -603,6 +608,8 @@ enum class TrackRequestParamKey : uint64_t {
   TRACK_FILTER = 0x29,
   NEW_GROUP_REQUEST = 0x32,
   TRACK_NAMESPACE_PREFIX = 0x34,
+  HOP_PATH = 0x40B57,
+  EXCLUDE_HOP = 0x40B58,
 };
 
 inline bool isRendezvousTimeoutParam(uint64_t key, uint64_t majorVersion) {
@@ -1391,6 +1398,7 @@ struct NamespaceDone {
 // Only used in draft-16 and above
 struct Namespace {
   TrackNamespace trackNamespaceSuffix;
+  TrackRequestParameters params{FrameType::NAMESPACE};
 };
 
 // SubscribeNamespaceError is now an alias for RequestError - see below
