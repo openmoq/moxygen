@@ -2333,6 +2333,10 @@ void MoQSession::cleanup() {
     sub->subscribeError({/*TrackReceiveState fills in subId*/ 0,
                          SubscribeErrorCode::INTERNAL_ERROR,
                          "session closed"});
+    // Wake read loops parked in readStreamData on an open subgroup: the
+    // transport may cancel the read handle without enqueuing an error, which
+    // the state-token await misses, leaking the open subgroup consumers.
+    sub->cancel();
   }
   subTracks_.clear();
   // We parse a publishDone after cleanup
@@ -3550,7 +3554,9 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     if (fetchState_) {
       return !fetchState_->getFetchCallback();
     } else if (subscribeState_) {
-      return !subgroupCallback_ || subscribeState_->isCancelled();
+      // A cancelled subscription still owes its open subgroup consumer one
+      // terminal (reset) per the MoQConsumers contract; only skip when null.
+      return !subgroupCallback_;
     }
     return true;
   }
