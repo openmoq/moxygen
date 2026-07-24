@@ -65,6 +65,7 @@ ParamValueEncoding paramEncodingV18(uint64_t key) {
     case K::FILL_TIMEOUT:
     case K::EXPIRES:
     case K::NEW_GROUP_REQUEST:
+    case K::EXCLUDE_HOP:
     // PUBLISHER_PRIORITY is extensions-only in v16+; parsed as varint so the
     // caller's allowlist check can reject it cleanly.
     case K::PUBLISHER_PRIORITY:
@@ -74,6 +75,7 @@ ParamValueEncoding paramEncodingV18(uint64_t key) {
     case K::AUTHORIZATION_TOKEN:
     case K::SUBSCRIPTION_FILTER:
     case K::TRACK_NAMESPACE_PREFIX:
+    case K::HOP_PATH:
     // TRACK_FILTER (0x29) is a fork-local active proposal; length-prefixed
     // value decoded via parseVariableParam (see parseTrackFilter).
     case K::TRACK_FILTER:
@@ -518,6 +520,56 @@ folly::Expected<std::string, ErrorCode> MoQFrameParser::parseFixedString(
   auto res = cursor.readFixedString(strLength->first);
   length -= strLength->first;
   return res;
+}
+
+folly::Expected<std::string, ErrorCode> encodeRelayHopPath(
+    const std::vector<uint64_t>& hopPath,
+    uint64_t version) noexcept {
+  if (hopPath.empty()) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+
+  folly::IOBufQueue encoded{folly::IOBufQueue::cacheChainLength()};
+  folly::io::QueueAppender appender(&encoded, kMaxFrameHeaderSize);
+  for (const auto hop : hopPath) {
+    if (getDraftMajorVersion(version) >= 17) {
+      if (encodeMoQVarint(hop, appender).hasError()) {
+        return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+      }
+      continue;
+    }
+    auto appenderOp = [&appender](auto value) mutable {
+      appender.writeBE(folly::tag<decltype(value)>, value);
+    };
+    if (quic::encodeQuicInteger(hop, appenderOp).hasError()) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+  }
+  return encoded.move()->moveToFbString().toStdString();
+}
+
+folly::Expected<std::vector<uint64_t>, ErrorCode> decodeRelayHopPath(
+    std::string_view encoded,
+    uint64_t version) noexcept {
+  if (encoded.empty()) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+
+  auto buffer = folly::IOBuf::copyBuffer(encoded);
+  folly::io::Cursor cursor(buffer.get());
+  size_t remaining = encoded.size();
+  std::vector<uint64_t> hopPath;
+  while (remaining > 0) {
+    const auto decoded = getDraftMajorVersion(version) >= 17
+        ? decodeMoQVarint(cursor, remaining)
+        : quic::follyutils::decodeQuicInteger(cursor, remaining);
+    if (!decoded) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+    hopPath.push_back(decoded->first);
+    remaining -= decoded->second;
+  }
+  return hopPath;
 }
 
 folly::Expected<std::optional<AuthToken>, ErrorCode>
@@ -1893,8 +1945,7 @@ std::optional<SubscriptionFilter> MoQFrameParser::extractSubscriptionFilter(
 std::optional<TrackFilter> MoQFrameParser::extractTrackFilter(
     const std::vector<Parameter>& requestSpecificParams) const noexcept {
   for (const auto& param : requestSpecificParams) {
-    if (param.key ==
-        folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
+    if (param.key == folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
       return param.asTrackFilter;
     }
   }
@@ -3690,6 +3741,24 @@ folly::Expected<Namespace, ErrorCode> MoQFrameParser::parseNamespace(
   ns.trackNamespaceSuffix = TrackNamespace(std::move(res.value()));
 
   if (length > 0) {
+    if (!relayHopsNegotiated_) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+    auto numParams = decodeVarint(cursor, length);
+    if (!numParams) {
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    length -= numParams->second;
+    std::vector<Parameter> requestSpecificParams;
+    auto paramsResult = parseTrackRequestParams(
+        cursor, length, numParams->first, ns.params, requestSpecificParams);
+    if (!paramsResult) {
+      return folly::makeUnexpected(paramsResult.error());
+    }
+  } else if (relayHopsNegotiated_) {
+    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  }
+  if (length > 0) {
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   return ns;
@@ -4308,7 +4377,7 @@ bool includeSetupParam(uint64_t version, SetupKey key) {
   }
   return key == SetupKey::MAX_REQUEST_ID || key == SetupKey::PATH ||
       key == SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE ||
-      key == SetupKey::AUTHORIZATION_TOKEN;
+      key == SetupKey::AUTHORIZATION_TOKEN || key == SetupKey::RELAY_HOPS;
 }
 
 WriteResult writeSetup(
@@ -4825,8 +4894,8 @@ void MoQFrameWriter::writeV18ParamValue(
           folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
         // TRACK_FILTER (0x29) is a fork-local length-prefixed param; its value
         // lives in asTrackFilter, not asString. Mirror the draft-16 path in
-        // writeParamValue so the v18 wire form round-trips (see parseTrackFilter
-        // via parseV18ParamValue -> parseVariableParam).
+        // writeParamValue so the v18 wire form round-trips (see
+        // parseTrackFilter via parseV18ParamValue -> parseVariableParam).
         folly::IOBufQueue tmpBuf{folly::IOBufQueue::cacheChainLength()};
         size_t tmpSize = 0;
         writeTrackFilter(tmpBuf, param.asTrackFilter, tmpSize, error);
@@ -6248,6 +6317,9 @@ WriteResult MoQFrameWriter::writeNamespace(
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::NAMESPACE, error);
   writeTrackNamespace(writeBuf, ns.trackNamespaceSuffix, size, error);
+  if (relayHopsNegotiated_) {
+    writeTrackRequestParams(writeBuf, ns.params, {}, size, error);
+  }
   writeSize(sizePtr, size, error, *version_);
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);

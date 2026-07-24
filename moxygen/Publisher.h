@@ -87,8 +87,8 @@ class Publisher {
   virtual folly::coro::Task<SubscribeResult> subscribe(
       SubscribeRequest sub,
       std::shared_ptr<TrackConsumer> callback) {
-    return folly::coro::makeTask<SubscribeResult>(folly::makeUnexpected(
-        SubscribeError{
+    return folly::coro::makeTask<SubscribeResult>(
+        folly::makeUnexpected(SubscribeError{
             sub.requestID,
             SubscribeErrorCode::NOT_SUPPORTED,
             "unimplemented"}));
@@ -125,9 +125,8 @@ class Publisher {
   virtual folly::coro::Task<FetchResult> fetch(
       Fetch fetch,
       std::shared_ptr<FetchConsumer> fetchCallback) {
-    return folly::coro::makeTask<FetchResult>(folly::makeUnexpected(
-        FetchError{
-            fetch.requestID, FetchErrorCode::NOT_SUPPORTED, "unimplemented"}));
+    return folly::coro::makeTask<FetchResult>(folly::makeUnexpected(FetchError{
+        fetch.requestID, FetchErrorCode::NOT_SUPPORTED, "unimplemented"}));
   }
 
   // On successful SUBSCRIBE_NAMESPACE, a SubscribeNamespaceHandle is returned,
@@ -161,6 +160,10 @@ class Publisher {
    public:
     virtual ~NamespacePublishHandle() = default;
 
+    virtual void namespaceMsg(const Namespace& ns) {
+      namespaceMsg(ns.trackNamespaceSuffix);
+    }
+
     virtual void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) = 0;
 
     virtual void namespaceDoneMsg(
@@ -176,11 +179,10 @@ class Publisher {
       std::shared_ptr<NamespacePublishHandle>
           namespacePublishHandle /* draft 16+ */) {
     return folly::coro::makeTask<SubscribeNamespaceResult>(
-        folly::makeUnexpected(
-            SubscribeNamespaceError{
-                subAnn.requestID,
-                SubscribeNamespaceErrorCode::NOT_SUPPORTED,
-                "unimplemented"}));
+        folly::makeUnexpected(SubscribeNamespaceError{
+            subAnn.requestID,
+            SubscribeNamespaceErrorCode::NOT_SUPPORTED,
+            "unimplemented"}));
   }
 
   // On successful SUBSCRIBE_TRACKS, a SubscribeTracksHandle is returned, which
@@ -228,8 +230,8 @@ class Publisher {
       SubscribeTracks subTracks,
       std::shared_ptr<PublishBlockedHandle> /*publishBlockedHandle*/ =
           nullptr) {
-    return folly::coro::makeTask<SubscribeTracksResult>(folly::makeUnexpected(
-        SubscribeTracksError{
+    return folly::coro::makeTask<SubscribeTracksResult>(
+        folly::makeUnexpected(SubscribeTracksError{
             subTracks.requestID,
             SubscribeTracksErrorCode::NOT_SUPPORTED,
             "unimplemented"}));

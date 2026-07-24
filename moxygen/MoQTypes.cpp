@@ -8,6 +8,7 @@
 #include <moxygen/MoQVersions.h>
 
 #include <folly/Conv.h>
+#include <folly/Random.h>
 #include <folly/String.h>
 #include <folly/container/F14Map.h>
 #include <folly/container/F14Set.h>
@@ -94,6 +95,15 @@ const char* getObjectStatusString(moxygen::ObjectStatus objectStatus) {
 } // namespace
 
 namespace moxygen {
+
+uint64_t generateRelayHopID() {
+  uint64_t hopID = 0;
+  do {
+    folly::Random::secureRandom(&hopID, sizeof(hopID));
+    hopID &= kMaxRelayHopID;
+  } while (hopID == 0);
+  return hopID;
+}
 
 PublishDoneStatusCode tooFarBehindCode(uint64_t negotiatedVersion) {
   return getDraftMajorVersion(negotiatedVersion) <= 16
@@ -264,6 +274,13 @@ const folly::F14FastSet<FrameType> kAllowedFramesForTrackNamespacePrefix = {
 const folly::F14FastSet<FrameType> kAllowedFramesForTrackFilter = {
     FrameType::SUBSCRIBE_NAMESPACE};
 
+const folly::F14FastSet<FrameType> kAllowedFramesForHopPath = {
+    FrameType::PUBLISH_NAMESPACE,
+    FrameType::NAMESPACE};
+
+const folly::F14FastSet<FrameType> kAllowedFramesForExcludeHop = {
+    FrameType::SUBSCRIBE_NAMESPACE};
+
 // Allowlist mapping: TrackRequestParamKey -> set of allowed FrameTypes
 // Empty set means allowed for all frame types
 const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
@@ -289,6 +306,8 @@ const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
         {TrackRequestParamKey::TRACK_NAMESPACE_PREFIX,
          kAllowedFramesForTrackNamespacePrefix},
         {TrackRequestParamKey::TRACK_FILTER, kAllowedFramesForTrackFilter},
+        {TrackRequestParamKey::HOP_PATH, kAllowedFramesForHopPath},
+        {TrackRequestParamKey::EXCLUDE_HOP, kAllowedFramesForExcludeHop},
 };
 
 // Frame types that allow all parameters (no validation)

@@ -68,14 +68,14 @@ folly::coro::Task<void> MoQServerBase::handleClientSession(
 
 Setup MoQServerBase::makeServerSetup() {
   Setup setup;
-  setup.params.insertParam(
-      Parameter{
-          folly::to_underlying(SetupKey::MAX_REQUEST_ID),
-          kDefaultMaxRequestID});
-  setup.params.insertParam(
-      Parameter{
-          folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
-          kDefaultMaxAuthTokenCacheSize});
+  setup.params.insertParam(Parameter{
+      folly::to_underlying(SetupKey::MAX_REQUEST_ID), kDefaultMaxRequestID});
+  setup.params.insertParam(Parameter{
+      folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
+      kDefaultMaxAuthTokenCacheSize});
+  for (const auto& parameter : setupParameters_) {
+    setup.params.insertParam(parameter);
+  }
   return setup;
 }
 

@@ -38,6 +38,10 @@ class MoQCodec {
     moqFrameParser_.initializeVersion(version);
   }
 
+  void setRelayHopsNegotiated(bool negotiated) noexcept {
+    moqFrameParser_.setRelayHopsNegotiated(negotiated);
+  }
+
   void setMaxAuthTokenCacheSize(size_t size) {
     moqFrameParser_.setTokenCacheMaxSize(size);
   }

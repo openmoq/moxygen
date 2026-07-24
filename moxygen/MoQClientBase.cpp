@@ -7,9 +7,9 @@
 #include <fizz/protocol/CertificateVerifier.h>
 #include <folly/String.h>
 #include <folly/coro/Error.h>
+#include <moxygen/MoQClientBase.h>
 #include <quic/client/QuicClientTransport.h>
 #include <quic/common/address/QuicSocketAddressBridge.h>
-#include <moxygen/MoQClientBase.h>
 
 #include <utility>
 
@@ -183,6 +183,9 @@ Setup MoQClientBase::getClientSetup(const std::optional<std::string>& path) {
   clientSetup.params.insertParam(Parameter(
       folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
       kDefaultMaxAuthTokenCacheSize));
+  for (const auto& parameter : setupParameters_) {
+    clientSetup.params.insertParam(parameter);
+  }
 
   if (path) {
     clientSetup.params.insertParam(

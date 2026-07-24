@@ -8,12 +8,12 @@
 #include <folly/Chrono.h>
 #include <folly/coro/Collect.h>
 #include <folly/coro/FutureUtil.h>
-#include <quic/common/CircularDeque.h>
-#include <quic/priority/HTTPPriorityQueue.h>
 #include <moxygen/BidiStreamControl.h>
 #include <moxygen/MoQTrackProperties.h>
 #include <moxygen/ReplyContext.h>
 #include <moxygen/events/MoQDeliveryTimeoutManager.h>
+#include <quic/common/CircularDeque.h>
+#include <quic/priority/HTTPPriorityQueue.h>
 
 #include <folly/logging/xlog.h>
 
@@ -23,6 +23,13 @@
 namespace {
 using namespace moxygen;
 constexpr uint64_t kMaxSendTokenCacheSize(1024);
+
+bool containsSetupOption(const SetupParameters& params, SetupKey key) {
+  const auto value = folly::to_underlying(key);
+  return std::any_of(params.begin(), params.end(), [value](const auto& param) {
+    return param.key == value;
+  });
+}
 
 // Bit allocations for 32-bit order: sub=5, pub=8, group=14, subgroup=5
 constexpr uint32_t kSubPriBits = 5;
@@ -2190,10 +2197,8 @@ MoQSession::PendingRequestState::setError(
       // REQUEST_ERROR == SUBSCRIBE_ERROR (both are 5), so check type
       if (type_ == Type::REQUEST_UPDATE) {
         // This is a REQUEST_ERROR for a REQUEST_UPDATE
-        storage_.requestUpdate_.setValue(
-            folly::makeUnexpected(
-                RequestError{
-                    error.requestID, error.errorCode, error.reasonPhrase}));
+        storage_.requestUpdate_.setValue(folly::makeUnexpected(RequestError{
+            error.requestID, error.errorCode, error.reasonPhrase}));
         return type_;
       }
       auto ptr = tryGetSubscribeTrack();
@@ -2330,9 +2335,10 @@ void MoQSession::cleanup() {
     // For pending subscribe, delivers subscribeError
     // For established subscriptions or pending publish, delivers publishDone
     // which can erase from subTracks_.
-    sub->subscribeError({/*TrackReceiveState fills in subId*/ 0,
-                         SubscribeErrorCode::INTERNAL_ERROR,
-                         "session closed"});
+    sub->subscribeError(
+        {/*TrackReceiveState fills in subId*/ 0,
+         SubscribeErrorCode::INTERNAL_ERROR,
+         "session closed"});
   }
   subTracks_.clear();
   // We parse a publishDone after cleanup
@@ -2587,6 +2593,9 @@ folly::Expected<folly::Unit, quic::TransportErrorCode> MoQSession::sendSetup(
       folly::coro::makePromiseContract<Setup>();
 
   auto maxRequestID = getMaxRequestIDIfPresent(setup.params);
+  localRelayHopsAdvertised_ =
+      containsSetupOption(setup.params, SetupKey::RELAY_HOPS);
+  updateRelayHopsNegotiation();
 
   setup.params.insertParam(SetupParameter(
       {folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION),
@@ -2684,6 +2693,9 @@ folly::coro::Task<Setup> MoQSession::awaitPeerSetup() {
 void MoQSession::onServerSetup(Setup serverSetup) {
   XCHECK(dir_ == MoQControlCodec::Direction::CLIENT);
   XLOG(DBG1) << __func__ << " sess=" << this;
+  peerRelayHopsAdvertised_ =
+      containsSetupOption(serverSetup.params, SetupKey::RELAY_HOPS);
+  updateRelayHopsNegotiation();
 
   if (logger_) {
     logger_->logServerSetup(
@@ -2724,6 +2736,9 @@ void MoQSession::onServerSetup(Setup serverSetup) {
 void MoQSession::onClientSetup(Setup clientSetup) {
   XCHECK(dir_ == MoQControlCodec::Direction::SERVER);
   XLOG(DBG1) << __func__ << " sess=" << this;
+  peerRelayHopsAdvertised_ =
+      containsSetupOption(clientSetup.params, SetupKey::RELAY_HOPS);
+  updateRelayHopsNegotiation();
 
   if (logger_) {
     logger_->logClientSetup(
@@ -2833,6 +2848,7 @@ std::unique_ptr<MoQControlCodec> MoQSession::makeBidiCodec(
   auto codec = std::make_unique<MoQBidiStreamCodec>(
       callback, std::move(allowedFrames), requestID, okType);
   codec->initializeVersion(*negotiatedVersion_);
+  codec->setRelayHopsNegotiated(relayHopsNegotiated_);
   codec->setTokenCache(&receiveTokenCache_);
   codec->setResponseIDQueue(responseIDQueue);
   return codec;
@@ -3153,11 +3169,10 @@ MoQSession::resolveJoiningFetch(
     }
     XLOG(ERR) << "Auto joining FETCH found no match for ftn=" << fullTrackName
               << " sess=" << this;
-    return folly::makeUnexpected(
-        FetchError{
-            requestID,
-            FetchErrorCode::INTERNAL_ERROR,
-            "No matching subscribe for auto joining FETCH"});
+    return folly::makeUnexpected(FetchError{
+        requestID,
+        FetchErrorCode::INTERNAL_ERROR,
+        "No matching subscribe for auto joining FETCH"});
   }
 
   std::shared_ptr<SubscribeTrackReceiveState> state;
@@ -3181,9 +3196,8 @@ MoQSession::resolveJoiningFetch(
   if (fullTrackName != state->fullTrackName()) {
     XLOG(ERR) << "API error, track name mismatch=" << fullTrackName << ","
               << state->fullTrackName() << " sess=" << this;
-    return folly::makeUnexpected(
-        FetchError{
-            requestID, FetchErrorCode::INTERNAL_ERROR, "Track name mismatch"});
+    return folly::makeUnexpected(FetchError{
+        requestID, FetchErrorCode::INTERNAL_ERROR, "Track name mismatch"});
   }
   return state;
 }
@@ -3702,8 +3716,8 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
     // First iteration may use initialBufferedData; subsequent iterations
     // read from the stream
     if (!(streamData.data || streamData.fin)) {
-      auto streamDataTry = co_await co_awaitTry(
-          folly::coro::co_withCancellation(
+      auto streamDataTry =
+          co_await co_awaitTry(folly::coro::co_withCancellation(
               token, readHandle->readStreamData().via(exec_.get())));
       if (streamDataTry.hasException()) {
         XLOG(ERR) << folly::exceptionStr(streamDataTry.exception())
@@ -4381,20 +4395,18 @@ class MoQSession::ReceiverSubscriptionHandle
   folly::coro::Task<SubscriptionHandle::RequestUpdateResult> requestUpdate(
       RequestUpdate requestUpdate) override {
     if (!session_) {
-      co_return folly::makeUnexpected(
-          RequestError{
-              requestUpdate.requestID,
-              RequestErrorCode::INTERNAL_ERROR,
-              "Session closed"});
+      co_return folly::makeUnexpected(RequestError{
+          requestUpdate.requestID,
+          RequestErrorCode::INTERNAL_ERROR,
+          "Session closed"});
     }
 
     requestUpdate.existingRequestID = subscribeOk_->requestID;
     if (session_->shouldFailNewLocalRequestDueToGoaway()) {
-      co_return folly::makeUnexpected(
-          RequestError{
-              session_->peekNextRequestID(),
-              RequestErrorCode::GOING_AWAY,
-              "Session received GOAWAY"});
+      co_return folly::makeUnexpected(RequestError{
+          session_->peekNextRequestID(),
+          RequestErrorCode::GOING_AWAY,
+          "Session received GOAWAY"});
     }
     if (getDraftMajorVersion(*(session_->getNegotiatedVersion())) >= 14) {
       requestUpdate.requestID = session_->getNextRequestID();
@@ -5138,18 +5150,16 @@ folly::coro::Task<MoQSession::TrackStatusResult> MoQSession::trackStatus(
       // Peer close (FIN or RST) before sending a reply: synthesize
       // TRACK_STATUS_ERROR. (sender control finIsCancellation=true.)
       [this](RequestID id) {
-        onTrackStatusError(
-            TrackStatusError{
-                id,
-                TrackStatusErrorCode::CANCELLED,
-                "peer closed stream before reply"});
+        onTrackStatusError(TrackStatusError{
+            id,
+            TrackStatusErrorCode::CANCELLED,
+            "peer closed stream before reply"});
       });
   if (sendResult.hasError()) {
-    co_return folly::makeUnexpected(
-        TrackStatusError{
-            reqID,
-            TrackStatusErrorCode::INTERNAL_ERROR,
-            std::move(sendResult.error().reasonPhrase)});
+    co_return folly::makeUnexpected(TrackStatusError{
+        reqID,
+        TrackStatusErrorCode::INTERNAL_ERROR,
+        std::move(sendResult.error().reasonPhrase)});
   }
   auto control = std::move(sendResult.value());
   // No REQUEST_UPDATE channel for TRACK_STATUS — FIN now.
@@ -5310,29 +5320,26 @@ Subscriber::PublishResult MoQSession::publish(
   if (draining_ || closed_) {
     XLOG(DBG1) << "Rejecting publish request, session draining/closed sess="
                << this;
-    return folly::makeUnexpected(
-        PublishError{
-            pub.requestID,
-            PublishErrorCode::INTERNAL_ERROR,
-            "draining/closed session"});
+    return folly::makeUnexpected(PublishError{
+        pub.requestID,
+        PublishErrorCode::INTERNAL_ERROR,
+        "draining/closed session"});
   }
   if (shouldFailNewLocalRequestDueToGoaway()) {
     XLOG(DBG1) << "Rejecting publish request, received GOAWAY sess=" << this;
-    return folly::makeUnexpected(
-        PublishError{
-            peekNextRequestID(),
-            PublishErrorCode::GOING_AWAY,
-            "Session received GOAWAY"});
+    return folly::makeUnexpected(PublishError{
+        peekNextRequestID(),
+        PublishErrorCode::GOING_AWAY,
+        "Session received GOAWAY"});
   }
 
   if (!handle) {
     XLOG(DBG1) << "Rejecting publish request, no subscription handle sess="
                << this;
-    return folly::makeUnexpected(
-        PublishError{
-            pub.requestID,
-            PublishErrorCode::INTERNAL_ERROR,
-            "No subscription handle"});
+    return folly::makeUnexpected(PublishError{
+        pub.requestID,
+        PublishErrorCode::INTERNAL_ERROR,
+        "No subscription handle"});
   }
 
   auto publishStartTime = std::chrono::steady_clock::now();
@@ -5384,14 +5391,13 @@ Subscriber::PublishResult MoQSession::publish(
       });
   if (sendResult.hasError()) {
     auto sendError = std::move(sendResult.error());
-    return folly::makeUnexpected(
-        PublishError{
-            pub.requestID,
-            PublishErrorCode::INTERNAL_ERROR,
-            std::move(sendError.reasonPhrase),
-            std::nullopt,
-            std::nullopt,
-            std::move(sendError.webTransportError)});
+    return folly::makeUnexpected(PublishError{
+        pub.requestID,
+        PublishErrorCode::INTERNAL_ERROR,
+        std::move(sendError.reasonPhrase),
+        std::nullopt,
+        std::nullopt,
+        std::move(sendError.webTransportError)});
   }
   if (logger_) {
     logger_->logPublish(
@@ -5951,11 +5957,10 @@ class MoQSession::ReceiverFetchHandle : public Publisher::FetchHandle {
 
   folly::coro::Task<FetchHandle::RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) override {
-    co_return folly::makeUnexpected(
-        RequestError{
-            reqUpdate.requestID,
-            RequestErrorCode::NOT_SUPPORTED,
-            "REQUEST_UPDATE not supported for FETCH"});
+    co_return folly::makeUnexpected(RequestError{
+        reqUpdate.requestID,
+        RequestErrorCode::NOT_SUPPORTED,
+        "REQUEST_UPDATE not supported for FETCH"});
   }
 
   void fetchCancel() override {
@@ -6242,10 +6247,9 @@ folly::coro::Task<void> MoQSession::handlePreSetupUniStream(
   bool fin = false;
 
   do {
-    auto streamData = co_await co_awaitTry(
-        folly::coro::co_withCancellation(
-            cancellationSource_.getToken(),
-            readHandle->readStreamData().via(exec_.get())));
+    auto streamData = co_await co_awaitTry(folly::coro::co_withCancellation(
+        cancellationSource_.getToken(),
+        readHandle->readStreamData().via(exec_.get())));
     if (!streamData.hasValue()) {
       break;
     }
@@ -6411,9 +6415,8 @@ folly::coro::Task<void> MoQSession::bidiStreamDemuxer(
   bool fin = false;
 
   do {
-    auto streamData = co_await co_awaitTry(
-        folly::coro::co_withCancellation(
-            token, readHandle->readStreamData().via(exec_.get())));
+    auto streamData = co_await co_awaitTry(folly::coro::co_withCancellation(
+        token, readHandle->readStreamData().via(exec_.get())));
     if (!streamData.hasValue()) {
       break;
     }
@@ -6678,6 +6681,16 @@ void MoQSession::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
   if (logger_) {
     logger_->setNegotiatedMoQVersion(negotiatedVersion);
   }
+}
+
+void MoQSession::updateRelayHopsNegotiation() noexcept {
+  if (relayHopsNegotiated_ ||
+      !(localRelayHopsAdvertised_ && peerRelayHopsAdvertised_)) {
+    return;
+  }
+  relayHopsNegotiated_ = true;
+  moqFrameWriter_.setRelayHopsNegotiated(true);
+  controlCodec_->setRelayHopsNegotiated(true);
 }
 
 /*static*/
