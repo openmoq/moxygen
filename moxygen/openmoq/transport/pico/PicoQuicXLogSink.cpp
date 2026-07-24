@@ -20,6 +20,15 @@ extern "C" {
 #include "picoquic_unified_log.h"
 }
 
+// Force every XLOG() in this translation unit to the "quic.picoquic" category,
+// overriding the file-path-derived default (openmoq.transport.pico.*). This is
+// the semantic root operators target (`--logging=quic.picoquic=DBG3`), and it
+// keeps picoquic independent of the build-side prefix-maps: unlike the C++ deps,
+// this bridge names its category explicitly rather than deriving it from
+// __FILE__. Must stay at global scope (the macro reopens namespace folly),
+// exactly once per TU.
+XLOG_SET_CATEGORY_NAME("quic.picoquic")
+
 namespace moxygen::openmoq::pico {
 namespace {
 
