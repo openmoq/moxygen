@@ -2688,6 +2688,11 @@ folly::Expected<folly::Unit, quic::TransportErrorCode> MoQSession::sendSetup(
       folly::coro::makePromiseContract<Setup>();
 
   auto maxRequestID = getMaxRequestIDIfPresent(setup.params);
+  localSetupOptions_.clear();
+  for (const auto& param : setup.params) {
+    localSetupOptions_.insert(param.key);
+  }
+  updateNegotiatedExtensions();
 
   setup.params.insertParam(SetupParameter(
       {folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION),
@@ -2785,6 +2790,11 @@ folly::coro::Task<Setup> MoQSession::awaitPeerSetup() {
 void MoQSession::onServerSetup(Setup serverSetup) {
   XCHECK(dir_ == MoQControlCodec::Direction::CLIENT);
   XLOG(DBG1) << __func__ << " sess=" << this;
+  peerSetupOptions_.clear();
+  for (const auto& param : serverSetup.params) {
+    peerSetupOptions_.insert(param.key);
+  }
+  updateNegotiatedExtensions();
 
   if (logger_) {
     logger_->logServerSetup(
@@ -2825,6 +2835,11 @@ void MoQSession::onServerSetup(Setup serverSetup) {
 void MoQSession::onClientSetup(Setup clientSetup) {
   XCHECK(dir_ == MoQControlCodec::Direction::SERVER);
   XLOG(DBG1) << __func__ << " sess=" << this;
+  peerSetupOptions_.clear();
+  for (const auto& param : clientSetup.params) {
+    peerSetupOptions_.insert(param.key);
+  }
+  updateNegotiatedExtensions();
 
   if (logger_) {
     logger_->logClientSetup(
@@ -2934,6 +2949,7 @@ std::unique_ptr<MoQControlCodec> MoQSession::makeBidiCodec(
   auto codec = std::make_unique<MoQBidiStreamCodec>(
       callback, std::move(allowedFrames), requestID, okType);
   codec->initializeVersion(*negotiatedVersion_);
+  codec->setRelayHopsNegotiated(isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
   codec->setTokenCache(&receiveTokenCache_);
   codec->setResponseIDQueue(responseIDQueue);
   return codec;
@@ -6795,6 +6811,13 @@ void MoQSession::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
   if (logger_) {
     logger_->setNegotiatedMoQVersion(negotiatedVersion);
   }
+}
+
+void MoQSession::updateNegotiatedExtensions() noexcept {
+  const auto relayHopsNegotiated =
+      isSetupOptionNegotiated(SetupKey::RELAY_HOPS);
+  moqFrameWriter_.setRelayHopsNegotiated(relayHopsNegotiated);
+  controlCodec_->setRelayHopsNegotiated(relayHopsNegotiated);
 }
 
 /*static*/

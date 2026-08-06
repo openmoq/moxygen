@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace moxygen {
 
@@ -67,6 +68,10 @@ class MoQServerBase : public MoQSession::ServerSetupCallback,
    */
   void setMLoggerFactory(std::shared_ptr<MLoggerFactory> factory);
 
+  void addSetupParameter(SetupParameter parameter) {
+    setupParameters_.push_back(std::move(parameter));
+  }
+
   // ServerSetupCallback overrides
   folly::Try<Setup> onClientSetup(
       Setup clientSetup,
@@ -104,6 +109,7 @@ class MoQServerBase : public MoQSession::ServerSetupCallback,
 
   std::unordered_set<std::string> endpoints_;
   std::shared_ptr<MLoggerFactory> mLoggerFactory_;
+  std::vector<SetupParameter> setupParameters_;
 };
 
 } // namespace moxygen

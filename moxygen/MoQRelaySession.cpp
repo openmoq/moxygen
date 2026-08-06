@@ -1341,7 +1341,7 @@ class SubNsStreamCallback : public MoQControlCodec::ControlCallback {
   }
 
   void onNamespace(Namespace ns) override {
-    namespacePublishHandle_->namespaceMsg(ns.trackNamespaceSuffix);
+    namespacePublishHandle_->namespaceMsg(ns);
   }
 
   void onNamespaceDone(NamespaceDone namespaceDone) override {
@@ -1543,14 +1543,18 @@ class MoQNamespacePublishHandle : public Publisher::NamespacePublishHandle {
     moqFrameWriter_.initializeVersion(negotiatedVersion);
   }
 
-  void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) override {
-    Namespace ns;
-    ns.trackNamespaceSuffix = trackNamespaceSuffix;
+  void namespaceMsg(const Namespace& ns) override {
     auto writeResult = subNsReply_->namespaceMsg(ns);
     if (!writeResult) {
       XLOG(ERR) << "writeNamespace failed";
       return;
     }
+  }
+
+  void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) override {
+    Namespace ns;
+    ns.trackNamespaceSuffix = trackNamespaceSuffix;
+    namespaceMsg(ns);
   }
 
   void namespaceDoneMsg(const TrackNamespace& trackNamespaceSuffix) override {

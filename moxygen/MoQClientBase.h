@@ -20,6 +20,7 @@
 #include <moxygen/mlog/MLogger.h>
 #include <functional>
 #include <memory>
+#include <vector>
 
 namespace moxygen {
 
@@ -129,6 +130,10 @@ class MoQClientBase {
     earlyDataHandler_ = handler;
   }
 
+  void addSetupParameter(SetupParameter parameter) {
+    setupParameters_.push_back(std::move(parameter));
+  }
+
   void goaway(const Goaway& goaway);
   std::shared_ptr<MLogger> logger_ = nullptr;
 
@@ -164,6 +169,7 @@ class MoQClientBase {
   bool useQuicWtSession_{false};
   std::chrono::milliseconds transportConnectTime_{0};
   std::chrono::milliseconds moqHandshakeTime_{0};
+  std::vector<SetupParameter> setupParameters_;
 
   const quic::QuicSocket* getQuicSocket() const {
     return quicSocket_.lock().get();

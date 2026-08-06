@@ -46,6 +46,44 @@ TEST_P(MoQVersionNegotiationTest, Setup) {
   folly::coro::blockingWait(setupMoQSession(), getExecutor());
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+
+using RelayHopsNegotiationTest = MoQSessionTest;
+
+INSTANTIATE_TEST_SUITE_P(
+    RelayHopsNegotiationTest,
+    RelayHopsNegotiationTest,
+    testing::Values(
+        VersionParams{{kVersionDraft16}, kVersionDraft16},
+        VersionParams{{kVersionDraft17}, kVersionDraft17},
+        VersionParams{{kVersionDraft18}, kVersionDraft18}));
+
+CO_TEST_P_X(RelayHopsNegotiationTest, NegotiatesWhenBothPeersAdvertise) {
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  EXPECT_TRUE(clientSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+  EXPECT_TRUE(serverSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+}
+
+CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWithoutAdvertisement) {
+  co_await setupMoQSession();
+  EXPECT_FALSE(clientSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+  EXPECT_FALSE(serverSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+}
+
+CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWhenOnlyServerAdvertises) {
+  serverRelayHopsSupported_ = true;
+  co_await setupMoQSession();
+  EXPECT_FALSE(clientSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+  EXPECT_FALSE(serverSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+}
+
+CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWhenOnlyClientAdvertises) {
+  clientRelayHopsSupported_ = true;
+  co_await setupMoQSession();
+  EXPECT_FALSE(clientSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+  EXPECT_FALSE(serverSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+}
+
 using CurrentVersionOnly = MoQSessionTest;
 
 CO_TEST_P_X(CurrentVersionOnly, SetupTimeout) {

@@ -75,6 +75,12 @@ class MockMoQSession : public MoQSession {
       (const, override));
 
   MOCK_METHOD(
+      bool,
+      isSetupOptionNegotiated,
+      (SetupKey),
+      (const, noexcept, override));
+
+  MOCK_METHOD(
       folly::coro::Task<Publisher::TrackStatusResult>,
       trackStatus,
       (TrackStatus),

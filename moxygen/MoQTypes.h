@@ -307,7 +307,8 @@ enum class SetupKey : uint64_t {
   AUTHORIZATION_TOKEN = 3,
   MAX_AUTH_TOKEN_CACHE_SIZE = 4,
   AUTHORITY = 5,
-  MOQT_IMPLEMENTATION = 7
+  MOQT_IMPLEMENTATION = 7,
+  RELAY_HOPS = 0x40B55,
 };
 
 constexpr uint64_t kDefaultMaxRequestID = 100;
@@ -603,6 +604,8 @@ enum class TrackRequestParamKey : uint64_t {
   TRACK_FILTER = 0x29,
   NEW_GROUP_REQUEST = 0x32,
   TRACK_NAMESPACE_PREFIX = 0x34,
+  HOP_PATH = 0x40B57,
+  EXCLUDE_HOP = 0x40B58,
 };
 
 inline bool isRendezvousTimeoutParam(uint64_t key, uint64_t majorVersion) {
@@ -638,6 +641,15 @@ class Parameters {
 
   const Parameter& at(size_t position) const {
     return params_.at(position);
+  }
+
+  const Parameter* getFirstParam(TrackRequestParamKey key) const {
+    const auto targetKey = folly::to_underlying(key);
+    auto it = std::find_if(
+        params_.begin(), params_.end(), [targetKey](const Parameter& param) {
+          return param.key == targetKey;
+        });
+    return it == params_.end() ? nullptr : &*it;
   }
 
   folly::Expected<folly::Unit, ErrorCode> insertParam(Parameter&& param) {
@@ -1392,6 +1404,7 @@ struct NamespaceDone {
 // Only used in draft-16 and above
 struct Namespace {
   TrackNamespace trackNamespaceSuffix;
+  TrackRequestParameters params{FrameType::NAMESPACE};
 };
 
 // SubscribeNamespaceError is now an alias for RequestError - see below
