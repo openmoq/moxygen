@@ -8,7 +8,6 @@
 #include <moxygen/MoQVersions.h>
 
 #include <folly/Conv.h>
-#include <folly/Random.h>
 #include <folly/String.h>
 #include <folly/container/F14Map.h>
 #include <folly/container/F14Set.h>
@@ -95,15 +94,6 @@ const char* getObjectStatusString(moxygen::ObjectStatus objectStatus) {
 } // namespace
 
 namespace moxygen {
-
-uint64_t generateRelayHopID() {
-  uint64_t hopID = 0;
-  do {
-    folly::Random::secureRandom(&hopID, sizeof(hopID));
-    hopID &= kMaxRelayHopID;
-  } while (hopID == 0);
-  return hopID;
-}
 
 PublishDoneStatusCode tooFarBehindCode(uint64_t negotiatedVersion) {
   return getDraftMajorVersion(negotiatedVersion) <= 16

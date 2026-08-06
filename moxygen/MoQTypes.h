@@ -313,9 +313,6 @@ enum class SetupKey : uint64_t {
 
 constexpr uint64_t kDefaultMaxRequestID = 100;
 constexpr uint64_t kDefaultMaxAuthTokenCacheSize = 1024;
-constexpr uint64_t kMaxRelayHopID = (uint64_t{1} << 62) - 1;
-
-uint64_t generateRelayHopID();
 
 enum class AliasType : uint8_t {
   DELETE_ALIAS = 0x0,
@@ -500,8 +497,7 @@ struct TrackFilter {
   TrackFilter(uint64_t pt, uint64_t ms) : propertyType(pt), maxSelected(ms) {}
 
   bool operator==(const TrackFilter& other) const {
-    return propertyType == other.propertyType &&
-        maxSelected == other.maxSelected;
+    return propertyType == other.propertyType && maxSelected == other.maxSelected;
   }
 };
 
@@ -645,6 +641,15 @@ class Parameters {
 
   const Parameter& at(size_t position) const {
     return params_.at(position);
+  }
+
+  const Parameter* getFirstParam(TrackRequestParamKey key) const {
+    const auto targetKey = folly::to_underlying(key);
+    auto it = std::find_if(
+        params_.begin(), params_.end(), [targetKey](const Parameter& param) {
+          return param.key == targetKey;
+        });
+    return it == params_.end() ? nullptr : &*it;
   }
 
   folly::Expected<folly::Unit, ErrorCode> insertParam(Parameter&& param) {

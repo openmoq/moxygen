@@ -796,10 +796,11 @@ TEST_P(MoQFramerTest, parseFixedString) {
   // Encode a QuicInteger onto the buffer
   auto quicIntegerSize = quic::getQuicIntegerSize(s.length());
   folly::io::QueueAppender appender(&writeBuf, *quicIntegerSize);
-  CHECK(quic::encodeQuicInteger(
-      s.length(), [appender = std::move(appender)](auto val) mutable {
-        appender.writeBE(folly::tag<decltype(val)>, val);
-      }));
+  CHECK(
+      quic::encodeQuicInteger(
+          s.length(), [appender = std::move(appender)](auto val) mutable {
+            appender.writeBE(folly::tag<decltype(val)>, val);
+          }));
 
   // Write a blob of bytes to buffer
   writeBuf.append(s.data(), s.length());
@@ -4431,8 +4432,9 @@ TEST_P(MoQFramerV16PlusTest, ParseEndOfUnknownRange) {
       cursor, cursor.totalLength(), headerTemplate);
 
   EXPECT_TRUE(parseResult.hasValue());
-  ASSERT_TRUE(std::holds_alternative<MoQFrameParser::EndOfRangeMarker>(
-      parseResult->value));
+  ASSERT_TRUE(
+      std::holds_alternative<MoQFrameParser::EndOfRangeMarker>(
+          parseResult->value));
   auto& marker = std::get<MoQFrameParser::EndOfRangeMarker>(parseResult->value);
   EXPECT_EQ(marker.groupId, 5);
   EXPECT_EQ(marker.objectId, 10);
@@ -4473,8 +4475,9 @@ TEST_P(MoQFramerV16PlusTest, ParseEndOfNonExistentRange) {
       cursor, cursor.totalLength(), headerTemplate);
 
   EXPECT_TRUE(parseResult.hasValue());
-  ASSERT_TRUE(std::holds_alternative<MoQFrameParser::EndOfRangeMarker>(
-      parseResult->value));
+  ASSERT_TRUE(
+      std::holds_alternative<MoQFrameParser::EndOfRangeMarker>(
+          parseResult->value));
   auto& marker = std::get<MoQFrameParser::EndOfRangeMarker>(parseResult->value);
   EXPECT_EQ(marker.groupId, 3);
   EXPECT_EQ(marker.objectId, 7);
@@ -4750,8 +4753,7 @@ TEST_P(MoQFramerV16PlusTest, SubscribeNamespaceWithTrackFilter) {
       subscribeNamespace.trackNamespacePrefix);
   EXPECT_EQ(parseResult->forward, subscribeNamespace.forward);
   // Draft 18 dropped the Subscribe Options field from the wire; the parser
-  // restores the NAMESPACE default. Pre-18 carries the PUBLISH option set
-  // above.
+  // restores the NAMESPACE default. Pre-18 carries the PUBLISH option set above.
   EXPECT_EQ(
       parseResult->options,
       majorVersion >= 18 ? SubscribeNamespaceOptions::NAMESPACE
@@ -4761,8 +4763,7 @@ TEST_P(MoQFramerV16PlusTest, SubscribeNamespaceWithTrackFilter) {
   ASSERT_EQ(parseResult->params.size(), 1);
   auto& parsedParam = parseResult->params.at(0);
   EXPECT_EQ(
-      parsedParam.key,
-      folly::to_underlying(TrackRequestParamKey::TRACK_FILTER));
+      parsedParam.key, folly::to_underlying(TrackRequestParamKey::TRACK_FILTER));
   EXPECT_EQ(parsedParam.asTrackFilter.propertyType, 0x10);
   EXPECT_EQ(parsedParam.asTrackFilter.maxSelected, 5);
 }
@@ -5604,8 +5605,9 @@ TEST_F(MoQFramerV18Test, FetchEndOfRangeSetsPriorGroupAndObject) {
   auto markerResult = parser_.parseFetchObjectHeader(
       cursor, cursor.totalLength(), headerTemplate);
   ASSERT_TRUE(markerResult.hasValue());
-  ASSERT_TRUE(std::holds_alternative<MoQFrameParser::EndOfRangeMarker>(
-      markerResult->value));
+  ASSERT_TRUE(
+      std::holds_alternative<MoQFrameParser::EndOfRangeMarker>(
+          markerResult->value));
   const auto& marker =
       std::get<MoQFrameParser::EndOfRangeMarker>(markerResult->value);
   EXPECT_EQ(marker.groupId, 5);
@@ -6011,6 +6013,25 @@ TEST(MoQFramerV16DeathTest, PublishNamespaceCancelWithoutRequestIDDies) {
 // Tests for Parameters::isParamAllowed()
 class ParametersIsParamAllowedTest : public ::testing::Test {};
 
+TEST_F(ParametersIsParamAllowedTest, FindsFirstParameterByKey) {
+  Parameters params(FrameType::PUBLISH_NAMESPACE);
+  ASSERT_TRUE(
+      params
+          .insertParam(Parameter(
+              folly::to_underlying(TrackRequestParamKey::HOP_PATH), "first"))
+          .hasValue());
+  ASSERT_TRUE(
+      params
+          .insertParam(Parameter(
+              folly::to_underlying(TrackRequestParamKey::HOP_PATH), "second"))
+          .hasValue());
+
+  const auto* found = params.getFirstParam(TrackRequestParamKey::HOP_PATH);
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found->asString, "first");
+  EXPECT_EQ(params.getFirstParam(TrackRequestParamKey::EXCLUDE_HOP), nullptr);
+}
+
 TEST_F(ParametersIsParamAllowedTest, ParamAllowedForFrameType) {
   Parameters params(FrameType::SUBSCRIBE);
   EXPECT_TRUE(params.isParamAllowed(TrackRequestParamKey::DELIVERY_TIMEOUT));
@@ -6024,9 +6045,7 @@ TEST_F(ParametersIsParamAllowedTest, ParamNotAllowedForFrameType) {
   EXPECT_FALSE(params.isParamAllowed(TrackRequestParamKey::EXPIRES));
 }
 
-TEST_F(
-    ParametersIsParamAllowedTest,
-    TrackFilterAllowedOnlyForSubscribeNamespace) {
+TEST_F(ParametersIsParamAllowedTest, TrackFilterAllowedOnlyForSubscribeNamespace) {
   // TRACK_FILTER should only be allowed for SUBSCRIBE_NAMESPACE
   Parameters paramsSubNs(FrameType::SUBSCRIBE_NAMESPACE);
   EXPECT_TRUE(paramsSubNs.isParamAllowed(TrackRequestParamKey::TRACK_FILTER));

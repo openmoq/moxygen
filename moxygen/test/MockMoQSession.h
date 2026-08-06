@@ -74,9 +74,11 @@ class MockMoQSession : public MoQSession {
       (),
       (const, override));
 
-  MOCK_METHOD(bool, isRelayHopsNegotiated, (), (const, noexcept, override));
-
-  MOCK_METHOD(uint64_t, getRelayHopSourceID, (), (const, noexcept, override));
+  MOCK_METHOD(
+      bool,
+      isSetupOptionNegotiated,
+      (SetupKey),
+      (const, noexcept, override));
 
   MOCK_METHOD(
       folly::coro::Task<Publisher::TrackStatusResult>,

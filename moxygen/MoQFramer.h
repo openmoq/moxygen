@@ -542,6 +542,7 @@ class MoQFrameParser {
 
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
+  // draft-lcurley-moq-relay-hops Section 3 extends negotiated NAMESPACE frames.
   bool relayHopsNegotiated_{false};
   MoQTokenCache* tokenCache_{nullptr};
   mutable std::optional<uint64_t> previousObjectID_;
@@ -941,6 +942,7 @@ class MoQFrameWriter {
 
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
+  // draft-lcurley-moq-relay-hops Section 3 extends negotiated NAMESPACE frames.
   bool relayHopsNegotiated_{false};
   mutable std::optional<uint64_t> previousObjectID_;
   // Context for FETCH object delta encoding (draft-15+)

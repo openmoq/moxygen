@@ -127,8 +127,9 @@ void expectSubscribeUpdate(
       .WillOnce(
           testing::Invoke([&baton](const RequestUpdate&) { baton.post(); }));
   EXPECT_CALL(*mockHandle, requestUpdateResult)
-      .WillOnce(testing::Return(
-          folly::Expected<RequestOk, RequestError>(RequestOk{})));
+      .WillOnce(
+          testing::Return(
+              folly::Expected<RequestOk, RequestError>(RequestOk{})));
 }
 
 // ParamBuilder implementation
@@ -202,8 +203,9 @@ void MoQSessionTest::SetUp() {
 
   // Set default behavior for setTrackAlias to return success
   ON_CALL(*subscribeCallback_, setTrackAlias(_))
-      .WillByDefault(testing::Return(
-          folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
+      .WillByDefault(
+          testing::Return(
+              folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
   EXPECT_CALL(*subscribeCallback_, setTrackAlias(_)).Times(testing::AtLeast(0));
 
   clientSubscriberStatsCallback_ =
@@ -332,11 +334,14 @@ folly::Try<moxygen::Setup> MoQSessionTest::onClientSetup(
   }
   return folly::Try<moxygen::Setup>([&]() {
     moxygen::Setup ss;
-    ss.params.insertParam(SetupParameter{
-        folly::to_underlying(SetupKey::MAX_REQUEST_ID), initialMaxRequestID_});
+    ss.params.insertParam(
+        SetupParameter{
+            folly::to_underlying(SetupKey::MAX_REQUEST_ID),
+            initialMaxRequestID_});
     if (!useBidiRequestStreams(getServerSelectedVersion())) {
-      ss.params.insertParam(SetupParameter{
-          folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
+      ss.params.insertParam(
+          SetupParameter{
+              folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
     }
     if (relayHopsSupported_ || serverRelayHopsSupported_) {
       ss.params.insertParam(SetupParameter{
@@ -359,8 +364,10 @@ folly::coro::Task<void> MoQSessionTest::setupMoQSession() {
     // Draft 18+: server proactively sends SERVER_SETUP on its uni stream.
     // Auth token aliasing is disabled in this mode, so skip the cache size.
     moxygen::Setup serverSetupMsg;
-    serverSetupMsg.params.insertParam(SetupParameter{
-        folly::to_underlying(SetupKey::MAX_REQUEST_ID), initialMaxRequestID_});
+    serverSetupMsg.params.insertParam(
+        SetupParameter{
+            folly::to_underlying(SetupKey::MAX_REQUEST_ID),
+            initialMaxRequestID_});
     if (relayHopsSupported_ || serverRelayHopsSupported_) {
       serverSetupMsg.params.insertParam(SetupParameter{
           folly::to_underlying(SetupKey::RELAY_HOPS), std::string{}});
@@ -412,8 +419,9 @@ folly::coro::Task<void> MoQSessionTest::setupMoQSessionForPublish(
     // Draft 18+: server proactively sends SERVER_SETUP on its uni stream.
     // Auth token aliasing is disabled in this mode, so skip the cache size.
     moxygen::Setup serverSetupMsg;
-    serverSetupMsg.params.insertParam(SetupParameter{
-        folly::to_underlying(SetupKey::MAX_REQUEST_ID), maxRequestID});
+    serverSetupMsg.params.insertParam(
+        SetupParameter{
+            folly::to_underlying(SetupKey::MAX_REQUEST_ID), maxRequestID});
     serverSession_->sendSetup(std::move(serverSetupMsg));
   }
 
@@ -616,10 +624,12 @@ moxygen::Setup MoQSessionTest::getClientSetup(uint64_t initialMaxRequestID) {
   moxygen::Setup setup;
   setup.params.insertParam(
       SetupParameter{folly::to_underlying(SetupKey::PATH), "/foo"});
-  setup.params.insertParam(SetupParameter{
-      folly::to_underlying(SetupKey::MAX_REQUEST_ID), initialMaxRequestID});
-  setup.params.insertParam(SetupParameter{
-      folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
+  setup.params.insertParam(
+      SetupParameter{
+          folly::to_underlying(SetupKey::MAX_REQUEST_ID), initialMaxRequestID});
+  setup.params.insertParam(
+      SetupParameter{
+          folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
   if (relayHopsSupported_ || clientRelayHopsSupported_) {
     setup.params.insertParam(SetupParameter{
         folly::to_underlying(SetupKey::RELAY_HOPS), std::string{}});

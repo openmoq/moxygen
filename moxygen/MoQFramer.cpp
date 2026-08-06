@@ -530,18 +530,13 @@ folly::Expected<std::string, ErrorCode> encodeRelayHopPath(
   }
 
   folly::IOBufQueue encoded{folly::IOBufQueue::cacheChainLength()};
-  folly::io::QueueAppender appender(&encoded, kMaxFrameHeaderSize);
+  MoQFrameWriter writer;
+  writer.initializeVersion(version);
+  size_t size = 0;
+  bool error = false;
   for (const auto hop : hopPath) {
-    if (getDraftMajorVersion(version) >= 17) {
-      if (encodeMoQVarint(hop, appender).hasError()) {
-        return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-      }
-      continue;
-    }
-    auto appenderOp = [&appender](auto value) mutable {
-      appender.writeBE(folly::tag<decltype(value)>, value);
-    };
-    if (quic::encodeQuicInteger(hop, appenderOp).hasError()) {
+    writer.writeVarint(encoded, hop, size, error);
+    if (error) {
       return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
   }
@@ -1945,7 +1940,8 @@ std::optional<SubscriptionFilter> MoQFrameParser::extractSubscriptionFilter(
 std::optional<TrackFilter> MoQFrameParser::extractTrackFilter(
     const std::vector<Parameter>& requestSpecificParams) const noexcept {
   for (const auto& param : requestSpecificParams) {
-    if (param.key == folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
+    if (param.key ==
+        folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
       return param.asTrackFilter;
     }
   }
@@ -4894,8 +4890,8 @@ void MoQFrameWriter::writeV18ParamValue(
           folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
         // TRACK_FILTER (0x29) is a fork-local length-prefixed param; its value
         // lives in asTrackFilter, not asString. Mirror the draft-16 path in
-        // writeParamValue so the v18 wire form round-trips (see
-        // parseTrackFilter via parseV18ParamValue -> parseVariableParam).
+        // writeParamValue so the v18 wire form round-trips (see parseTrackFilter
+        // via parseV18ParamValue -> parseVariableParam).
         folly::IOBufQueue tmpBuf{folly::IOBufQueue::cacheChainLength()};
         size_t tmpSize = 0;
         writeTrackFilter(tmpBuf, param.asTrackFilter, tmpSize, error);

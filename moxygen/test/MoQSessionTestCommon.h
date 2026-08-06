@@ -14,17 +14,17 @@
 #include <folly/logging/xlog.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
+#include <proxygen/lib/http/webtransport/test/FakeSharedWebTransport.h>
 #include <moxygen/MoQClient.h>
 #include <moxygen/MoQClientBase.h>
 #include <moxygen/relay/MoQRelayClient.h>
-#include <proxygen/lib/http/webtransport/test/FakeSharedWebTransport.h>
 #include "moxygen/MoQSession.h"
 
+#include <quic/common/events/QuicTimer.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
 #include <moxygen/test/Mocks.h>
 #include <moxygen/test/TestHelpers.h>
 #include <moxygen/test/TestUtils.h>
-#include <quic/common/events/QuicTimer.h>
 #include "moxygen/MoQRelaySession.h"
 
 #include <string_view>
@@ -91,8 +91,9 @@ inline Subscriber::PublishResult makePublishOkResult(
     bool expectDone = true) {
   auto mockConsumer = std::make_shared<MockTrackConsumer>();
   EXPECT_CALL(*mockConsumer, setTrackAlias(testing::_))
-      .WillRepeatedly(testing::Return(
-          folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
+      .WillRepeatedly(
+          testing::Return(
+              folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
   if (expectDone) {
     EXPECT_CALL(*mockConsumer, publishDone(testing::_))
         .WillOnce(testing::Return(folly::unit));

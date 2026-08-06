@@ -6,10 +6,10 @@
 
 #pragma once
 
+#include <proxygen/lib/http/webtransport/WebTransport.h>
 #include <moxygen/MoQCodec.h>
 #include <moxygen/events/MoQDeliveryTimer.h>
 #include <moxygen/events/MoQExecutor.h>
-#include <proxygen/lib/http/webtransport/WebTransport.h>
 #include <chrono>
 
 #include <folly/MaybeManagedPtr.h>
@@ -225,12 +225,10 @@ class MoQSession : public Subscriber,
     return negotiatedVersion_;
   }
 
-  virtual bool isRelayHopsNegotiated() const noexcept {
-    return relayHopsNegotiated_;
-  }
-
-  virtual uint64_t getRelayHopSourceID() const noexcept {
-    return relayHopSourceID_;
+  virtual bool isSetupOptionNegotiated(SetupKey key) const noexcept {
+    const auto value = folly::to_underlying(key);
+    return localSetupOptions_.contains(value) &&
+        peerSetupOptions_.contains(value);
   }
 
   virtual std::shared_ptr<SubNSReply> getSubNsReply(
@@ -1184,7 +1182,7 @@ class MoQSession : public Subscriber,
 
   // Private implementation methods
   void initializeNegotiatedVersion(uint64_t negotiatedVersion);
-  void updateRelayHopsNegotiation() noexcept;
+  void updateNegotiatedExtensions() noexcept;
   void removeBufferedSubgroupBaton(TrackAlias alias, TimedBaton* baton);
   void scheduleGoawayTimeout(uint64_t timeoutMs);
   void cancelGoawayTimeout();
@@ -1193,10 +1191,8 @@ class MoQSession : public Subscriber,
   bool hasOpenRequestsForGoaway() const;
 
   // Private session state
-  bool localRelayHopsAdvertised_{false};
-  bool peerRelayHopsAdvertised_{false};
-  bool relayHopsNegotiated_{false};
-  uint64_t relayHopSourceID_{generateRelayHopID()};
+  folly::F14FastSet<uint64_t> localSetupOptions_;
+  folly::F14FastSet<uint64_t> peerSetupOptions_;
   folly::F14FastMap<RequestID, std::shared_ptr<PublisherImpl>, RequestID::hash>
       pubTracks_;
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingPublishTracks_;

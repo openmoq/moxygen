@@ -60,36 +60,28 @@ INSTANTIATE_TEST_SUITE_P(
 CO_TEST_P_X(RelayHopsNegotiationTest, NegotiatesWhenBothPeersAdvertise) {
   relayHopsSupported_ = true;
   co_await setupMoQSession();
-  EXPECT_TRUE(clientSession_->isRelayHopsNegotiated());
-  EXPECT_TRUE(serverSession_->isRelayHopsNegotiated());
-  EXPECT_GT(clientSession_->getRelayHopSourceID(), 0);
-  EXPECT_LE(clientSession_->getRelayHopSourceID(), kMaxRelayHopID);
-  EXPECT_EQ(
-      clientSession_->getRelayHopSourceID(),
-      clientSession_->getRelayHopSourceID());
-  EXPECT_NE(
-      clientSession_->getRelayHopSourceID(),
-      serverSession_->getRelayHopSourceID());
+  EXPECT_TRUE(clientSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+  EXPECT_TRUE(serverSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
 }
 
 CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWithoutAdvertisement) {
   co_await setupMoQSession();
-  EXPECT_FALSE(clientSession_->isRelayHopsNegotiated());
-  EXPECT_FALSE(serverSession_->isRelayHopsNegotiated());
+  EXPECT_FALSE(clientSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+  EXPECT_FALSE(serverSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
 }
 
 CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWhenOnlyServerAdvertises) {
   serverRelayHopsSupported_ = true;
   co_await setupMoQSession();
-  EXPECT_FALSE(clientSession_->isRelayHopsNegotiated());
-  EXPECT_FALSE(serverSession_->isRelayHopsNegotiated());
+  EXPECT_FALSE(clientSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+  EXPECT_FALSE(serverSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
 }
 
 CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWhenOnlyClientAdvertises) {
   clientRelayHopsSupported_ = true;
   co_await setupMoQSession();
-  EXPECT_FALSE(clientSession_->isRelayHopsNegotiated());
-  EXPECT_FALSE(serverSession_->isRelayHopsNegotiated());
+  EXPECT_FALSE(clientSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+  EXPECT_FALSE(serverSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
 }
 
 using CurrentVersionOnly = MoQSessionTest;
@@ -274,11 +266,13 @@ class Draft18GoawayRequestRejectionTest : public MoQSessionTest {
     auto keepAliveConsumer =
         std::make_shared<testing::NiceMock<MockTrackConsumer>>();
     ON_CALL(*keepAliveConsumer, setTrackAlias(_))
-        .WillByDefault(testing::Return(
-            folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
+        .WillByDefault(
+            testing::Return(
+                folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
     ON_CALL(*keepAliveConsumer, publishDone(_))
-        .WillByDefault(testing::Return(
-            folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
+        .WillByDefault(
+            testing::Return(
+                folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
     return keepAliveConsumer;
   }
 
@@ -369,8 +363,9 @@ class Draft18GoawayRequestRejectionTest : public MoQSessionTest {
 
     folly::coro::Baton goawayReceived;
     EXPECT_CALL(*clientPublisher, goaway(_))
-        .WillOnce(testing::Invoke(
-            [&goawayReceived](Goaway /* goaway */) { goawayReceived.post(); }));
+        .WillOnce(testing::Invoke([&goawayReceived](Goaway /* goaway */) {
+          goawayReceived.post();
+        }));
     serverSession_->goaway(Goaway{});
     co_await goawayReceived;
 
@@ -856,10 +851,13 @@ CO_TEST_P_X(MoQUniControlTest, UniControlDataStreamBeforeSetup) {
 
   // Server sends SERVER_SETUP
   moxygen::Setup serverSetup;
-  serverSetup.params.insertParam(SetupParameter{
-      folly::to_underlying(SetupKey::MAX_REQUEST_ID), initialMaxRequestID_});
-  serverSetup.params.insertParam(SetupParameter{
-      folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
+  serverSetup.params.insertParam(
+      SetupParameter{
+          folly::to_underlying(SetupKey::MAX_REQUEST_ID),
+          initialMaxRequestID_});
+  serverSetup.params.insertParam(
+      SetupParameter{
+          folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
   serverSession_->sendSetup(std::move(serverSetup));
 
   // Before client completes setup, server opens a data uni stream with
@@ -970,10 +968,13 @@ CO_TEST_P_X(MoQUniControlTest, MaxBufferedPreSetupUniStreams) {
 
   // Server proactively sends SERVER_SETUP
   moxygen::Setup serverSetup;
-  serverSetup.params.insertParam(SetupParameter{
-      folly::to_underlying(SetupKey::MAX_REQUEST_ID), initialMaxRequestID_});
-  serverSetup.params.insertParam(SetupParameter{
-      folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
+  serverSetup.params.insertParam(
+      SetupParameter{
+          folly::to_underlying(SetupKey::MAX_REQUEST_ID),
+          initialMaxRequestID_});
+  serverSetup.params.insertParam(
+      SetupParameter{
+          folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
   serverSession_->sendSetup(std::move(serverSetup));
 
   // Before client completes setup, open 101 data uni streams from server.
