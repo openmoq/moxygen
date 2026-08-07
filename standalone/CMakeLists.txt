@@ -579,6 +579,13 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../moxygen moxygen)
 
 moxygen_install_headers(moxygen ${CMAKE_CURRENT_SOURCE_DIR}/../moxygen)
 
+# XLOG category regression test; drives the sample binaries, so register it only
+# when they are built.
+if(BUILD_TESTS AND TARGET moqdateserver AND TARGET moqtextclient)
+  enable_testing()
+  add_subdirectory(test)
+endif()
+
 # =============================================================================
 # Installation (mirrors main CMakeLists.txt)
 # =============================================================================
