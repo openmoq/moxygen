@@ -2701,6 +2701,8 @@ folly::Expected<folly::Unit, quic::TransportErrorCode> MoQSession::sendSetup(
          getMoQTImplementationString()}));
   }
 
+  onSetupParams(setup.params, /*local=*/true);
+
   uint64_t setupSerializationVersion = kVersionDraft14;
   if (negotiatedVersion_) {
     setupSerializationVersion = *negotiatedVersion_;
@@ -2821,6 +2823,8 @@ void MoQSession::onServerSetup(Setup serverSetup) {
     initializeNegotiatedVersion(kVersionDraft14);
   }
 
+  onSetupParams(serverSetup.params, /*local=*/false);
+
   initPeerMaxRequestID(serverSetup.params);
   auto peerAuthCacheSize = getMaxAuthTokenCacheSizeIfPresent(
       serverSetup.params, *getNegotiatedVersion());
@@ -2846,6 +2850,8 @@ void MoQSession::onClientSetup(Setup clientSetup) {
     XLOG(DBG1) << "Client MOQT_IMPLEMENTATION=" << *moqtImplementation
                << " sess=" << this;
   }
+
+  onSetupParams(clientSetup.params, /*local=*/false);
 
   initPeerMaxRequestID(clientSetup.params);
   auto peerAuthCacheSize = getMaxAuthTokenCacheSizeIfPresent(
@@ -2942,6 +2948,7 @@ std::unique_ptr<MoQControlCodec> MoQSession::makeBidiCodec(
   auto codec = std::make_unique<MoQBidiStreamCodec>(
       callback, std::move(allowedFrames), requestID, okType);
   codec->initializeVersion(*negotiatedVersion_);
+  codec->setNegotiatedExtensions(negotiatedExtensions_);
   codec->setTokenCache(&receiveTokenCache_);
   codec->setResponseIDQueue(responseIDQueue);
   return codec;
@@ -6814,6 +6821,20 @@ void MoQSession::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
   if (logger_) {
     logger_->setNegotiatedMoQVersion(negotiatedVersion);
   }
+}
+
+void MoQSession::onSetupParams(SetupParameters params, bool local) {
+  auto& half = local ? localSetupParams_ : peerSetupParams_;
+  XCHECK(!half) << "Setup already recorded local=" << local << " sess=" << this;
+  half = std::move(params);
+  if (!localSetupParams_ || !peerSetupParams_) {
+    return;
+  }
+
+  negotiatedExtensions_ =
+      computeNegotiatedExtensions(*localSetupParams_, *peerSetupParams_);
+  moqFrameWriter_.setNegotiatedExtensions(negotiatedExtensions_);
+  controlCodec_->setNegotiatedExtensions(negotiatedExtensions_);
 }
 
 /*static*/

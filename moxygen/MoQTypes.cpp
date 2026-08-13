@@ -470,6 +470,22 @@ Fetch::Fetch(
   }
 }
 
+const std::vector<SetupExtensionDescriptor> kSetupExtensions = {};
+
+SetupExtensions computeNegotiatedExtensions(
+    const SetupParameters& localParams,
+    const SetupParameters& peerParams,
+    const std::vector<SetupExtensionDescriptor>& descriptors) {
+  SetupExtensions extensions;
+  for (const auto& descriptor : descriptors) {
+    if (localParams.hasParam(descriptor.setupKey) &&
+        peerParams.hasParam(descriptor.setupKey)) {
+      extensions.add(descriptor.extension);
+    }
+  }
+  return extensions;
+}
+
 void applySetupParameters(
     SetupParameters& params,
     const std::vector<SetupParameter>& extraParams) {

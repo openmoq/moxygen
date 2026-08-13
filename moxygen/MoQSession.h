@@ -225,6 +225,22 @@ class MoQSession : public Subscriber,
     return negotiatedVersion_;
   }
 
+  // Extensions in force on this session. Empty until both SETUPs are known.
+  virtual bool hasSetupExtension(SetupExtension extension) const noexcept {
+    return negotiatedExtensions_.has(extension);
+  }
+
+  // The SETUP this endpoint sent / the peer sent, retained for extensions that
+  // negotiate on something other than mutual advertisement. Empty until sent /
+  // received respectively.
+  const std::optional<SetupParameters>& getLocalSetupParams() const {
+    return localSetupParams_;
+  }
+
+  const std::optional<SetupParameters>& getPeerSetupParams() const {
+    return peerSetupParams_;
+  }
+
   virtual std::shared_ptr<SubNSReply> getSubNsReply(
       std::shared_ptr<ReplyContext> replyContext) {
     return std::make_shared<SubNSReply>(
@@ -1209,6 +1225,11 @@ class MoQSession : public Subscriber,
 
   // Private implementation methods
   void initializeNegotiatedVersion(uint64_t negotiatedVersion);
+  // Records one half of the setup exchange. Once both halves are in, computes
+  // the negotiated extensions and pushes them to the framers, which is why
+  // this runs before any frame that an extension could alter is sent or
+  // parsed.
+  void onSetupParams(SetupParameters params, bool local);
   void removeBufferedSubgroupBaton(TrackAlias alias, TimedBaton* baton);
   void scheduleGoawayTimeout(uint64_t timeoutMs);
   void cancelGoawayTimeout();
@@ -1217,6 +1238,9 @@ class MoQSession : public Subscriber,
   bool hasOpenRequestsForGoaway() const;
 
   // Private session state
+  std::optional<SetupParameters> localSetupParams_;
+  std::optional<SetupParameters> peerSetupParams_;
+  SetupExtensions negotiatedExtensions_;
   folly::F14FastMap<RequestID, std::shared_ptr<PublisherImpl>, RequestID::hash>
       pubTracks_;
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingPublishTracks_;

@@ -6034,6 +6034,81 @@ TEST_F(ApplySetupParametersTest, EmptyExtraParamsLeavesParamsUntouched) {
   EXPECT_EQ(params.getFirstParam(SetupKey::MAX_REQUEST_ID)->asUint64, 100);
 }
 
+// Tests for computeNegotiatedExtensions()
+class SetupExtensionsTest : public ::testing::Test {
+ protected:
+  // Stand-ins for real extensions; the shipped table is empty.
+  static constexpr auto kExtA = static_cast<SetupExtension>(1u << 0);
+  static constexpr auto kExtB = static_cast<SetupExtension>(1u << 1);
+  static constexpr uint64_t kKeyA = 0x40B55;
+  static constexpr uint64_t kKeyB = 0x40B56;
+
+  const std::vector<SetupExtensionDescriptor> descriptors_{
+      {kExtA, kKeyA},
+      {kExtB, kKeyB}};
+
+  static SetupParameters params(const std::vector<uint64_t>& keys) {
+    SetupParameters result(FrameType::CLIENT_SETUP);
+    for (auto key : keys) {
+      result.insertParam(SetupParameter(key, std::string{}));
+    }
+    return result;
+  }
+};
+
+TEST_F(SetupExtensionsTest, NegotiatedWhenBothAdvertise) {
+  auto extensions =
+      computeNegotiatedExtensions(params({kKeyA}), params({kKeyA}),
+                                  descriptors_);
+  EXPECT_TRUE(extensions.has(kExtA));
+  EXPECT_FALSE(extensions.has(kExtB));
+}
+
+TEST_F(SetupExtensionsTest, NotNegotiatedWhenOnlyOneSideAdvertises) {
+  EXPECT_TRUE(
+      computeNegotiatedExtensions(params({kKeyA}), params({}), descriptors_)
+          .empty());
+  EXPECT_TRUE(
+      computeNegotiatedExtensions(params({}), params({kKeyA}), descriptors_)
+          .empty());
+}
+
+TEST_F(SetupExtensionsTest, NotNegotiatedWhenNeitherAdvertises) {
+  EXPECT_TRUE(
+      computeNegotiatedExtensions(params({}), params({}), descriptors_)
+          .empty());
+}
+
+TEST_F(SetupExtensionsTest, ExtensionsAreIndependent) {
+  auto extensions = computeNegotiatedExtensions(
+      params({kKeyA, kKeyB}), params({kKeyB}), descriptors_);
+  EXPECT_FALSE(extensions.has(kExtA));
+  EXPECT_TRUE(extensions.has(kExtB));
+  EXPECT_FALSE(extensions.empty());
+}
+
+TEST_F(SetupExtensionsTest, UnrelatedSetupParamsDoNotNegotiate) {
+  auto extensions = computeNegotiatedExtensions(
+      params({folly::to_underlying(SetupKey::MAX_REQUEST_ID)}),
+      params({folly::to_underlying(SetupKey::MAX_REQUEST_ID)}),
+      descriptors_);
+  EXPECT_TRUE(extensions.empty());
+}
+
+TEST_F(SetupExtensionsTest, NoneIsNeverHeld) {
+  auto extensions =
+      computeNegotiatedExtensions(params({kKeyA}), params({kKeyA}),
+                                  descriptors_);
+  EXPECT_FALSE(extensions.has(SetupExtension::None));
+  EXPECT_FALSE(SetupExtensions().has(SetupExtension::None));
+}
+
+TEST_F(SetupExtensionsTest, ShippedTableNegotiatesNothingYet) {
+  EXPECT_TRUE(kSetupExtensions.empty());
+  EXPECT_TRUE(
+      computeNegotiatedExtensions(params({kKeyA}), params({kKeyA})).empty());
+}
+
 // Tests for Parameters::isParamAllowed()
 class ParametersIsParamAllowedTest : public ::testing::Test {};
 

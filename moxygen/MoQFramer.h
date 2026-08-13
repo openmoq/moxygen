@@ -317,6 +317,14 @@ class MoQFrameParser {
     return version_;
   }
 
+  void setNegotiatedExtensions(SetupExtensions extensions) noexcept {
+    extensions_ = extensions;
+  }
+
+  bool hasExtension(SetupExtension extension) const noexcept {
+    return extensions_.has(extension);
+  }
+
   // Decode a TRACK_NAMESPACE_PREFIX parameter value (a Track Namespace tuple,
   // §2.4.1) into a TrackNamespace for the given negotiated version. Used by
   // consumers of REQUEST_UPDATE (e.g. the relay) that receive the prefix as a
@@ -530,6 +538,7 @@ class MoQFrameParser {
 
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
+  SetupExtensions extensions_;
   MoQTokenCache* tokenCache_{nullptr};
   mutable std::optional<uint64_t> previousObjectID_;
   // Context for FETCH object delta encoding (draft-15+)
@@ -762,6 +771,14 @@ class MoQFrameWriter {
     return version_;
   }
 
+  void setNegotiatedExtensions(SetupExtensions extensions) noexcept {
+    extensions_ = extensions;
+  }
+
+  bool hasExtension(SetupExtension extension) const noexcept {
+    return extensions_.has(extension);
+  }
+
   // Encode a TrackNamespace as a TRACK_NAMESPACE_PREFIX parameter (a Track
   // Namespace tuple value, §2.4.1) for the given negotiated version. The
   // resulting parameter can be added to a REQUEST_UPDATE's parameter list to
@@ -924,6 +941,7 @@ class MoQFrameWriter {
 
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
+  SetupExtensions extensions_;
   mutable std::optional<uint64_t> previousObjectID_;
   // Context for FETCH object delta encoding (draft-15+)
   mutable std::optional<uint64_t> previousFetchGroup_;

@@ -779,6 +779,60 @@ void applySetupParameters(
     SetupParameters& params,
     const std::vector<SetupParameter>& extraParams);
 
+// A protocol extension that is off unless both peers negotiate it. Each
+// extension owns one bit; see kSetupExtensions for how a bit is negotiated.
+enum class SetupExtension : uint32_t {
+  None = 0,
+  // Extensions add a bit here, e.g. Foo = 1u << 0.
+};
+
+// The set of extensions in force on a session.
+class SetupExtensions {
+ public:
+  SetupExtensions() = default;
+
+  bool has(SetupExtension extension) const {
+    auto bit = folly::to_underlying(extension);
+    return bit != 0 && (bits_ & bit) == bit;
+  }
+
+  void add(SetupExtension extension) {
+    bits_ |= folly::to_underlying(extension);
+  }
+
+  bool empty() const {
+    return bits_ == 0;
+  }
+
+  bool operator==(const SetupExtensions& other) const {
+    return bits_ == other.bits_;
+  }
+
+ private:
+  uint32_t bits_{0};
+};
+
+// Ties an extension bit to the setup key that negotiates it. Mutual advertising
+// of a zero-length option is how every extension so far turns on; an extension
+// that negotiates differently (by value, or one-sided) does not belong in this
+// table and should compute its own state from the retained setup parameters.
+struct SetupExtensionDescriptor {
+  SetupExtension extension;
+  uint64_t setupKey;
+};
+
+// Every extension negotiated by mutual advertisement. Empty until the first
+// such extension lands.
+extern const std::vector<SetupExtensionDescriptor> kSetupExtensions;
+
+// Returns the extensions both peers advertised. Called once per session, after
+// both SETUPs are known. `descriptors` is injectable for testing.
+SetupExtensions computeNegotiatedExtensions(
+    const SetupParameters& localParams,
+    const SetupParameters& peerParams,
+    const std::vector<SetupExtensionDescriptor>& descriptors =
+        kSetupExtensions);
+
 struct Setup {
   SetupParameters params{FrameType::CLIENT_SETUP};
 };

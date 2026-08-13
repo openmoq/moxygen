@@ -46,6 +46,21 @@ TEST_P(MoQVersionNegotiationTest, Setup) {
   folly::coro::blockingWait(setupMoQSession(), getExecutor());
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+
+// Both halves of the setup exchange are retained on both endpoints, which is
+// what extension negotiation runs on.
+TEST_P(MoQVersionNegotiationTest, SetupParamsRetainedOnBothEndpoints) {
+  folly::coro::blockingWait(setupMoQSession(), getExecutor());
+  for (auto* session : {clientSession_.get(), serverSession_.get()}) {
+    ASSERT_TRUE(session->getLocalSetupParams().has_value());
+    ASSERT_TRUE(session->getPeerSetupParams().has_value());
+    EXPECT_TRUE(session->getLocalSetupParams()->hasParam(
+        folly::to_underlying(SetupKey::MAX_REQUEST_ID)));
+    EXPECT_TRUE(session->getPeerSetupParams()->hasParam(
+        folly::to_underlying(SetupKey::MAX_REQUEST_ID)));
+  }
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
 using CurrentVersionOnly = MoQSessionTest;
 
 CO_TEST_P_X(CurrentVersionOnly, SetupTimeout) {
