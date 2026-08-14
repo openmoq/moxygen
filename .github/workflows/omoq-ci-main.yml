@@ -155,6 +155,14 @@ jobs:
             sanitizer: asan
             build_type: Debug
 
+          - name: ubuntu-24.04-amd64-tsan
+            runner: ubuntu-24.04
+            artifact: moxygen-ubuntu-24.04-amd64-tsan.tar.gz
+            debug_artifact: moxygen-ubuntu-24.04-amd64-tsan-dbg.tar.gz
+            container: ""
+            sanitizer: tsan
+            build_type: Debug
+
           - name: macos-15-arm64
             runner: macos-15
             artifact: moxygen-macos-15-arm64.tar.gz
