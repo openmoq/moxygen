@@ -140,6 +140,11 @@ class MoQSession : public Subscriber,
                    public proxygen::WebTransportHandler,
                    public std::enable_shared_from_this<MoQSession> {
  public:
+  struct CloseResult {
+    SessionCloseErrorCode error;
+    folly::Optional<uint32_t> wtError;
+  };
+
   struct MoQSessionRequestData : public folly::RequestData {
     explicit MoQSessionRequestData(std::shared_ptr<MoQSession> s)
         : session(std::move(s)) {}
@@ -184,6 +189,10 @@ class MoQSession : public Subscriber,
 
   bool isClosed() const {
     return closed_;
+  }
+
+  const std::optional<CloseResult>& getCloseResult() const {
+    return closeResult_;
   }
 
   void setAuthority(std::string a) {
@@ -407,11 +416,21 @@ class MoQSession : public Subscriber,
       session_ = session;
     }
 
+    // Priority for one schedulable element of this request, encoded from the
+    // subscriber priority, publisher priority and group order.
+    quic::PriorityQueue::Priority elementPriority(
+        uint64_t groupId,
+        uint64_t subgroupId,
+        uint8_t pubPri) const;
+
     virtual void terminatePublish(
         PublishDone pubDone,
         ResetStreamErrorCode error = ResetStreamErrorCode::INTERNAL_ERROR) = 0;
 
     virtual void onStreamCreated() {}
+
+    // Advance the tracked largest published object as objects are written.
+    virtual void updateLargest(const AbsoluteLocation& /*location*/) {}
 
     virtual void onStreamComplete(const ObjectHeader& finalHeader) = 0;
 
@@ -480,6 +499,32 @@ class MoQSession : public Subscriber,
       return bidiControl_;
     }
 
+    // Only ESTABLISHED holds a +1 on the active-subscription gauge; FETCH
+    // publishers never leave PENDING.
+    enum class State { PENDING, ESTABLISHED, DONE };
+
+    State state() const {
+      return state_;
+    }
+    bool isDone() const {
+      return state_ == State::DONE;
+    }
+    // True on the PENDING -> ESTABLISHED edge, so begin fires exactly once.
+    bool markEstablished() {
+      if (state_ != State::PENDING) {
+        return false;
+      }
+      state_ = State::ESTABLISHED;
+      return true;
+    }
+    // True only if the subscription was counted, so teardown can't decrement
+    // one that never went active.
+    bool markDone() {
+      bool wasEstablished = (state_ == State::ESTABLISHED);
+      state_ = State::DONE;
+      return wasEstablished;
+    }
+
    protected:
     MoQSession* session_{nullptr};
     FullTrackName fullTrackName_;
@@ -493,6 +538,7 @@ class MoQSession : public Subscriber,
     std::optional<uint8_t> publisherPriority_;
     std::shared_ptr<ReplyContext> replyContext_;
     std::shared_ptr<BidiStreamControl> bidiControl_;
+    State state_{State::PENDING};
   };
 
   void onNewUniStream(
@@ -682,6 +728,9 @@ class MoQSession : public Subscriber,
     requestUpdateError(reqError, existingReqID);
   }
   void sendPublishDone(const PublishDone& pubDone);
+
+  void beginSubscriptionStat(PublisherImpl& pubTrack);
+  void endSubscriptionStat(PublisherImpl& pubTrack);
 
   folly::coro::Task<void> handleFetch(
       Fetch fetch,
@@ -910,6 +959,9 @@ class MoQSession : public Subscriber,
   // Returns nullptr only when the request can no longer be found.
   virtual ReplyContext* getRequestUpdateReplyContext(
       RequestID existingRequestID);
+
+  // Priority for a control or request stream.
+  quic::PriorityQueue::Priority controlPriority() const;
 
   // REQUEST_UPDATE handler (protected for subclass access)
   void onRequestUpdate(RequestUpdate requestUpdate) override;
@@ -1236,6 +1288,7 @@ class MoQSession : public Subscriber,
   mutable quic::TransportInfo cachedTransportInfo_;
   mutable std::chrono::steady_clock::time_point lastTransportInfoUpdate_{};
   std::unique_ptr<GoawayTimeoutCallback> goawayTimeout_;
+  std::optional<CloseResult> closeResult_;
   bool closed_{false};
   std::string authority_;
   std::string path_;

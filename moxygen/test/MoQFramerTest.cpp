@@ -544,6 +544,83 @@ TEST_P(MoQFramerTest, ParseDatagramNormal) {
   EXPECT_EQ(parseResult->objectHeader.length, 8);
 }
 
+TEST_P(MoQFramerTest, DatagramObjectHeaderIsMarkedAsDatagram) {
+  // A receiver must be able to tell from the parsed header that the object
+  // arrived on a datagram, for both normal and status datagrams.
+  for (auto status : {ObjectStatus::NORMAL, ObjectStatus::END_OF_GROUP}) {
+    const bool isStatus = (status != ObjectStatus::NORMAL);
+    folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+    auto result = writer_.writeDatagramObject(
+        writeBuf,
+        TrackAlias(22), // trackAlias
+        {33,            // group
+         0,             // subgroup
+         44,            // id
+         55,            // priority
+         status,
+         noExtensions(),
+         isStatus ? 0u : 8u},
+        isStatus ? nullptr : folly::IOBuf::copyBuffer("datagram"));
+    ASSERT_TRUE(result.hasValue());
+    auto serialized = writeBuf.move();
+    folly::io::Cursor cursor(serialized.get());
+
+    auto dgType = parseDatagramType(cursor);
+    ASSERT_EQ(
+        dgType, getDatagramType(GetParam(), isStatus, false, false, false));
+    auto length = cursor.totalLength();
+    auto parseResult =
+        parser_.parseDatagramObjectHeader(cursor, dgType, length);
+    ASSERT_TRUE(parseResult.hasValue());
+    EXPECT_TRUE(parseResult->objectHeader.forwardingPreferenceIsDatagram)
+        << "status=" << uint64_t(status);
+  }
+}
+
+TEST_P(MoQFramerTest, SubgroupObjectHeaderIsNotMarkedAsDatagram) {
+  ObjectHeader objectHeader = {
+      33, // group
+      0,  // subgroup
+      44, // id
+      55, // priority
+      ObjectStatus::NORMAL,
+      noExtensions(),
+      4};
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  auto streamType =
+      getSubgroupStreamType(GetParam(), SubgroupIDFormat::Zero, false, false);
+  ASSERT_TRUE(writer_
+                  .writeSubgroupHeader(
+                      writeBuf,
+                      TrackAlias(22),
+                      objectHeader,
+                      SubgroupIDFormat::Zero,
+                      false)
+                  .hasValue());
+  ASSERT_TRUE(writer_
+                  .writeStreamObject(
+                      writeBuf,
+                      streamType,
+                      objectHeader,
+                      folly::IOBuf::copyBuffer("EFGH"))
+                  .hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+  ASSERT_EQ(parseStreamType(cursor), streamType);
+  auto sgOptions = getSubgroupOptions(GetParam(), streamType);
+  auto headerResult =
+      parser_.parseSubgroupHeader(cursor, cursor.totalLength(), sgOptions);
+  ASSERT_TRUE(headerResult.hasValue());
+  auto parseResult = parser_.parseSubgroupObjectHeader(
+      cursor,
+      cursor.totalLength(),
+      headerResult->value.objectHeader,
+      sgOptions);
+  ASSERT_TRUE(parseResult.hasValue());
+  EXPECT_FALSE(parseResult->value.forwardingPreferenceIsDatagram);
+}
+
 TEST(MoQFramerTest, ParseServerSetupQuicIntegerLength) {
   // Malformed server setup, see that we don't crash
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
@@ -1859,6 +1936,7 @@ TEST(MoQFramerTest, SubscribeUpdateDraft15ForwardUnset) {
   EXPECT_EQ(parseResult->start->group, 0);
   EXPECT_EQ(parseResult->start->object, 0);
   EXPECT_EQ(parseResult->endGroup, 0);
+  // An explicit priority (even the default) is serialized and round-trips.
   EXPECT_EQ(parseResult->priority, kDefaultPriority);
   // Verify forward field is NOT set (preserves existing state per draft 15+)
   EXPECT_FALSE(parseResult->forward.has_value());
@@ -4947,6 +5025,48 @@ TEST_F(MoQFramerV18Test, WritePaddingDatagram) {
   size_t remainingLength = cursor.totalLength();
   EXPECT_TRUE(parsePaddingData(cursor, remainingLength).hasValue());
   EXPECT_EQ(remainingLength, 0);
+}
+
+TEST_F(MoQFramerV18Test, DatagramEndOfGroupRoundTrips) {
+  // Regression test: the END_OF_GROUP bit must survive serialize -> parse.
+  for (bool endOfGroup : {false, true}) {
+    folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+    auto result = writer_.writeDatagramObject(
+        writeBuf,
+        TrackAlias(22), // trackAlias
+        {33,            // group
+         0,             // subgroup
+         44,            // id
+         55,            // priority
+         ObjectStatus::NORMAL,
+         noExtensions(),
+         8},
+        folly::IOBuf::copyBuffer("datagram"),
+        endOfGroup);
+    ASSERT_TRUE(result.hasValue());
+    auto serialized = writeBuf.move();
+
+    // The END_OF_GROUP bit (0x2) must actually be present in the first wire
+    // byte (the datagram type varint) when endOfGroup is set.
+    uint8_t firstWireByte = *serialized->data();
+    EXPECT_EQ(bool(firstWireByte & DG_HAS_END_OF_GROUP), endOfGroup)
+        << "wire byte=0x" << std::hex << int(firstWireByte)
+        << " endOfGroup=" << std::dec << endOfGroup;
+
+    folly::io::Cursor cursor(serialized.get());
+    auto dgType = parser_.decodeVarint(cursor);
+    ASSERT_TRUE(dgType.has_value());
+    EXPECT_EQ(
+        dgType->first,
+        folly::to_underlying(
+            getDatagramType(kVersionDraft18, false, false, endOfGroup, false)));
+    auto length = cursor.totalLength();
+    auto parseResult = parser_.parseDatagramObjectHeader(
+        cursor, DatagramType(dgType->first), length);
+    ASSERT_TRUE(parseResult.hasValue());
+    EXPECT_EQ(parseResult->endOfGroup, endOfGroup)
+        << "END_OF_GROUP bit lost for endOfGroup=" << endOfGroup;
+  }
 }
 
 TEST_F(MoQFramerV18Test, PaddingDataRejectsNonZeroBytes) {

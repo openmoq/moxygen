@@ -74,6 +74,9 @@ endif()
 
 find_package(ZLIB REQUIRED)
 find_library(ZSTD_LIBRARY NAMES zstd)
+# Ubuntu 24.04 names the static lib libcares_static.a; seed the cache var so
+# fbcode_builder's FindCares (NAMES cares only) accepts it under .a-only search.
+find_library(CARES_LIBRARIES NAMES cares cares_static)
 
 # =============================================================================
 # Read pinned commit hashes from github_hashes (same as getdeps uses)
@@ -210,8 +213,11 @@ set(FETCHCONTENT_QUIET OFF)
 # googletest 1.12+ required for move-only WillOnce support
 # (Ubuntu 22.04 ships 1.11 which doesn't support this)
 if(BUILD_TESTS)
-    # Try to find system googletest first
-    find_package(GTest 1.12.1 QUIET)
+    # Try to find system googletest first. CONFIG mode only: consumers of the
+    # installed tree (e.g. moqx) do find_package(GTest REQUIRED CONFIG), so a
+    # module-mode-only system googletest (libs/headers without cmake package
+    # config) must not short-circuit the FetchContent bundling below.
+    find_package(GTest 1.12.1 QUIET CONFIG)
 
     if(GTest_FOUND)
         message(STATUS "Using system googletest ${GTest_VERSION}")
@@ -465,6 +471,11 @@ if(NOT folly_POPULATED)
     FetchContent_Populate(folly)
     apply_dep_patches(folly "${folly_SOURCE_DIR}")
     set(CMAKE_INSTALL_DIR "lib/cmake/folly" CACHE STRING "" FORCE)
+    # Root this dep's XLOG categories at its natural name (folly.*, fizz.*, ...)
+    # instead of the absolute build path, by rewriting __FILE__ from the consumer
+    # side — we don't own these deps' CMakeLists. -fmacro-prefix-map, not
+    # -ffile-prefix-map: debug-info paths stay intact and the maps stack.
+    add_compile_options(-fmacro-prefix-map=${folly_SOURCE_DIR}/=)
     add_subdirectory(${folly_SOURCE_DIR} ${folly_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
@@ -473,6 +484,8 @@ if(NOT fizz_POPULATED)
     FetchContent_Populate(fizz)
     apply_dep_patches(fizz "${fizz_SOURCE_DIR}")
     set(CMAKE_INSTALL_DIR "lib/cmake/fizz" CACHE STRING "" FORCE)
+    # Root fizz XLOG categories at fizz.* (see folly block above).
+    add_compile_options(-fmacro-prefix-map=${fizz_SOURCE_DIR}/=)
     add_subdirectory(${fizz_SOURCE_DIR}/fizz ${fizz_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
@@ -481,6 +494,8 @@ if(NOT wangle_POPULATED)
     FetchContent_Populate(wangle)
     apply_dep_patches(wangle "${wangle_SOURCE_DIR}")
     set(CMAKE_INSTALL_DIR "lib/cmake/wangle" CACHE STRING "" FORCE)
+    # Root wangle XLOG categories at wangle.* (see folly block above).
+    add_compile_options(-fmacro-prefix-map=${wangle_SOURCE_DIR}/=)
     add_subdirectory(${wangle_SOURCE_DIR}/wangle ${wangle_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
@@ -489,6 +504,9 @@ if(NOT mvfst_POPULATED)
     FetchContent_Populate(mvfst)
     apply_dep_patches(mvfst "${mvfst_SOURCE_DIR}")
     # mvfst uses CMAKE_INSTALL_MODULE_DIR, not CMAKE_INSTALL_DIR — no conflict
+    # mvfst's tree is rooted at quic/; map it to quic/mvfst/ so it lands on the
+    # documented quic.mvfst.* root rather than claiming a bare quic.*.
+    add_compile_options(-fmacro-prefix-map=${mvfst_SOURCE_DIR}/quic/=quic/mvfst/)
     add_subdirectory(${mvfst_SOURCE_DIR} ${mvfst_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
@@ -497,6 +515,8 @@ if(NOT proxygen_POPULATED)
     FetchContent_Populate(proxygen)
     apply_dep_patches(proxygen "${proxygen_SOURCE_DIR}")
     set(CMAKE_INSTALL_DIR "lib/cmake/proxygen" CACHE STRING "" FORCE)
+    # Root proxygen XLOG categories at proxygen.* (see folly block above).
+    add_compile_options(-fmacro-prefix-map=${proxygen_SOURCE_DIR}/=)
     add_subdirectory(${proxygen_SOURCE_DIR} ${proxygen_BINARY_DIR} ${_EXCLUDE_FLAG})
 endif()
 
@@ -547,9 +567,24 @@ if(BUILD_TESTS)
 endif()
 
 # Include moxygen's main CMakeLists.txt
+# Root moxygen's own XLOG categories at moxygen.* here too: this build adds the
+# inner moxygen/ dir directly, so the repo-root CMakeLists.txt that sets
+# FOLLY_XLOG_STRIP_PREFIXES is never processed. Strip the repo root, not the
+# inner moxygen/ dir — sources are <repo>/moxygen/MoQSession.cpp, so the leading
+# moxygen/ component has to survive.
+get_filename_component(_MOXYGEN_REPO_ROOT
+  "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+add_compile_options(-fmacro-prefix-map=${_MOXYGEN_REPO_ROOT}/=)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../moxygen moxygen)
 
 moxygen_install_headers(moxygen ${CMAKE_CURRENT_SOURCE_DIR}/../moxygen)
+
+# XLOG category regression test; drives the sample binaries, so register it only
+# when they are built.
+if(BUILD_TESTS AND TARGET moqdateserver AND TARGET moqtextclient)
+  enable_testing()
+  add_subdirectory(test)
+endif()
 
 # =============================================================================
 # Installation (mirrors main CMakeLists.txt)

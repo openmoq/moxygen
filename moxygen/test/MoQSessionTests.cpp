@@ -906,6 +906,8 @@ CO_TEST_P_X(MoQUniControlTest, UniControlDataStreamBeforeSetup) {
         baton.post();
         return folly::unit;
       });
+  // unsubscribe() cancels the subscription; its open subgroup is reset.
+  EXPECT_CALL(*sgConsumer, reset(_));
 
   auto subscribeRequest = getSubscribe(kTestTrackName);
   auto res =
@@ -1022,7 +1024,6 @@ class DummyMoQClientBase : public MoQClientBase {
 
  protected:
   folly::coro::Task<std::shared_ptr<quic::QuicClientTransport>> connectQuic(
-      folly::SocketAddress /*connectAddr*/,
       std::chrono::milliseconds /*timeoutMs*/,
       std::shared_ptr<fizz::CertificateVerifier> /*verifier*/,
       const std::vector<std::string>& /*alpns*/,

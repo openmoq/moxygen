@@ -676,7 +676,12 @@ StreamPublisherImpl::writeCurrentObject(
       header_,
       std::move(payload),
       forwardingPreferenceIsDatagram);
-  return writeToStream(finStream, entireObjectWritten);
+  auto writeResult = writeToStream(finStream, entireObjectWritten);
+  // Only advance the largest once the full object has been written to the wire.
+  if (writeResult.hasValue() && entireObjectWritten) {
+    publisher_->updateLargest({header_.group, objectID});
+  }
+  return writeResult;
 }
 
 folly::Expected<folly::Unit, MoQPublishError>
@@ -1033,12 +1038,13 @@ StreamPublisherImpl::ensureWriteHandle() {
   }
   XLOG(DBG4) << "New stream created, id: " << stream.value()->getID()
              << " tp=" << this;
-  // publisher group order is not known here, but it shouldn't matter
-  // Currently sets group=0 for FETCH priority bits
-  auto pri = getStreamPriority(
-      0, 0, publisher_->subPriority(), 0, GroupOrder::OldestFirst);
-  stream.value()->setPriority(
-      quic::HTTPPriorityQueue::Priority(pri.urgency, false, pri.order));
+  // For FETCH, ensureWrite comes from validatePublish or endOfFetch.
+  // In the former case, header_ is valid and the priority is set based
+  // on the first published object.  If the stream is empty, defaults are used
+  stream.value()->setPriority(publisher_->elementPriority(
+      header_.group,
+      header_.subgroup,
+      header_.priority.value_or(kDefaultPriority)));
   setWriteHandle(*stream);
   return folly::unit;
 }
@@ -1072,6 +1078,37 @@ class ControlStreamReplyContext : public ReplyContext {
   folly::IOBufQueue& controlWriteBuf_;
   moxygen::TimedBaton& controlWriteEvent_;
 };
+
+// Fold a newer REQUEST_UPDATE into an accumulated one for draft-18+ coalescing:
+// later values win; absent optional fields keep the earlier value.
+void mergeRequestUpdate(RequestUpdate& latest, const RequestUpdate& incoming) {
+  latest.requestID = incoming.requestID;
+  latest.existingRequestID = incoming.existingRequestID;
+  if (incoming.priority) {
+    latest.priority = incoming.priority;
+  }
+  if (incoming.start) {
+    latest.start = incoming.start;
+  }
+  if (incoming.endGroup) {
+    latest.endGroup = incoming.endGroup;
+  }
+  if (incoming.forward) {
+    latest.forward = incoming.forward;
+  }
+  // Upsert params by key: a later value replaces an earlier one of that key,
+  // while params only the earlier update carried are preserved.
+  for (const auto& param : incoming.params) {
+    latest.params.eraseAllParamsOfType(
+        static_cast<TrackRequestParamKey>(param.key));
+  }
+  for (const auto& param : incoming.params) {
+    auto result = latest.params.insertParam(param);
+    if (result.hasError()) {
+      XLOG(ERR) << "mergeRequestUpdate: param not allowed, key=" << param.key;
+    }
+  }
+}
 
 } // namespace
 
@@ -1130,6 +1167,11 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     if (!trackAlias_) {
       trackAlias_ = handle->subscribeOk().trackAlias;
     }
+    // Seed the largest from SUBSCRIBE_OK when present; the PUBLISH path's
+    // handle carries none.
+    if (handle->hasSubscribeOk()) {
+      largest_ = handle->subscribeOk().largest;
+    }
     subscriptionHandle_ = std::move(handle);
     if (pendingPublishDone_) {
       // If publishDone is called before publishHandler_->subscribe() returns,
@@ -1146,6 +1188,12 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
   // PublisherImpl overrides
   void onStreamCreated() override {
     streamCount_++;
+  }
+
+  void updateLargest(const AbsoluteLocation& location) override {
+    if (!largest_ || location > *largest_) {
+      largest_ = location;
+    }
   }
 
   void onStreamComplete(const ObjectHeader& finalHeader) override;
@@ -1173,6 +1221,17 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
 
     auto trackPubImpl =
         std::static_pointer_cast<TrackPublisherImpl>(shared_from_this());
+
+    // Accumulate the cumulative newest update so older queued ones coalesce.
+    // Only tracked for draft 18+, where handleRequestUpdate consumes/resets it;
+    // pre-18 there is no coalescing, so avoid growing state that is never read.
+    if (getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 18) {
+      if (latestRequest_.has_value()) {
+        mergeRequestUpdate(latestRequest_.value(), requestUpdate);
+      } else {
+        latestRequest_ = requestUpdate;
+      }
+    }
 
     // Handle asynchronously with shared ownership to prevent use-after-free
     // if session closes before completion
@@ -1203,6 +1262,28 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
 
     auto updateRequestID = requestUpdate.requestID;
     auto existingRequestID = requestID_;
+    bool canCoalesce =
+        getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 18;
+
+    // A newer update supersedes this one: ack it, but skip re-applying its
+    // intermediate state (draft 18+ coalescing).
+    if (canCoalesce && latestRequest_.has_value() &&
+        updateRequestID != latestRequest_.value().requestID) {
+      RequestOk requestOk{.requestID = updateRequestID, .trackProperties = {}};
+      requestOks_.push_back(requestOk);
+      co_return;
+    }
+
+    // Newest update of the burst: take the cumulative merged view so fields set
+    // by earlier (superseded) updates are not lost, and reset the accumulator
+    // so the next burst starts fresh instead of folding into stale state.
+    std::vector<RequestOk> currentOks;
+    if (canCoalesce && latestRequest_.has_value()) {
+      requestUpdate = std::move(latestRequest_.value());
+      currentOks = std::move(requestOks_);
+      latestRequest_.reset();
+      requestOks_.clear();
+    }
 
     // Update delivery timeout if present
     auto timeoutValue = MoQSession::getDeliveryTimeoutIfPresent(
@@ -1259,18 +1340,21 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
         updateErr.requestID = updateRequestID; // In case app got it wrong
         session_->requestUpdateError(updateErr, existingRequestID);
       } else {
-        // send REQUEST_OK with LARGEST_OBJECT if available
-        // TODO: Do we relay the params we got from the app?
-        std::vector<Parameter> requestSpecificParams;
-        if (subscriptionHandle_->subscribeOk().largest) {
-          requestSpecificParams.emplace_back(
-              folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT),
-              subscriptionHandle_->subscribeOk().largest.value());
-        }
+        // Add final RequestOk
         RequestOk requestOk{
-            .requestID = updateRequestID,
-            .requestSpecificParams = std::move(requestSpecificParams)};
-        session_->requestUpdateOk(requestOk, existingRequestID);
+            .requestID = updateRequestID, .trackProperties = {}};
+        currentOks.push_back(requestOk);
+
+        for (RequestOk reqOk : currentOks) {
+          // send REQUEST_OK with the current LARGEST_OBJECT if available
+          std::vector<Parameter> requestSpecificParams;
+          if (largest_) {
+            reqOk.requestSpecificParams.emplace_back(
+                folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT),
+                largest_.value());
+          }
+          session_->requestUpdateOk(reqOk, existingRequestID);
+        }
       }
     }
   }
@@ -1289,6 +1373,12 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       deliveryTimeoutManager_.setSubscriberTimeout(
           std::chrono::milliseconds(*timeoutValue));
     }
+    session_->beginSubscriptionStat(*this);
+  }
+
+  // A deferred publishDone stops writes but still sends SUBSCRIBE_OK.
+  bool publishEnded() const {
+    return isDone() || pendingPublishDone_.has_value();
   }
 
   void publishSent(const PublishRequest& publish) {
@@ -1308,6 +1398,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     if (timeout.has_value() && shouldApplyDeliveryTimeout(timeout->count())) {
       deliveryTimeoutManager_.setPublisherTimeout(*timeout);
     }
+    session_->beginSubscriptionStat(*this);
   }
 
   void setForward(bool forward) {
@@ -1408,11 +1499,22 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       std::shared_ptr<StreamPublisherImpl>>
       subgroups_;
   uint64_t streamCount_{0};
-  enum class State { OPEN, DONE };
-  State state_{State::OPEN};
   bool forward_;
   std::shared_ptr<DeliveryCallback> deliveryCallback_;
   MoQDeliveryTimeoutManager deliveryTimeoutManager_;
+
+  // Cumulative newest REQUEST_UPDATE; older queued handlers coalesce into it.
+  folly::Optional<RequestUpdate> latestRequest_;
+
+  // On coalesce REQUEST_UPDATES, the REQUEST_OKs for each update will be held
+  // until either the update is successful in which each will be sent, or the
+  // update results in an error, in which only a single REQUEST_ERROR will be
+  // sent
+  std::vector<RequestOk> requestOks_;
+
+  // Largest object published so far; advances as objects are written and is
+  // reported in REQUEST_UPDATE acks. Seeded from the SUBSCRIBE_OK largest.
+  std::optional<AbsoluteLocation> largest_;
 };
 
 class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
@@ -1576,7 +1678,7 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
   }
 
   auto wt = getWebTransport();
-  if (!wt || state_ != State::OPEN) {
+  if (!wt || publishEnded()) {
     XLOG(ERR) << "Trying to publish after publishDone";
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Publish after publishDone"));
@@ -1593,10 +1695,8 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
   XLOG(DBG4) << "New stream created, id: " << stream.value()->getID()
              << " tp=" << this;
   session_->onSubscriptionStreamOpened();
-  auto pri = getStreamPriority(
-      groupID, subgroupID, subPriority_, pubPriority, groupOrder_);
   stream.value()->setPriority(
-      quic::HTTPPriorityQueue::Priority(pri.urgency, false, pri.order));
+      elementPriority(groupID, subgroupID, pubPriority));
 
   // Get effective timeout to pass to StreamPublisherImpl
   auto effectiveTimeout = deliveryTimeoutManager_.getEffectiveTimeout();
@@ -1628,7 +1728,7 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
 folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>
 MoQSession::TrackPublisherImpl::awaitStreamCredit() {
   auto wt = getWebTransport();
-  if (!wt || state_ != State::OPEN) {
+  if (!wt || publishEnded()) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "awaitStreamCredit after publishDone"));
   }
@@ -1734,7 +1834,7 @@ MoQSession::TrackPublisherImpl::datagram(
         "Cannot send datagrams for subscriptions with forward flag set to false"));
   }
   auto wt = getWebTransport();
-  if (!wt || state_ != State::OPEN) {
+  if (!wt || publishEnded()) {
     XLOG(ERR) << "Trying to publish after publishDone";
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Publish after publishDone"));
@@ -1775,16 +1875,17 @@ MoQSession::TrackPublisherImpl::datagram(
     return folly::makeUnexpected(
         MoQPublishError(MoQPublishError::WRITE_ERROR, "sendDatagram failed"));
   }
+  // Only advance the largest after the datagram is actually sent.
+  updateLargest({header.group, header.id});
   return folly::unit;
 }
 
 folly::Expected<folly::Unit, MoQPublishError>
 MoQSession::TrackPublisherImpl::publishDone(PublishDone pubDone) {
-  if (state_ != State::OPEN || !session_) {
+  if (publishEnded() || !session_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "publishDone twice or after close"));
   }
-  state_ = State::DONE;
   pubDone.requestID = requestID_;
   if (!subscriptionHandle_) {
     // publishDone called from inside the subscribe handler,
@@ -2312,7 +2413,7 @@ void MoQSession::cleanup() {
     if (const auto& control = pubTrack->bidiControl()) {
       control->disarmOnPeerTermination();
     }
-    MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscriptionEnd);
+    endSubscriptionStat(*pubTrack);
     pubTrack->terminatePublish(
         PublishDone(
             {requestID,
@@ -2333,6 +2434,9 @@ void MoQSession::cleanup() {
     sub->subscribeError({/*TrackReceiveState fills in subId*/ 0,
                          SubscribeErrorCode::INTERNAL_ERROR,
                          "session closed"});
+    // Wake read loops parked in readStreamData: the transport may cancel
+    // the read handle without enqueuing an error, leaking the consumer.
+    sub->cancel();
   }
   subTracks_.clear();
   // We parse a publishDone after cleanup
@@ -2370,9 +2474,22 @@ const folly::RequestToken& MoQSession::sessionRequestToken() {
   return token;
 }
 
+quic::PriorityQueue::Priority MoQSession::PublisherImpl::elementPriority(
+    uint64_t groupId,
+    uint64_t subgroupId,
+    uint8_t pubPri) const {
+  auto pri =
+      getStreamPriority(groupId, subgroupId, subPriority_, pubPri, groupOrder_);
+  return quic::HTTPPriorityQueue::Priority(pri.urgency, false, pri.order);
+}
+
+quic::PriorityQueue::Priority MoQSession::controlPriority() const {
+  return quic::HTTPPriorityQueue::Priority(0, false, 0);
+}
+
 void MoQSession::startControlWriteLoop(
     proxygen::WebTransport::StreamWriteHandle* writeHandle) {
-  writeHandle->setPriority(quic::HTTPPriorityQueue::Priority(0, false, 0));
+  writeHandle->setPriority(controlPriority());
   if (logger_) {
     logger_->logStreamTypeSet(
         writeHandle->getID(), MOQTStreamType::CONTROL, Owner::LOCAL);
@@ -2516,6 +2633,7 @@ void MoQSession::close(
   if (closed_) {
     return;
   }
+  closeResult_ = CloseResult{error, wtError};
   closed_ = true;
   if (closeCallback_) {
     XLOG(DBG1) << "Calling close callback";
@@ -3094,6 +3212,7 @@ MoQSession::SendRequestResult MoQSession::sendRequest(
       return folly::makeUnexpected(
           SendRequestError{bidiStream.error(), "Failed to create bidi stream"});
     }
+    bidiStream->writeHandle->setPriority(controlPriority());
     bidiStream->writeHandle->writeStreamData(
         writeBuf.move(), /*fin=*/false, nullptr);
     auto* cb = senderCallback ? senderCallback.get() : this;
@@ -3543,12 +3662,14 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     session_->close(error);
   }
 
-  // Called by read loop on read error (eg: RESET_STREAM)
+  // Called by read loop on read error (eg: RESET_STREAM). Fires reset() on
+  // a still-open consumer even if the subscription was cancelled — the
+  // MoQConsumers contract requires exactly one terminal callback.
   bool reset(ResetStreamErrorCode error) {
     if (!subscribeState_ && !fetchState_) {
       return false;
     }
-    if (!isCancelled()) {
+    if (hasOpenConsumer()) {
       // ignoring error from reset?
       invokeCallbackNoGroup(
           &SubgroupConsumer::reset, &FetchConsumer::reset, error);
@@ -3569,6 +3690,15 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       return !subgroupCallback_ || subscribeState_->isCancelled();
     }
     return true;
+  }
+
+  // Like isCancelled() but ignores subscription cancellation: a cancelled
+  // subscription still owes its open consumer the terminal callback.
+  bool hasOpenConsumer() const {
+    if (fetchState_) {
+      return fetchState_->getFetchCallback() != nullptr;
+    }
+    return subgroupCallback_ != nullptr;
   }
 
   void endOfSubgroup(bool deliverCallback = false) {
@@ -4073,7 +4203,11 @@ void MoQSession::handleSubscribeRequestUpdate(
     return;
   }
 
-  trackPublisher->setSubPriority(requestUpdate.priority);
+  // An update that omits priority leaves it unchanged, so only apply an
+  // explicit value; otherwise the current subscriber priority is preserved.
+  if (requestUpdate.priority) {
+    trackPublisher->setSubPriority(*requestUpdate.priority);
+  }
   trackPublisher->onRequestUpdate(std::move(requestUpdate));
 }
 
@@ -4126,15 +4260,16 @@ void MoQSession::onUnsubscribe(Unsubscribe unsubscribe) {
               << " sess=" << this;
     return;
   }
+  // Holds a ref so the erase below can't destroy it out from under the stat.
   auto trackPublisher =
-      dynamic_cast<TrackPublisherImpl*>(pubTrackIt->second.get());
+      std::dynamic_pointer_cast<TrackPublisherImpl>(pubTrackIt->second);
   if (!trackPublisher) {
     XLOG(ERR) << "RequestID in Unsubscribe is for a FETCH, id="
               << unsubscribe.requestID << " sess=" << this;
   } else {
     trackPublisher->unsubscribe();
     if (pubTracks_.erase(unsubscribe.requestID)) {
-      MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscriptionEnd);
+      endSubscriptionStat(*trackPublisher);
       retireRequestID(/*signalWriteLoop=*/true);
       checkForCloseOnDrain();
     } // else, the caller invoked publishDone, which isn't needed but fine
@@ -4171,7 +4306,6 @@ void MoQSession::onPublishOk(PublishOk publishOk) {
         std::static_pointer_cast<TrackPublisherImpl>(trackIt->second);
     trackPublisher->onPublishOk(publishOk);
     pendingPublishTracks_.erase(trackIt->second->fullTrackName());
-    MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscriptionBegin);
   }
   // No disarm: PUBLISH_OK is non-terminal; publishDone's flush(fin) disarms.
 
@@ -5655,7 +5789,6 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
 void MoQSession::sendSubscribeOk(const SubscribeOk& subOk, ReplyContext& ctx) {
   XLOG(DBG1) << __func__ << " sess=" << this;
   MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscribeSuccess);
-  MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscriptionBegin);
   auto res = moqFrameWriter_.writeSubscribeOk(ctx.writeBuf(), subOk);
   if (!res) {
     XLOG(ERR) << "writeSubscribeOk failed sess=" << this;
@@ -5746,6 +5879,18 @@ void MoQSession::unsubscribe(
   checkForCloseOnDrain();
 }
 
+void MoQSession::beginSubscriptionStat(PublisherImpl& pubTrack) {
+  if (pubTrack.markEstablished()) {
+    MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscriptionBegin);
+  }
+}
+
+void MoQSession::endSubscriptionStat(PublisherImpl& pubTrack) {
+  if (pubTrack.markDone()) {
+    MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscriptionEnd);
+  }
+}
+
 void MoQSession::sendPublishDone(const PublishDone& pubDone) {
   XLOG(DBG1) << __func__ << " sess=" << this;
   MOQ_PUBLISHER_STATS(
@@ -5756,7 +5901,7 @@ void MoQSession::sendPublishDone(const PublishDone& pubDone) {
               << " sess=" << this;
     return;
   }
-  MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscriptionEnd);
+  endSubscriptionStat(*it->second);
   auto* ctx = it->second->replyContext();
   SCOPE_EXIT {
     pubTracks_.erase(it);
@@ -6324,7 +6469,7 @@ void MoQSession::handleClientSetup(
           bh.readHandle->getID(), MOQTStreamType::CONTROL, Owner::REMOTE);
     }
 
-    bh.writeHandle->setPriority(quic::HTTPPriorityQueue::Priority(0, false, 0));
+    bh.writeHandle->setPriority(controlPriority());
     co_withExecutor(
         exec_.get(),
         co_withCancellation(
@@ -6475,6 +6620,7 @@ folly::coro::Task<void> MoQSession::bidiStreamDemuxer(
         close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
         co_return;
       }
+      bh.writeHandle->setPriority(controlPriority());
       auto control = std::make_shared<BidiStreamControl>(
           bh.writeHandle,
           cancellationSource_.getToken(),
@@ -6603,7 +6749,8 @@ void MoQSession::onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept {
       if (!objHeader.objectHeader.priority.has_value()) {
         objHeader.objectHeader.priority = state->getPublisherPriority();
       }
-      callback->datagram(objHeader.objectHeader, readBuf.move());
+      callback->datagram(
+          objHeader.objectHeader, readBuf.move(), objHeader.endOfGroup);
     }
   }
 }

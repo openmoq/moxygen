@@ -6,25 +6,26 @@
 
 #pragma once
 
-#include <moxygen/events/MoQLibevExecutorImpl.h>
-
 #include <folly/coro/Task.h>
 #include <proxygen/lib/utils/URL.h>
 #include <quic/state/TransportSettings.h>
 #include <moxygen/MoQClientBase.h>
+#include <moxygen/MoQQuicAddressResolver.h>
 
 namespace moxygen {
+class MoQLibevExecutorImpl;
 
 class MoQClientMobile : public MoQClientBase {
  public:
   MoQClientMobile(
       std::shared_ptr<MoQLibevExecutorImpl> moqEvb,
-      proxygen::URL url)
-      : MoQClientBase(moqEvb, url), moqlibevEvb_(moqEvb) {}
+      proxygen::URL url,
+      std::shared_ptr<fizz::CertificateVerifier> verifier,
+      bool useQuicWtSession,
+      std::shared_ptr<MoQQuicAddressResolver> addressResolver);
 
  protected:
   folly::coro::Task<std::shared_ptr<quic::QuicClientTransport>> connectQuic(
-      folly::SocketAddress connectAddr,
       std::chrono::milliseconds timeoutMs,
       std::shared_ptr<fizz::CertificateVerifier> verifier,
       const std::vector<std::string>& alpns,
@@ -32,6 +33,7 @@ class MoQClientMobile : public MoQClientBase {
 
  private:
   std::shared_ptr<MoQLibevExecutorImpl> moqlibevEvb_;
+  std::shared_ptr<MoQQuicAddressResolver> addressResolver_;
 };
 
 } // namespace moxygen

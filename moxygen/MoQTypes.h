@@ -1028,9 +1028,10 @@ struct ObjectHeader {
 struct DatagramObjectHeader {
   TrackAlias trackAlias;
   ObjectHeader objectHeader;
+  bool endOfGroup{false};
 
-  DatagramObjectHeader(TrackAlias alias, ObjectHeader header)
-      : trackAlias(alias), objectHeader(std::move(header)) {}
+  DatagramObjectHeader(TrackAlias alias, ObjectHeader header, bool eog = false)
+      : trackAlias(alias), objectHeader(std::move(header)), endOfGroup(eog) {}
 };
 
 std::ostream& operator<<(std::ostream& os, const ObjectHeader& type);
@@ -1168,7 +1169,7 @@ struct RequestUpdate {
   RequestID existingRequestID;
   std::optional<AbsoluteLocation> start;
   std::optional<uint64_t> endGroup;
-  uint8_t priority{kDefaultPriority};
+  std::optional<uint8_t> priority;
   // Draft 15+: Optional forward field. When absent, existing forward state is
   // preserved. For earlier drafts, this is always set during parsing.
   std::optional<bool> forward;

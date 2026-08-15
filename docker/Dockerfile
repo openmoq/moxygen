@@ -64,7 +64,7 @@
 
   RUN ./build/fbcode_builder/getdeps.py build --allow-system-packages --verbose moxygen 2>&1 || \
       (echo "=== Build failed, showing logs ===" && \
-       find /tmp -name "*.log" -type f -exec echo "=== {} ===" \; -exec cat {} \; 2>/dev/null; \
+       find /tmp -path '*/extracted' -prune -o -name "*.log" -type f -exec echo "=== {} ===" \; -exec tail -200 {} \; 2>/dev/null; \
        exit 1)
 
   # Stage the binary and getdeps-built shared libs for the runtime image
