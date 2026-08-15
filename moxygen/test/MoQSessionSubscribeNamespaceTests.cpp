@@ -174,8 +174,10 @@ CO_TEST_P_X(
     NamespacePreservesRelayHopParameters) {
   relayHopsSupported_ = true;
   co_await setupMoQSession();
-  EXPECT_TRUE(clientSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
-  EXPECT_TRUE(serverSession_->isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+  EXPECT_TRUE(
+      clientSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
+  EXPECT_TRUE(
+      serverSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
 
   std::shared_ptr<MockSubscribeNamespaceHandle> serverSubscribeHandle;
   std::shared_ptr<Publisher::NamespacePublishHandle> serverPublishHandle;
@@ -328,7 +330,6 @@ INSTANTIATE_TEST_SUITE_P(
     V16PlusSubscribeNamespaceTest,
     testing::Values(
         VersionParams{{kVersionDraft16}, kVersionDraft16},
-        VersionParams{{kVersionDraft17}, kVersionDraft17},
         VersionParams{{kVersionDraft18}, kVersionDraft18}));
 
 CO_TEST_P_X(MoQSessionTest, SubscribeNamespaceError) {

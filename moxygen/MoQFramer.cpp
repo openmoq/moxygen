@@ -3752,7 +3752,7 @@ folly::Expected<Namespace, ErrorCode> MoQFrameParser::parseNamespace(
   ns.trackNamespaceSuffix = TrackNamespace(std::move(res.value()));
 
   if (length > 0) {
-    if (!relayHopsNegotiated_) {
+    if (!hasExtension(SetupExtension::RelayHops)) {
       return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     auto numParams = decodeVarint(cursor, length);
@@ -3766,7 +3766,7 @@ folly::Expected<Namespace, ErrorCode> MoQFrameParser::parseNamespace(
     if (!paramsResult) {
       return folly::makeUnexpected(paramsResult.error());
     }
-  } else if (relayHopsNegotiated_) {
+  } else if (hasExtension(SetupExtension::RelayHops)) {
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   if (length > 0) {
@@ -6334,7 +6334,7 @@ WriteResult MoQFrameWriter::writeNamespace(
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::NAMESPACE, error);
   writeTrackNamespace(writeBuf, ns.trackNamespaceSuffix, size, error);
-  if (relayHopsNegotiated_) {
+  if (hasExtension(SetupExtension::RelayHops)) {
     writeTrackRequestParams(writeBuf, ns.params, {}, size, error);
   }
   writeSize(sizePtr, size, error, *version_);

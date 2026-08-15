@@ -315,18 +315,30 @@ class MoQFrameParser {
       size_t& length,
       ObjectHeader& objectHeader) const noexcept;
 
-  void initializeVersion(uint64_t versionIn) {
+  // Framers built after the setup exchange should pass the session's
+  // extensions here; the session's own pair learns its version first and picks
+  // the extensions up later via setNegotiatedExtensions().
+  void initializeVersion(uint64_t versionIn, SetupExtensions extensions = {}) {
     XCHECK(!version_) << "Version already initialized";
     version_ = versionIn;
     useMoQVarint_ = getDraftMajorVersion(versionIn) >= 17;
+    extensions_ = extensions;
   }
 
   std::optional<uint64_t> getVersion() const {
     return version_;
   }
 
-  void setRelayHopsNegotiated(bool negotiated) noexcept {
-    relayHopsNegotiated_ = negotiated;
+  void setNegotiatedExtensions(SetupExtensions extensions) noexcept {
+    extensions_ = extensions;
+  }
+
+  SetupExtensions getNegotiatedExtensions() const noexcept {
+    return extensions_;
+  }
+
+  bool hasExtension(SetupExtension extension) const noexcept {
+    return extensions_.has(extension);
   }
 
   // Decode a TRACK_NAMESPACE_PREFIX parameter value (a Track Namespace tuple,
@@ -542,8 +554,7 @@ class MoQFrameParser {
 
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
-  // draft-lcurley-moq-relay-hops Section 3 extends negotiated NAMESPACE frames.
-  bool relayHopsNegotiated_{false};
+  SetupExtensions extensions_;
   MoQTokenCache* tokenCache_{nullptr};
   mutable std::optional<uint64_t> previousObjectID_;
   // Context for FETCH object delta encoding (draft-15+)
@@ -766,18 +777,28 @@ class MoQFrameWriter {
       const std::string& tokenValue,
       const std::optional<uint64_t>& forceVersion = std::nullopt) const;
 
-  void initializeVersion(uint64_t versionIn) {
+  // See MoQFrameParser::initializeVersion.
+  void initializeVersion(uint64_t versionIn, SetupExtensions extensions = {}) {
     XCHECK(!version_) << "Version already initialized";
     version_ = versionIn;
     useMoQVarint_ = getDraftMajorVersion(versionIn) >= 17;
+    extensions_ = extensions;
   }
 
   std::optional<uint64_t> getVersion() const {
     return version_;
   }
 
-  void setRelayHopsNegotiated(bool negotiated) noexcept {
-    relayHopsNegotiated_ = negotiated;
+  void setNegotiatedExtensions(SetupExtensions extensions) noexcept {
+    extensions_ = extensions;
+  }
+
+  SetupExtensions getNegotiatedExtensions() const noexcept {
+    return extensions_;
+  }
+
+  bool hasExtension(SetupExtension extension) const noexcept {
+    return extensions_.has(extension);
   }
 
   // Encode a TrackNamespace as a TRACK_NAMESPACE_PREFIX parameter (a Track
@@ -942,8 +963,7 @@ class MoQFrameWriter {
 
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
-  // draft-lcurley-moq-relay-hops Section 3 extends negotiated NAMESPACE frames.
-  bool relayHopsNegotiated_{false};
+  SetupExtensions extensions_;
   mutable std::optional<uint64_t> previousObjectID_;
   // Context for FETCH object delta encoding (draft-15+)
   mutable std::optional<uint64_t> previousFetchGroup_;

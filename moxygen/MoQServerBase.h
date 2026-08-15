@@ -68,8 +68,11 @@ class MoQServerBase : public MoQSession::ServerSetupCallback,
    */
   void setMLoggerFactory(std::shared_ptr<MLoggerFactory> factory);
 
+  // Adds a parameter to every SETUP, replacing (not duplicating) any parameter
+  // makeServerSetup() would otherwise send with the same key. Call before
+  // accepting sessions.
   void addSetupParameter(SetupParameter parameter) {
-    setupParameters_.push_back(std::move(parameter));
+    setupParams_.emplace_back(std::move(parameter));
   }
 
   // ServerSetupCallback overrides
@@ -109,7 +112,7 @@ class MoQServerBase : public MoQSession::ServerSetupCallback,
 
   std::unordered_set<std::string> endpoints_;
   std::shared_ptr<MLoggerFactory> mLoggerFactory_;
-  std::vector<SetupParameter> setupParameters_;
+  std::vector<SetupParameter> setupParams_;
 };
 
 } // namespace moxygen

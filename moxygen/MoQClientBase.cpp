@@ -178,10 +178,6 @@ Setup MoQClientBase::getClientSetup(const std::optional<std::string>& path) {
   clientSetup.params.insertParam(Parameter(
       folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
       kDefaultMaxAuthTokenCacheSize));
-  for (const auto& parameter : setupParameters_) {
-    clientSetup.params.insertParam(parameter);
-  }
-
   if (path) {
     clientSetup.params.insertParam(
         SetupParameter(folly::to_underlying(SetupKey::PATH), *path));
@@ -198,6 +194,9 @@ Setup MoQClientBase::getClientSetup(const std::optional<std::string>& path) {
     clientSetup.params.insertParam(
         SetupParameter(folly::to_underlying(SetupKey::AUTHORITY), authority));
   }
+
+  // Last, so the application can override anything set above.
+  applySetupParameters(clientSetup.params, setupParams_);
 
   return clientSetup;
 }

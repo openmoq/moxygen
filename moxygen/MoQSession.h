@@ -234,10 +234,40 @@ class MoQSession : public Subscriber,
     return negotiatedVersion_;
   }
 
-  virtual bool isSetupOptionNegotiated(SetupKey key) const noexcept {
-    const auto value = folly::to_underlying(key);
-    return localSetupOptions_.contains(value) &&
-        peerSetupOptions_.contains(value);
+  // Every extension this build knows how to negotiate, and the rule that wins
+  // each one. Adding one is a bit in SetupExtension plus a row here.
+  static const std::vector<SetupExtensionDescriptor>& kSetupExtensions();
+
+  // Runs each rule in `descriptors` over the two SETUPs. `descriptors` is a
+  // parameter so tests can negotiate extensions this build doesn't ship.
+  static SetupExtensions computeNegotiatedExtensions(
+      const SetupParameters& localParams,
+      const SetupParameters& peerParams,
+      uint64_t version,
+      const std::vector<SetupExtensionDescriptor>& descriptors =
+          kSetupExtensions());
+
+  // Whether `extension` is in force here. False until both SETUPs are known.
+  virtual bool negotiatedSetupExtension(
+      SetupExtension extension) const noexcept {
+    return negotiatedExtensions_.has(extension);
+  }
+
+  // For framers built after the setup exchange; see
+  // MoQFrameParser::initializeVersion.
+  SetupExtensions getNegotiatedExtensions() const noexcept {
+    return negotiatedExtensions_;
+  }
+
+  // The SETUP this endpoint sent / the peer sent, retained for extensions that
+  // negotiate on something other than mutual advertisement. Empty until sent /
+  // received respectively.
+  const std::optional<SetupParameters>& getLocalSetupParams() const {
+    return localSetupParams_;
+  }
+
+  const std::optional<SetupParameters>& getPeerSetupParams() const {
+    return peerSetupParams_;
   }
 
   virtual std::shared_ptr<SubNSReply> getSubNsReply(
@@ -379,7 +409,9 @@ class MoQSession : public Subscriber,
           groupOrder_(groupOrder),
           version_(version),
           bytesBufferedThreshold_(bytesBufferedThreshold) {
-      moqFrameWriter_.initializeVersion(version);
+      moqFrameWriter_.initializeVersion(
+          version,
+          session_ ? session_->getNegotiatedExtensions() : SetupExtensions());
     }
 
     virtual ~PublisherImpl() = default;
@@ -454,6 +486,10 @@ class MoQSession : public Subscriber,
 
     uint64_t getVersion() const {
       return version_;
+    }
+
+    SetupExtensions getNegotiatedExtensions() const {
+      return moqFrameWriter_.getNegotiatedExtensions();
     }
 
     void onBytesBuffered(uint64_t amount) {
@@ -1234,7 +1270,11 @@ class MoQSession : public Subscriber,
 
   // Private implementation methods
   void initializeNegotiatedVersion(uint64_t negotiatedVersion);
-  void updateNegotiatedExtensions() noexcept;
+  // Records one half of the setup exchange. Once both halves are in, computes
+  // the negotiated extensions and pushes them to the framers, which is why
+  // this runs before any frame that an extension could alter is sent or
+  // parsed.
+  void onSetupParams(SetupParameters params, bool local);
   void removeBufferedSubgroupBaton(TrackAlias alias, TimedBaton* baton);
   void scheduleGoawayTimeout(uint64_t timeoutMs);
   void cancelGoawayTimeout();
@@ -1243,8 +1283,9 @@ class MoQSession : public Subscriber,
   bool hasOpenRequestsForGoaway() const;
 
   // Private session state
-  folly::F14FastSet<uint64_t> localSetupOptions_;
-  folly::F14FastSet<uint64_t> peerSetupOptions_;
+  std::optional<SetupParameters> localSetupParams_;
+  std::optional<SetupParameters> peerSetupParams_;
+  SetupExtensions negotiatedExtensions_;
   folly::F14FastMap<RequestID, std::shared_ptr<PublisherImpl>, RequestID::hash>
       pubTracks_;
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingPublishTracks_;

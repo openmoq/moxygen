@@ -33,13 +33,13 @@ class MoQCodec {
     streamId_ = streamId;
   }
 
-  void initializeVersion(uint64_t version) {
+  void initializeVersion(uint64_t version, SetupExtensions extensions = {}) {
     negotiatedVersion_ = version;
-    moqFrameParser_.initializeVersion(version);
+    moqFrameParser_.initializeVersion(version, extensions);
   }
 
-  void setRelayHopsNegotiated(bool negotiated) noexcept {
-    moqFrameParser_.setRelayHopsNegotiated(negotiated);
+  void setNegotiatedExtensions(SetupExtensions extensions) {
+    moqFrameParser_.setNegotiatedExtensions(extensions);
   }
 
   void setMaxAuthTokenCacheSize(size_t size) {

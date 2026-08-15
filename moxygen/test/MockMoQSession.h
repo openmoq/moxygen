@@ -76,8 +76,8 @@ class MockMoQSession : public MoQSession {
 
   MOCK_METHOD(
       bool,
-      isSetupOptionNegotiated,
-      (SetupKey),
+      negotiatedSetupExtension,
+      (SetupExtension),
       (const, noexcept, override));
 
   MOCK_METHOD(

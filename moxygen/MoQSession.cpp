@@ -532,7 +532,8 @@ StreamPublisherImpl::StreamPublisherImpl(
     }
   }
 
-  moqFrameWriter_.initializeVersion(publisher->getVersion());
+  moqFrameWriter_.initializeVersion(
+      publisher->getVersion(), publisher->getNegotiatedExtensions());
   moqFrameWriter_.setFetchGroupOrder(publisher->getGroupOrder());
   (void)moqFrameWriter_.writeFetchHeader(writeBuf_, publisher->requestID());
 }
@@ -2705,15 +2706,16 @@ folly::Expected<folly::Unit, quic::TransportErrorCode> MoQSession::sendSetup(
       folly::coro::makePromiseContract<Setup>();
 
   auto maxRequestID = getMaxRequestIDIfPresent(setup.params);
-  localSetupOptions_.clear();
-  for (const auto& param : setup.params) {
-    localSetupOptions_.insert(param.key);
-  }
-  updateNegotiatedExtensions();
 
-  setup.params.insertParam(SetupParameter(
-      {folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION),
-       getMoQTImplementationString()}));
+  // Don't duplicate a key the application already set via addSetupParameter().
+  if (!setup.params.hasParam(
+          folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION))) {
+    setup.params.insertParam(SetupParameter(
+        {folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION),
+         getMoQTImplementationString()}));
+  }
+
+  onSetupParams(setup.params, /*local=*/true);
 
   uint64_t setupSerializationVersion = kVersionDraft14;
   if (negotiatedVersion_) {
@@ -2807,11 +2809,6 @@ folly::coro::Task<Setup> MoQSession::awaitPeerSetup() {
 void MoQSession::onServerSetup(Setup serverSetup) {
   XCHECK(dir_ == MoQControlCodec::Direction::CLIENT);
   XLOG(DBG1) << __func__ << " sess=" << this;
-  peerSetupOptions_.clear();
-  for (const auto& param : serverSetup.params) {
-    peerSetupOptions_.insert(param.key);
-  }
-  updateNegotiatedExtensions();
 
   if (logger_) {
     logger_->logServerSetup(
@@ -2840,6 +2837,8 @@ void MoQSession::onServerSetup(Setup serverSetup) {
     initializeNegotiatedVersion(kVersionDraft14);
   }
 
+  onSetupParams(serverSetup.params, /*local=*/false);
+
   initPeerMaxRequestID(serverSetup.params);
   auto peerAuthCacheSize = getMaxAuthTokenCacheSizeIfPresent(
       serverSetup.params, *getNegotiatedVersion());
@@ -2852,11 +2851,6 @@ void MoQSession::onServerSetup(Setup serverSetup) {
 void MoQSession::onClientSetup(Setup clientSetup) {
   XCHECK(dir_ == MoQControlCodec::Direction::SERVER);
   XLOG(DBG1) << __func__ << " sess=" << this;
-  peerSetupOptions_.clear();
-  for (const auto& param : clientSetup.params) {
-    peerSetupOptions_.insert(param.key);
-  }
-  updateNegotiatedExtensions();
 
   if (logger_) {
     logger_->logClientSetup(
@@ -2919,6 +2913,11 @@ void MoQSession::onClientSetup(Setup clientSetup) {
     initializeNegotiatedVersion(kVersionDraft14);
   }
 
+  // After the version is settled: in uni control mode the server has already
+  // sent SERVER_SETUP, making this the second half, and extension rules are
+  // version-dependent.
+  onSetupParams(clientSetup.params, /*local=*/false);
+
   // Validate authority with the negotiated version
   auto authorityValidation = serverSetupCallback_->validateAuthority(
       clientSetup, *getNegotiatedVersion(), shared_from_this());
@@ -2965,8 +2964,7 @@ std::unique_ptr<MoQControlCodec> MoQSession::makeBidiCodec(
     std::deque<RequestID>* responseIDQueue) {
   auto codec = std::make_unique<MoQBidiStreamCodec>(
       callback, std::move(allowedFrames), requestID, okType);
-  codec->initializeVersion(*negotiatedVersion_);
-  codec->setRelayHopsNegotiated(isSetupOptionNegotiated(SetupKey::RELAY_HOPS));
+  codec->initializeVersion(*negotiatedVersion_, negotiatedExtensions_);
   codec->setTokenCache(&receiveTokenCache_);
   codec->setResponseIDQueue(responseIDQueue);
   return codec;
@@ -3775,7 +3773,7 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
   }
 
   MoQObjectStreamCodec codec(nullptr);
-  codec.initializeVersion(*negotiatedVersion_);
+  codec.initializeVersion(*negotiatedVersion_, negotiatedExtensions_);
 
   // Baton for waiting on unknown alias
   TimedBaton aliasBaton;
@@ -6666,7 +6664,7 @@ void MoQSession::onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept {
   size_t remainingLength = readBuf.chainLength();
   folly::io::Cursor cursor(readBuf.front());
   MoQFrameParser parser;
-  parser.initializeVersion(*negotiatedVersion_);
+  parser.initializeVersion(*negotiatedVersion_, negotiatedExtensions_);
   auto type = parser.decodeVarint(cursor);
   if (!type) {
     XLOG(ERR) << __func__ << " Bad datagram header failed to parse type l="
@@ -6843,11 +6841,52 @@ void MoQSession::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
   }
 }
 
-void MoQSession::updateNegotiatedExtensions() noexcept {
-  const auto relayHopsNegotiated =
-      isSetupOptionNegotiated(SetupKey::RELAY_HOPS);
-  moqFrameWriter_.setRelayHopsNegotiated(relayHopsNegotiated);
-  controlCodec_->setRelayHopsNegotiated(relayHopsNegotiated);
+/*static*/
+const std::vector<SetupExtensionDescriptor>& MoQSession::kSetupExtensions() {
+  static const std::vector<SetupExtensionDescriptor> kExtensions{
+      {SetupExtension::RelayHops,
+       [](const SetupParameters& local,
+          const SetupParameters& peer,
+          uint64_t version) {
+         const auto draft = getDraftMajorVersion(version);
+         return draft >= 16 && draft != 17 &&
+             local.hasParam(folly::to_underlying(SetupKey::RELAY_HOPS)) &&
+             peer.hasParam(folly::to_underlying(SetupKey::RELAY_HOPS));
+       }}};
+  return kExtensions;
+}
+
+/*static*/
+SetupExtensions MoQSession::computeNegotiatedExtensions(
+    const SetupParameters& localParams,
+    const SetupParameters& peerParams,
+    uint64_t version,
+    const std::vector<SetupExtensionDescriptor>& descriptors) {
+  SetupExtensions extensions;
+  for (const auto& descriptor : descriptors) {
+    if (descriptor.negotiate(localParams, peerParams, version)) {
+      extensions.add(descriptor.extension);
+    }
+  }
+  return extensions;
+}
+
+void MoQSession::onSetupParams(SetupParameters params, bool local) {
+  auto& half = local ? localSetupParams_ : peerSetupParams_;
+  XCHECK(!half) << "Setup already recorded local=" << local << " sess=" << this;
+  half = std::move(params);
+  if (!localSetupParams_ || !peerSetupParams_) {
+    return;
+  }
+
+  // Rules may be version-dependent, so both callers record their half only
+  // after the version is settled.
+  XCHECK(negotiatedVersion_)
+      << "Setup complete without a version sess=" << this;
+  negotiatedExtensions_ = computeNegotiatedExtensions(
+      *localSetupParams_, *peerSetupParams_, *negotiatedVersion_);
+  moqFrameWriter_.setNegotiatedExtensions(negotiatedExtensions_);
+  controlCodec_->setNegotiatedExtensions(negotiatedExtensions_);
 }
 
 /*static*/
