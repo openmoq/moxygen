@@ -248,8 +248,8 @@ class MoQSession : public Subscriber,
           kSetupExtensions());
 
   // Whether `extension` is in force here. False until both SETUPs are known.
-  virtual bool negotiatedSetupExtension(
-      SetupExtension extension) const noexcept {
+  virtual bool negotiatedSetupExtension(SetupExtension extension) const
+      noexcept {
     return negotiatedExtensions_.has(extension);
   }
 

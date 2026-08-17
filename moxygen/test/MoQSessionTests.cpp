@@ -160,7 +160,9 @@ TEST_F(SetupExtensionsTest, UnrelatedSetupParamsDoNotNegotiate) {
 TEST_F(SetupExtensionsTest, RuleCanNegotiateOnValue) {
   const std::vector<SetupExtensionDescriptor> byValue{
       {kExtA,
-       [](const SetupParameters& local, const SetupParameters& peer, uint64_t) {
+       [](const SetupParameters& local,
+          const SetupParameters& peer,
+          uint64_t) {
          const auto* localParam = local.getFirstParam(kKeyA);
          const auto* peerParam = peer.getFirstParam(kKeyA);
          return localParam && peerParam &&

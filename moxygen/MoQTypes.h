@@ -12,8 +12,8 @@
 #include <folly/logging/xlog.h>
 #include <proxygen/lib/http/webtransport/WebTransport.h>
 #include <algorithm>
-#include <functional>
 #include <limits>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -665,6 +665,7 @@ class Parameters {
   bool hasParam(uint64_t key) const {
     return getFirstParam(key) != nullptr;
   }
+
   folly::Expected<folly::Unit, ErrorCode> insertParam(Parameter&& param) {
     auto key = static_cast<TrackRequestParamKey>(param.key);
     if (!isParamAllowed(key)) {

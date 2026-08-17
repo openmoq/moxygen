@@ -6137,22 +6137,24 @@ class ParametersLookupTest : public ::testing::Test {};
 
 TEST_F(ParametersLookupTest, GetFirstParamReturnsEarliestMatch) {
   Parameters params(FrameType::SUBSCRIBE);
-  ASSERT_TRUE(
-      params
-          .insertParam(Parameter(
-              folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT), 1))
-          .hasValue());
-  ASSERT_TRUE(
-      params
-          .insertParam(Parameter(
-              folly::to_underlying(TrackRequestParamKey::MAX_CACHE_DURATION),
-              2))
-          .hasValue());
-  ASSERT_TRUE(
-      params
-          .insertParam(Parameter(
-              folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT), 3))
-          .hasValue());
+  ASSERT_TRUE(params
+                  .insertParam(Parameter(
+                      folly::to_underlying(
+                          TrackRequestParamKey::DELIVERY_TIMEOUT),
+                      1))
+                  .hasValue());
+  ASSERT_TRUE(params
+                  .insertParam(Parameter(
+                      folly::to_underlying(
+                          TrackRequestParamKey::MAX_CACHE_DURATION),
+                      2))
+                  .hasValue());
+  ASSERT_TRUE(params
+                  .insertParam(Parameter(
+                      folly::to_underlying(
+                          TrackRequestParamKey::DELIVERY_TIMEOUT),
+                      3))
+                  .hasValue());
 
   const auto* found =
       params.getFirstParam(TrackRequestParamKey::DELIVERY_TIMEOUT);
@@ -6194,7 +6196,8 @@ TEST_F(ApplySetupParametersTest, AppendsUnknownKeys) {
                   .hasValue());
 
   constexpr uint64_t kExtensionKey = 0x40B55;
-  applySetupParameters(params, {SetupParameter(kExtensionKey, std::string{})});
+  applySetupParameters(
+      params, {SetupParameter(kExtensionKey, std::string{})});
 
   EXPECT_EQ(params.size(), 2);
   EXPECT_EQ(params.getFirstParam(SetupKey::MAX_REQUEST_ID)->asUint64, 100);

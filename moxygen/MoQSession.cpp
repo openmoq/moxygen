@@ -6881,8 +6881,7 @@ void MoQSession::onSetupParams(SetupParameters params, bool local) {
 
   // Rules may be version-dependent, so both callers record their half only
   // after the version is settled.
-  XCHECK(negotiatedVersion_)
-      << "Setup complete without a version sess=" << this;
+  XCHECK(negotiatedVersion_) << "Setup complete without a version sess=" << this;
   negotiatedExtensions_ = computeNegotiatedExtensions(
       *localSetupParams_, *peerSetupParams_, *negotiatedVersion_);
   moqFrameWriter_.setNegotiatedExtensions(negotiatedExtensions_);

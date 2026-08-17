@@ -173,6 +173,7 @@ class MoQClientBase {
   bool useQuicWtSession_{false};
   std::chrono::milliseconds transportConnectTime_{0};
   std::chrono::milliseconds moqHandshakeTime_{0};
+
   const quic::QuicSocket* getQuicSocket() const {
     return quicSocket_.lock().get();
   }
