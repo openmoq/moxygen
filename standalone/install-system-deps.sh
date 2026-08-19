@@ -7,10 +7,17 @@
 
 set -e
 
+# apt has no overall deadline: a stalled mirror connection can hang a fetch
+# indefinitely. Bound each transfer and retry so a bad mirror fails the run in
+# minutes instead of wedging it.
+apt_get() {
+    sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"
+}
+
 install_ubuntu() {
     echo "Installing dependencies for Ubuntu/Debian..."
-    sudo apt-get update
-    sudo apt-get install -y \
+    apt_get update
+    apt_get install -y \
         build-essential \
         cmake \
         ninja-build \
