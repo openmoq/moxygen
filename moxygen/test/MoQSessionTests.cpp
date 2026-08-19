@@ -47,14 +47,58 @@ TEST_P(MoQVersionNegotiationTest, Setup) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
-// Tests for MoQSession::computeNegotiatedExtensions(). The shipped table is
-// empty, so these inject their own descriptors.
+using RelayHopsNegotiationTest = MoQSessionTest;
+
+INSTANTIATE_TEST_SUITE_P(
+    RelayHopsNegotiationTest,
+    RelayHopsNegotiationTest,
+    testing::Values(
+        VersionParams{{kVersionDraft16}, kVersionDraft16},
+        VersionParams{{kVersionDraft18}, kVersionDraft18}));
+
+CO_TEST_P_X(RelayHopsNegotiationTest, NegotiatesWhenBothPeersAdvertise) {
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  EXPECT_TRUE(
+      clientSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
+  EXPECT_TRUE(
+      serverSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
+}
+
+CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWithoutAdvertisement) {
+  co_await setupMoQSession();
+  EXPECT_FALSE(
+      clientSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
+  EXPECT_FALSE(
+      serverSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
+}
+
+CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWhenOnlyServerAdvertises) {
+  serverRelayHopsSupported_ = true;
+  co_await setupMoQSession();
+  EXPECT_FALSE(
+      clientSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
+  EXPECT_FALSE(
+      serverSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
+}
+
+CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWhenOnlyClientAdvertises) {
+  clientRelayHopsSupported_ = true;
+  co_await setupMoQSession();
+  EXPECT_FALSE(
+      clientSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
+  EXPECT_FALSE(
+      serverSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
+}
+
+// Tests for MoQSession::computeNegotiatedExtensions().
 class SetupExtensionsTest : public ::testing::Test {
  protected:
   static constexpr auto kExtA = static_cast<SetupExtension>(1u << 0);
   static constexpr auto kExtB = static_cast<SetupExtension>(1u << 1);
-  static constexpr uint64_t kKeyA = 0x40B55;
-  static constexpr uint64_t kKeyB = 0x40B56;
+  // Synthetic keys for these tests; deliberately not any real SetupKey.
+  static constexpr uint64_t kKeyA = 0xF00D1;
+  static constexpr uint64_t kKeyB = 0xF00D2;
   static constexpr uint64_t kVersion = kVersionDraft18;
 
   const std::vector<SetupExtensionDescriptor> mutualFlags_{
@@ -185,11 +229,23 @@ TEST_F(SetupExtensionsTest, NoneIsNeverHeld) {
   EXPECT_FALSE(SetupExtensions().has(SetupExtension::None));
 }
 
-TEST_F(SetupExtensionsTest, ShippedTableNegotiatesNothingYet) {
-  EXPECT_TRUE(MoQSession::kSetupExtensions().empty());
-  EXPECT_TRUE(MoQSession::computeNegotiatedExtensions(
-                  params({flag(kKeyA)}), params({flag(kKeyA)}), kVersion)
-                  .empty());
+TEST_F(SetupExtensionsTest, ShippedTableNegotiatesRelayHops) {
+  auto both = params({flag(folly::to_underlying(SetupKey::RELAY_HOPS))});
+  auto relayHops =
+      MoQSession::computeNegotiatedExtensions(both, both, kVersion);
+  EXPECT_TRUE(relayHops.has(SetupExtension::RelayHops));
+
+  auto oneSided =
+      MoQSession::computeNegotiatedExtensions(both, params({}), kVersion);
+  EXPECT_FALSE(oneSided.has(SetupExtension::RelayHops));
+
+  auto draft17 =
+      MoQSession::computeNegotiatedExtensions(both, both, kVersionDraft17);
+  EXPECT_TRUE(draft17.has(SetupExtension::RelayHops));
+
+  auto draft15 =
+      MoQSession::computeNegotiatedExtensions(both, both, kVersionDraft15);
+  EXPECT_FALSE(draft15.has(SetupExtension::RelayHops));
 }
 
 // Both halves of the setup exchange are retained on both endpoints, which is

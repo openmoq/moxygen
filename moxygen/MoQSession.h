@@ -235,8 +235,7 @@ class MoQSession : public Subscriber,
   }
 
   // Every extension this build knows how to negotiate, and the rule that wins
-  // each one. Empty until the first extension lands; adding one is a bit in
-  // SetupExtension plus a row here.
+  // each one. Adding one is a bit in SetupExtension plus a row here.
   static const std::vector<SetupExtensionDescriptor>& kSetupExtensions();
 
   // Runs each rule in `descriptors` over the two SETUPs. `descriptors` is a

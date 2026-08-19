@@ -6843,7 +6843,16 @@ void MoQSession::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
 
 /*static*/
 const std::vector<SetupExtensionDescriptor>& MoQSession::kSetupExtensions() {
-  static const std::vector<SetupExtensionDescriptor> kExtensions{};
+  static const std::vector<SetupExtensionDescriptor> kExtensions{
+      {SetupExtension::RelayHops,
+       [](const SetupParameters& local,
+          const SetupParameters& peer,
+          uint64_t version) {
+         const auto draft = getDraftMajorVersion(version);
+         return draft >= 16 &&
+             local.hasParam(folly::to_underlying(SetupKey::RELAY_HOPS)) &&
+             peer.hasParam(folly::to_underlying(SetupKey::RELAY_HOPS));
+       }}};
   return kExtensions;
 }
 

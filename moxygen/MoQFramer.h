@@ -40,6 +40,14 @@ folly::Expected<std::string, ErrorCode> parseFixedString(
     folly::io::Cursor& cursor,
     size_t& length);
 
+folly::Expected<std::string, ErrorCode> encodeRelayHopPath(
+    const std::vector<uint64_t>& hopPath,
+    uint64_t version) noexcept;
+
+folly::Expected<std::vector<uint64_t>, ErrorCode> decodeRelayHopPath(
+    std::string_view encoded,
+    uint64_t version) noexcept;
+
 inline StreamType getSubgroupStreamType(
     uint64_t version,
     SubgroupIDFormat format,

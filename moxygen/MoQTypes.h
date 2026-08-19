@@ -308,7 +308,8 @@ enum class SetupKey : uint64_t {
   AUTHORIZATION_TOKEN = 3,
   MAX_AUTH_TOKEN_CACHE_SIZE = 4,
   AUTHORITY = 5,
-  MOQT_IMPLEMENTATION = 7
+  MOQT_IMPLEMENTATION = 7,
+  RELAY_HOPS = 0x40B55,
 };
 
 constexpr uint64_t kDefaultMaxRequestID = 100;
@@ -604,6 +605,8 @@ enum class TrackRequestParamKey : uint64_t {
   TRACK_FILTER = 0x29,
   NEW_GROUP_REQUEST = 0x32,
   TRACK_NAMESPACE_PREFIX = 0x34,
+  HOP_PATH = 0x40B57,
+  EXCLUDE_HOP = 0x40B58,
 };
 
 inline bool isRendezvousTimeoutParam(uint64_t key, uint64_t majorVersion) {
@@ -784,7 +787,7 @@ void applySetupParameters(
 // extension owns one bit; MoQSession::kSetupExtensions says how a bit is won.
 enum class SetupExtension : uint32_t {
   None = 0,
-  // Extensions add a bit here, e.g. Foo = 1u << 0.
+  RelayHops = 1u << 0,
 };
 
 // The set of extensions in force on a session.
@@ -1470,6 +1473,7 @@ struct NamespaceDone {
 // Only used in draft-16 and above
 struct Namespace {
   TrackNamespace trackNamespaceSuffix;
+  TrackRequestParameters params{FrameType::NAMESPACE};
 };
 
 // SubscribeNamespaceError is now an alias for RequestError - see below
