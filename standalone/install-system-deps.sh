@@ -7,11 +7,38 @@
 
 set -e
 
-# apt has no overall deadline: a stalled mirror connection can hang a fetch
-# indefinitely. Bound each transfer and retry so a bad mirror fails the run in
-# minutes instead of wedging it.
+# apt can hang past its own transfer timeouts: a dribbling mirror defeats the
+# 30s read timeout, and a wedged https helper never fires it (the helper is
+# what enforces it). Progress watchdog: healthy apt prints continuously, so
+# kill the call after 2 minutes of output silence; hard-cap the whole call at
+# 15 minutes as a backstop against a mirror that trickles forever.
 apt_get() {
-    sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"
+    local log pid rc size prev=-1 idle=0
+    log=$(mktemp)
+    sudo timeout -k 30 900 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@" >"$log" 2>&1 &
+    pid=$!
+    tail -f --pid="$pid" "$log" &
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 5
+        size=$(stat -c %s "$log" 2>/dev/null || echo -1)
+        if [ "$size" = "$prev" ]; then
+            idle=$((idle + 5))
+            if [ "$idle" -ge 120 ]; then
+                echo "ERROR: apt-get made no progress for ${idle}s; aborting" >&2
+                sudo kill "$pid" 2>/dev/null || true
+                sleep 5
+                sudo kill -9 "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+                rm -f "$log"
+                return 124
+            fi
+        else
+            prev=$size; idle=0
+        fi
+    done
+    wait "$pid" && rc=0 || rc=$?
+    rm -f "$log"
+    return "$rc"
 }
 
 install_ubuntu() {
