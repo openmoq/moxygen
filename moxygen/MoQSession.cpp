@@ -6849,7 +6849,7 @@ const std::vector<SetupExtensionDescriptor>& MoQSession::kSetupExtensions() {
           const SetupParameters& peer,
           uint64_t version) {
          const auto draft = getDraftMajorVersion(version);
-         return draft >= 16 && draft != 17 &&
+         return draft >= 16 &&
              local.hasParam(folly::to_underlying(SetupKey::RELAY_HOPS)) &&
              peer.hasParam(folly::to_underlying(SetupKey::RELAY_HOPS));
        }}};

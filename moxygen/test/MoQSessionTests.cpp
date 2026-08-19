@@ -96,8 +96,9 @@ class SetupExtensionsTest : public ::testing::Test {
  protected:
   static constexpr auto kExtA = static_cast<SetupExtension>(1u << 0);
   static constexpr auto kExtB = static_cast<SetupExtension>(1u << 1);
-  static constexpr uint64_t kKeyA = 0x40B55;
-  static constexpr uint64_t kKeyB = 0x40B56;
+  // Synthetic keys for these tests; deliberately not any real SetupKey.
+  static constexpr uint64_t kKeyA = 0xF00D1;
+  static constexpr uint64_t kKeyB = 0xF00D2;
   static constexpr uint64_t kVersion = kVersionDraft18;
 
   const std::vector<SetupExtensionDescriptor> mutualFlags_{
@@ -240,7 +241,11 @@ TEST_F(SetupExtensionsTest, ShippedTableNegotiatesRelayHops) {
 
   auto draft17 =
       MoQSession::computeNegotiatedExtensions(both, both, kVersionDraft17);
-  EXPECT_FALSE(draft17.has(SetupExtension::RelayHops));
+  EXPECT_TRUE(draft17.has(SetupExtension::RelayHops));
+
+  auto draft15 =
+      MoQSession::computeNegotiatedExtensions(both, both, kVersionDraft15);
+  EXPECT_FALSE(draft15.has(SetupExtension::RelayHops));
 }
 
 // Both halves of the setup exchange are retained on both endpoints, which is
