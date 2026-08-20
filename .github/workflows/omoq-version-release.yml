@@ -58,6 +58,7 @@ jobs:
       tag: ${{ steps.v.outputs.tag }}
       snapshot_tag: ${{ steps.v.outputs.snapshot_tag }}
       snapshot_sha: ${{ steps.v.outputs.snapshot_sha }}
+      promote_tag: ${{ steps.v.outputs.promote_tag }}
     steps:
       - uses: actions/checkout@v4
 
@@ -94,13 +95,25 @@ jobs:
             exit 1
           fi
 
+          # Assets live on the pinned per-rev release; the alias is an
+          # asset-less pointer. Fall back to the alias for snapshots published
+          # before pinned releases existed (it still carries assets there).
+          PIN_TAG="snapshot-${SNAPSHOT_SHA:0:12}"
+          if gh api "repos/{owner}/{repo}/releases/tags/$PIN_TAG" --jq .id >/dev/null 2>&1; then
+            PROMOTE_TAG="$PIN_TAG"
+          else
+            echo "Note: $PIN_TAG not found — promoting from $SNAPSHOT_TAG (pre-pinned-snapshot build)"
+            PROMOTE_TAG="$SNAPSHOT_TAG"
+          fi
+
           {
             echo "version=$VERSION"
             echo "tag=$TAG"
             echo "snapshot_tag=$SNAPSHOT_TAG"
             echo "snapshot_sha=$SNAPSHOT_SHA"
+            echo "promote_tag=$PROMOTE_TAG"
           } >> "$GITHUB_OUTPUT"
-          echo "Dispatched from $BRANCH → snapshot $SNAPSHOT_TAG @ $SNAPSHOT_SHA"
+          echo "Dispatched from $BRANCH → snapshot $SNAPSHOT_TAG @ $SNAPSHOT_SHA (assets: $PROMOTE_TAG)"
 
   # ════════════════════════════════════════════════════════════════════════════
   # Create-release: open a draft release that the upload jobs append to.
@@ -126,8 +139,8 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           VERSION: ${{ needs.validate.outputs.version }}
           TAG: ${{ needs.validate.outputs.tag }}
-          SNAPSHOT_TAG: ${{ needs.validate.outputs.snapshot_tag }}
           SNAPSHOT_SHA: ${{ needs.validate.outputs.snapshot_sha }}
+          PROMOTE_TAG: ${{ needs.validate.outputs.promote_tag }}
         run: |
           # Mark prereleases (1.2.3-rc1) as such so GitHub's "latest"
           # algorithm correctly excludes them.
@@ -143,7 +156,7 @@ jobs:
           **Version:** \`${VERSION}\`
           **Commit:** \`${SNAPSHOT_SHA}\`
 
-          Existing platform tarballs promoted from [\`${SNAPSHOT_TAG}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${SNAPSHOT_TAG}); portable Linux tarballs built fresh from this commit.
+          Existing platform tarballs promoted from [\`${PROMOTE_TAG}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${PROMOTE_TAG}); portable Linux tarballs built fresh from this commit.
 
           **Existing platform tarballs** (RelWithDebInfo, distro-specific):
           - \`moxygen-<platform>.tar.gz\` — stripped release build
@@ -288,17 +301,19 @@ jobs:
           app-id: ${{ secrets.OMOQ_APP_ID }}
           private-key: ${{ secrets.OMOQ_APP_PRIV_KEY }}
 
-      - name: Verify snapshot hasn't been replaced mid-flight
+      # For a pinned promote source this is an integrity assert; for the
+      # pre-pinned alias fallback it is the replaced-mid-release race check.
+      - name: Verify promote source matches the resolved commit
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
-          SNAPSHOT_TAG: ${{ needs.validate.outputs.snapshot_tag }}
+          PROMOTE_TAG: ${{ needs.validate.outputs.promote_tag }}
           EXPECTED_SHA: ${{ needs.validate.outputs.snapshot_sha }}
         run: |
-          CURRENT_SHA=$(gh api "repos/$REPO/releases" \
-            --jq ".[] | select(.tag_name == \"$SNAPSHOT_TAG\") | .target_commitish")
+          CURRENT_SHA=$(gh api "repos/$REPO/releases/tags/$PROMOTE_TAG" \
+            --jq .target_commitish)
           if [ "$CURRENT_SHA" != "$EXPECTED_SHA" ]; then
-            echo "Error: $SNAPSHOT_TAG was replaced mid-release." >&2
+            echo "Error: $PROMOTE_TAG does not match the resolved snapshot commit." >&2
             echo "  expected: $EXPECTED_SHA" >&2
             echo "  current:  $CURRENT_SHA" >&2
             echo "Retry the dispatch — ci-main published a new snapshot during this run." >&2
@@ -309,10 +324,10 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
-          SNAPSHOT_TAG: ${{ needs.validate.outputs.snapshot_tag }}
+          PROMOTE_TAG: ${{ needs.validate.outputs.promote_tag }}
         run: |
           mkdir -p snapshot-assets
-          gh release download "$SNAPSHOT_TAG" --repo "$REPO" --dir snapshot-assets --pattern '*.tar.gz'
+          gh release download "$PROMOTE_TAG" --repo "$REPO" --dir snapshot-assets --pattern '*.tar.gz'
           # Drop any portable tarballs from snapshot — those are built fresh
           # in portable-build and uploaded directly there.
           rm -f snapshot-assets/moxygen-linux-amd64*.tar.gz \
