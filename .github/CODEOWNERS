@@ -1,0 +1,8 @@
+# Pin-bump protection. Dependency pins change through upstream-sync PRs as the
+# primary path (bot-created, auto-approved by a code owner via PAT); any other
+# PR touching them needs explicit code-owner approval. Enforced by "require
+# review from Code Owners" on the main branch protection.
+/build/deps/github_hashes/ @gmarzot @michalhosna
+
+# The guard guards itself.
+/.github/CODEOWNERS @gmarzot @michalhosna
