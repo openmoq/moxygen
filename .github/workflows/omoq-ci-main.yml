@@ -4,9 +4,9 @@ name: ci main
 # BUNDLE_DEPS artifacts, release snapshot, notify. PRs use omoq-ci-pr.yml
 # (build/test only).
 #
-# Every push  → snapshot-<sha12> pinned pre-release (retained; pin consumers)
-# main           → snapshot-latest rolling alias
-# release/<lbl>  → snapshot-<lbl>-latest rolling alias (independent namespace)
+# Every push  → snapshot-<sha12> pinned pre-release (assets; 30-day retention)
+# main           → snapshot-latest asset-less pointer to the pinned release
+# release/<lbl>  → snapshot-<lbl>-latest pointer (independent namespace)
 #
 # Job graph:
 #
@@ -315,9 +315,10 @@ jobs:
           echo "pin_tag=$PIN_TAG" >> "$GITHUB_OUTPUT"
           echo "Release tags: $PIN_TAG + $TAG (branch: $BRANCH)"
 
-      # The pinned per-rev snapshot is the contract pin-following consumers
-      # depend on, so it publishes before the rolling alias: if the alias
-      # upload fails, the rev is still fetchable by pin.
+      # The pinned per-rev snapshot carries the assets (uploaded once) and is
+      # the contract pin-following consumers depend on, so it publishes before
+      # the alias: if the alias update fails, the rev is still fetchable by pin.
+      # Pinned snapshots older than 30 days are pruned with their tags.
       - name: Publish pinned snapshot
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -326,14 +327,15 @@ jobs:
             --artifacts-dir artifacts/ \
             --sha "$GITHUB_SHA" \
             --tag "${{ steps.tag.outputs.pin_tag }}" \
-            --branch "${{ github.ref_name }}"
+            --branch "${{ github.ref_name }}" \
+            --prune-days 30
 
-      - name: Publish rolling snapshot alias
+      - name: Publish rolling alias (asset-less pointer)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash openmoq/scripts/publish-artifacts.sh \
-            --artifacts-dir artifacts/ \
+            --pointer-to "${{ steps.tag.outputs.pin_tag }}" \
             --sha "$GITHUB_SHA" \
             --tag "${{ steps.tag.outputs.tag }}" \
             --branch "${{ github.ref_name }}"
