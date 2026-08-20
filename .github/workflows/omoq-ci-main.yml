@@ -4,8 +4,9 @@ name: ci main
 # BUNDLE_DEPS artifacts, release snapshot, notify. PRs use omoq-ci-pr.yml
 # (build/test only).
 #
-# main           → snapshot-latest pre-release
-# release/<lbl>  → snapshot-<lbl>-latest pre-release (independent namespace)
+# Every push  → snapshot-<sha12> pinned pre-release (retained; pin consumers)
+# main           → snapshot-latest rolling alias
+# release/<lbl>  → snapshot-<lbl>-latest rolling alias (independent namespace)
 #
 # Job graph:
 #
@@ -297,7 +298,7 @@ jobs:
         with:
           path: artifacts/
 
-      - name: Compute release tag
+      - name: Compute release tags
         id: tag
         run: |
           BRANCH="${{ github.ref_name }}"
@@ -308,10 +309,26 @@ jobs:
             LABEL="${BRANCH#release/}"
             TAG="snapshot-${LABEL}-latest"
           fi
+          # 12 hex chars matches the moqx prebuilt cache key (_rev_short).
+          PIN_TAG="snapshot-$(echo "$GITHUB_SHA" | cut -c1-12)"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG (branch: $BRANCH)"
+          echo "pin_tag=$PIN_TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tags: $PIN_TAG + $TAG (branch: $BRANCH)"
 
-      - name: Publish snapshot
+      # The pinned per-rev snapshot is the contract pin-following consumers
+      # depend on, so it publishes before the rolling alias: if the alias
+      # upload fails, the rev is still fetchable by pin.
+      - name: Publish pinned snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash openmoq/scripts/publish-artifacts.sh \
+            --artifacts-dir artifacts/ \
+            --sha "$GITHUB_SHA" \
+            --tag "${{ steps.tag.outputs.pin_tag }}" \
+            --branch "${{ github.ref_name }}"
+
+      - name: Publish rolling snapshot alias
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# publish-artifacts.sh — Publish build artifacts as a rolling GitHub pre-release.
+# publish-artifacts.sh — Publish build artifacts as a GitHub pre-release.
 #
-# Creates (or replaces) a `snapshot-latest` pre-release tagged at the given
-# commit SHA, uploading all .tar.gz files from the artifacts directory.
+# Creates (or replaces) a pre-release tagged at the given commit SHA, uploading
+# all .tar.gz files from the artifacts directory. Two tag kinds, inferred from
+# the name:
+#   snapshot-latest / snapshot-*-latest — rolling alias, replaced every push
+#   anything else (e.g. snapshot-<sha12>) — pinned snapshot, retained so
+#     pin-following consumers (moqx MOXYGEN_REV) can fetch this exact rev
 #
 # Usage:
 #   publish-artifacts.sh \
@@ -117,7 +121,30 @@ upload_with_retry() {
   return 1
 }
 
-# ── Step 3: Create/replace snapshot-latest ────────────────────────────────────
+# ── Step 3: Create/replace the release ───────────────────────────────────────
+
+# Rolling aliases move every push; pinned snapshots describe one rev forever.
+ROLLING=false
+case "$TAG" in
+  snapshot-latest|snapshot-*-latest) ROLLING=true ;;
+esac
+
+if [[ "$ROLLING" == true ]]; then
+  NOTES_BODY="Rolling snapshot of the latest build from \`${BRANCH}\`.
+
+**Commit:** \`${SHA}\`
+**Built:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+This pre-release is automatically replaced on every push to \`${BRANCH}\`."
+else
+  NOTES_BODY="Pinned snapshot of the build at \`${SHORT_SHA}\` (\`${BRANCH}\`).
+
+**Commit:** \`${SHA}\`
+**Built:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+Retained so pin-following consumers (moqx \`MOXYGEN_REV\`) can fetch prebuilts
+for this exact revision."
+fi
 
 echo "==> Publishing snapshot: $TAG (commit $SHORT_SHA)"
 
@@ -125,11 +152,18 @@ if [[ "$DRY_RUN" == true ]]; then
   echo "    [dry-run] Would delete existing release $TAG"
   echo "    [dry-run] Would create pre-release $TAG with $ASSET_COUNT assets"
 else
-  # Delete existing snapshot release and tag
+  # Delete any existing release/tag with this name: replacement for rolling
+  # aliases, idempotent re-publish (workflow rerun) for pinned snapshots.
   # shellcheck disable=SC2086
   gh release delete "$TAG" --yes $REPO_FLAG 2>/dev/null || true
   git tag -d "$TAG" 2>/dev/null || true
   git push origin ":refs/tags/$TAG" 2>/dev/null || true
+
+  if [[ "$ROLLING" == true ]]; then
+    TITLE="Latest build — ${BRANCH} (${SHORT_SHA})"
+  else
+    TITLE="Build — ${BRANCH} (${SHORT_SHA})"
+  fi
 
   # Create as pre-release so it doesn't show as "Latest release"
   # --target must stay an explicit sha: downstream fetchers verify
@@ -137,15 +171,10 @@ else
   # shellcheck disable=SC2086
   gh release create "$TAG" \
     --target "$SHA" \
-    --title "Latest build — ${BRANCH} (${SHORT_SHA})" \
+    --title "$TITLE" \
     --prerelease \
     --notes "$(cat <<EOF
-Rolling snapshot of the latest build from \`${BRANCH}\`.
-
-**Commit:** \`${SHA}\`
-**Built:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-This pre-release is automatically replaced on every push to \`${BRANCH}\`.
+${NOTES_BODY}
 
 Each platform has two tarballs:
 - \`moxygen-<platform>.tar.gz\` — stripped release build
