@@ -52,6 +52,11 @@ if [[ ! -d "$INSTALL_PREFIX" ]]; then
   exit 1
 fi
 
+# ── Step 0: Drop binaries that are not part of the relay artifact ────────────
+# The media server builds under BUILD_SAMPLES with binaries we do ship
+# (moqtest_client, relay samples), so it is excluded here rather than in CMake.
+rm -f "$INSTALL_PREFIX"/bin/moq_media_server* "$INSTALL_PREFIX"/bin/moq_mp4_receiver*
+
 # ── Step 1: Report contents ──────────────────────────────────────────────────
 
 echo "==> Install prefix: $INSTALL_PREFIX"
@@ -81,7 +86,10 @@ fi
 
 if [[ "$OS" == "Darwin" ]]; then
   while IFS= read -r -d '' lib; do
-    if [[ -n "$DEBUG_DIR" ]]; then
+    # No sidecars for static archives: their DWARF is already in every
+    # executable that links them, and nothing debugs a .a — the sidecars
+    # only doubled the dbg tarball.
+    if [[ -n "$DEBUG_DIR" && "$lib" != *.a ]]; then
       REL="${lib#$INSTALL_PREFIX/}"
       mkdir -p "$DEBUG_DIR/$(dirname "$REL")"
       # macOS: copy unstripped lib as debug sidecar (no objcopy equivalent)
@@ -104,8 +112,11 @@ if [[ "$OS" == "Darwin" ]]; then
 
 elif [[ "$OS" == "Linux" ]]; then
   while IFS= read -r -d '' lib; do
-    if [[ -n "$DEBUG_DIR" ]]; then
-      REL="${lib#$INSTALL_PREFIX/}"
+    REL="${lib#$INSTALL_PREFIX/}"
+    # No sidecars for static archives: their DWARF is already in every
+    # executable that links them, and nothing debugs a .a — the sidecars
+    # only doubled the dbg tarball.
+    if [[ -n "$DEBUG_DIR" && "$lib" != *.a ]]; then
       mkdir -p "$DEBUG_DIR/$(dirname "$REL")"
       # Extract debug sections into sidecar file. Compressed DWARF (zlib,
       # readable by gdb/elfutils) roughly halves sidecar size; the dbg
