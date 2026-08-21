@@ -52,6 +52,10 @@ if [[ ! -d "$INSTALL_PREFIX" ]]; then
   exit 1
 fi
 
+# ── Step 0: Drop binaries that are not part of the relay artifact ────────────
+# Built under BUILD_SAMPLES beside binaries we do ship, so excluded here.
+rm -f "$INSTALL_PREFIX"/bin/moq_media_server* "$INSTALL_PREFIX"/bin/moq_mp4_receiver*
+
 # ── Step 1: Report contents ──────────────────────────────────────────────────
 
 echo "==> Install prefix: $INSTALL_PREFIX"
@@ -81,7 +85,8 @@ fi
 
 if [[ "$OS" == "Darwin" ]]; then
   while IFS= read -r -d '' lib; do
-    if [[ -n "$DEBUG_DIR" ]]; then
+    # No .a sidecars — see the Linux loop.
+    if [[ -n "$DEBUG_DIR" && "$lib" != *.a ]]; then
       REL="${lib#$INSTALL_PREFIX/}"
       mkdir -p "$DEBUG_DIR/$(dirname "$REL")"
       # macOS: copy unstripped lib as debug sidecar (no objcopy equivalent)
@@ -104,11 +109,13 @@ if [[ "$OS" == "Darwin" ]]; then
 
 elif [[ "$OS" == "Linux" ]]; then
   while IFS= read -r -d '' lib; do
-    if [[ -n "$DEBUG_DIR" ]]; then
-      REL="${lib#$INSTALL_PREFIX/}"
+    REL="${lib#$INSTALL_PREFIX/}"
+    # No .a sidecars: every executable that links an archive already carries
+    # its DWARF, and nothing debugs a .a.
+    if [[ -n "$DEBUG_DIR" && "$lib" != *.a ]]; then
       mkdir -p "$DEBUG_DIR/$(dirname "$REL")"
-      # Extract debug sections into sidecar file
-      objcopy --only-keep-debug "$lib" "$DEBUG_DIR/${REL}.debug" 2>/dev/null || true
+      # Compressed DWARF (zlib, gdb/elfutils-readable) halves sidecar size.
+      objcopy --only-keep-debug --compress-debug-sections "$lib" "$DEBUG_DIR/${REL}.debug" 2>/dev/null || true
     fi
     if strip --strip-debug "$lib" 2>/dev/null; then
       # Add debuglink so gdb can find the sidecar automatically
@@ -126,7 +133,7 @@ elif [[ "$OS" == "Linux" ]]; then
       if [[ -n "$DEBUG_DIR" ]]; then
         REL="${exe#$INSTALL_PREFIX/}"
         mkdir -p "$DEBUG_DIR/$(dirname "$REL")"
-        objcopy --only-keep-debug "$exe" "$DEBUG_DIR/${REL}.debug" 2>/dev/null || true
+        objcopy --only-keep-debug --compress-debug-sections "$exe" "$DEBUG_DIR/${REL}.debug" 2>/dev/null || true
       fi
       if strip --strip-debug "$exe" 2>/dev/null; then
         if [[ -n "$DEBUG_DIR" && -f "$DEBUG_DIR/${REL}.debug" ]]; then
@@ -155,6 +162,12 @@ if [[ -n "$DEBUG_OUTPUT" && -n "$DEBUG_DIR" ]]; then
     tar czf "$DEBUG_OUTPUT" -C "$DEBUG_DIR" .
     DBG_SIZE=$(du -sh "$DEBUG_OUTPUT" | cut -f1)
     echo "    Debug tarball size: $DBG_SIZE"
+    # Same 2 GiB release-asset limit as the main tarball.
+    DBG_BYTES=$(stat --format=%s "$DEBUG_OUTPUT" 2>/dev/null || stat -f%z "$DEBUG_OUTPUT" 2>/dev/null)
+    if [[ "$DBG_BYTES" -ge $((2 * 1024 * 1024 * 1024)) ]]; then
+      echo "ERROR: Debug tarball exceeds GitHub Release 2 GiB limit ($DBG_SIZE)!" >&2
+      exit 1
+    fi
   else
     echo "==> No debug files extracted, skipping debug tarball"
   fi
