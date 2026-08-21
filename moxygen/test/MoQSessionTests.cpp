@@ -891,6 +891,457 @@ CO_TEST_P_X(MoQSessionTest, Goaway) {
 
   subscribeHandler->unsubscribe();
 }
+
+// Draft-18 request-stream GOAWAY (per-request migration). These exercise
+// MoQSession::onRequestStreamGoaway: the codec already routes a GOAWAY received
+// on an established request stream here. The first client-initiated request has
+// internal RequestID 0, which keys subTracks_/reqIdToTrackAlias_/fetches_.
+class Draft18RequestStreamGoawayTest : public MoQSessionTest {
+ protected:
+  // Internal RequestID of the first client-initiated request.
+  const RequestID kFirstRequestID{0};
+
+  // onRequestStreamGoaway is a ControlCallback override; the codec invokes it
+  // on a GOAWAY received on an established request stream. Reach it through the
+  // public base interface to mirror that dispatch path.
+  static void deliverRequestStreamGoaway(
+      const std::shared_ptr<MoQSession>& session,
+      RequestID requestID,
+      Goaway goaway) {
+    static_cast<MoQControlCodec::ControlCallback&>(*session)
+        .onRequestStreamGoaway(requestID, std::move(goaway));
+  }
+
+  folly::coro::Task<std::shared_ptr<Publisher::SubscriptionHandle>>
+  openClientSubscription() {
+    co_await setupMoQSession();
+    expectSubscribe([](auto sub, auto /* pub */) -> TaskSubscribeResult {
+      co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+    });
+    auto result = co_await clientSession_->subscribe(
+        getSubscribe(kTestTrackName), subscribeCallback_);
+    EXPECT_FALSE(result.hasError());
+    if (result.hasError()) {
+      co_return nullptr;
+    }
+    co_return result.value();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    Draft18RequestStreamGoawayTest,
+    Draft18RequestStreamGoawayTest,
+    testing::Values(VersionParams{{kVersionDraft18}, kVersionDraft18}));
+
+CO_TEST_P_X(
+    Draft18RequestStreamGoawayTest,
+    SurfacesMigrationToSubscribeConsumer) {
+  auto subscription = co_await openClientSubscription();
+  if (!subscription) {
+    co_return;
+  }
+
+  Goaway received;
+  EXPECT_CALL(*subscribeCallback_, goaway(_))
+      .WillOnce(testing::Invoke([&received](Goaway goaway) {
+        received = std::move(goaway);
+      }));
+
+  Goaway goaway;
+  goaway.newSessionUri = "moqt://relay-b.example/path";
+  goaway.timeout = 5000;
+  deliverRequestStreamGoaway(clientSession_, kFirstRequestID, goaway);
+
+  // Surfaced verbatim; GOAWAY does not impact subscription state, so the
+  // handle remains usable.
+  EXPECT_EQ(received.newSessionUri, "moqt://relay-b.example/path");
+  EXPECT_EQ(received.timeout, 5000);
+  EXPECT_FALSE(clientWt_->isSessionClosed());
+
+  subscription->unsubscribe();
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    Draft18RequestStreamGoawayTest,
+    ServerRejectsRequestStreamGoawayWithUri) {
+  co_await setupMoQSession();
+
+  // A client must not advertise a new session URI; a server receiving one on a
+  // request stream MUST treat it as a protocol violation.
+  Goaway goaway;
+  goaway.newSessionUri = "moqt://relay-b.example/path";
+  deliverRequestStreamGoaway(serverSession_, RequestID(2), goaway);
+
+  EXPECT_TRUE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(Draft18RequestStreamGoawayTest, UnknownRequestIsNoOp) {
+  co_await setupMoQSession();
+
+  // No request has been established, so the lookup misses. A GOAWAY racing
+  // after teardown is expected: no callback, no close, no crash.
+  Goaway goaway;
+  goaway.timeout = 5000;
+  deliverRequestStreamGoaway(clientSession_, kFirstRequestID, goaway);
+
+  EXPECT_FALSE(clientWt_->isSessionClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    Draft18RequestStreamGoawayTest,
+    SecondRequestStreamGoawayClosesSession) {
+  auto subscription = co_await openClientSubscription();
+  if (!subscription) {
+    co_return;
+  }
+
+  EXPECT_CALL(*subscribeCallback_, goaway(_)).Times(1);
+  // The protocol-violation close tears down the open subscription, which
+  // delivers PUBLISH_DONE to the consumer.
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
+      .WillOnce(testing::Return(folly::unit));
+
+  Goaway goaway;
+  goaway.timeout = 5000;
+  deliverRequestStreamGoaway(clientSession_, kFirstRequestID, goaway);
+  EXPECT_FALSE(clientWt_->isSessionClosed());
+
+  // More than one GOAWAY on a single request stream is a protocol violation.
+  deliverRequestStreamGoaway(clientSession_, kFirstRequestID, goaway);
+  EXPECT_TRUE(clientSession_->isClosed());
+}
+
+// Publisher SEND path: the server, as publisher of a client SUBSCRIBE, emits a
+// request-stream GOAWAY on that request's reply stream. The client decodes it
+// over the wire and surfaces it to the subscribe consumer with the Request ID
+// omitted (request-stream wire form).
+CO_TEST_P_X(
+    Draft18RequestStreamGoawayTest,
+    PublisherSendsRequestStreamGoawayToSubscribe) {
+  co_await setupMoQSession();
+  std::shared_ptr<MockSubscriptionHandle> pubHandle;
+  expectSubscribe(
+      [&pubHandle](auto sub, auto /* pub */) -> TaskSubscribeResult {
+        pubHandle = makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+        co_return pubHandle;
+      });
+  auto result = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_FALSE(result.hasError());
+
+  Goaway received;
+  EXPECT_CALL(*subscribeCallback_, goaway(_))
+      .WillOnce(testing::Invoke([&received](Goaway goaway) {
+        received = std::move(goaway);
+      }));
+
+  serverSession_->requestStreamGoaway(
+      kFirstRequestID,
+      "moqt://relay-b.example/path",
+      std::chrono::milliseconds(5000));
+  co_await rescheduleN(4);
+
+  EXPECT_EQ(received.newSessionUri, "moqt://relay-b.example/path");
+  EXPECT_EQ(received.timeout, 5000);
+  // Request-stream GOAWAY omits the Request ID on the wire.
+  EXPECT_FALSE(received.requestID.has_value());
+  // GOAWAY neither drains the session nor tears down the request.
+  EXPECT_FALSE(clientWt_->isSessionClosed());
+  EXPECT_FALSE(serverSession_->isClosed());
+
+  result.value()->unsubscribe();
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// Publisher SEND path for a FETCH request.
+CO_TEST_P_X(
+    Draft18RequestStreamGoawayTest,
+    PublisherSendsRequestStreamGoawayToFetch) {
+  co_await setupMoQSession();
+  std::shared_ptr<MockFetchHandle> pubHandle;
+  expectFetch(
+      [&pubHandle](Fetch fetch, auto /* fetchPub */) -> TaskFetchResult {
+        pubHandle = makeFetchOkResult(fetch, AbsoluteLocation{100, 100});
+        co_return pubHandle;
+      });
+  expectFetchSuccess();
+  EXPECT_CALL(*clientSubscriberStatsCallback_, recordFetchLatency(_));
+  auto res =
+      co_await clientSession_->fetch(getFetch({0, 0}, {0, 1}), fetchCallback_);
+  EXPECT_FALSE(res.hasError());
+
+  Goaway received;
+  EXPECT_CALL(*fetchCallback_, goaway(_))
+      .WillOnce(testing::Invoke([&received](Goaway goaway) {
+        received = std::move(goaway);
+      }));
+
+  serverSession_->requestStreamGoaway(
+      kFirstRequestID,
+      "moqt://relay-b.example/path",
+      std::chrono::milliseconds(5000));
+  co_await rescheduleN(4);
+
+  EXPECT_EQ(received.newSessionUri, "moqt://relay-b.example/path");
+  EXPECT_EQ(received.timeout, 5000);
+  EXPECT_FALSE(received.requestID.has_value());
+  EXPECT_FALSE(clientWt_->isSessionClosed());
+  EXPECT_FALSE(serverSession_->isClosed());
+
+  folly::coro::Baton cancelBaton;
+  EXPECT_CALL(*pubHandle, fetchCancel()).WillOnce([&] { cancelBaton.post(); });
+  res.value()->fetchCancel();
+  co_await cancelBaton;
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    Draft18RequestStreamGoawayTest,
+    PublisherDoesNotSendDuplicateRequestStreamGoaway) {
+  co_await setupMoQSession();
+  expectSubscribe([](auto sub, auto /* pub */) -> TaskSubscribeResult {
+    co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+  });
+  auto result = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_FALSE(result.hasError());
+
+  EXPECT_CALL(*subscribeCallback_, goaway(_)).Times(1);
+
+  serverSession_->requestStreamGoaway(
+      kFirstRequestID,
+      "moqt://relay-b.example/path",
+      std::chrono::milliseconds(5000));
+  serverSession_->requestStreamGoaway(
+      kFirstRequestID,
+      "moqt://relay-c.example/path",
+      std::chrono::milliseconds(5000));
+  co_await rescheduleN(4);
+
+  EXPECT_FALSE(clientWt_->isSessionClosed());
+  EXPECT_FALSE(serverSession_->isClosed());
+
+  result.value()->unsubscribe();
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// Spec draft-18 §10.4: after sending a request-stream GOAWAY with a positive
+// timeout, the publisher resets that request's (bidi) stream with GOING_AWAY
+// once the timeout elapses -- it does NOT send PUBLISH_DONE. The subscriber
+// observes the peer reset as a synthesized PUBLISH_DONE with status
+// SUBSCRIPTION_ENDED. On the publisher side the request state is cleaned up
+// (onSubscriptionEnd fires, so pubTracks_ no longer holds the request), and the
+// session is not drained/closed.
+CO_TEST_P_X(
+    Draft18RequestStreamGoawayTest,
+    PublisherResetsSubscribeStreamAfterTimeout) {
+  co_await setupMoQSession();
+  std::shared_ptr<MockSubscriptionHandle> pubHandle;
+  expectSubscribe(
+      [&pubHandle](auto sub, auto /* pub */) -> TaskSubscribeResult {
+        pubHandle = makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+        co_return pubHandle;
+      });
+  auto result = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_FALSE(result.hasError());
+
+  EXPECT_CALL(*subscribeCallback_, goaway(_)).WillOnce(testing::Return());
+  // The publisher resets the request stream instead of sending PUBLISH_DONE;
+  // the subscriber surfaces the peer reset as SUBSCRIPTION_ENDED.
+  folly::coro::Baton publishDoneReceived;
+  PublishDone received;
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
+      .WillOnce(
+          testing::Invoke(
+              [&](PublishDone done)
+                  -> folly::Expected<folly::Unit, MoQPublishError> {
+                received = std::move(done);
+                publishDoneReceived.post();
+                return folly::unit;
+              }));
+  // Publisher-side cleanup: the reset path erases the request and accounts for
+  // it as a subscription end. This firing proves there is no pubTracks_ leak.
+  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscriptionEnd()).Times(1);
+
+  // 1ms real timeout; the event loop driven by the test fires it.
+  serverSession_->requestStreamGoaway(
+      kFirstRequestID,
+      "moqt://relay-b.example/path",
+      std::chrono::milliseconds(1));
+  co_await publishDoneReceived;
+
+  EXPECT_EQ(received.statusCode, PublishDoneStatusCode::SUBSCRIPTION_ENDED);
+  // The reset tears down the request but does not close the session.
+  EXPECT_FALSE(clientWt_->isSessionClosed());
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// FETCH variant: on timeout the publisher resets both the request (bidi) stream
+// and the FETCH data stream with GOING_AWAY. Post-FETCH_OK the subscriber's
+// bidi peer-termination is disarmed (the data streams own completion), so the
+// observable signal is reset(GOING_AWAY) on the data stream. The publisher must
+// open the FETCH data stream (write an object) first; a FETCH stream is created
+// lazily on first write, so an unopened stream has nothing to reset on the
+// wire.
+CO_TEST_P_X(
+    Draft18RequestStreamGoawayTest,
+    PublisherResetsFetchStreamAfterTimeout) {
+  co_await setupMoQSession();
+  std::shared_ptr<FetchConsumer> fetchPub;
+  expectFetch(
+      [&fetchPub, this](Fetch fetch, auto inFetchPub) -> TaskFetchResult {
+        fetchPub = std::move(inFetchPub);
+        eventBase_.add(
+            [fetchPub = fetchPub] { fetchPub->object(0, 0, 0, makeBuf(100)); });
+        co_return makeFetchOkResult(fetch, AbsoluteLocation{100, 100});
+      });
+  expectFetchSuccess();
+  EXPECT_CALL(*clientSubscriberStatsCallback_, recordFetchLatency(_));
+
+  folly::coro::Baton objectReceived;
+  EXPECT_CALL(
+      *fetchCallback_, object(0, 0, 0, HasChainDataLengthOf(100), _, false, _))
+      .WillOnce(testing::Invoke([&] {
+        objectReceived.post();
+        return folly::unit;
+      }));
+  auto res =
+      co_await clientSession_->fetch(getFetch({0, 0}, {0, 1}), fetchCallback_);
+  EXPECT_FALSE(res.hasError());
+  // Wait until the FETCH data stream is open at the subscriber.
+  co_await objectReceived;
+
+  EXPECT_CALL(*fetchCallback_, goaway(_)).WillOnce(testing::Return());
+  folly::coro::Baton resetReceived;
+  ResetStreamErrorCode resetCode{ResetStreamErrorCode::INTERNAL_ERROR};
+  EXPECT_CALL(*fetchCallback_, reset(_))
+      .WillOnce(testing::Invoke([&](ResetStreamErrorCode code) {
+        resetCode = code;
+        resetReceived.post();
+      }));
+
+  serverSession_->requestStreamGoaway(
+      kFirstRequestID,
+      "moqt://relay-b.example/path",
+      std::chrono::milliseconds(1));
+  co_await resetReceived;
+
+  EXPECT_EQ(resetCode, ResetStreamErrorCode::GOING_AWAY);
+  EXPECT_FALSE(clientWt_->isSessionClosed());
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// A timeout of 0 means "no specific timeout": the publisher arms no reset
+// timer, so the request stream is never reset and the session stays open.
+CO_TEST_P_X(
+    Draft18RequestStreamGoawayTest,
+    ZeroTimeoutDoesNotResetSubscribeStream) {
+  co_await setupMoQSession();
+  std::shared_ptr<MockSubscriptionHandle> pubHandle;
+  expectSubscribe(
+      [&pubHandle](auto sub, auto /* pub */) -> TaskSubscribeResult {
+        pubHandle = makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+        co_return pubHandle;
+      });
+  auto result = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_FALSE(result.hasError());
+
+  EXPECT_CALL(*subscribeCallback_, goaway(_)).WillOnce(testing::Return());
+  // No reset timer is armed, so no PUBLISH_DONE is delivered.
+  EXPECT_CALL(*subscribeCallback_, publishDone(_)).Times(0);
+
+  serverSession_->requestStreamGoaway(
+      kFirstRequestID,
+      "moqt://relay-b.example/path",
+      std::chrono::milliseconds(0));
+  co_await rescheduleN(4);
+
+  EXPECT_FALSE(clientWt_->isSessionClosed());
+  EXPECT_FALSE(serverSession_->isClosed());
+  result.value()->unsubscribe();
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// Tearing down the request before the timeout elapses cancels the reset timer
+// (via ~PublisherImpl), so no spurious GOING_AWAY reset fires and there is no
+// use-after-free. A large timeout guarantees teardown wins the race.
+CO_TEST_P_X(
+    Draft18RequestStreamGoawayTest,
+    UnsubscribeBeforeTimeoutCancelsReset) {
+  co_await setupMoQSession();
+  std::shared_ptr<MockSubscriptionHandle> pubHandle;
+  expectSubscribe(
+      [&pubHandle](auto sub, auto /* pub */) -> TaskSubscribeResult {
+        pubHandle = makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+        co_return pubHandle;
+      });
+  auto result = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_FALSE(result.hasError());
+
+  EXPECT_CALL(*subscribeCallback_, goaway(_)).WillOnce(testing::Return());
+  // The timer-driven reset must not fire after the request is torn down.
+  EXPECT_CALL(*subscribeCallback_, publishDone(_)).Times(0);
+  EXPECT_CALL(*pubHandle, unsubscribe());
+
+  // A large timeout guarantees the reset timer cannot elapse during the loop
+  // pumps below, so any observed reset would be a lifecycle bug, not the timer.
+  serverSession_->requestStreamGoaway(
+      kFirstRequestID,
+      "moqt://relay-b.example/path",
+      std::chrono::milliseconds(60000));
+  co_await rescheduleN(4);
+
+  // Tear down the request; this destroys the publisher and cancels its timer.
+  result.value()->unsubscribe();
+  co_await rescheduleN(4);
+
+  EXPECT_FALSE(clientWt_->isSessionClosed());
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// Sending a request-stream GOAWAY for an unknown request is a no-op: no frame
+// reaches the peer, nothing crashes, the session stays open.
+CO_TEST_P_X(Draft18RequestStreamGoawayTest, PublisherSendUnknownRequestIsNoOp) {
+  co_await setupMoQSession();
+
+  EXPECT_CALL(*subscribeCallback_, goaway(_)).Times(0);
+  serverSession_->requestStreamGoaway(
+      RequestID(999), "", std::chrono::milliseconds(5000));
+  co_await rescheduleN(4);
+
+  EXPECT_FALSE(clientWt_->isSessionClosed());
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// On a pre-draft-18 session requestStreamGoaway is a no-op: the explicit
+// version guard returns before writing anything, so no GOAWAY reaches the peer
+// and nothing crashes.
+CO_TEST_P_X(PreDraft18Test, RequestStreamGoawayIsNoOpPreDraft18) {
+  co_await setupMoQSession();
+
+  EXPECT_CALL(*subscribeCallback_, goaway(_)).Times(0);
+  serverSession_->requestStreamGoaway(
+      RequestID(0),
+      "moqt://relay-b.example/path",
+      std::chrono::milliseconds(5000));
+  co_await rescheduleN(4);
+
+  EXPECT_FALSE(clientWt_->isSessionClosed());
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, UniStreamBeforeSetup) {
   if (useUniControlStreams(getServerSelectedVersion())) {
     // Draft 18+ uses uni streams for control, so receiving one before

@@ -1212,13 +1212,15 @@ CO_TEST_P_X(MoQSessionTest, NoSubscriptionEndForPublishPendingOkAtClose) {
   EXPECT_CALL(*serverSubscriber, publish(_, _))
       .WillOnce(
           [&replyBlocked](
-              PublishRequest actualPub, std::shared_ptr<SubscriptionHandle>)
+              const PublishRequest& actualPub,
+              std::shared_ptr<SubscriptionHandle>)
               -> Subscriber::PublishResult {
             auto consumer = std::make_shared<MockTrackConsumer>();
             EXPECT_CALL(*consumer, setTrackAlias(_))
-                .WillRepeatedly(testing::Return(
-                    folly::Expected<folly::Unit, MoQPublishError>(
-                        folly::unit)));
+                .WillRepeatedly(
+                    testing::Return(
+                        folly::Expected<folly::Unit, MoQPublishError>(
+                            folly::unit)));
             EXPECT_CALL(*consumer, publishDone(_))
                 .WillRepeatedly(testing::Return(folly::unit));
             auto requestID = actualPub.requestID;
@@ -1229,10 +1231,11 @@ CO_TEST_P_X(MoQSessionTest, NoSubscriptionEndForPublishPendingOkAtClose) {
                         -> folly::coro::Task<
                             folly::Expected<PublishOk, PublishError>> {
                       co_await replyBlocked;
-                      co_return folly::makeUnexpected(PublishError{
-                          requestID,
-                          PublishErrorCode::INTERNAL_ERROR,
-                          "never accepted"});
+                      co_return folly::makeUnexpected(
+                          PublishError{
+                              requestID,
+                              PublishErrorCode::INTERNAL_ERROR,
+                              "never accepted"});
                     })};
           });
 

@@ -24,6 +24,9 @@ namespace {
 using namespace moxygen;
 constexpr uint64_t kMaxSendTokenCacheSize(1024);
 
+// Draft-18 §10.4: GOAWAY newSessionUri MUST NOT exceed 8192 bytes.
+constexpr uint64_t kMaxGoawayUriLength(8192);
+
 // Bit allocations for 32-bit order: sub=5, pub=8, group=14, subgroup=5
 constexpr uint32_t kSubPriBits = 5;
 constexpr uint32_t kPubPriBits = 8;
@@ -451,7 +454,8 @@ class StreamPublisherImpl
   void setWriteHandle(proxygen::WebTransport::StreamWriteHandle* writeHandle);
 
   folly::Expected<folly::Unit, MoQPublishError> validatePublish(
-      uint64_t objectID);
+      uint64_t objectID,
+      const Extensions& extensions);
   folly::Expected<ObjectPublishStatus, MoQPublishError>
   validateObjectPublishAndUpdateState(folly::IOBuf* payload, bool finStream);
   folly::Expected<folly::Unit, MoQPublishError> objectImpl(
@@ -478,6 +482,7 @@ class StreamPublisherImpl
   std::optional<folly::CancellationCallback> cancelCallback_;
   proxygen::WebTransport::StreamWriteHandle* writeHandle_{nullptr};
   StreamType streamType_;
+  bool includeExtensions_{true}; // Subgroups only, FETCH always allows them
   TrackAlias trackAlias_{0}; // Store track alias separately from ObjectHeader
   ObjectHeader header_;
   std::optional<uint64_t> currentLengthRemaining_;
@@ -569,6 +574,7 @@ StreamPublisherImpl::StreamPublisherImpl(
       endOfGroup,
       sgPriority.has_value(),
       beginsWithFirstObject);
+  includeExtensions_ = includeExtensions;
   trackAlias_ = alias;
   setWriteHandle(writeHandle);
   setGroupAndSubgroup(groupID, subgroupID);
@@ -639,7 +645,16 @@ void StreamPublisherImpl::onStreamComplete() {
 }
 
 folly::Expected<folly::Unit, MoQPublishError>
-StreamPublisherImpl::validatePublish(uint64_t objectID) {
+StreamPublisherImpl::validatePublish(
+    uint64_t objectID,
+    const Extensions& extensions) {
+  if (!includeExtensions_ && !extensions.empty()) {
+    XLOG(ERR) << "Extensions on a subgroup opened without them sgp=" << this;
+    reset(ResetStreamErrorCode::INTERNAL_ERROR);
+    return folly::makeUnexpected(MoQPublishError(
+        MoQPublishError::API_ERROR,
+        "Extensions on a subgroup opened with includeExtensions=false"));
+  }
   if (currentLengthRemaining_) {
     XLOG(ERR) << "Still publishing previous object sgp=" << this;
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
@@ -799,7 +814,7 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::objectImpl(
     return folly::makeUnexpected(
         MoQPublishError(MoQPublishError::API_ERROR, "shouldForward is false"));
   }
-  auto validateRes = validatePublish(objectID);
+  auto validateRes = validatePublish(objectID, extensions);
   if (!validateRes) {
     return validateRes;
   }
@@ -842,7 +857,7 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::beginObject(
     return folly::makeUnexpected(
         MoQPublishError(MoQPublishError::API_ERROR, "shouldForward is false"));
   }
-  auto validateRes = validatePublish(objectID);
+  auto validateRes = validatePublish(objectID, extensions);
   if (!validateRes) {
     return validateRes;
   }
@@ -934,7 +949,7 @@ StreamPublisherImpl::publishStatus(
     return folly::makeUnexpected(
         MoQPublishError(MoQPublishError::API_ERROR, "shouldForward is false"));
   }
-  auto validateRes = validatePublish(objectID);
+  auto validateRes = validatePublish(objectID, extensions);
   if (!validateRes) {
     return validateRes;
   }
@@ -1436,6 +1451,17 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     }
   }
 
+  void resetForGoaway(ResetStreamErrorCode code) override {
+    resetAllSubgroups(code);
+    subscriptionHandle_.reset();
+    if (replyContext_) {
+      replyContext_->cancel(code);
+    }
+    if (auto session = std::exchange(session_, nullptr)) {
+      session->cleanupSubscribePublisherAfterGoawayReset(requestID_);
+    }
+  }
+
   void resetAllSubgroups(ResetStreamErrorCode code) {
     while (!subgroups_.empty()) {
       auto it = subgroups_.begin();
@@ -1566,6 +1592,15 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
 
   void terminatePublish(PublishDone, ResetStreamErrorCode error) override {
     reset(error);
+  }
+
+  void resetForGoaway(ResetStreamErrorCode code) override {
+    // Reset the request (bidi) stream first; reset() below resets the data
+    // stream and drives fetchComplete -> pubTracks_.erase + retireRequestID.
+    if (replyContext_) {
+      replyContext_->cancel(code);
+    }
+    reset(code);
   }
 
   void reset(ResetStreamErrorCode error) {
@@ -1952,11 +1987,20 @@ class MoQSession::TrackReceiveStateBase {
     return bidiControl_;
   }
 
+  // Marks that a draft-18 request-stream GOAWAY has been delivered for this
+  // request. Returns true the first time (newly marked); false if one was
+  // already delivered (a second is a protocol violation). The flag lives with
+  // the per-request state, so it is freed automatically on teardown.
+  bool markRequestStreamGoawaySeen() {
+    return !std::exchange(requestStreamGoawaySeen_, true);
+  }
+
  protected:
   FullTrackName fullTrackName_;
   RequestID requestID_;
   folly::CancellationSource cancelSource_;
   std::shared_ptr<BidiStreamControl> bidiControl_;
+  bool requestStreamGoawaySeen_{false};
 };
 
 class MoQSession::SubscribeTrackReceiveState
@@ -2213,6 +2257,10 @@ class MoQSession::FetchTrackReceiveState
     return fetchGroupOrder_;
   }
 
+  uint32_t dataStreamCancelCode() const {
+    return dataStreamCancelCode_;
+  }
+
   void resetFetchCallback(MoQSession* session) {
     callback_.reset();
     if (fetchOkAndAllDataReceived()) {
@@ -2235,8 +2283,25 @@ class MoQSession::FetchTrackReceiveState
     resetFetchCallback(session);
   }
 
+  void sessionClosed() {
+    if (!fetchEstablished_) {
+      return;
+    }
+    auto callback = std::exchange(callback_, nullptr);
+    if (bidiControl_) {
+      bidiControl_->cancel(ResetStreamErrorCode::SESSION_CLOSED);
+    }
+    dataStreamCancelCode_ =
+        folly::to_underlying(ResetStreamErrorCode::SESSION_CLOSED);
+    cancelSource_.requestCancellation();
+    if (callback) {
+      callback->reset(ResetStreamErrorCode::SESSION_CLOSED);
+    }
+  }
+
   void fetchOK(FetchOk ok) {
     XLOG(DBG1) << __func__ << " trackReceiveState=" << this;
+    fetchEstablished_ = true;
     promise_.setValue(std::move(ok));
   }
 
@@ -2269,6 +2334,8 @@ class MoQSession::FetchTrackReceiveState
   GroupOrder fetchGroupOrder_;
   folly::coro::Promise<FetchResult> promise_;
   uint64_t currentStreamId_{0};
+  uint32_t dataStreamCancelCode_{0};
+  bool fetchEstablished_{false};
 };
 
 const std::shared_ptr<BidiStreamControl>&
@@ -2398,13 +2465,14 @@ MoQSession::~MoQSession() {
 
 void MoQSession::cleanup() {
   cancelGoawayTimeout();
-  // Each loop disarms its entry's bidi control before tearing it down so a
-  // peer close mid-shutdown can't race the canonical error delivery.
-  // fetches_ has no per-entry destroy loop, so it needs an upfront pass.
-  for (auto& [reqID, fetch] : fetches_) {
+  while (!fetches_.empty()) {
+    auto it = fetches_.begin();
+    auto fetch = std::move(it->second);
+    fetches_.erase(it);
     if (const auto& control = fetch->bidiControl()) {
       control->disarmOnPeerTermination();
     }
+    fetch->sessionClosed();
   }
   while (!pubTracks_.empty()) {
     auto it = pubTracks_.begin();
@@ -2442,10 +2510,6 @@ void MoQSession::cleanup() {
   subTracks_.clear();
   // We parse a publishDone after cleanup
   reqIdToTrackAlias_.clear();
-  // TODO: there needs to be a way to queue an error in TrackReceiveState,
-  // both from here, when close races the FETCH stream, and from readLoop
-  // where we get a reset.
-  fetches_.clear();
   for (auto& [reqID, pendingState] : pendingRequests_) {
     if (const auto& control = pendingState->bidiControl()) {
       control->disarmOnPeerTermination();
@@ -2578,6 +2642,74 @@ void MoQSession::goaway(Goaway goaway) {
   }
 }
 
+void MoQSession::requestStreamGoaway(
+    RequestID requestID,
+    std::string newSessionUri,
+    std::chrono::milliseconds timeout) {
+  XLOG(DBG1) << __func__ << " id=" << requestID << " sess=" << this;
+
+  // Request-stream GOAWAY (per-request migration) is a draft-18+ feature.
+  auto negotiatedVersion = getNegotiatedVersion();
+  if (!negotiatedVersion || getDraftMajorVersion(*negotiatedVersion) < 18) {
+    XLOG(ERR) << "request-stream GOAWAY on pre-draft-18 session sess=" << this;
+    return;
+  }
+
+  XCHECK_LE(newSessionUri.size(), kMaxGoawayUriLength)
+      << "request-stream GOAWAY newSessionUri must not exceed 8192 bytes";
+
+  // Spec draft-18 §10.4: only a server may advertise a new session URI. Clear
+  // it rather than emit an illegal client URI; this is a local-misuse guard, so
+  // do not close the session.
+  if (dir_ != MoQControlCodec::Direction::SERVER && !newSessionUri.empty()) {
+    XLOG(ERR) << "client may not advertise request-stream GOAWAY newSessionUri "
+              << "sess=" << this;
+    newSessionUri.clear();
+  }
+
+  auto it = pubTracks_.find(requestID);
+  if (it == pubTracks_.end()) {
+    XLOG(ERR) << "request-stream GOAWAY for unknown request id=" << requestID
+              << " sess=" << this;
+    return;
+  }
+  auto* ctx = it->second->replyContext();
+  if (!ctx) {
+    XLOG(ERR) << "request-stream GOAWAY: no reply context for id=" << requestID
+              << " sess=" << this;
+    return;
+  }
+  if (!it->second->markRequestStreamGoawaySent()) {
+    XLOG(ERR) << "duplicate request-stream GOAWAY for id=" << requestID
+              << " sess=" << this;
+    return;
+  }
+  // Writing after the reply stream is closed is a silent no-op in the reply
+  // context, so no explicit closed-stream check is needed here.
+
+  Goaway g;
+  g.newSessionUri = std::move(newSessionUri);
+  g.timeout = static_cast<uint64_t>(timeout.count());
+  g.requestID = std::nullopt;
+  auto res =
+      moqFrameWriter_.writeGoaway(ctx->writeBuf(), g, /*onRequestStream=*/true);
+  if (!res) {
+    XLOG(ERR) << "writeGoaway on request stream failed sess=" << this;
+    return;
+  }
+  ctx->flush(/*fin=*/false);
+
+  if (logger_) {
+    logger_->logGoaway(g);
+  }
+
+  // Spec draft-18 §10.4: a timeout of 0 means "no specific timeout", so the
+  // sender does not schedule a reset. Arm only for a positive timeout.
+  if (timeout.count() > 0) {
+    it->second->armGoawayResetTimer(timeout);
+  }
+}
+
 void MoQSession::checkForCloseOnDrain() {
   if (draining_ && !hasOpenRequestsForDrain()) {
     close(SessionCloseErrorCode::NO_ERROR);
@@ -2602,6 +2734,94 @@ void MoQSession::cancelGoawayTimeout() {
     goawayTimeout_->cancelTimerCallback();
     goawayTimeout_.reset();
   }
+}
+
+// Per-request reset timer (draft-18 §10.4). Owned by the PublisherImpl whose
+// request stream it resets, so any teardown path that destroys the
+// PublisherImpl cancels it via ~PublisherImpl. The expiry callback re-hops to
+// the executor and re-checks a weak_ptr to the PublisherImpl, so it cannot fire
+// on freed state even though the reset itself destroys the PublisherImpl (and
+// this timer).
+class MoQSession::PublisherImpl::GoawayResetTimeoutCallback
+    : public quic::QuicTimerCallback {
+ public:
+  explicit GoawayResetTimeoutCallback(PublisherImpl& publisher)
+      : publisher_(publisher) {}
+
+  void timeoutExpired() noexcept override {
+    auto exec = publisher_.getExecutor();
+    if (!exec) {
+      return;
+    }
+    auto weakPublisher = publisher_.weak_from_this();
+    exec->add([weakPublisher = std::move(weakPublisher)]() mutable {
+      if (auto publisher = weakPublisher.lock()) {
+        publisher->onGoawayResetTimerExpired();
+      }
+    });
+  }
+
+  void callbackCanceled() noexcept override {
+    XLOG(DBG4) << "request-stream GOAWAY reset timeout canceled pub="
+               << &publisher_;
+  }
+
+ private:
+  PublisherImpl& publisher_;
+};
+
+void MoQSession::PublisherImpl::armGoawayResetTimer(
+    std::chrono::milliseconds timeout) {
+  cancelGoawayResetTimer();
+  auto exec = getExecutor();
+  if (!exec) {
+    XLOG(ERR) << "request-stream GOAWAY reset timer: no executor pub=" << this;
+    return;
+  }
+  goawayResetTimer_ = std::make_unique<GoawayResetTimeoutCallback>(*this);
+  XLOG(DBG1) << "Scheduling request-stream GOAWAY reset timeoutMs="
+             << timeout.count() << " pub=" << this;
+  exec->scheduleTimeout(goawayResetTimer_.get(), timeout);
+}
+
+void MoQSession::PublisherImpl::cancelGoawayResetTimer() {
+  if (goawayResetTimer_) {
+    goawayResetTimer_->cancelTimerCallback();
+    goawayResetTimer_.reset();
+  }
+}
+
+void MoQSession::PublisherImpl::onGoawayResetTimerExpired() {
+  XLOG(DBG1) << "request-stream GOAWAY reset timer expired, resetting stream "
+             << "id=" << requestID_ << " pub=" << this;
+  // Spec draft-18 §10.4: reset the request (bidi) stream and data streams with
+  // GOING_AWAY -- do NOT send PUBLISH_DONE. resetForGoaway also cleans up the
+  // publisher state (pubTracks_.erase + accounting). Safe to destroy this
+  // PublisherImpl here: the expiry callback holds a shared_ptr for the call's
+  // duration (see GoawayResetTimeoutCallback).
+  resetForGoaway(ResetStreamErrorCode::GOING_AWAY);
+}
+
+MoQSession::PublisherImpl::PublisherImpl(
+    MoQSession* session,
+    FullTrackName ftn,
+    RequestID requestID,
+    Priority subPriority,
+    GroupOrder groupOrder,
+    uint64_t version,
+    uint64_t bytesBufferedThreshold)
+    : session_(session),
+      fullTrackName_(std::move(ftn)),
+      requestID_(requestID),
+      subPriority_(subPriority),
+      groupOrder_(groupOrder),
+      version_(version),
+      bytesBufferedThreshold_(bytesBufferedThreshold) {
+  moqFrameWriter_.initializeVersion(version);
+}
+
+MoQSession::PublisherImpl::~PublisherImpl() {
+  cancelGoawayResetTimer();
 }
 
 void MoQSession::onGoawayTimeoutExpired() {
@@ -3737,6 +3957,8 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
   auto rhToken = readHandle->getCancelToken();
   XLOG(DBG1) << __func__ << " id=" << id << " sess=" << this;
   bool isSubscriptionStream = false;
+  std::shared_ptr<FetchTrackReceiveState> fetchState;
+  std::optional<folly::CancellationCallback> fetchCancelCb;
   auto g = folly::makeGuard([func = __func__, this, id, &isSubscriptionStream] {
     XLOG(DBG1) << "exit " << func << " id=" << id << " sess=" << this;
     if (isSubscriptionStream) {
@@ -3824,15 +4046,24 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
   };
 
   // Lambda for onFetch
-  auto onFetchFunc = [this, &token, &codec](RequestID requestID) {
-    auto state = getFetchTrackReceiveState(requestID);
-    if (state) {
-      // FetchTrackReceiveState lifecycle now controls read loop
-      token = state->getCancelToken();
-      codec.setFetchGroupOrder(state->getFetchGroupOrder());
-    }
-    return state;
-  };
+  auto onFetchFunc =
+      [this, &token, &codec, &fetchState, &fetchCancelCb, &readHandle](
+          RequestID requestID) {
+        auto state = getFetchTrackReceiveState(requestID);
+        if (state) {
+          // FetchTrackReceiveState lifecycle now controls read loop
+          fetchState = state;
+          token = state->getCancelToken();
+          fetchCancelCb.emplace(token, [&readHandle, &fetchState] {
+            if (readHandle && fetchState) {
+              readHandle->stopSending(fetchState->dataStreamCancelCode());
+              readHandle = nullptr;
+            }
+          });
+          codec.setFetchGroupOrder(state->getFetchGroupOrder());
+        }
+        return state;
+      };
 
   detail::ObjectStreamCallback dcb(this, onSubgroupFunc, onFetchFunc);
   if (logger_) {
@@ -5439,6 +5670,85 @@ void MoQSession::onGoaway(Goaway goaway) {
   }
 }
 
+void MoQSession::onRequestStreamGoaway(RequestID requestID, Goaway goaway) {
+  XLOG(DBG1) << __func__ << " id=" << requestID << " sess=" << this;
+
+  if (logger_) {
+    logger_->logGoaway(goaway, ControlMessageType::PARSED);
+  }
+
+  // Request-stream GOAWAY (per-request migration) is a draft-18+ feature.
+  auto negotiatedVersion = getNegotiatedVersion();
+  if (!negotiatedVersion || getDraftMajorVersion(*negotiatedVersion) < 18) {
+    XLOG(ERR) << "request-stream GOAWAY on pre-draft-18 session sess=" << this;
+    close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+    return;
+  }
+
+  // Spec draft-18 §10.4: only a server may advertise a new session URI.
+  if (dir_ == MoQControlCodec::Direction::SERVER &&
+      !goaway.newSessionUri.empty()) {
+    XLOG(ERR) << "Server received request-stream GOAWAY newSessionUri sess="
+              << this;
+    close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+    return;
+  }
+  if (goaway.newSessionUri.size() > kMaxGoawayUriLength) {
+    XLOG(ERR) << "request-stream GOAWAY newSessionUri too long len="
+              << goaway.newSessionUri.size() << " sess=" << this;
+    close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+    return;
+  }
+
+  // Resolve the consumer from the stream's RequestID (goaway.requestID is unset
+  // on a request stream). A SUBSCRIBE request maps via reqIdToTrackAlias_; a
+  // FETCH request lives directly in fetches_.
+  std::shared_ptr<TrackConsumer> trackConsumer;
+  std::shared_ptr<FetchConsumer> fetchConsumer;
+  TrackReceiveStateBase* receiveState = nullptr;
+  auto aliasIt = reqIdToTrackAlias_.find(requestID);
+  if (aliasIt != reqIdToTrackAlias_.end()) {
+    if (auto state = getSubscribeTrackReceiveState(aliasIt->second)) {
+      trackConsumer = state->getSubscribeCallback();
+      receiveState = state.get();
+    }
+  } else {
+    auto fetchIt = fetches_.find(requestID);
+    if (fetchIt != fetches_.end()) {
+      fetchConsumer = fetchIt->second->getFetchCallback();
+      receiveState = fetchIt->second.get();
+    }
+  }
+
+  if (!trackConsumer && !fetchConsumer) {
+    // A GOAWAY racing after the app already re-issued and tore down the request
+    // is expected; do not close the session.
+    XLOG(DBG1) << "request-stream GOAWAY for unknown request id=" << requestID
+               << " sess=" << this;
+    return;
+  }
+
+  // Spec draft-18: more than one GOAWAY on a single request stream is a
+  // session-level protocol violation. The dedup flag lives on the per-request
+  // receive state, so it is freed automatically when the request is torn down.
+  if (receiveState && !receiveState->markRequestStreamGoawaySeen()) {
+    XLOG(ERR) << "Multiple request-stream GOAWAYs for request id=" << requestID
+              << " sess=" << this;
+    close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+    return;
+  }
+
+  // Surface the migration request to the application. GOAWAY does not impact
+  // subscription state; the app drives teardown.
+  folly::RequestContextScopeGuard guard;
+  setRequestSession();
+  if (trackConsumer) {
+    trackConsumer->goaway(std::move(goaway));
+  } else {
+    fetchConsumer->goaway(std::move(goaway));
+  }
+}
+
 void MoQSession::onConnectionError(ErrorCode error) {
   XLOG(DBG1) << __func__ << " sess=" << this;
   XLOG(ERR) << "MoQCodec control stream parse error err="
@@ -5721,9 +6031,13 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
       buf,
       FrameType::SUBSCRIBE_OK,
       /*postTerminal=*/
+      // GOAWAY is admitted on the reply stream so the responder can ask us to
+      // migrate this request. Responder-side admission stays deferred until
+      // PUBLISH-initiated migration lands.
       {FrameType::PUBLISH_DONE,
        FrameType::REQUEST_OK,
-       FrameType::REQUEST_ERROR},
+       FrameType::REQUEST_ERROR,
+       FrameType::GOAWAY},
       reqID,
       /*minBidiDraftVersion=*/18,
       /*senderCallback=*/nullptr,
@@ -6046,6 +6360,16 @@ void MoQSession::fetchComplete(RequestID requestID) {
   checkForCloseOnDrain();
 }
 
+void MoQSession::cleanupSubscribePublisherAfterGoawayReset(
+    RequestID requestID) {
+  XLOG(DBG1) << __func__ << " id=" << requestID << " sess=" << this;
+  if (pubTracks_.erase(requestID)) {
+    MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscriptionEnd);
+    retireRequestID(/*signalWriteLoop=*/true);
+    checkForCloseOnDrain();
+  }
+}
+
 void MoQSession::requestUpdate(
     const RequestUpdate& reqUpdate,
     const std::shared_ptr<BidiStreamControl>& control) {
@@ -6190,7 +6514,10 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
   auto sendResult = sendRequest(
       writeBuf,
       FrameType::FETCH_OK,
-      /*postTerminal=*/{FrameType::REQUEST_OK, FrameType::REQUEST_ERROR},
+      // GOAWAY is admitted here too; responder-side admission is deferred until
+      // PUBLISH-initiated migration lands.
+      /*postTerminal=*/
+      {FrameType::REQUEST_OK, FrameType::REQUEST_ERROR, FrameType::GOAWAY},
       reqID,
       /*minBidiDraftVersion=*/18,
       /*senderCallback=*/nullptr,
