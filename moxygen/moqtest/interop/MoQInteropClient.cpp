@@ -104,11 +104,26 @@ class SimplePublisher : public moxygen::Publisher {
 namespace moxygen {
 
 namespace {
+// Reports the first version negotiated in a test. Every session in a test
+// offers the same ALPNs to the same relay, so one sample is representative;
+// a relay that answers a later connection differently is recorded separately
+// rather than replacing the first.
 void recordNegotiatedVersion(
     InteropTestResult& result,
     const MoQClient& client) {
-  if (client.moqSession_) {
-    result.negotiatedVersion = client.moqSession_->getNegotiatedVersion();
+  if (!client.moqSession_) {
+    return;
+  }
+  auto version = client.moqSession_->getNegotiatedVersion();
+  if (!version) {
+    return;
+  }
+  if (!result.negotiatedVersion) {
+    result.negotiatedVersion = version;
+    return;
+  }
+  if (*version != *result.negotiatedVersion) {
+    result.divergentNegotiatedVersion = version;
   }
 }
 } // namespace
@@ -381,6 +396,7 @@ folly::coro::Task<InteropTestResult> MoQInteropClient::testAnnounceSubscribe() {
 
     // Set up subscriber and subscribe
     subscriber = co_await createAndSetupSession();
+    recordNegotiatedVersion(result, *subscriber);
 
     FullTrackName ftn{TrackNamespace({"moq-interop-test"}), "interop-track"};
     auto sub = SubscribeRequest::make(ftn);
@@ -500,10 +516,11 @@ MoQInteropClient::testSubscribeBeforeAnnounce() {
     auto [subTry, pubTry] = co_await folly::coro::timeout(
         folly::coro::collectAllTry(
             subscriber->moqSession_->subscribe(std::move(sub), consumer),
-            [this, &publisher, &publishNamespaceHandle]()
+            [this, &result, &publisher, &publishNamespaceHandle]()
                 -> folly::coro::Task<void> {
               co_await folly::coro::sleep(std::chrono::milliseconds(500));
               publisher = co_await createAndSetupRelaySession();
+              recordNegotiatedVersion(result, *publisher);
               PublishNamespace pn;
               pn.trackNamespace = TrackNamespace(
                   std::vector<std::string>{"moq-test", "interop"});

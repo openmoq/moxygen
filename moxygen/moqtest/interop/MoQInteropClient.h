@@ -25,6 +25,9 @@ struct InteropTestResult {
   std::string message;
   // Draft negotiated on the wire, not the one requested.
   std::optional<uint64_t> negotiatedVersion;
+  // Set only if a later session in the same test negotiated a different draft,
+  // which makes negotiatedVersion unrepresentative.
+  std::optional<uint64_t> divergentNegotiatedVersion;
 };
 
 class MoQInteropClient {

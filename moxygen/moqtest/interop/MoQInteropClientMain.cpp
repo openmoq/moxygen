@@ -7,7 +7,6 @@
 #include <folly/String.h>
 #include <folly/coro/BlockingWait.h>
 #include <folly/init/Init.h>
-#include <folly/logging/xlog.h>
 #include <gflags/gflags.h>
 #include <cstdlib>
 #include <iostream>
@@ -135,6 +134,12 @@ void printTapResult(
   if (result.negotiatedVersion) {
     std::cout << "  negotiated_version: draft-"
               << moxygen::getDraftMajorVersion(*result.negotiatedVersion)
+              << std::endl;
+  }
+  if (result.divergentNegotiatedVersion) {
+    std::cout << "  negotiated_version_divergent: draft-"
+              << moxygen::getDraftMajorVersion(
+                     *result.divergentNegotiatedVersion)
               << std::endl;
   }
   if (!result.message.empty()) {
