@@ -52,6 +52,10 @@ if [[ ! -d "$INSTALL_PREFIX" ]]; then
   exit 1
 fi
 
+# ── Step 0: Drop binaries that are not part of the relay artifact ────────────
+# Built under BUILD_SAMPLES beside binaries we do ship, so excluded here.
+rm -f "$INSTALL_PREFIX"/bin/moq_media_server* "$INSTALL_PREFIX"/bin/moq_mp4_receiver*
+
 # ── Step 1: Report contents ──────────────────────────────────────────────────
 
 echo "==> Install prefix: $INSTALL_PREFIX"

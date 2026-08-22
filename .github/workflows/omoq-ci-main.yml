@@ -237,8 +237,6 @@ jobs:
           if [ -n "${{ matrix.sanitizer }}" ]; then
             EXTRA_FLAGS+=(-DMOXYGEN_SANITIZER="${{ matrix.sanitizer }}")
           fi
-          # Samples are never built in the standalone tree; moqtest supplies
-          # every binary the artifact ships and every binary the tests drive.
           cmake -B _build -S standalone -G Ninja \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
