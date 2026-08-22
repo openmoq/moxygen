@@ -15,9 +15,8 @@
 
 set -uo pipefail
 
-# The marker maps and assert_scoping's nameref need bash 4. macOS ships 3.2,
-# where both fail silently and every assertion is skipped -- report that as a
-# skip rather than a pass. See #378.
+# The marker maps and assert_scoping's nameref need bash 4; on 3.2 both fail
+# silently and every assertion is skipped. Report that as a skip, not a pass.
 if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
   echo "SKIP  bash ${BASH_VERSION} lacks associative arrays and namerefs (need 4+)"
   exit 77

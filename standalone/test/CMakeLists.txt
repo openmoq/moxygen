@@ -1,6 +1,6 @@
 # Regression guard for the per-layer XLOG category rooting in ../CMakeLists.txt:
 # drives a short mvfst session and asserts each layer's --logging selector scopes
-# to that layer. Skips (77) on bash < 4 — see #378.
+# to that layer. Skips (77) on bash < 4.
 add_test(
   NAME xlog_category_roots
   COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/xlog_category_smoke.sh
