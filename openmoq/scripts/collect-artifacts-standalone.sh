@@ -83,6 +83,19 @@ if [[ -n "$DEBUG_OUTPUT" ]]; then
   DEBUG_DIR=$(mktemp -d)
 fi
 
+# Sample binaries ship stripped but without sidecars: each statically links the
+# whole folly/proxygen/mvfst stack, so a sidecar apiece adds ~130 MB of duplicate
+# DWARF and pushes the -dbg tarball past GitHub's 2 GB asset limit.
+NO_SIDECAR_BINS='moqchatclient moqdateserver moqflvreceiverclient moqflvstreamerclient moqtextclient'
+
+wants_sidecar() {
+  local name
+  name=$(basename "$1")
+  case " $NO_SIDECAR_BINS " in
+    *" $name "*) return 1 ;;
+  esac
+}
+
 if [[ "$OS" == "Darwin" ]]; then
   while IFS= read -r -d '' lib; do
     # No .a sidecars — see the Linux loop.
@@ -97,7 +110,7 @@ if [[ "$OS" == "Darwin" ]]; then
   # Executables under bin/ — same treatment.
   if [[ -d "$INSTALL_PREFIX/bin" ]]; then
     while IFS= read -r -d '' exe; do
-      if [[ -n "$DEBUG_DIR" ]]; then
+      if [[ -n "$DEBUG_DIR" ]] && wants_sidecar "$exe"; then
         REL="${exe#$INSTALL_PREFIX/}"
         mkdir -p "$DEBUG_DIR/$(dirname "$REL")"
         cp "$exe" "$DEBUG_DIR/${REL}.debug" 2>/dev/null || true
@@ -125,13 +138,12 @@ elif [[ "$OS" == "Linux" ]]; then
       STRIPPED=$((STRIPPED + 1))
     fi
   done < <(find "$INSTALL_PREFIX" \( -name '*.a' -o -name '*.so' -o -name '*.so.*' \) -type f -print0)
-  # Executables under bin/ — same treatment as libs.
-  # Walks bin/ explicitly (executables typically have no extension, so the
-  # lib find above misses them — that's the bug fix).
+  # Executables under bin/ — same treatment as libs. Walked explicitly: they
+  # typically have no extension, so the lib find above misses them.
   if [[ -d "$INSTALL_PREFIX/bin" ]]; then
     while IFS= read -r -d '' exe; do
-      if [[ -n "$DEBUG_DIR" ]]; then
-        REL="${exe#$INSTALL_PREFIX/}"
+      REL="${exe#$INSTALL_PREFIX/}"
+      if [[ -n "$DEBUG_DIR" ]] && wants_sidecar "$exe"; then
         mkdir -p "$DEBUG_DIR/$(dirname "$REL")"
         objcopy --only-keep-debug --compress-debug-sections "$exe" "$DEBUG_DIR/${REL}.debug" 2>/dev/null || true
       fi
