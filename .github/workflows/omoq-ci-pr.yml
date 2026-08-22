@@ -87,14 +87,11 @@ jobs:
           if [ "$USE_LINODE" = "true" ]; then
             EXTRA_FLAGS+=(-DFETCHCONTENT_BASE_DIR="$HOME/.cache/moxygen-${{ matrix.cache_prefix }}/_deps")
           fi
-          # BUILD_SAMPLES supplies moqdateserver/moqtextclient, which the XLOG
-          # category smoke test drives. Artifact builds turn it off.
           cmake -B _build -S standalone -G Ninja \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DBUILD_TESTING=ON \
-            -DBUILD_SAMPLES=ON \
             -DBUILD_MOQTEST=ON \
             -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/_install \
             "${ASAN_FLAGS[@]}" "${EXTRA_FLAGS[@]}"

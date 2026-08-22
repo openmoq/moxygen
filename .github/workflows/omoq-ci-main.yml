@@ -91,14 +91,11 @@ jobs:
           if echo '${{ toJSON(matrix.runner) }}' | grep -q linode; then
             EXTRA_FLAGS+=(-DFETCHCONTENT_BASE_DIR="$HOME/.cache/moxygen-${{ matrix.cache_prefix }}/_deps")
           fi
-          # BUILD_SAMPLES supplies moqdateserver/moqtextclient, which the XLOG
-          # category smoke test drives. Artifact builds turn it off.
           cmake -B _build -S standalone -G Ninja \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DBUILD_TESTING=ON \
-            -DBUILD_SAMPLES=ON \
             -DBUILD_MOQTEST=ON \
             -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/_install \
             "${ASAN_FLAGS[@]}" "${EXTRA_FLAGS[@]}"
@@ -240,14 +237,13 @@ jobs:
           if [ -n "${{ matrix.sanitizer }}" ]; then
             EXTRA_FLAGS+=(-DMOXYGEN_SANITIZER="${{ matrix.sanitizer }}")
           fi
-          # The artifact ships the moqtest binaries only; samples and the media
-          # server are test/dev tools no consumer resolves from the tarball.
+          # Samples are never built in the standalone tree; moqtest supplies
+          # every binary the artifact ships and every binary the tests drive.
           cmake -B _build -S standalone -G Ninja \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type || 'RelWithDebInfo' }} \
             -DBUILD_TESTING=OFF \
-            -DBUILD_SAMPLES=OFF \
             -DBUILD_MOQTEST=ON \
             -DBUILD_SHARED_LIBS=OFF \
             -DBUNDLE_DEPS=ON \

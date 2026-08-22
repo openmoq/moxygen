@@ -11,12 +11,20 @@
 #
 # Layers not built on the XLOG backend, or not exercised by a session, SKIP.
 #
-# Usage: xlog_category_smoke.sh <moqdateserver> <moqtextclient> [base-port]
+# Usage: xlog_category_smoke.sh <moqtest_server> <moqtest_client> [base-port]
 
 set -uo pipefail
 
-DS="${1:?usage: <moqdateserver> <moqtextclient> [port]}"
-TC="${2:?usage: <moqdateserver> <moqtextclient> [port]}"
+# The marker maps and assert_scoping's nameref need bash 4. macOS ships 3.2,
+# where both fail silently and every assertion is skipped -- report that as a
+# skip rather than a pass. See #378.
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  echo "SKIP  bash ${BASH_VERSION} lacks associative arrays and namerefs (need 4+)"
+  exit 77
+fi
+
+SRV="${1:?usage: <moqtest_server> <moqtest_client> [port]}"
+CLI="${2:?usage: <moqtest_server> <moqtest_client> [port]}"
 PORT="${3:-14337}"
 
 WORK="$(mktemp -d)"
@@ -70,17 +78,34 @@ assert_scoping() {
   [ "${#active[@]}" -gt 0 ] || echo "WARN  no layers active for $runner (nothing verified)"
 }
 
+# The server's UDP socket is the readiness signal. Polling it replaces a fixed
+# sleep sized for the slowest runner.
+wait_listening() {
+  local port="$1" i
+  for i in $(seq 1 100); do
+    if command -v ss >/dev/null 2>&1; then
+      ss -uln 2>/dev/null | grep -q ":$port " && return 0
+    elif command -v lsof >/dev/null 2>&1; then
+      lsof -nP -iUDP:"$port" >/dev/null 2>&1 && return 0
+    else
+      sleep 1; return 0
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
 # ── mvfst session: the six prefix-map layers on the default transport ─────────
+# Every marker lands during connection setup, and the client runs until killed,
+# so the timeout bounds the session rather than waiting for it to finish.
 run_mvfst() {
   local spec="$1" log="$WORK/mvfst.log"
-  "$DS" --insecure -port "$PORT" --logging="$spec" >/dev/null 2>"$log" &
+  "$SRV" --port "$PORT" --quic --logging="$spec" >/dev/null 2>"$log" &
   local sp=$!
-  sleep 1
-  timeout 3 "$TC" --insecure \
-    --connect_url "https://localhost:$PORT/moq-date" \
-    --track_namespace "moq-date" --track_name "date" \
+  wait_listening "$PORT"
+  timeout 0.5 "$CLI" \
+    --url "https://localhost:$PORT/test" --request subscribe \
     --logging=INFO >/dev/null 2>/dev/null
-  sleep 0.3
   kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
   cat "$log"
 }

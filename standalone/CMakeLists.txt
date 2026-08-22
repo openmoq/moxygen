@@ -36,7 +36,6 @@ add_compile_definitions(GLOG_USE_GLOG_EXPORT)
 # Options
 # =============================================================================
 option(BUILD_TESTS "Build tests" ON)
-option(BUILD_SAMPLES "Build moxygen sample executables and test tools" ON)
 option(BUILD_MOQTEST "Build the moqtest client, server and perf executables" ON)
 option(BUILD_SHARED_LIBS "Build shared libraries (discouraged)" OFF)
 option(BUNDLE_DEPS "Build all dep targets for artifact bundling" OFF)
@@ -278,9 +277,10 @@ if(BUILD_TESTS)
     endif()
 endif()
 
-# Save original BUILD_TESTS/BUILD_SAMPLES/BUILD_TESTING values, then disable for fetched dependencies
+# Save original BUILD_TESTS/BUILD_TESTING values, then disable for fetched
+# dependencies. BUILD_SAMPLES is forced off and left off: moxygen's samples are
+# not built here, and proxygen declares its own option of that name.
 set(_MOXYGEN_BUILD_TESTS ${BUILD_TESTS})
-set(_MOXYGEN_BUILD_SAMPLES ${BUILD_SAMPLES})
 set(_MOXYGEN_BUILD_TESTING ${BUILD_TESTING})
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -571,9 +571,8 @@ endif()
 # =============================================================================
 # Moxygen
 # =============================================================================
-# Re-enable tests and samples for moxygen itself
+# Re-enable tests for moxygen itself
 set(BUILD_TESTS ${_MOXYGEN_BUILD_TESTS} CACHE BOOL "" FORCE)
-set(BUILD_SAMPLES ${_MOXYGEN_BUILD_SAMPLES} CACHE BOOL "" FORCE)
 set(BUILD_TESTING ${_MOXYGEN_BUILD_TESTING} CACHE BOOL "" FORCE)
 
 # Set MOXYGEN_FBCODE_ROOT to match what main CMakeLists.txt expects
@@ -612,7 +611,7 @@ moxygen_install_headers(moxygen ${CMAKE_CURRENT_SOURCE_DIR}/../moxygen)
 
 # XLOG category regression test; drives the sample binaries, so register it only
 # when they are built.
-if(BUILD_TESTS AND TARGET moqdateserver AND TARGET moqtextclient)
+if(BUILD_TESTS AND TARGET moqtest_server AND TARGET moqtest_client)
   enable_testing()
   add_subdirectory(test)
 endif()
