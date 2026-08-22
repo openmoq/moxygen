@@ -36,6 +36,7 @@ add_compile_definitions(GLOG_USE_GLOG_EXPORT)
 # Options
 # =============================================================================
 option(BUILD_TESTS "Build tests" ON)
+option(BUILD_SAMPLES "Build moxygen sample executables and test tools" ON)
 option(BUILD_MOQTEST "Build the moqtest client, server and perf executables" ON)
 option(BUILD_SHARED_LIBS "Build shared libraries (discouraged)" OFF)
 option(BUNDLE_DEPS "Build all dep targets for artifact bundling" OFF)
