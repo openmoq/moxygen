@@ -235,6 +235,9 @@ jobs:
           # BUILD_TESTS=ON intentional: the moxygen tarball ships
           # lib/cmake/GTest/GTestConfig.cmake which moqx's test/CMakeLists.txt
           # consumes. No tests run because BUILD_TESTING=OFF.
+          #
+          # The tarball ships the moqtest binaries only; samples and the media
+          # server are test/dev tools no consumer resolves from it.
           cmake -B _build -S standalone -G Ninja \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -242,6 +245,8 @@ jobs:
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DBUILD_TESTS=ON \
             -DBUILD_TESTING=OFF \
+            -DBUILD_SAMPLES=OFF \
+            -DBUILD_MOQTEST=ON \
             -DBUILD_SHARED_LIBS=OFF \
             -DBUNDLE_DEPS=ON \
             -DBUNDLE_DEPS_STATIC_SYSLIBS=ON \
