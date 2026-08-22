@@ -96,6 +96,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DBUILD_TESTING=ON \
+            -DBUILD_MOQTEST=ON \
             -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/_install \
             "${ASAN_FLAGS[@]}" "${EXTRA_FLAGS[@]}"
 
@@ -241,6 +242,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type || 'RelWithDebInfo' }} \
             -DBUILD_TESTING=OFF \
+            -DBUILD_MOQTEST=ON \
             -DBUILD_SHARED_LIBS=OFF \
             -DBUNDLE_DEPS=ON \
             -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
