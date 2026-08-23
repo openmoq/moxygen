@@ -343,8 +343,11 @@ if(BUILD_SAMPLES OR BUILD_MOQTEST)
 endif()
 
 if(BUILD_SAMPLES)
-  add_subdirectory(media_server)
   add_subdirectory(samples)
+endif()
+
+if(BUILD_MEDIA_SERVER)
+  add_subdirectory(media_server)
 endif()
 
 if(BUILD_MOQTEST)
