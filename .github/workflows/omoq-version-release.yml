@@ -242,6 +242,7 @@ jobs:
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DBUILD_TESTS=ON \
             -DBUILD_TESTING=OFF \
+            -DBUILD_MOQTEST=ON \
             -DBUILD_SHARED_LIBS=OFF \
             -DBUNDLE_DEPS=ON \
             -DBUNDLE_DEPS_STATIC_SYSLIBS=ON \
