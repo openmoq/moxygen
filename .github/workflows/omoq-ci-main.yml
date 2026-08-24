@@ -346,6 +346,63 @@ jobs:
   # Notify: aggregate status (runs after everything)
   # ════════════════════════════════════════════════════════════════════════════
 
+  # ════════════════════════════════════════════════════════════════════════════
+  # Prune build caches: keep the newest generation of each cache family.
+  #
+  # Both cache kinds mint a new entry rather than replacing one — the dep key
+  # hashes the pin files, and ccache-action keys on a timestamp. Keeping one
+  # generation each holds the repo near the 10 GB budget, where eviction would
+  # otherwise drop main's caches and leave every PR restoring nothing.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  prune-caches:
+    needs: [build, publish]
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: write
+    steps:
+      # Runs after build and publish so this run's caches are already saved and
+      # are the generation kept.
+      - name: Delete superseded generations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cat > family.jq <<'JQ'
+          # Family = the key without its varying suffix: dep caches end in
+          # -deps-<hash>, ccache-action keys end in -<ISO timestamp>.
+          def family:
+            if (.key | test("-deps-")) then
+              (.key | capture("^(?<p>.*-deps)-").p)
+            elif (.key | test("-[0-9]{4}-[0-9]{2}-[0-9]{2}T")) then
+              (.key | capture("^(?<p>.*)-[0-9]{4}-[0-9]{2}-[0-9]{2}T").p)
+            else null end;
+          map(select(family != null))
+          | group_by(family)
+          | map(sort_by(.createdAt) | reverse | .[1:])
+          | flatten
+          | .[] | "\(.id)\t\(.sizeInBytes)\t\(.key)"
+          JQ
+
+          gh cache list --ref refs/heads/main --limit 100 \
+            --json id,key,sizeInBytes,createdAt > caches.json
+          jq -r -f family.jq caches.json > stale.tsv
+
+          if [ ! -s stale.tsv ]; then
+            echo "==> nothing superseded"
+            exit 0
+          fi
+
+          FREED=0
+          while IFS=$'\t' read -r id size key; do
+            echo "  deleting $key ($((size / 1048576)) MB)"
+            if gh cache delete "$id"; then
+              FREED=$((FREED + size))
+            fi
+          done < stale.tsv
+          echo "==> freed $((FREED / 1048576)) MB"
+
   notify:
     needs: [build, publish, release]
     if: always()
