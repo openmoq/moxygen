@@ -343,8 +343,11 @@ if(BUILD_SAMPLES OR BUILD_MOQTEST)
 endif()
 
 if(BUILD_SAMPLES)
-  add_subdirectory(media_server)
   add_subdirectory(samples)
+endif()
+
+if(BUILD_MEDIA_SERVER)
+  add_subdirectory(media_server)
 endif()
 
 if(BUILD_MOQTEST)
@@ -352,6 +355,9 @@ if(BUILD_MOQTEST)
 endif()
 
 add_subdirectory(test)
+
+# OpenMoQ extensions (isolated to minimize upstream merge conflicts)
+add_subdirectory(openmoq)
 
 # Resolve deferred moxygen internal dependencies
 moxygen_resolve_deferred_dependencies()
