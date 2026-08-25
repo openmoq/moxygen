@@ -161,6 +161,24 @@ moxygen::LatencyHistogram mergeLatency(
   return hist;
 }
 
+// Bucket-resolution percentile over every object delivered so far: the smallest
+// bucket bound whose cumulative count covers pct. The buckets are the reported
+// resolution, so no interpolation is done or implied.
+uint64_t percentileMs(const moxygen::LatencyHistogram& hist, double pct) {
+  auto total = hist.count();
+  if (total == 0) {
+    return 0;
+  }
+  auto cum = hist.cumulative();
+  auto need = static_cast<uint64_t>(total * pct / 100.0);
+  for (size_t i = 0; i < moxygen::LatencyHistogram::kNumBounds; ++i) {
+    if (cum[i] >= need) {
+      return moxygen::kLatencyBucketsMs[i];
+    }
+  }
+  return moxygen::kLatencyBucketsMs[moxygen::LatencyHistogram::kNumBounds - 1];
+}
+
 } // namespace
 
 // Stats aggregation coroutine
@@ -236,6 +254,7 @@ folly::coro::Task<void> aggregateStats(
     double mbps = (intervalBytes * 8.0) / (1024.0 * 1024.0);
     double totalMB = totalBytes / (1024.0 * 1024.0);
 
+    auto runLatency = mergeLatency(clients);
     double runAvgLatencyMs = latencyObjects > 0
         ? static_cast<double>(totalLatencyMs) /
             static_cast<double>(latencyObjects)
@@ -259,7 +278,10 @@ folly::coro::Task<void> aggregateStats(
                << " total"
                << " | Failures: " << intervalFailures << "/s, " << totalFailures
                << " total"
-               << " | Done: " << totalCompleted << "/" << clients.size();
+               << " | Done: " << totalCompleted << "/" << clients.size()
+               << " | Latency(p50/p90/p99): " << percentileMs(runLatency, 50)
+               << "/" << percentileMs(runLatency, 90) << "/"
+               << percentileMs(runLatency, 99) << " ms";
 
     if (!metricsOut.empty()) {
       PerfPromSnapshot snap;
