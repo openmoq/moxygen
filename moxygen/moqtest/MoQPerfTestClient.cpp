@@ -93,6 +93,19 @@ folly::coro::Task<void> SubscriberState::connect() {
           ts.rxPacketsBeforeAckAfterInit = 2;
           ts.shouldUseRecvmmsgForBatchRecv = true;
           ts.maxRecvBatchSize = 32;
+          // A flow control window caps a sender at window/RTT, so the mvfst
+          // defaults (65 KB per stream, 1 MB per connection) limit one stream
+          // to 10 Mbps on a 50 ms path. A load generator that cannot receive
+          // the offered rate measures itself rather than the relay, and the
+          // shortfall looks like relay latency because objects queue upstream.
+          // These match what MoQServer advertises, so neither side is the
+          // narrower one.
+          ts.advertisedInitialConnectionFlowControlWindow = 64 * 1024 * 1024;
+          ts.advertisedInitialUniStreamFlowControlWindow = 16 * 1024 * 1024;
+          ts.advertisedInitialBidiLocalStreamFlowControlWindow =
+              16 * 1024 * 1024;
+          ts.advertisedInitialBidiRemoteStreamFlowControlWindow =
+              16 * 1024 * 1024;
           return ts;
         }(),
         getMoqtProtocols(FLAGS_versions, true));
