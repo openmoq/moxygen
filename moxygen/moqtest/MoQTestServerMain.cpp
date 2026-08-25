@@ -41,6 +41,20 @@ DEFINE_bool(
     false,
     "DEPRECATED: use --transport=quic (or --transport=h3wt) instead. "
     "Selects raw QUIC vs WebTransport for the relay client.");
+DEFINE_string(
+    announce_namespace,
+    "moq-test-00",
+    "Namespace to advertise to the relay. Slash-separated, so passing a full "
+    "moq-test tuple announces that one track instead of the base prefix. "
+    "Needed by relays that resolve subscriptions by exact path rather than by "
+    "prefix, which otherwise match no subscriber.");
+DEFINE_int32(
+    object_priority,
+    -1,
+    "Publisher priority for every subgroup. -1 keeps the default. Draft-16 "
+    "encodes subgroup headers without an explicit priority (0x30-0x3D) "
+    "differently from those with one (0x10-0x1D), so this selects which "
+    "family the publisher emits.");
 DEFINE_string(cert, "", "Path to TLS certificate file");
 DEFINE_string(key, "", "Path to TLS private key file");
 DEFINE_string(
@@ -75,6 +89,10 @@ int main(int argc, char** argv) {
   auto server = std::make_shared<moxygen::MoQTestServer>(
       FLAGS_cert, FLAGS_key, FLAGS_versions);
   server->setIncludeTimestampExtension(FLAGS_include_timestamp_extension);
+  server->setAnnounceNamespace(FLAGS_announce_namespace);
+  if (FLAGS_object_priority >= 0) {
+    server->setObjectPriority(static_cast<uint8_t>(FLAGS_object_priority));
+  }
 
   std::shared_ptr<moxygen::MoQTestQmuxServer> qmuxServer;
   if (FLAGS_qmux) {

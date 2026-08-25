@@ -188,7 +188,7 @@ folly::coro::Task<void> MoQTestServer::sendOneSubgroupPerGroup(
        groupNum += params.groupIncrement) {
     // Begin a New Subgroup (Default Priority)
     auto maybeSubConsumer =
-        callback->beginSubgroup(groupNum, 0, kDefaultPriority);
+        callback->beginSubgroup(groupNum, 0, objectPriority_);
     auto subConsumer = maybeSubConsumer->get();
 
     // Iterate Through Objects in SubGroup
@@ -251,7 +251,7 @@ folly::coro::Task<void> MoQTestServer::sendOneSubgroupPerObject(
       }
       // Begin a New Subgroup per object (Default Priority)
       auto maybeSubConsumer =
-          callback->beginSubgroup(groupNum, objectId, kDefaultPriority);
+          callback->beginSubgroup(groupNum, objectId, objectPriority_);
       auto subConsumer = maybeSubConsumer->get();
       // Find Object Size
       int objectSize = moxygen::getObjectSize(objectId, &params);
@@ -300,7 +300,7 @@ folly::coro::Task<void> MoQTestServer::sendTwoSubgroupsPerGroup(
         (params.objectsPerGroup > 1 && params.objectIncrement % 2 == 1)) {
       // we have at least one even object
       subConsumers.push_back(
-          callback->beginSubgroup(groupNum, 0, kDefaultPriority).value());
+          callback->beginSubgroup(groupNum, 0, objectPriority_).value());
     } else {
       subConsumers.push_back(nullptr);
     }
@@ -309,7 +309,7 @@ folly::coro::Task<void> MoQTestServer::sendTwoSubgroupsPerGroup(
         (params.objectsPerGroup > 1 && params.objectIncrement % 2 == 1)) {
       // we have at least one odd object
       subConsumers.push_back(
-          callback->beginSubgroup(groupNum, 1, kDefaultPriority).value());
+          callback->beginSubgroup(groupNum, 1, objectPriority_).value());
     } else {
       subConsumers.push_back(nullptr);
     }
@@ -691,9 +691,10 @@ folly::coro::Task<void> MoQTestServer::doRelaySetup(
     co_return;
   }
 
-  // Send PUBLISH_NAMESPACE for the base namespace "moq-test-00"
+  // Announce the configured namespace. Defaults to the "moq-test-00" prefix,
+  // which prefix-matching relays expand; a full tuple targets one exact track.
   PublishNamespace publishNamespace;
-  publishNamespace.trackNamespace = TrackNamespace("moq-test-00", "/");
+  publishNamespace.trackNamespace = TrackNamespace(announceNamespace_, "/");
 
   auto publishNamespaceResult =
       co_await relaySession_->publishNamespace(publishNamespace);
@@ -706,7 +707,8 @@ folly::coro::Task<void> MoQTestServer::doRelaySetup(
   // Store publishNamespace handle to keep it alive
   publishNamespaceHandle_ = publishNamespaceResult.value();
 
-  XLOG(INFO) << "Successfully published namespace 'moq-test-00' to relay at "
+  XLOG(INFO) << "Successfully published namespace '" << announceNamespace_
+             << "' to relay at "
              << relayUrl;
 
   // Pass session to onNewSession to treat it like any other client

@@ -65,6 +65,21 @@ class MoQTestServer : public moxygen::Publisher, public moxygen::MoQServer {
     includeTimestampExtension_ = include;
   }
 
+  // Namespace advertised to the relay. TrackNamespace splits on "/", so a full
+  // moq-test tuple announces that exact track rather than the base prefix.
+  // Relays that resolve subscriptions by exact path, rather than by prefix,
+  // never match a subscriber unless the whole tuple was announced.
+  void setAnnounceNamespace(const std::string& ns) {
+    announceNamespace_ = ns;
+  }
+
+  // Publisher priority stamped on each subgroup. Draft-16 encodes a subgroup
+  // header without an explicit priority (types 0x30-0x3D) differently from one
+  // with it (0x10-0x1D), so this selects which family the publisher emits.
+  void setObjectPriority(uint8_t priority) {
+    objectPriority_ = priority;
+  }
+
   //  Override onNewSession to set publisher handler to be this object
   virtual void onNewSession(
       std::shared_ptr<MoQSession> clientSession) override {
@@ -172,6 +187,8 @@ class MoQTestServer : public moxygen::Publisher, public moxygen::MoQServer {
   // Timekeeper singleton, which can crash if used during process teardown.
   folly::ThreadWheelTimekeeper timekeeper_;
   bool includeTimestampExtension_{false};
+  std::string announceNamespace_{"moq-test-00"};
+  uint8_t objectPriority_{kDefaultPriority};
 };
 
 // QMUX-on-TCP variant of MoQTestServer. Holds a shared MoQTestServer purely
