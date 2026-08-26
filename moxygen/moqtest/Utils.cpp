@@ -178,6 +178,20 @@ std::vector<Extension> getExtensions(
   return extensions;
 }
 
+std::string makeTestPayload(size_t size, bool stamp) {
+  std::string p(size, 't');
+  if (stamp && size >= kPayloadTimestampBytes) {
+    uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+    for (size_t i = 0; i < kPayloadTimestampBytes; ++i) {
+      p[i] = static_cast<char>(
+          (ms >> (8 * (kPayloadTimestampBytes - 1 - i))) & 0xFF);
+    }
+  }
+  return p;
+}
+
 int getObjectSize(uint64_t objectId, MoQTestParameters* params) {
   if (objectId == params->startObject) {
     return params->sizeOfObjectZero;

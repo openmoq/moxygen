@@ -212,7 +212,7 @@ folly::coro::Task<void> MoQTestServer::sendOneSubgroupPerGroup(
       if (objectId < params.lastObjectInTrack ||
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
-        std::string p = std::string(objectSize, 't');
+        std::string p = makeTestPayload(objectSize, includeTimestampExtension_);
         auto objectPayload = folly::IOBuf::copyBuffer(p);
         subConsumer->object(
             objectId,
@@ -267,7 +267,7 @@ folly::coro::Task<void> MoQTestServer::sendOneSubgroupPerObject(
       if (objectId < params.lastObjectInTrack ||
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
-        std::string p = std::string(objectSize, 't');
+        std::string p = makeTestPayload(objectSize, includeTimestampExtension_);
         auto objectPayload = folly::IOBuf::copyBuffer(p);
         subConsumer->object(
             objectId,
@@ -336,7 +336,7 @@ folly::coro::Task<void> MoQTestServer::sendTwoSubgroupsPerGroup(
         // Begin Delivering Object With Payload
         int index = objectId % 2;
         XLOG(INFO) << "Sending Object " << objectId << " to Subgroup " << index;
-        std::string p = std::string(objectSize, 't');
+        std::string p = makeTestPayload(objectSize, includeTimestampExtension_);
         auto objectPayload = folly::IOBuf::copyBuffer(p);
         subConsumers[index]->object(
             objectId,
@@ -406,7 +406,7 @@ folly::coro::Task<void> MoQTestServer::sendDatagram(
       // Find Object Size
       int objectSize = getObjectSize(objectId, &params);
 
-      std::string p = std::string(objectSize, 't');
+      std::string p = makeTestPayload(objectSize, includeTimestampExtension_);
       auto objectPayload = folly::IOBuf::copyBuffer(p);
 
       // Build object header
@@ -539,7 +539,7 @@ folly::coro::Task<void> MoQTestServer::fetchOneSubgroupPerGroup(
       if (objectId < params.lastObjectInTrack ||
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
-        std::string p = std::string(objectSize, 't');
+        std::string p = makeTestPayload(objectSize, includeTimestampExtension_);
         auto objectPayload = folly::IOBuf::copyBuffer(p);
         callback->object(
             groupNum,
@@ -590,7 +590,7 @@ folly::coro::Task<void> MoQTestServer::fetchOneSubgroupPerObject(
       if (objectId < params.lastObjectInTrack ||
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
-        std::string p = std::string(objectSize, 't');
+        std::string p = makeTestPayload(objectSize, includeTimestampExtension_);
         auto objectPayload = folly::IOBuf::copyBuffer(p);
         callback->object(
             groupNum,
@@ -647,7 +647,7 @@ folly::coro::Task<void> MoQTestServer::fetchTwoSubgroupsPerGroup(
       if (objectId < params.lastObjectInTrack ||
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
-        std::string p = std::string(objectSize, 't');
+        std::string p = makeTestPayload(objectSize, includeTimestampExtension_);
         auto objectPayload = folly::IOBuf::copyBuffer(p);
         callback->object(
             groupNum,

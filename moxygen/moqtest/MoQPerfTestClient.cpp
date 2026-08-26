@@ -6,6 +6,8 @@
 
 #include "moxygen/moqtest/MoQPerfTestClient.h"
 
+#include <folly/io/Cursor.h>
+
 #include <folly/coro/Sleep.h>
 #include <folly/logging/xlog.h>
 #include <chrono>
@@ -215,12 +217,28 @@ ObjectReceiverCallback::FlowControlState SubscriberState::Callback::onObject(
     state_->bytesReceived_ += payload->computeChainDataLength();
   }
 
-  if (auto sendTs =
-          objHeader.extensions.getIntExtension(kTimestampExtensionType)) {
+  // Send time comes from the object extension where the path preserves it, and
+  // from the head of the payload where it does not. A relay that drops
+  // extension types it does not recognise leaves latency unmeasurable
+  // otherwise, and payload bytes are opaque to every relay.
+  std::optional<uint64_t> sendTs =
+      objHeader.extensions.getIntExtension(kTimestampExtensionType);
+  if (!sendTs && payload &&
+      payload->computeChainDataLength() >= kPayloadTimestampBytes) {
+    folly::io::Cursor cursor(payload.get());
+    uint64_t v = 0;
+    for (size_t i = 0; i < kPayloadTimestampBytes; ++i) {
+      v = (v << 8) | cursor.readBE<uint8_t>();
+    }
+    sendTs = v;
+  }
+  if (sendTs) {
     uint64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
-    if (nowMs >= *sendTs) {
+    // An unstamped payload reads as an enormous value, and a clock stepping
+    // backwards as a negative one; bound the result so neither is recorded.
+    if (nowMs >= *sendTs && (nowMs - *sendTs) < kMaxPlausibleLatencyMs) {
       uint64_t latencyMs = nowMs - *sendTs;
       state_->totalLatencyMs_ += latencyMs;
       state_->latencyObjects_++;

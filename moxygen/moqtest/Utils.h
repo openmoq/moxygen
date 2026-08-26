@@ -15,6 +15,23 @@ namespace moxygen {
 // test integer extensions (which use 2 * testIntegerExtension).
 constexpr uint64_t kTimestampExtensionType = 0xC000;
 
+// Bytes of send timestamp written at the head of each test payload.
+constexpr size_t kPayloadTimestampBytes = 8;
+
+// Upper bound on a latency sample. Guards against an unstamped payload, whose
+// first bytes decode to an enormous value, and against a clock step.
+constexpr uint64_t kMaxPlausibleLatencyMs = 600000;
+
+// Build a test payload of `size` bytes, writing the send time as big-endian
+// milliseconds into the first 8 when `stamp` is set and the object is large
+// enough to hold it.
+//
+// Payload bytes are opaque to a relay, so a timestamp carried here survives
+// hops that drop object extensions they do not recognise - which is the case
+// for at least one relay under test, whose end-to-end latency is otherwise
+// unmeasurable. The extension remains the preferred carrier where it survives.
+std::string makeTestPayload(size_t size, bool stamp);
+
 folly::Expected<folly::Unit, std::runtime_error> validateMoQTestParameters(
     const MoQTestParameters& track);
 
