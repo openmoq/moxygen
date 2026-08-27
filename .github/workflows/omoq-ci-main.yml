@@ -11,7 +11,8 @@ name: ci main
 # Job graph:
 #
 #   build (linux, macos, asan debug) ─────────────────────────────────────────┐
-#   publish (3 platforms) ───────────────────────────────────────────────────┼── release ── notify
+#   publish (7 platforms) ───────────────────────────────────────────────────┼── release ── notify
+#                                                                            └── prune-caches
 
 on:
   push:
@@ -343,10 +344,6 @@ jobs:
             --branch "${{ github.ref_name }}"
 
   # ════════════════════════════════════════════════════════════════════════════
-  # Notify: aggregate status (runs after everything)
-  # ════════════════════════════════════════════════════════════════════════════
-
-  # ════════════════════════════════════════════════════════════════════════════
   # Prune build caches: keep the newest generation of each cache family.
   #
   # Both cache kinds mint a new entry rather than replacing one — the dep key
@@ -357,7 +354,7 @@ jobs:
 
   prune-caches:
     needs: [build, publish]
-    if: always() && github.ref == 'refs/heads/main'
+    if: always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ubuntu-22.04
     permissions:
       actions: write
@@ -385,7 +382,7 @@ jobs:
           | .[] | "\(.id)\t\(.sizeInBytes)\t\(.key)"
           JQ
 
-          gh cache list --ref refs/heads/main --limit 100 \
+          gh cache list --ref "$GITHUB_REF" --limit 100 \
             --json id,key,sizeInBytes,createdAt > caches.json
           jq -r -f family.jq caches.json > stale.tsv
 
@@ -402,6 +399,10 @@ jobs:
             fi
           done < stale.tsv
           echo "==> freed $((FREED / 1048576)) MB"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Notify: aggregate status (runs after everything)
+  # ════════════════════════════════════════════════════════════════════════════
 
   notify:
     needs: [build, publish, release]
