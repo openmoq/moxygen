@@ -22,33 +22,33 @@ const LocationType kDefaultLocationType = LocationType::NextGroupStart;
 const uint64_t kDefaultEndGroup = 10;
 
 MoQTestClient::MoQTestClient(
+    PrivateTag,
     folly::EventBase* evb,
     proxygen::URL url,
     samples::TransportType transportType)
-    : moqExecutor_(std::make_shared<MoQFollyExecutorImpl>(evb)),
-      moqClient_(
-          samples::makeRelayClientTransport(
-              moqExecutor_,
-              std::move(url),
-              std::make_shared<
-                  test::InsecureVerifierDangerousDoNotUseInProduction>(),
-              transportType)),
-
+    : url_(std::move(url)),
+      transportType_(transportType),
+      moqExecutor_(std::make_shared<MoQFollyExecutorImpl>(evb)),
       subReceiver_(
-          std::make_shared<ObjectReceiver>(
+          std::make_shared<VerifyingObjectReceiver>(
               ObjectReceiver::SUBSCRIBE,
               std::shared_ptr<ObjectReceiverCallback>(
                   std::shared_ptr<void>(),
-                  &objectReceiverCallback_))),
+                  &objectReceiverCallback_),
+              *this)),
       fetchReceiver_(
-          std::make_shared<ObjectReceiver>(
+          std::make_shared<VerifyingObjectReceiver>(
               ObjectReceiver::FETCH,
               std::shared_ptr<ObjectReceiverCallback>(
                   std::shared_ptr<void>(),
-                  &objectReceiverCallback_))) {}
+                  &objectReceiverCallback_),
+              *this)) {}
 
 void MoQTestClient::setLogger(const std::shared_ptr<MLogger>& logger) {
-  moqClient_->setLogger(logger);
+  logger_ = logger;
+  if (moqClient_) {
+    moqClient_->setLogger(logger);
+  }
 }
 
 void MoQTestClient::shutdown() {
@@ -62,8 +62,18 @@ void MoQTestClient::shutdown() {
     fetchHandle_->fetchCancel();
     fetchHandle_.reset();
   }
-  if (moqClient_->moqSession_) {
+  if (subscribeTracksHandle_) {
+    subscribeTracksHandle_->unsubscribeTracks();
+    subscribeTracksHandle_.reset();
+  }
+  if (publisher_) {
+    publisher_->cancelAll();
+  }
+  if (moqClient_ && moqClient_->moqSession_) {
     moqClient_->moqSession_->drain();
+  }
+  if (pubClient_ && pubClient_->moqSession_) {
+    pubClient_->moqSession_->drain();
   }
   doneBaton_.post();
 }
@@ -92,23 +102,44 @@ void MoQTestClient::subscribeUpdate(SubscribeUpdate update) {
   }
 }
 
-folly::coro::Task<void> MoQTestClient::connect(
-    folly::EventBase* evb,
-    const std::string& versions) {
-  auto alpns = getMoqtProtocols(versions, true);
+folly::coro::Task<std::unique_ptr<MoQClientBase>> MoQTestClient::connectSession(
+    const std::string& versions,
+    std::shared_ptr<Publisher> publishHandler,
+    std::shared_ptr<Subscriber> subscribeHandler) {
+  // The relay-session factory is required for SUBSCRIBE_TRACKS; a plain
+  // MoQSession does not implement it.
+  auto client = samples::makeRelayClientTransport(
+      moqExecutor_,
+      url_,
+      MoQRelaySession::createRelaySessionFactory(),
+      std::make_shared<test::InsecureVerifierDangerousDoNotUseInProduction>(),
+      transportType_);
 
-  co_await moqClient_->setupMoQSession(
+  co_await client->setupMoQSession(
       std::chrono::milliseconds(FLAGS_connect_timeout),
       std::chrono::seconds(FLAGS_transaction_timeout),
-      nullptr,
-      nullptr,
+      std::move(publishHandler),
+      std::move(subscribeHandler),
       [] {
         quic::TransportSettings ts;
         ts.orderedReadCallbacks = true;
         return ts;
       }(),
-      alpns);
+      getMoqtProtocols(versions, true));
 
+  co_return client;
+}
+
+folly::coro::Task<void> MoQTestClient::connect(
+    folly::EventBase* /*evb*/,
+    const std::string& versions) {
+  // Register as the subscribe handler so a relay-forwarded PUBLISH lands in
+  // publish(); harmless in subscribe/fetch mode, where none arrives.
+  moqClient_ = co_await connectSession(
+      versions, /*publishHandler=*/nullptr, shared_from_this());
+  if (logger_) {
+    moqClient_->setLogger(logger_);
+  }
   co_return;
 }
 
@@ -170,6 +201,138 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::subscribe(
   }
 
   co_await doneBaton_;
+  co_return trackNamespace.value();
+}
+
+Subscriber::PublishResult MoQTestClient::publish(
+    PublishRequest pub,
+    std::shared_ptr<SubscriptionHandle> handle) {
+  XLOG(INFO) << "MoQTest: received PUBLISH for ns="
+             << pub.fullTrackName.trackNamespace;
+  // Keep the handle so a validation failure can unsubscribe.
+  if (handle) {
+    subHandle_ = std::move(handle);
+  }
+
+  PublishOk ok;
+  ok.requestID = pub.requestID;
+  ok.forward = true;
+  ok.subscriberPriority = kDefaultPriority;
+  ok.groupOrder = GroupOrder::Default;
+  ok.locType = LocationType::AbsoluteStart;
+  ok.start = AbsoluteLocation(0, 0);
+
+  return Subscriber::PublishConsumerAndReplyTask{
+      subReceiver_,
+      folly::coro::makeTask(
+          folly::Expected<PublishOk, PublishError>(std::move(ok)))};
+}
+
+folly::coro::Task<void> MoQTestClient::subscribeTracks(
+    const TrackNamespace& trackNamespace) {
+  auto relaySession =
+      std::dynamic_pointer_cast<MoQRelaySession>(moqClient_->moqSession_);
+  if (!relaySession) {
+    co_yield folly::coro::co_error(
+        std::runtime_error("Session does not support SUBSCRIBE_TRACKS"));
+  }
+
+  SubscribeTracks subTracks;
+  subTracks.requestID = kDefaultRequestId;
+  subTracks.trackNamespacePrefix = trackNamespace;
+  subTracks.forward = true;
+
+  auto res = co_await relaySession->subscribeTracks(subTracks);
+  if (res.hasError()) {
+    co_yield folly::coro::co_error(
+        std::runtime_error(
+            folly::to<std::string>(
+                "SUBSCRIBE_TRACKS failed. Error code: ",
+                static_cast<uint64_t>(res.error().errorCode),
+                ", Reason: ",
+                res.error().reasonPhrase)));
+  }
+  subscribeTracksHandle_ = res.value();
+}
+
+folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::publishTrack(
+    MoQTestParameters params,
+    const std::string& versions,
+    PublishOrder order) {
+  auto trackNamespace = convertMoqTestParamToTrackNamespace(params);
+  if (trackNamespace.hasError()) {
+    XLOG(ERR)
+        << "MoQTest verification result: "
+        << "FAILURE! Reason: Error Converting Parameters to TrackNamespace: "
+        << trackNamespace.error().what();
+    moqClient_->moqSession_->drain();
+    co_yield folly::coro::co_error(trackNamespace.error());
+  }
+
+  receivingType_ = ReceivingType::SUBSCRIBE;
+  requestID_ = kDefaultRequestId;
+  initializeExpecteds(params);
+
+  auto onFailure = [this](const std::exception& ex) {
+    XLOG(ERR) << "MoQTest verification result: FAILURE! Reason: " << ex.what();
+    shutdown();
+  };
+
+  if (order == PublishOrder::SubscribeFirst) {
+    // The relay has a SUBSCRIBE_TRACKS subscriber registered when our PUBLISH
+    // arrives, so it answers with forward=1 and we stream immediately.
+    auto subRes = co_await folly::coro::co_awaitTry(
+        subscribeTracks(trackNamespace.value()));
+    if (subRes.hasException()) {
+      onFailure(std::runtime_error(subRes.exception().what().toStdString()));
+      co_return trackNamespace.value();
+    }
+  }
+
+  publisher_ = std::make_shared<MoQTestPublisher>();
+  pubClient_ = co_await connectSession(
+      versions, /*publishHandler=*/nullptr, /*subscribeHandler=*/nullptr);
+
+  FullTrackName ftn;
+  ftn.trackNamespace = trackNamespace.value();
+  ftn.trackName = kDefaultTrackName;
+  // The PUBLISH and the SUBSCRIBE_TRACKS travel on different sessions, so
+  // waiting for PUBLISH_OK is the only thing that puts them in a known order
+  // at the relay.
+  auto streamTask =
+      co_await folly::coro::co_awaitTry(publisher_->startPublishTrack(
+          pubClient_->moqSession_,
+          std::move(ftn),
+          params,
+          RequestID(kDefaultRequestId)));
+  if (streamTask.hasException()) {
+    onFailure(std::runtime_error(streamTask.exception().what().toStdString()));
+    co_return trackNamespace.value();
+  }
+
+  if (order == PublishOrder::PublishFirst) {
+    // Nothing was subscribed, so the relay answered PUBLISH_OK with forward=0
+    // and the track stays paused until SUBSCRIBE_TRACKS makes the relay send a
+    // REQUEST_UPDATE turning forwarding on.
+    auto subRes = co_await folly::coro::co_awaitTry(
+        subscribeTracks(trackNamespace.value()));
+    if (subRes.hasException()) {
+      onFailure(std::runtime_error(subRes.exception().what().toStdString()));
+      co_return trackNamespace.value();
+    }
+  }
+
+  auto pubRes =
+      co_await folly::coro::co_awaitTry(std::move(streamTask.value()));
+  if (pubRes.hasException()) {
+    onFailure(std::runtime_error(pubRes.exception().what().toStdString()));
+    co_return trackNamespace.value();
+  }
+
+  co_await doneBaton_;
+  // Drained here rather than up front: draining the subscriber session before
+  // the PUBLISH arrives would reject it.
+  shutdown();
   co_return trackNamespace.value();
 }
 
@@ -307,6 +470,13 @@ void MoQTestClient::onAllDataReceived() {
     doneBaton_.post();
   });
 
+  if (semanticsFailed_) {
+    // The individual mismatches were already logged as they were detected
+    XLOG(ERR)
+        << "MoQTest verification result: FAILURE! reason: Delivery Semantics Not Preserved";
+    return;
+  }
+
   if (params_.forwardingPreference == ForwardingPreference::DATAGRAM) {
     // For datagrams, some drops are allowed based on datagramDropPercentage
     uint64_t totalExpected = (((params_.lastGroupInTrack - params_.startGroup) /
@@ -351,6 +521,100 @@ void MoQTestClient::onAllDataReceived() {
   XLOG(INFO) << "MoQTest verification result: SUCCESS! All Data Received";
 }
 
+uint64_t MoQTestClient::draftMajorVersion() const {
+  auto version = moqClient_->moqSession_->getNegotiatedVersion();
+  return version ? getDraftMajorVersion(*version) : 0;
+}
+
+void MoQTestClient::recordSemanticsFailure(const std::string& reason) {
+  semanticsFailed_ = true;
+  XLOG(ERR) << "MoQTest verification result: FAILURE! reason: " << reason;
+}
+
+void MoQTestClient::validateSubgroupHeader(
+    uint64_t groupID,
+    uint64_t subgroupID,
+    Priority priority,
+    const TrackConsumer::BeginSubgroupOptions& options) {
+  if (receivingType_ != ReceivingType::SUBSCRIBE) {
+    // FETCH responses arrive on a fetch stream, which has no subgroup header
+    return;
+  }
+
+  auto expectEndOfGroup = subgroupCarriesLastObject(params_, subgroupID);
+  if (options.containsLastInGroup != expectEndOfGroup) {
+    recordSemanticsFailure(
+        folly::to<std::string>(
+            "End of Group Signal Mismatch for group=",
+            groupID,
+            " subgroup=",
+            subgroupID,
+            ": Actual=",
+            options.containsLastInGroup,
+            "  Expected=",
+            expectEndOfGroup));
+  }
+
+  // Every subgroup the test server opens starts at its own first object, but
+  // the draft only carries that signal from 18 onwards.
+  if (draftMajorVersion() >= 18 && !options.beginsWithFirstObject) {
+    recordSemanticsFailure(
+        folly::to<std::string>(
+            "Missing Begins With First Object Signal for group=",
+            groupID,
+            " subgroup=",
+            subgroupID));
+  }
+
+  // The publisher may elide the priority from the wire, but the value the
+  // subscriber ends up with must still be the one the publisher chose.
+  auto expectedPriority = publisherPriorityForGroup(groupID);
+  if (priority != expectedPriority) {
+    recordSemanticsFailure(
+        folly::to<std::string>(
+            "Subgroup Priority Mismatch for group=",
+            groupID,
+            " subgroup=",
+            subgroupID,
+            ": Actual=",
+            static_cast<uint64_t>(priority),
+            "  Expected=",
+            static_cast<uint64_t>(expectedPriority)));
+  }
+}
+
+void MoQTestClient::validateDatagramHeader(
+    const ObjectHeader& header,
+    bool endOfGroup) {
+  auto expectEndOfGroup = header.id == lastObjectInGroup(params_);
+  if (endOfGroup != expectEndOfGroup) {
+    recordSemanticsFailure(
+        folly::to<std::string>(
+            "Datagram End of Group Signal Mismatch for group=",
+            header.group,
+            " id=",
+            header.id,
+            ": Actual=",
+            endOfGroup,
+            "  Expected=",
+            expectEndOfGroup));
+  }
+
+  auto expectedPriority = publisherPriorityForGroup(header.group);
+  if (header.priority != expectedPriority) {
+    recordSemanticsFailure(
+        folly::to<std::string>(
+            "Datagram Priority Mismatch for group=",
+            header.group,
+            " id=",
+            header.id,
+            ": Actual=",
+            header.priority ? std::to_string(*header.priority) : "none",
+            "  Expected=",
+            static_cast<uint64_t>(expectedPriority)));
+  }
+}
+
 bool MoQTestClient::validateSubscribedData(
     const ObjectHeader& header,
     const std::string& payload) {
@@ -383,6 +647,9 @@ bool MoQTestClient::validateSubscribedData(
         return false;
       }
     } else if (header.group != expectedGroup_) {
+      // Can spuriously fail; groups are separate streams and may reorder.  The
+      // server publishes even and odd groups one priority apart, so every even
+      // group outranks every odd one and the halves can interleave.
       XLOG(ERR)
           << "MoQTest verification result: FAILURE! reason: Group Mismatch: Actual="
           << header.group << "  Expected=" << expectedGroup_;
@@ -641,6 +908,7 @@ void MoQTestClient::initializeExpecteds(MoQTestParameters& params) {
   }
   expectedSubgroup_ = 0;
   expectEndOfGroup_ = params.sendEndOfGroupMarkers;
+  semanticsFailed_ = false;
 
   // Initialize scoreboard with all expected (group, objectId) pairs
   expectedObjects_.clear();

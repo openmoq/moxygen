@@ -316,7 +316,7 @@ class MoQForwarder : public TrackConsumer {
         Fn&& fn,
         bool makeNew = true,
         const std::string& callsite = "",
-        bool beginsWithFirstObjectForNewSubgroups = false);
+        TrackConsumer::BeginSubgroupOptions newSubgroupOptions = {});
 
     // Helper to erase subgroup from subscriber and remove subscriber if
     // draining
@@ -337,6 +337,11 @@ class MoQForwarder : public TrackConsumer {
     void updateLargest(uint64_t group, uint64_t object);
 
     bool startsWithFirstObject(uint64_t objectID);
+
+    // Options for a subgroup stream this forwarder is about to open for a
+    // subscriber, where objectID is the first object that stream will carry.
+    TrackConsumer::BeginSubgroupOptions optionsForNewSubgroup(
+        uint64_t objectID);
 
    public:
     SubgroupForwarder(

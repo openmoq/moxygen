@@ -48,6 +48,7 @@ target_link_libraries(
   moqtest_utils
   moxygen_mlog_file_mlogger
   moxygen_moq_relay_session
+  moxygen_moq_test_publisher
   moxygen_samples_util_qmux_relay_utils
   Folly::folly_init_init
   Folly::folly_io_async_async_signal_handler
@@ -55,6 +56,63 @@ target_link_libraries(
 
 install(
     TARGETS moqtest_client
+    EXPORT moxygen-exports
+    ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
+    LIBRARY DESTINATION ${LIB_INSTALL_DIR}
+)
+
+# moxygen_moq_test_publisher library (track generation; no listener/transport)
+add_library(moxygen_moq_test_publisher MoQTestPublisher.cpp)
+target_include_directories(
+  moxygen_moq_test_publisher PUBLIC $<BUILD_INTERFACE:${MOXYGEN_FBCODE_ROOT}>
+)
+target_compile_options(
+  moxygen_moq_test_publisher PRIVATE
+  ${_MOXYGEN_COMMON_COMPILE_OPTIONS}
+)
+target_link_libraries(
+  moxygen_moq_test_publisher PUBLIC
+  moqtest_utils
+  moxygen_relay_moq_forwarder
+)
+
+install(
+    TARGETS moxygen_moq_test_publisher
+    EXPORT moxygen-exports
+    ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
+    LIBRARY DESTINATION ${LIB_INSTALL_DIR}
+)
+
+# moqtest_publisher (standalone PUBLISH-only origin)
+add_executable(
+  moqtest_publisher
+  MoQTestPublisherMain.cpp
+)
+set_target_properties(
+  moqtest_publisher
+  PROPERTIES
+    BUILD_RPATH ${DEPS_LIBRARIES_DIR}
+    INSTALL_RPATH ${DEPS_LIBRARIES_DIR}
+)
+target_include_directories(
+  moqtest_publisher PUBLIC $<BUILD_INTERFACE:${MOXYGEN_FBCODE_ROOT}>
+)
+target_compile_options(
+  moqtest_publisher PRIVATE
+  ${_MOXYGEN_COMMON_COMPILE_OPTIONS}
+)
+target_link_libraries(
+  moqtest_publisher PUBLIC
+  moqtest_utils
+  moxygen_moq_test_publisher
+  moxygen_moq_relay_session
+  moxygen_samples_util_qmux_relay_utils
+  Folly::folly_init_init
+  Folly::folly_io_async_async_signal_handler
+)
+
+install(
+    TARGETS moqtest_publisher
     EXPORT moxygen-exports
     ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
     LIBRARY DESTINATION ${LIB_INSTALL_DIR}
@@ -71,11 +129,10 @@ target_compile_options(
 )
 target_link_libraries(
   moxygen_moq_test_server PUBLIC
-  moqtest_utils
+  moxygen_moq_test_publisher
   moxygen_moq_qmux_server
   moxygen_moq_server
   moxygen_moq_relay_session
-  moxygen_relay_moq_forwarder
   moxygen_samples_util_qmux_relay_utils
 )
 

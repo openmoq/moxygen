@@ -7,7 +7,7 @@
 #include <folly/portability/GTest.h>
 #include "folly/Expected.h"
 #include "folly/coro/BlockingWait.h"
-#include "moxygen/moqtest/MoQTestServer.h"
+#include "moxygen/moqtest/MoQTestPublisher.h"
 #include "moxygen/moqtest/Utils.h"
 #include "moxygen/test/MockMoQSession.h"
 #include "moxygen/test/Mocks.h"
@@ -58,8 +58,8 @@ class MoQTrackServerTest : public testing::Test {
 
   moxygen::MoQTestParameters params_;
   moxygen::TrackNamespace track_;
-  std::shared_ptr<moxygen::MoQTestServer> server_{
-      std::make_shared<moxygen::MoQTestServer>()};
+  std::shared_ptr<moxygen::MoQTestPublisher> publisher_{
+      std::make_shared<moxygen::MoQTestPublisher>()};
 };
 
 } // namespace
@@ -75,7 +75,7 @@ TEST_F(
   req.fullTrackName.trackNamespace = track_;
 
   // Call the subscribe method
-  auto task = server_->subscribe(req, nullptr);
+  auto task = publisher_->subscribe(req, nullptr);
 
   // Wait for the coroutine to complete and get the result
   auto result = folly::coro::blockingWait(std::move(task));
@@ -131,7 +131,7 @@ TEST_F(MoQTrackServerTest, ValidateSubscribeWithForwardPreferenceZero) {
   }
 
   // Call the onSubscribe method
-  auto task = server_->sendOneSubgroupPerGroup(params_, mockConsumer);
+  auto task = publisher_->sendOneSubgroupPerGroup(params_, mockConsumer);
 
   // Wait for the coroutine to complete
   folly::coro::blockingWait(std::move(task));
@@ -206,7 +206,7 @@ TEST_F(
   }
 
   // Call the onSubscribe method
-  auto task = server_->sendOneSubgroupPerGroup(params_, mockConsumer);
+  auto task = publisher_->sendOneSubgroupPerGroup(params_, mockConsumer);
 
   // Wait for the coroutine to complete
   folly::coro::blockingWait(std::move(task));
@@ -247,7 +247,7 @@ TEST_F(MoQTrackServerTest, ValidateSubscribeWithForwardPreferenceOne) {
   }
 
   // Call the onSubscribe method
-  auto task = server_->sendOneSubgroupPerObject(params_, mockConsumer);
+  auto task = publisher_->sendOneSubgroupPerObject(params_, mockConsumer);
 
   // Wait for the coroutine to complete
   folly::coro::blockingWait(std::move(task));
@@ -324,7 +324,7 @@ TEST_F(MoQTrackServerTest, ValidateSubscribeWithForwardPreferenceTwo) {
   }
 
   // Call the onSubscribe method
-  auto task = server_->sendTwoSubgroupsPerGroup(params_, mockConsumer);
+  auto task = publisher_->sendTwoSubgroupsPerGroup(params_, mockConsumer);
 
   // Wait for the coroutine to complete
   folly::coro::blockingWait(std::move(task));
@@ -408,7 +408,7 @@ TEST_F(
   }
 
   // Call the onSubscribe method
-  auto task = server_->sendTwoSubgroupsPerGroup(params_, mockConsumer);
+  auto task = publisher_->sendTwoSubgroupsPerGroup(params_, mockConsumer);
 
   // Wait for the coroutine to complete
   folly::coro::blockingWait(std::move(task));
@@ -447,6 +447,7 @@ TEST_F(MoQTrackServerTest, ValidateSubscribeWithForwardPreferenceThree) {
       moxygen::ObjectHeader expectedHeader;
       expectedHeader.group = groupNum;
       expectedHeader.id = objectId;
+      expectedHeader.priority = moxygen::publisherPriorityForGroup(groupNum);
       expectedHeader.extensions = moxygen::Extensions(
           moxygen::getExtensions(
               params_.testIntegerExtension, params_.testVariableExtension),
@@ -473,7 +474,7 @@ TEST_F(MoQTrackServerTest, ValidateSubscribeWithForwardPreferenceThree) {
   }
 
   // Call the sendObjectsForForwardPreferenceThree method
-  auto task = server_->sendDatagram(sub, params_, mockConsumer);
+  auto task = publisher_->sendDatagram(sub.requestID, params_, mockConsumer);
 
   // Wait for the coroutine to complete
   folly::coro::blockingWait(std::move(task));
@@ -490,7 +491,7 @@ TEST_F(
   req.fullTrackName.trackNamespace = track_;
 
   // Call the subscribe method
-  auto task = server_->fetch(req, nullptr);
+  auto task = publisher_->fetch(req, nullptr);
 
   // Wait for the coroutine to complete and get the result
   auto result = folly::coro::blockingWait(std::move(task));
@@ -555,7 +556,7 @@ TEST_F(MoQTrackServerTest, ValidateFetchWithForwardPreferenceZero) {
                   folly::unit)));
 
   // Call the onSubscribe method
-  auto task = server_->fetchOneSubgroupPerGroup(params_, mockConsumer);
+  auto task = publisher_->fetchOneSubgroupPerGroup(params_, mockConsumer);
 
   // Wait for the coroutine to complete
   folly::coro::blockingWait(std::move(task));
@@ -635,7 +636,7 @@ TEST_F(
                   folly::unit)));
 
   // Call the onSubscribe method
-  auto task = server_->fetchOneSubgroupPerGroup(params_, mockConsumer);
+  auto task = publisher_->fetchOneSubgroupPerGroup(params_, mockConsumer);
 
   // Wait for the coroutine to complete
   folly::coro::blockingWait(std::move(task));
@@ -692,7 +693,7 @@ TEST_F(MoQTrackServerTest, ValidateFetchWithForwardPreferenceOne) {
                   folly::unit)));
 
   // Call the onSubscribe method
-  auto task = server_->fetchOneSubgroupPerObject(params_, mockConsumer);
+  auto task = publisher_->fetchOneSubgroupPerObject(params_, mockConsumer);
 
   // Wait for the coroutine to complete
   folly::coro::blockingWait(std::move(task));
@@ -745,7 +746,7 @@ TEST_F(MoQTrackServerTest, ValidateFetchWithForwardPreferenceTwo) {
                   folly::unit)));
 
   // Call the onSubscribe method
-  auto task = server_->fetchOneSubgroupPerObject(params_, mockConsumer);
+  auto task = publisher_->fetchOneSubgroupPerObject(params_, mockConsumer);
 
   // Wait for the coroutine to complete
   folly::coro::blockingWait(std::move(task));
@@ -813,7 +814,7 @@ TEST_F(
                   folly::unit)));
 
   // Call the onSubscribe method
-  auto task = server_->fetchTwoSubgroupsPerGroup(params_, mockConsumer);
+  auto task = publisher_->fetchTwoSubgroupsPerGroup(params_, mockConsumer);
 
   // Wait for the coroutine to complete
   folly::coro::blockingWait(std::move(task));
@@ -878,7 +879,7 @@ TEST_F(MoQTrackServerTest, ValidateFetchWithForwardPreferenceThree) {
                   folly::unit)));
 
   // Call the fetchDatagram method
-  auto task = server_->fetchDatagram(params_, mockConsumer);
+  auto task = publisher_->fetchDatagram(params_, mockConsumer);
 
   // Wait for the coroutine to complete
   folly::coro::blockingWait(std::move(task));
@@ -963,4 +964,199 @@ TEST_F(MoQTrackServerTest, RequestUpdateTogglesForward) {
     ASSERT_TRUE(sgRes.hasValue());
     EXPECT_TRUE((*sgRes)->endOfSubgroup().hasValue());
   }
+}
+
+// Subgroup header encoding tests
+//
+// The server must pick the most compact subgroup header the draft allows:
+// elide the subgroup ID when it is zero or equal to the subgroup's first
+// object ID, only claim extensions when the track carries them, and mark the
+// subgroup that ends the group.
+
+namespace {
+
+// Collects the BeginSubgroupOptions the server publishes with, keyed by
+// subgroup ID.  Every subgroup in a moq-test group uses the same options
+// regardless of group number.
+class SubgroupOptionsRecorder {
+ public:
+  explicit SubgroupOptionsRecorder(
+      std::shared_ptr<moxygen::MockTrackConsumer> consumer)
+      : consumer_(std::move(consumer)) {
+    subgroupConsumer_ =
+        std::make_shared<testing::NiceMock<moxygen::MockSubgroupConsumer>>();
+    auto ok = folly::makeExpected<moxygen::MoQPublishError>(folly::unit);
+    ON_CALL(
+        *subgroupConsumer_,
+        object(testing::_, testing::_, testing::_, testing::_))
+        .WillByDefault(testing::Return(ok));
+    ON_CALL(*subgroupConsumer_, endOfGroup(testing::_))
+        .WillByDefault(testing::Return(ok));
+    ON_CALL(*subgroupConsumer_, endOfSubgroup())
+        .WillByDefault(testing::Return(ok));
+
+    EXPECT_CALL(
+        *consumer_,
+        beginSubgroup(testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(
+            [this](
+                uint64_t,
+                uint64_t subgroupID,
+                uint8_t,
+                moxygen::TrackConsumer::BeginSubgroupOptions options) {
+              optionsBySubgroup_[subgroupID] = options;
+              return folly::makeExpected<moxygen::MoQPublishError>(
+                  std::shared_ptr<moxygen::SubgroupConsumer>(
+                      subgroupConsumer_));
+            });
+  }
+
+  const moxygen::TrackConsumer::BeginSubgroupOptions& operator[](
+      uint64_t subgroupID) const {
+    auto it = optionsBySubgroup_.find(subgroupID);
+    EXPECT_NE(it, optionsBySubgroup_.end())
+        << "no subgroup " << subgroupID << " was opened";
+    return it->second;
+  }
+
+  size_t numSubgroups() const {
+    return optionsBySubgroup_.size();
+  }
+
+ private:
+  std::shared_ptr<moxygen::MockTrackConsumer> consumer_;
+  std::shared_ptr<testing::NiceMock<moxygen::MockSubgroupConsumer>>
+      subgroupConsumer_;
+  std::map<uint64_t, moxygen::TrackConsumer::BeginSubgroupOptions>
+      optionsBySubgroup_;
+};
+
+} // namespace
+
+TEST_F(MoQTrackServerTest, SubgroupEncodingOneSubgroupPerGroup) {
+  MoQTrackServerTest::CreateDefaultMoQTestParameters();
+  // -1 disables an extension; the fixture default of 0 selects extension ID 0
+  params_.testIntegerExtension = -1;
+  params_.testVariableExtension = -1;
+  auto mockConsumer = std::make_shared<moxygen::MockTrackConsumer>();
+  SubgroupOptionsRecorder recorder(mockConsumer);
+
+  folly::coro::blockingWait(
+      publisher_->sendOneSubgroupPerGroup(params_, mockConsumer));
+
+  ASSERT_EQ(recorder.numSubgroups(), 1);
+  // Subgroup 0 is implied by the stream type, the track has no extensions, and
+  // the group's only subgroup necessarily carries its last object.
+  EXPECT_EQ(recorder[0].subgroupIDFormat, moxygen::SubgroupIDFormat::Zero);
+  EXPECT_FALSE(recorder[0].includeExtensions);
+  EXPECT_TRUE(recorder[0].containsLastInGroup);
+  EXPECT_TRUE(recorder[0].beginsWithFirstObject);
+}
+
+TEST_F(MoQTrackServerTest, SubgroupEncodingClaimsExtensionsWhenConfigured) {
+  MoQTrackServerTest::CreateDefaultMoQTestParameters();
+  params_.testIntegerExtension = 1;
+  params_.testVariableExtension = -1;
+  auto mockConsumer = std::make_shared<moxygen::MockTrackConsumer>();
+  SubgroupOptionsRecorder recorder(mockConsumer);
+
+  folly::coro::blockingWait(
+      publisher_->sendOneSubgroupPerGroup(params_, mockConsumer));
+
+  EXPECT_TRUE(recorder[0].includeExtensions);
+}
+
+TEST_F(MoQTrackServerTest, SubgroupEncodingOneSubgroupPerObject) {
+  MoQTrackServerTest::CreateDefaultMoQTestParameters();
+  params_.forwardingPreference = moxygen::ForwardingPreference(1);
+  auto mockConsumer = std::make_shared<moxygen::MockTrackConsumer>();
+  SubgroupOptionsRecorder recorder(mockConsumer);
+
+  folly::coro::blockingWait(
+      publisher_->sendOneSubgroupPerObject(params_, mockConsumer));
+
+  // Objects 0 and 1 each get their own subgroup, numbered after the object.
+  ASSERT_EQ(recorder.numSubgroups(), 2);
+  EXPECT_EQ(recorder[0].subgroupIDFormat, moxygen::SubgroupIDFormat::Zero);
+  EXPECT_FALSE(recorder[0].containsLastInGroup);
+  // Subgroup 1 holds object 1, so the ID is derivable from the first object.
+  EXPECT_EQ(
+      recorder[1].subgroupIDFormat, moxygen::SubgroupIDFormat::FirstObject);
+  EXPECT_TRUE(recorder[1].containsLastInGroup);
+}
+
+TEST_F(MoQTrackServerTest, SubgroupEncodingTwoSubgroupsPerGroup) {
+  MoQTrackServerTest::CreateDefaultMoQTestParameters();
+  params_.forwardingPreference = moxygen::ForwardingPreference(2);
+  params_.lastObjectInTrack = 2;
+  params_.objectsPerGroup = 2;
+  auto mockConsumer = std::make_shared<moxygen::MockTrackConsumer>();
+  SubgroupOptionsRecorder recorder(mockConsumer);
+
+  folly::coro::blockingWait(
+      publisher_->sendTwoSubgroupsPerGroup(params_, mockConsumer));
+
+  ASSERT_EQ(recorder.numSubgroups(), 2);
+  // Objects 0 and 2 land on subgroup 0, object 1 on subgroup 1.
+  EXPECT_EQ(recorder[0].subgroupIDFormat, moxygen::SubgroupIDFormat::Zero);
+  EXPECT_TRUE(recorder[0].containsLastInGroup);
+  EXPECT_EQ(
+      recorder[1].subgroupIDFormat, moxygen::SubgroupIDFormat::FirstObject);
+  EXPECT_FALSE(recorder[1].containsLastInGroup);
+}
+
+TEST_F(MoQTrackServerTest, SubgroupEncodingFallsBackToExplicitSubgroupID) {
+  MoQTrackServerTest::CreateDefaultMoQTestParameters();
+  params_.forwardingPreference = moxygen::ForwardingPreference(2);
+  params_.objectsPerGroup = 2;
+  params_.objectIncrement = 3;
+  params_.lastObjectInTrack = 6;
+  auto mockConsumer = std::make_shared<moxygen::MockTrackConsumer>();
+  SubgroupOptionsRecorder recorder(mockConsumer);
+
+  folly::coro::blockingWait(
+      publisher_->sendTwoSubgroupsPerGroup(params_, mockConsumer));
+
+  ASSERT_EQ(recorder.numSubgroups(), 2);
+  // Objects 0 and 6 land on subgroup 0, object 3 on subgroup 1.  Subgroup 1
+  // starts at object 3, so neither elision applies and the ID goes on the wire.
+  EXPECT_EQ(recorder[0].subgroupIDFormat, moxygen::SubgroupIDFormat::Zero);
+  EXPECT_TRUE(recorder[0].containsLastInGroup);
+  EXPECT_EQ(recorder[1].subgroupIDFormat, moxygen::SubgroupIDFormat::Present);
+  EXPECT_FALSE(recorder[1].containsLastInGroup);
+}
+
+TEST_F(MoQTrackServerTest, DatagramSignalsEndOfGroupOnLastObject) {
+  MoQTrackServerTest::CreateDefaultMoQTestParameters();
+  params_.forwardingPreference = moxygen::ForwardingPreference(3);
+  params_.lastGroupInTrack = 1;
+  params_.lastObjectInTrack = 2;
+  params_.objectsPerGroup = 2;
+
+  moxygen::SubscribeRequest sub;
+  sub.requestID = 0;
+  auto mockConsumer =
+      std::make_shared<testing::NiceMock<moxygen::MockTrackConsumer>>();
+  ON_CALL(*mockConsumer, setTrackAlias(testing::_))
+      .WillByDefault(
+          testing::Return(
+              folly::makeExpected<moxygen::MoQPublishError>(folly::unit)));
+
+  std::vector<std::pair<uint64_t, bool>> endOfGroupByObject;
+  ON_CALL(*mockConsumer, datagram(testing::_, testing::_, testing::_))
+      .WillByDefault([&endOfGroupByObject](
+                         const moxygen::ObjectHeader& header,
+                         moxygen::Payload,
+                         bool endOfGroup) {
+        endOfGroupByObject.emplace_back(header.id, endOfGroup);
+        return folly::makeExpected<moxygen::MoQPublishError>(folly::unit);
+      });
+
+  folly::coro::blockingWait(
+      publisher_->sendDatagram(sub.requestID, params_, mockConsumer));
+
+  // Two groups of objects 0..2; only object 2 ends its group.
+  const std::vector<std::pair<uint64_t, bool>> expected{
+      {0, false}, {1, false}, {2, true}, {0, false}, {1, false}, {2, true}};
+  EXPECT_EQ(endOfGroupByObject, expected);
 }

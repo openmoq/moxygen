@@ -333,6 +333,7 @@ add_subdirectory(flv_parser)
 add_subdirectory(mlog)
 add_subdirectory(moq_mi)
 add_subdirectory(moq_mi_to_flv)
+add_subdirectory(proxy)
 add_subdirectory(stats)
 add_subdirectory(util)
 
