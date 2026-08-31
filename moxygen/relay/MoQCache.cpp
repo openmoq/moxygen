@@ -2297,6 +2297,35 @@ size_t MoQCache::evictTrack(const FullTrackName& ftn) {
   // Remove from cache
   cache_.erase(it);
   XLOG(DBG1) << "Evicted track: " << *name;
+  return 1;
+}
+
+size_t MoQCache::purge(const TrackNamespace& ns) {
+  // Snapshot to avoid iterator invalidation when evictTrack() modifies cache_.
+  std::vector<FullTrackName> matching;
+  for (auto& [ftn, _] : cache_) {
+    if (ftn.trackNamespace == ns) {
+      matching.push_back(ftn);
+    }
+  }
+  size_t count = 0;
+  for (auto& trackName : matching) {
+    count += evictTrack(trackName);
+  }
+  return count;
+}
+
+size_t MoQCache::purge() {
+  // Snapshot keys to avoid iterator invalidation during eviction.
+  std::vector<FullTrackName> all;
+  all.reserve(cache_.size());
+  for (auto& [ftn, _] : cache_) {
+    all.push_back(ftn);
+  }
+  for (auto& trackName : all) {
+    evictTrack(trackName);
+  }
+  return all.size();
 }
 
 void MoQCache::evictOldestGroupsIfNeeded(CacheTrack& track) {
