@@ -2273,7 +2273,12 @@ size_t MoQCache::evictTrack(const FullTrackName& ftn) {
     return 0;
   }
 
-  XLOG(DBG1) << "Evicting track: " << ftn;
+  // ftn may alias a trackLRU_ node or the cache_ key, both destroyed below.
+  std::optional<FullTrackName> name;
+  if (XLOG_IS_ON(DBG1)) {
+    name = ftn;
+  }
+
   auto& track = *it->second;
   // Stamp evicted before erasing so any in-flight SubscribeWriteback/
   // FetchReadback objects discover the flag and stop caching.
@@ -2291,6 +2296,7 @@ size_t MoQCache::evictTrack(const FullTrackName& ftn) {
 
   // Remove from cache
   cache_.erase(it);
+  XLOG(DBG1) << "Evicted track: " << *name;
   return 1;
 }
 
