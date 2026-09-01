@@ -1003,7 +1003,8 @@ void StreamPublisherImpl::reset(ResetStreamErrorCode error) {
   }
 
   if (auto* wh = std::exchange(writeHandle_, nullptr)) {
-    wh->resetStream(uint32_t(error));
+    wh->resetStream(
+        toWireResetStreamErrorCode(error, publisher_->getVersion()));
   } else {
     // Can happen on STOP_SENDING, delivery timeout, multiple resets,
     // or prior to first fetch write
@@ -1798,8 +1799,7 @@ void MoQSession::TrackPublisherImpl::onTooManyBytesBuffered() {
   terminatePublish(
       PublishDone(
           {requestID_,
-           tooFarBehindCode(
-               session_->getNegotiatedVersion().value_or(kVersionDraft14)),
+           PublishDoneStatusCode::TOO_FAR_BEHIND,
            streamCount_,
            "peer is too far behind"}),
       ResetStreamErrorCode::TOO_FAR_BEHIND);
@@ -2259,7 +2259,7 @@ class MoQSession::FetchTrackReceiveState
     return fetchGroupOrder_;
   }
 
-  uint32_t dataStreamCancelCode() const {
+  ResetStreamErrorCode dataStreamCancelCode() const {
     return dataStreamCancelCode_;
   }
 
@@ -2293,8 +2293,7 @@ class MoQSession::FetchTrackReceiveState
     if (bidiControl_) {
       bidiControl_->cancel(ResetStreamErrorCode::SESSION_CLOSED);
     }
-    dataStreamCancelCode_ =
-        folly::to_underlying(ResetStreamErrorCode::SESSION_CLOSED);
+    dataStreamCancelCode_ = ResetStreamErrorCode::SESSION_CLOSED;
     cancelSource_.requestCancellation();
     if (callback) {
       callback->reset(ResetStreamErrorCode::SESSION_CLOSED);
@@ -2336,7 +2335,8 @@ class MoQSession::FetchTrackReceiveState
   GroupOrder fetchGroupOrder_;
   folly::coro::Promise<FetchResult> promise_;
   uint64_t currentStreamId_{0};
-  uint32_t dataStreamCancelCode_{0};
+  ResetStreamErrorCode dataStreamCancelCode_{
+      ResetStreamErrorCode::INTERNAL_ERROR};
   bool fetchEstablished_{false};
 };
 
@@ -3441,6 +3441,7 @@ MoQSession::SendRequestResult MoQSession::sendRequest(
     auto control = std::make_shared<BidiStreamControl>(
         bidiStream->writeHandle,
         cancellationSource_.getToken(),
+        *negotiatedVersion_,
         /*finIsCancellation=*/true);
     control->setRequestID(requestID);
     auto codec = makeBidiCodec(
@@ -4056,9 +4057,10 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
           // FetchTrackReceiveState lifecycle now controls read loop
           fetchState = state;
           token = state->getCancelToken();
-          fetchCancelCb.emplace(token, [&readHandle, &fetchState] {
+          fetchCancelCb.emplace(token, [this, &readHandle, &fetchState] {
             if (readHandle && fetchState) {
-              readHandle->stopSending(fetchState->dataStreamCancelCode());
+              readHandle->stopSending(toWireResetStreamErrorCode(
+                  fetchState->dataStreamCancelCode(), *negotiatedVersion_));
               readHandle = nullptr;
             }
           });
@@ -4090,7 +4092,8 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
             streamDataTry
                 .tryGetExceptionObject<proxygen::WebTransport::Exception>();
         if (wtEx) {
-          errorCode = ResetStreamErrorCode(wtEx->error);
+          errorCode =
+              fromWireResetStreamErrorCode(wtEx->error, *negotiatedVersion_);
         }
         if (!dcb.reset(errorCode)) {
           XLOG(ERR) << __func__ << " terminating for unknown "
@@ -6968,6 +6971,7 @@ folly::coro::Task<void> MoQSession::bidiStreamDemuxer(
       auto control = std::make_shared<BidiStreamControl>(
           bh.writeHandle,
           cancellationSource_.getToken(),
+          *negotiatedVersion_,
           config->finIsCancellation);
       auto cb = std::make_unique<BidiRequestCallback>(
           this, control, std::move(config->onPeerTermination));

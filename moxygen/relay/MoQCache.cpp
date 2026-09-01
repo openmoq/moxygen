@@ -16,6 +16,21 @@ using namespace moxygen;
 // Cap on prior-gap validation scans to avoid O(n) work for huge gaps.
 constexpr uint64_t kMaxGapValidation = 100;
 
+// On the wire an end object of 0 asks for all of the end group; every other
+// value is already one past the last object.  Everything inside the cache
+// works in the plain exclusive form this returns.
+AbsoluteLocation toExclusiveEnd(AbsoluteLocation wireEnd) {
+  if (wireEnd.object != 0) {
+    return wireEnd;
+  }
+  auto nextGroup = wireEnd.nextGroup();
+  if (!nextGroup) {
+    XLOG(ERR) << "Fetch end group=" << wireEnd.group
+              << " at max, using kLocationMax as exclusive end";
+  }
+  return nextGroup.value_or(kLocationMax);
+}
+
 // Compute the next iterator position after a gap when iterating descending
 // (NewestFirst). Groups iterate high-to-low, but objects within a group go
 // low-to-high. Returns std::nullopt if the gap extends past the iteration
@@ -932,16 +947,12 @@ MoQCache::FetchWriteback* MoQCache::CacheTrack::findFetchInProgress(
 class MoQCache::FetchWriteback : public FetchConsumer {
  public:
   FetchWriteback(
-      AbsoluteLocation start,
-      AbsoluteLocation end,
       bool proxyFin,
       std::shared_ptr<FetchConsumer> consumer,
       FetchRangeIterator fetchRangeIt,
       MoQCache& cache,
       const FullTrackName& ftn)
-      : start_(start),
-        end_(end),
-        proxyFin_(proxyFin),
+      : proxyFin_(proxyFin),
         consumer_(std::move(consumer)),
         fetchRangeIt_(std::move(fetchRangeIt)),
         cache_(cache),
@@ -949,15 +960,15 @@ class MoQCache::FetchWriteback : public FetchConsumer {
     // Track becomes non-evictable (remove from LRU)
     cache_.removeTrackFromLRU(*fetchRangeIt_.track);
 
-    emplaceAndPinGroup(start, FetchInProgressEntry{end, start, this});
+    auto start = fetchRangeIt_.minLocation;
+    emplaceAndPinGroup(
+        start, FetchInProgressEntry{fetchRangeIt_.maxLocation, start, this});
   }
 
   ~FetchWriteback() override {
     XLOG(DBG1) << "FetchWriteback destructing";
     inProgress_.post();
-    if (fetchInProgressIt_ != fetchRangeIt_.track->fetchesInProgress.end()) {
-      eraseAndMakeGroupEvictable();
-    }
+    eraseAndMakeGroupEvictable();
     cancelSource_.requestCancellation();
 
     // Track may become evictable (add back to LRU if still in cache)
@@ -1001,6 +1012,9 @@ class MoQCache::FetchWriteback : public FetchConsumer {
       Extensions ext,
       bool fin,
       bool forwardingPreferenceIsDatagram = false) override {
+    if (auto res = checkInRange({gID, objID}); !res) {
+      return res;
+    }
     if (fetchRangeIt_.track->evicted) {
       return consumer_->object(
           gID,
@@ -1047,6 +1061,11 @@ class MoQCache::FetchWriteback : public FetchConsumer {
       uint64_t len,
       Payload initPayload,
       Extensions ext) override {
+    auto inRange = checkInRange({gID, objID});
+    beginObjectAccepted_ = inRange.hasValue();
+    if (!inRange) {
+      return inRange;
+    }
     if (fetchRangeIt_.track->evicted) {
       return consumer_->beginObject(
           gID, sgID, objID, len, std::move(initPayload), std::move(ext));
@@ -1071,13 +1090,29 @@ class MoQCache::FetchWriteback : public FetchConsumer {
   folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
       Payload payload,
       bool finFetch) override {
+    // beginObject can be rejected (out of range), and the payload for the
+    // object it refused belongs nowhere, cached or forwarded.
+    if (!beginObjectAccepted_) {
+      XLOG(ERR) << "objectPayload without beginObject";
+      return folly::makeUnexpected(MoQPublishError(
+          MoQPublishError::MALFORMED_TRACK, "Payload without beginObject"));
+    }
     if (fetchRangeIt_.track->evicted) {
       return consumer_->objectPayload(
           std::move(payload), finFetch && proxyFin_);
     }
     auto& group = fetchRangeIt_.track->getOrCreateGroupWithEviction(
         fetchRangeIt_->group, cache_, ftn_);
-    auto& object = group.objects[fetchRangeIt_->object];
+    // Only the fetch's first group is pinned, so a later one can be evicted
+    // out from under an object in progress.
+    auto objectIt = group.objects.find(fetchRangeIt_->object);
+    if (objectIt == group.objects.end() || !objectIt->second) {
+      XLOG(ERR) << "objectPayload with no object in progress at "
+                << *fetchRangeIt_;
+      return folly::makeUnexpected(MoQPublishError(
+          MoQPublishError::MALFORMED_TRACK, "Payload without beginObject"));
+    }
+    auto& object = objectIt->second;
     size_t addedBytes = payload->computeChainDataLength();
     if (object->payload) {
       object->payload->appendChain(payload->clone());
@@ -1107,6 +1142,9 @@ class MoQCache::FetchWriteback : public FetchConsumer {
 
   folly::Expected<folly::Unit, MoQPublishError>
   endOfGroup(uint64_t gID, uint64_t sgID, uint64_t objID, bool fin) override {
+    if (auto res = checkInRange({gID, objID}); !res) {
+      return res;
+    }
     if (fetchRangeIt_.track->evicted) {
       return consumer_->endOfGroup(gID, sgID, objID, fin && proxyFin_);
     }
@@ -1122,6 +1160,9 @@ class MoQCache::FetchWriteback : public FetchConsumer {
 
   folly::Expected<folly::Unit, MoQPublishError>
   endOfTrackAndGroup(uint64_t gID, uint64_t sgID, uint64_t objID) override {
+    if (auto res = checkInRange({gID, objID}); !res) {
+      return res;
+    }
     if (fetchRangeIt_.track->evicted) {
       return consumer_->endOfTrackAndGroup(gID, sgID, objID);
     }
@@ -1152,7 +1193,6 @@ class MoQCache::FetchWriteback : public FetchConsumer {
     consumer_->reset(error);
     wasReset_ = true;
     complete_.post();
-    start_ = end_; // nothing else is coming
     fetchRangeIt_.invalidate();
     updateInProgress();
   }
@@ -1198,6 +1238,22 @@ class MoQCache::FetchWriteback : public FetchConsumer {
   }
 
  private:
+  // Upstream may only send what it was asked for, markers included: a marker
+  // takes an object ID like any object.  Anything else would be cached and
+  // forwarded to a consumer that never requested it, and the gap marking would
+  // run against positions this fetch does not own.
+  folly::Expected<folly::Unit, MoQPublishError> checkInRange(
+      AbsoluteLocation loc) const {
+    if (loc < fetchRangeIt_.minLocation || loc >= fetchRangeIt_.maxLocation) {
+      XLOG(ERR) << "Upstream sent " << loc << " outside fetch range ["
+                << fetchRangeIt_.minLocation << ", "
+                << fetchRangeIt_.maxLocation << ")";
+      return folly::makeUnexpected(MoQPublishError(
+          MoQPublishError::MALFORMED_TRACK, "Object outside fetch range"));
+    }
+    return folly::unit;
+  }
+
   void emplaceAndPinGroup(AbsoluteLocation loc, FetchInProgressEntry entry) {
     auto [it, inserted] =
         fetchRangeIt_.track->fetchesInProgress.emplace(loc, entry);
@@ -1219,6 +1275,11 @@ class MoQCache::FetchWriteback : public FetchConsumer {
   }
 
   void eraseAndMakeGroupEvictable() {
+    // Idempotent: a reset, a cancellation or an upstream error retires the
+    // entry through updateInProgress(), then the destructor calls this again.
+    if (fetchInProgressIt_ == fetchRangeIt_.track->fetchesInProgress.end()) {
+      return;
+    }
     auto groupID = fetchInProgressIt_->first.group;
     fetchRangeIt_.track->fetchesInProgress.erase(fetchInProgressIt_);
     fetchInProgressIt_ = fetchRangeIt_.track->fetchesInProgress.end();
@@ -1228,8 +1289,6 @@ class MoQCache::FetchWriteback : public FetchConsumer {
     }
   }
 
-  AbsoluteLocation start_;
-  AbsoluteLocation end_;
   FetchesInProgressMap::iterator fetchInProgressIt_;
   std::shared_ptr<CacheGroup> pinnedGroup_;
   bool proxyFin_{false};
@@ -1237,6 +1296,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
   folly::coro::Baton inProgress_;
   folly::coro::Baton complete_;
   uint64_t currentLength_{0};
+  bool beginObjectAccepted_{false};
   bool wasReset_{false};
   folly::CancellationSource cancelSource_;
   FetchRangeIterator fetchRangeIt_;
@@ -1355,34 +1415,30 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetch(
 
     // track is new (not cached), forward upstream, with writeback
     XLOG(DBG1) << "Cache miss, upstream fetch";
+    // standalone aliases fetch.args, so the end can't be normalized in place
+    // here: the request forwarded upstream has to keep the wire form.
     FetchRangeIterator fetchRangeIt(
-        standalone->start, standalone->end, fetch.groupOrder, track);
+        standalone->start,
+        toExclusiveEnd(standalone->end),
+        fetch.groupOrder,
+        track);
     co_return co_await upstream->fetch(
         fetch,
         std::make_shared<FetchWriteback>(
-            standalone->start,
-            standalone->end,
             true,
             std::move(consumer),
             fetchRangeIt,
             *this,
             fetch.fullTrackName));
   }
-  AbsoluteLocation last = standalone->end;
-  if (last.object > 0) {
-    last.object--;
-  } else {
-    // {N, 0} means "all of group N" — inclusive last is {N, MAX}
-    last.object = kLocationMax.object;
-    auto nextGrp = standalone->end.nextGroup();
-    if (!nextGrp) {
-      XLOG(ERR) << "Fetch end group=" << standalone->end.group
-                << " at max, using kLocationMax as exclusive end";
-    }
-    standalone->end = nextGrp.value_or(kLocationMax);
-    // TODO: handle case where track.largestGroupAndObject is an END_OF_GROUP
-    // or END_OF_TRACK
-  }
+  // Nothing is forwarded verbatim from here on, so normalize in place and let
+  // fetchUpstream put the wire form back when it talks to upstream.
+  // TODO: handle case where track.largestGroupAndObject is an END_OF_GROUP
+  // or END_OF_TRACK
+  standalone->end = toExclusiveEnd(standalone->end);
+  auto lastMaybe = standalone->end.prev();
+  XCHECK(lastMaybe) << "exclusive end must be > {0, 0}";
+  AbsoluteLocation last = *lastMaybe;
   if (track->largestGroupAndObject &&
       (track->liveWritebackCount > 0 ||
        last <= *track->largestGroupAndObject)) {
@@ -1692,6 +1748,8 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchUpstream(
   XLOG(DBG1) << "Fetching upstream for {" << fetchStart.group << ","
              << fetchStart.object << "}, {" << fetchEnd.group << ","
              << fetchEnd.object << "}";
+  // Put the wire form back for the request itself: an exclusive end sitting on
+  // a group boundary is "all of the previous group" to the peer.
   auto adjFetchEnd = fetchEnd;
   if (adjFetchEnd.object == 0) {
     auto pg = adjFetchEnd.prevGroup();
@@ -1704,13 +1762,7 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchUpstream(
   // a smaller upstream end leaves stale fetchInProgress range that
   // makes concurrent lookups wait until endOfFetch.
   auto writeback = std::make_shared<FetchWriteback>(
-      fetchStart,
-      adjFetchEnd,
-      lastObject,
-      consumer,
-      fetchRangeIt,
-      *this,
-      fetch.fullTrackName);
+      lastObject, consumer, fetchRangeIt, *this, fetch.fullTrackName);
   auto res = co_await upstream->fetch(
       Fetch(
           0,

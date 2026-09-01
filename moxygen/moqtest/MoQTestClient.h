@@ -15,6 +15,7 @@
 #include "moxygen/mlog/MLogger.h"
 #include "moxygen/moqtest/MoQTestPublisher.h"
 #include "moxygen/moqtest/Types.h"
+#include "moxygen/moqtest/Utils.h"
 #include "moxygen/samples/util/Utils.h"
 
 namespace moxygen {
@@ -86,7 +87,18 @@ class MoQTestClient : public Subscriber,
   folly::coro::Task<moxygen::TrackNamespace> subscribe(
       MoQTestParameters params);
 
-  folly::coro::Task<moxygen::TrackNamespace> fetch(MoQTestParameters params);
+  // `range` defaults to the whole track the namespace describes.
+  folly::coro::Task<moxygen::TrackNamespace> fetch(
+      MoQTestParameters params,
+      std::optional<StandaloneFetch> range = std::nullopt);
+
+  // SUBSCRIBE plus a FETCH that backfills what ran before it, so a late
+  // subscriber still sees the whole track.  A non-negative `joinStart` is an
+  // absolute group to fetch from; a negative one counts that many groups back
+  // from where the subscription begins.
+  folly::coro::Task<moxygen::TrackNamespace> join(
+      MoQTestParameters params,
+      int64_t joinStart);
 
   // Asks the relay for the track via SUBSCRIBE_TRACKS, then opens a second
   // session to the same endpoint and PUBLISHes it. The relay matches the two
@@ -130,24 +142,41 @@ class MoQTestClient : public Subscriber,
   folly::coro::Task<void> doSubscribeUpdate(
       std::shared_ptr<Publisher::SubscriptionHandle> handle,
       SubscribeUpdate update);
+  // Where validation has got to in the track.  A join delivers its fetch and
+  // subscribe halves concurrently on separate streams, so each carries its own
+  // position; the scoreboard of expected objects stays shared.
+  struct ReceiveState {
+    ReceivingType type{ReceivingType::UNKNOWN_RECEIVING_TYPE};
+    uint64_t expectedGroup{};
+    uint64_t expectedSubgroup{};
+    std::array<uint64_t, 2> subgroupToExpectedObjId{};
+    bool expectEndOfGroup{};
+    bool active{false};
+    bool done{false};
+    // A joining subscription starts wherever the publisher had reached, which
+    // the client only learns from the first object it delivers.
+    bool seeded{true};
+  };
+
   // An ObjectReceiverCallback implementation that forwards calls to a
-  // MoQTestClient.
+  // MoQTestClient, tagged with the half of the request it belongs to.
   class ObjectReceiverCallback : public moxygen::ObjectReceiverCallback {
    public:
-    explicit ObjectReceiverCallback(MoQTestClient& client) : client_(client) {}
+    ObjectReceiverCallback(MoQTestClient& client, ReceiveState& state)
+        : client_(client), state_(state) {}
 
     FlowControlState onObject(
         std::optional<TrackAlias> trackAlias,
         const ObjectHeader& objHeader,
         Payload payload) override {
       return client_.onObject(
-          std::move(trackAlias), objHeader, std::move(payload));
+          state_, std::move(trackAlias), objHeader, std::move(payload));
     }
 
     void onObjectStatus(
         std::optional<TrackAlias> trackAlias,
         const ObjectHeader& objHeader) override {
-      client_.onObjectStatus(std::move(trackAlias), objHeader);
+      client_.onObjectStatus(state_, std::move(trackAlias), objHeader);
     }
 
     void onEndOfStream() override {
@@ -155,17 +184,18 @@ class MoQTestClient : public Subscriber,
     }
 
     void onError(ResetStreamErrorCode code) override {
-      client_.onError(code);
+      client_.onError(state_, code);
     }
 
     void onPublishDone(PublishDone /* done */) override {}
 
     void onAllDataReceived() override {
-      client_.onAllDataReceived();
+      client_.onAllDataReceived(state_);
     }
 
    private:
     MoQTestClient& client_;
+    ReceiveState& state_;
   };
 
   // Wraps ObjectReceiver to inspect the delivery semantics the publisher
@@ -177,8 +207,11 @@ class MoQTestClient : public Subscriber,
     VerifyingObjectReceiver(
         Type type,
         std::shared_ptr<moxygen::ObjectReceiverCallback> callback,
-        MoQTestClient& client)
-        : ObjectReceiver(type, std::move(callback)), client_(client) {}
+        MoQTestClient& client,
+        ReceiveState& state)
+        : ObjectReceiver(type, std::move(callback)),
+          client_(client),
+          state_(state) {}
 
     folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>
     beginSubgroup(
@@ -186,7 +219,8 @@ class MoQTestClient : public Subscriber,
         uint64_t subgroupID,
         Priority priority,
         BeginSubgroupOptions options) override {
-      client_.validateSubgroupHeader(groupID, subgroupID, priority, options);
+      client_.validateSubgroupHeader(
+          state_, groupID, subgroupID, priority, options);
       return ObjectReceiver::beginSubgroup(
           groupID, subgroupID, priority, options);
     }
@@ -195,27 +229,33 @@ class MoQTestClient : public Subscriber,
         const ObjectHeader& header,
         Payload payload,
         bool endOfGroup) override {
-      client_.validateDatagramHeader(header, endOfGroup);
+      client_.validateDatagramHeader(state_, header, endOfGroup);
       return ObjectReceiver::datagram(header, std::move(payload), endOfGroup);
     }
 
    private:
     MoQTestClient& client_;
+    ReceiveState& state_;
   };
 
   // Override Vritual Functions for now to return basic print statements
   ObjectReceiverCallback::FlowControlState onObject(
+      ReceiveState& state,
       const std::optional<TrackAlias>& trackAlias,
       const ObjectHeader& objHeader,
       Payload payload);
   void onObjectStatus(
+      ReceiveState& state,
       const std::optional<TrackAlias>& trackAlias,
       const ObjectHeader& objHeader);
   void onEndOfStream();
-  void onError(ResetStreamErrorCode);
-  void onAllDataReceived();
+  void onError(ReceiveState& state, ResetStreamErrorCode);
+  void onAllDataReceived(ReceiveState& state);
 
-  ObjectReceiverCallback objectReceiverCallback_{*this};
+  ReceiveState subState_;
+  ReceiveState fetchState_;
+  ObjectReceiverCallback subCallback_{*this, subState_};
+  ObjectReceiverCallback fetchCallback_{*this, fetchState_};
 
   proxygen::URL url_;
   samples::TransportType transportType_;
@@ -232,26 +272,23 @@ class MoQTestClient : public Subscriber,
   std::shared_ptr<MoQTestPublisher> publisher_;
 
   // Holds Current Request Parameters
-  ReceivingType receivingType_ = ReceivingType::UNKNOWN_RECEIVING_TYPE;
   MoQTestParameters params_;
   RequestID requestID_{};
 
-  // Holds Current Request Group, SubGroup, and objectId (updated based on
-  // expected data)
-  uint64_t expectedGroup_{};
-  uint64_t expectedSubgroup_{};
-  std::array<uint64_t, 2> subgroupToExpectedObjId_{};
+  // The slice of the track the current request covers
+  MoQTestFetchWindow window_;
 
   // Scoreboard of expected (group, objectId) pairs
   // When receiving: if present, erase; if absent, it's a duplicate
   // At end: success == scoreboard.empty() (or within drop limit for datagrams)
   std::set<std::pair<uint64_t, uint64_t>> expectedObjects_;
 
-  // Holds if current request expects end of group markers
-  bool expectEndOfGroup_{};
-
   // Set when a delivery-semantics check fails; suppresses the final SUCCESS
   bool semanticsFailed_{false};
+
+  // Set once we cancel the request ourselves; the peer answers with a stream
+  // reset that must not count against the track
+  bool tearingDown_{false};
 
   // Holds Datagram Objects Recieved - (Only relevant for forwarding preference
   // 3)
@@ -266,17 +303,69 @@ class MoQTestClient : public Subscriber,
   // header or datagram, so these check what the encoding means rather than
   // which stream/datagram type byte was used.
   void validateSubgroupHeader(
+      const ReceiveState& state,
       uint64_t groupID,
       uint64_t subgroupID,
       Priority priority,
       const TrackConsumer::BeginSubgroupOptions& options);
-  void validateDatagramHeader(const ObjectHeader& header, bool endOfGroup);
+  void validateDatagramHeader(
+      const ReceiveState& state,
+      const ObjectHeader& header,
+      bool endOfGroup);
   void recordSemanticsFailure(const std::string& reason);
   uint64_t draftMajorVersion() const;
 
-  // Subscription Data Validation functions
-  void initializeExpecteds(MoQTestParameters& params);
+  // The shape the objects actually arrive in, which is not always the track's
+  // forwarding preference -- see fetchForwardingPreference().
+  ForwardingPreference deliveredForwardingPreference(
+      const ReceiveState& state) const;
+
+  // Cancels every request in flight.  Handles are assigned only after the peer
+  // replies, and objects can be parsed before that, so this is a no-op if a
+  // failure is detected that early.
+  void cancelRequest();
+
+  // Checks FETCH_OK against the range the client asked for.  Must run after
+  // initializeExpecteds, which sets the window this compares against.
+  void validateFetchOk(
+      const FetchOk& ok,
+      const MoQTestParameters& params,
+      const StandaloneFetch& range);
+
+  // The group a joining FETCH backfills from.  A relative join counts back
+  // from where the subscription begins, so it needs the reported Largest.
+  static uint64_t joiningStartGroup(
+      int64_t joinStart,
+      const AbsoluteLocation& largest);
+
+  // The client does not choose a joining FETCH's range, but it can reconstruct
+  // it: the backfill runs from `startGroup` up to the object the subscription
+  // reported as Largest.
+  void validateJoiningFetchOk(
+      const FetchOk& ok,
+      const MoQTestParameters& params,
+      const AbsoluteLocation& largest,
+      uint64_t startGroup);
+
+  // Drops expectations below `group`.  A join that does not reach back to the
+  // start of the track never delivers those, and neither half is at fault.
+  void trimExpectedBefore(uint64_t group);
+
+  // Subscription Data Validation functions.  Expectations follow `window`,
+  // which is the whole track except for a ranged FETCH.
+  void initializeExpecteds(
+      MoQTestParameters& params,
+      MoQTestFetchWindow window);
+  // Arms one half of the request and puts its cursor at the window's start.
+  // `seeded` is false for a joining subscription, whose start the publisher
+  // chooses.
+  void
+  startReceiving(ReceiveState& state, ReceivingType type, bool seeded = true);
+
+  // Puts an unseeded cursor at the first object its half delivers.
+  void seedCursor(ReceiveState& state, const ObjectHeader& header);
   bool validateSubscribedData(
+      ReceiveState& state,
       const ObjectHeader& header,
       const std::string& payload);
   folly::Expected<folly::Unit, ExtensionError> validateExtensions(
@@ -284,15 +373,20 @@ class MoQTestClient : public Subscriber,
       MoQTestParameters* params);
 
   AdjustedExpectedResult adjustExpected(
+      ReceiveState& state,
       MoQTestParameters& params,
-      const ObjectHeader* header);
+      const ObjectHeader& header);
   AdjustedExpectedResult adjustExpectedForOneSubgroupPerGroup(
+      ReceiveState& state,
       MoQTestParameters& params);
   AdjustedExpectedResult adjustExpectedForOneSubgroupPerObject();
   AdjustedExpectedResult adjustExpectedForTwoSubgroupsPerGroup(
-      const ObjectHeader* header,
+      ReceiveState& state,
+      const ObjectHeader& header,
       MoQTestParameters& params);
-  AdjustedExpectedResult adjustExpectedForDatagram(MoQTestParameters& params);
+  AdjustedExpectedResult adjustExpectedForDatagram(
+      const ReceiveState& state,
+      MoQTestParameters& params);
   bool validateDatagramObjects(const ObjectHeader& header);
 };
 } // namespace moxygen

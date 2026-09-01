@@ -2435,7 +2435,8 @@ folly::Expected<PublishDone, ErrorCode> MoQFrameParser::parsePublishDone(
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= statusCode->second;
-  publishDone.statusCode = PublishDoneStatusCode(statusCode->first);
+  publishDone.statusCode = fromWirePublishDoneStatusCode(
+      static_cast<uint32_t>(statusCode->first), version_.value());
 
   auto streamCount = decodeVarint(cursor, length);
   if (!streamCount) {
@@ -5746,7 +5747,10 @@ WriteResult MoQFrameWriter::writePublishDone(
     writeVarint(writeBuf, publishDone.requestID.value, size, error);
   }
   writeVarint(
-      writeBuf, folly::to_underlying(publishDone.statusCode), size, error);
+      writeBuf,
+      toWirePublishDoneStatusCode(publishDone.statusCode, *version_),
+      size,
+      error);
   writeVarint(writeBuf, publishDone.streamCount, size, error);
   writeFixedString(writeBuf, publishDone.reasonPhrase, size, error);
   if (getDraftMajorVersion(*version_) <= 9) {

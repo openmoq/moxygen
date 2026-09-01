@@ -14,7 +14,7 @@
 
 set -e
 
-SKIP_FETCH=1
+SKIP_FETCH=${SKIP_FETCH:-0}
 
 # Colors for output
 RED='\033[0;31m'
@@ -53,7 +53,7 @@ RELAY_URL="$1"
 # Transport flag: default to HTTP/3 + WebTransport (Q = raw QUIC, X = QMUX-on-TCP)
 # Versions flag: default to empty (all supported)
 TRANSPORT_FLAG="--transport=h3wt"
-VERSION_FLAG=""
+VERSION_FLAG=()
 shift 1
 for arg in "$@"; do
     if [ "$arg" = "Q" ]; then
@@ -61,7 +61,7 @@ for arg in "$@"; do
     elif [ "$arg" = "X" ]; then
         TRANSPORT_FLAG="--transport=qmux"
     elif [[ "$arg" =~ ^[0-9,]+$ ]]; then
-        VERSION_FLAG="--versions=$arg"
+        VERSION_FLAG=(--versions="$arg")
     fi
 done
 
@@ -90,12 +90,22 @@ set_section() {
 }
 
 # Function to run a test case
+# SECTIONS="9 10" runs only those sections; unset runs everything.
+section_enabled() {
+    [ -z "${SECTIONS:-}" ] && return 0
+    case " $SECTIONS " in
+        *" $CURRENT_SECTION "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 run_test() {
     local test_name="$1"
     local request_type="$2"
     shift 2
     local args=("$@")  # SC2124: assign as array
 
+    section_enabled || return 0
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     echo -e "\n${BLUE}[Test $TOTAL_TESTS] $test_name${NC}"
     echo "  Request: $request_type"
@@ -106,7 +116,7 @@ run_test() {
     local exit_code
 
     if output=$("$CLIENT_BINARY" --url="$RELAY_URL" --request="$request_type" \
-        "$TRANSPORT_FLAG" $VERSION_FLAG "${args[@]}" 2>&1); then  # SC2086: quote expansions
+        "$TRANSPORT_FLAG" "${VERSION_FLAG[@]}" "${args[@]}" 2>&1); then
         exit_code=0
     else
         exit_code=$?
@@ -114,7 +124,36 @@ run_test() {
 
     # Check for success or failure in output
     echo "$output"
+    local reason
+    reason=$(verdict_of "$output" "$exit_code") || true
+    record_result "$test_name" "$reason"
+}
+
+# The client's own verdict, as an empty string when it passed and a reason when
+# it did not.
+verdict_of() {
+    local output="$1"
+    local exit_code="$2"
+
     if echo "$output" | grep -q "MoQTest verification result: SUCCESS"; then
+        return 0
+    fi
+    # Guarded: the script runs under `set -e` and grep exits non-zero when the
+    # client died before printing a verdict at all.
+    local reason
+    reason=$(echo "$output" | grep "MoQTest verification result: FAILURE" | sed 's/.*reason: //') || true
+    if [ -z "$reason" ]; then
+        reason="Unexpected output (exit code: $exit_code)"
+    fi
+    echo "$reason"
+}
+
+# Records one outcome.  An empty `reason` means the test passed.
+record_result() {
+    local test_name="$1"
+    local reason="$2"
+
+    if [ -z "$reason" ]; then
         echo -e "${GREEN}  ✓ PASSED${NC}"
         PASSED_TESTS=$((PASSED_TESTS + 1))
         TEST_RESULTS+=("PASS|$test_name|$CURRENT_SECTION")
@@ -122,9 +161,7 @@ run_test() {
             SECTION_PASSED[$CURRENT_SECTION]=$((SECTION_PASSED[$CURRENT_SECTION] + 1))
             SECTION_TOTAL[$CURRENT_SECTION]=$((SECTION_TOTAL[$CURRENT_SECTION] + 1))
         fi
-    elif echo "$output" | grep -q "MoQTest verification result: FAILURE"; then
-        local reason
-        reason=$(echo "$output" | grep "MoQTest verification result: FAILURE" | sed 's/.*reason: //')  # SC2155: declare and assign separately
+    else
         echo -e "${RED}  ✗ FAILED: $reason${NC}"
         FAILED_TESTS=$((FAILED_TESTS + 1))
         TEST_RESULTS+=("FAIL|$test_name|$CURRENT_SECTION|$reason")
@@ -132,15 +169,67 @@ run_test() {
             SECTION_FAILED[$CURRENT_SECTION]=$((SECTION_FAILED[$CURRENT_SECTION] + 1))
             SECTION_TOTAL[$CURRENT_SECTION]=$((SECTION_TOTAL[$CURRENT_SECTION] + 1))
         fi
+    fi
+}
+
+# Runs a joining FETCH.  A background subscriber holds the track open first,
+# because a join against a track that starts with it has nothing to catch up
+# on.  `expect` is "backfill" or "empty".
+run_join_test() {
+    local test_name="$1"
+    local join_start="$2"
+    local expect="$3"
+    shift 3
+    local args=("$@")
+
+    section_enabled || return 0
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    echo -e "\n${BLUE}[Test $TOTAL_TESTS] $test_name${NC}"
+    echo "  Request: subscribe --join_start=$join_start (expect $expect)"
+    echo "  Args: ${args[*]}"
+
+    local holder=""
+    if [ "$expect" = "backfill" ]; then
+        "$CLIENT_BINARY" --url="$RELAY_URL" --request=subscribe \
+            "$TRANSPORT_FLAG" "${VERSION_FLAG[@]}" "${args[@]}" >/dev/null 2>&1 &
+        holder=$!
+        sleep "$JOIN_DELAY"
+    fi
+
+    local output
+    local exit_code
+    if output=$("$CLIENT_BINARY" --url="$RELAY_URL" --request=subscribe \
+        --join_start="$join_start" "$TRANSPORT_FLAG" "${VERSION_FLAG[@]}" \
+        "${args[@]}" 2>&1); then
+        exit_code=0
     else
-        echo -e "${RED}  ✗ FAILED: Unexpected output or error (exit code: $exit_code)${NC}"
-        FAILED_TESTS=$((FAILED_TESTS + 1))
-        TEST_RESULTS+=("FAIL|$test_name|$CURRENT_SECTION|Unexpected output (exit code: $exit_code)")
-        if [ -n "$CURRENT_SECTION" ]; then
-            SECTION_FAILED[$CURRENT_SECTION]=$((SECTION_FAILED[$CURRENT_SECTION] + 1))
-            SECTION_TOTAL[$CURRENT_SECTION]=$((SECTION_TOTAL[$CURRENT_SECTION] + 1))
+        exit_code=$?
+    fi
+
+    if [ -n "$holder" ]; then
+        kill "$holder" 2>/dev/null || true
+        wait "$holder" 2>/dev/null || true
+    fi
+
+    echo "$output"
+    local reason
+    reason=$(verdict_of "$output" "$exit_code") || true
+    # A passing verdict is not enough: if the track had already finished the
+    # join would have started a fresh one and validated it without ever
+    # backfilling, so check which range the two halves actually met on.
+    local backfill
+    backfill=$(echo "$output" | grep -o "joining FETCH backfills.*" | tail -1) || true
+    if [ -z "$reason" ]; then
+        if [ "$expect" = "backfill" ] && ! echo "$backfill" | grep -q "groups"; then
+            reason="Join backfilled nothing, so it did not land mid-track"
+        elif [ "$expect" = "empty" ] && echo "$backfill" | grep -q "groups"; then
+            reason="Join backfilled a track that had published nothing"
         fi
     fi
+    if [ -z "$reason" ] && [ -n "$backfill" ]; then
+        echo "  ${backfill}"
+    fi
+    record_result "$test_name" "$reason"
 }
 
 
@@ -439,7 +528,7 @@ run_test "Large increments (group=10, object=5)" \
     --object_increment=5
 
 # ============================================================================
-# SECTION 5: End of Group Markers (Tests 31-36)
+# SECTION 5: End of Group Markers (Tests 31-37)
 # ============================================================================
 echo -e "\n${YELLOW}=== SECTION 5: End of Group Markers ===${NC}"
 set_section "5" "End of Group Markers"
@@ -500,8 +589,21 @@ run_test "End of group markers with single object" \
     --objects_per_group=1 \
     --send_end_of_group_markers=true
 
+# Test 37: End of group markers with DATAGRAM.  A datagram type byte carries
+# the end-of-group bit or an object status, so the marker arrives as a status
+# datagram with the bit clear -- and carries no extensions, unlike the payload
+# datagrams around it, which is what puts it on the wire differently.
+run_test "End of group markers with DATAGRAM and extensions" \
+    "subscribe" \
+    --forwarding_preference=3 \
+    --last_group=2 \
+    --objects_per_group=4 \
+    --test_integer_extension=1 \
+    --test_variable_extension=1 \
+    --send_end_of_group_markers=true
+
 # ============================================================================
-# SECTION 6: Extensions (Tests 37-42)
+# SECTION 6: Extensions (Tests 38-43)
 # ============================================================================
 echo -e "\n${YELLOW}=== SECTION 6: Extensions ===${NC}"
 set_section "6" "Extensions"
@@ -567,7 +669,7 @@ run_test "Extensions with end of group markers" \
     --send_end_of_group_markers=true
 
 # ============================================================================
-# SECTION 7: Complex Scenarios (Tests 43-50)
+# SECTION 7: Complex Scenarios (Tests 44-51)
 # ============================================================================
 echo -e "\n${YELLOW}=== SECTION 7: Complex Scenarios ===${NC}"
 set_section "7" "Complex Scenarios"
@@ -663,7 +765,7 @@ run_test "Stress: DATAGRAM rapid delivery" \
     --test_variable_extension=1
 
 # ============================================================================
-# SECTION 8: PUBLISH (Tests 51-56)
+# SECTION 8: PUBLISH (Tests 52-57)
 # ============================================================================
 # These ask the relay for the track with SUBSCRIBE_TRACKS and PUBLISH it on a
 # second session, so they exercise the relay's PUBLISH forwarding rather than
@@ -738,6 +840,99 @@ run_test "PUBLISH before SUBSCRIBE_TRACKS with DATAGRAM" \
     --objects_per_group=5 \
     --size_of_object_zero=100 \
     --size_of_object_greater_than_zero=50
+
+# ============================================================================
+echo -e "\n${YELLOW}=== SECTION 9: FETCH Ranges ===${NC}"
+set_section "9" "FETCH Ranges"
+# ============================================================================
+# The range is carried in the FETCH, not the track namespace, so every test in
+# a group below addresses the same track.  A relay that caches will serve the
+# overlapping part of each later fetch out of cache, and the objects delivered
+# have to be identical either way.  Groups A-E are 0-4; the fetches walk
+# C, then B-C, then C-D, then A-E so each one overlaps what the last cached.
+
+# Every test here is a FETCH, so the whole section goes behind the guard.
+if [ "$SKIP_FETCH" -ne 1 ]; then
+
+# Objects 0-9 per group, so group N is [N,0 - N,10).
+FETCH_TRACK=(--forwarding_preference=0 --last_group=4 --objects_per_group=10 \
+    --last_object_in_track=9)
+
+run_test "FETCH range C" "fetch" \
+    "${FETCH_TRACK[@]}" --start_location=2,0 --end_location=2,10
+
+run_test "FETCH range B-C, C cached" "fetch" \
+    "${FETCH_TRACK[@]}" --start_location=1,0 --end_location=2,10
+
+run_test "FETCH range C-D, C cached" "fetch" \
+    "${FETCH_TRACK[@]}" --start_location=2,0 --end_location=3,10
+
+run_test "FETCH range A-E, B-D cached" "fetch" \
+    "${FETCH_TRACK[@]}" --start_location=0,0 --end_location=4,10
+
+# Same walk against a track that ends each group with a marker, so group N is
+# [N,0 - N,11) with the marker at object 10.
+FETCH_TRACK_EOG=(--forwarding_preference=0 --last_group=4 \
+    --objects_per_group=10 --last_object_in_track=10 \
+    --send_end_of_group_markers=true)
+
+run_test "FETCH range C, end of group markers" "fetch" \
+    "${FETCH_TRACK_EOG[@]}" --start_location=2,0 --end_location=2,11
+
+run_test "FETCH range B-C cached, end of group markers" "fetch" \
+    "${FETCH_TRACK_EOG[@]}" --start_location=1,0 --end_location=2,11
+
+run_test "FETCH range C-D cached, end of group markers" "fetch" \
+    "${FETCH_TRACK_EOG[@]}" --start_location=2,0 --end_location=3,11
+
+run_test "FETCH range A-E cached, end of group markers" "fetch" \
+    "${FETCH_TRACK_EOG[@]}" --start_location=0,0 --end_location=4,11
+
+fi
+
+# ============================================================================
+echo -e "\n${YELLOW}=== SECTION 10: Joining FETCH ===${NC}"
+set_section "10" "Joining FETCH"
+# ============================================================================
+# A joining FETCH backfills what ran before the subscription started, so the
+# two together cover the track.  Every test but the last runs against a track
+# a background subscriber is already holding open.
+
+# 16 groups of 6 objects at 50ms is a little under five seconds of track, so
+# it is still running when the join lands a second and a half in.
+JOIN_TRACK=(--last_group=15 --objects_per_group=5 --object_frequency=50)
+JOIN_DELAY=1.5
+
+run_join_test "Join from the start of the track" 0 backfill \
+    "${JOIN_TRACK[@]}"
+
+run_join_test "Join two groups back" -2 backfill \
+    "${JOIN_TRACK[@]}"
+
+run_join_test "Join from an absolute group partway in" 3 backfill \
+    "${JOIN_TRACK[@]}"
+
+run_join_test "Join with ONE_SUBGROUP_PER_OBJECT" 0 backfill \
+    "${JOIN_TRACK[@]}" --forwarding_preference=1
+
+run_join_test "Join with TWO_SUBGROUPS_PER_GROUP" 0 backfill \
+    "${JOIN_TRACK[@]}" --forwarding_preference=2
+
+# The halves disagree on shape here: the backfill arrives as one subgroup per
+# group while the subscription arrives as datagrams.
+run_join_test "Join with DATAGRAM" 0 backfill \
+    "${JOIN_TRACK[@]}" --forwarding_preference=3
+
+run_join_test "Join with end of group markers" 0 backfill \
+    "${JOIN_TRACK[@]}" --send_end_of_group_markers=true
+
+run_join_test "Join with both extensions" 0 backfill \
+    "${JOIN_TRACK[@]}" --test_integer_extension=1 --test_variable_extension=1
+
+# No holder, so the track starts with this subscription and has published
+# nothing to anchor a join on.
+run_join_test "Join a track that has not started" 0 empty \
+    --last_group=4
 
 # ============================================================================
 # Generate Report

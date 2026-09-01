@@ -26,7 +26,7 @@ MoQTestFetchHandle::requestUpdate(RequestUpdate update) {
 }
 
 void MoQTestFetchHandle::fetchCancel() {
-  cancelSource_.requestCancellation();
+  cancelSource_->requestCancellation();
 }
 
 folly::coro::Task<void> MoQTestPublisher::delay(uint64_t ms) {
@@ -34,7 +34,11 @@ folly::coro::Task<void> MoQTestPublisher::delay(uint64_t ms) {
 }
 
 void MoQTestPublisher::cancelAll() {
-  for (auto& [key, state] : activeSubscriptions_) {
+  // Move before cancelling: a generator that unwinds inline retires its own
+  // entry.
+  auto tracks = std::move(tracks_);
+  tracks_.clear();
+  for (auto& [ftn, state] : tracks) {
     state.cancelSource.requestCancellation();
   }
   // Move before cancelling: cancel() can resume a waiting publish inline, and
@@ -44,14 +48,49 @@ void MoQTestPublisher::cancelAll() {
   for (auto& p : pending) {
     p->cancel();
   }
+  auto fetches = std::move(activeFetches_);
+  activeFetches_.clear();
+  for (auto& f : fetches) {
+    f->requestCancellation();
+  }
 }
 
-void MoQTestPublisher::removeSubscription(SubKey key) {
-  auto it = activeSubscriptions_.find(key);
-  if (it != activeSubscriptions_.end()) {
-    it->second.cancelSource.requestCancellation();
-    activeSubscriptions_.erase(it);
+std::shared_ptr<MoQForwarder> MoQTestPublisher::makeForwarder(
+    const FullTrackName& ftn,
+    MoQSession& session) {
+  auto forwarder = std::make_shared<MoQForwarder>(ftn);
+
+  // Advertise the priority even-numbered groups are published at, so the
+  // draft-15+ subgroup and datagram encodings elide it for those and write it
+  // explicitly for the odd ones.  The framer downgrades the extension to a
+  // PUBLISHER_PRIORITY param for draft 15; earlier drafts have no way to carry
+  // it, so the priority always stays on the wire instead.
+  auto version = session.getNegotiatedVersion();
+  if (version && getDraftMajorVersion(*version) >= 15) {
+    Extensions trackProperties;
+    trackProperties.insertMutableExtension(
+        Extension{kPublisherPriorityExtensionType, kMoQTestPublisherPriority});
+    forwarder->setExtensions(std::move(trackProperties));
   }
+
+  auto cb = std::make_shared<TrackCallback>();
+  cb->publisher = shared_from_this();
+  cb->ftn = ftn;
+  forwarder->setCallback(std::move(cb));
+  return forwarder;
+}
+
+void MoQTestPublisher::retireTrack(
+    const FullTrackName& ftn,
+    const MoQForwarder* forwarder) {
+  auto it = tracks_.find(ftn);
+  // A track that ended and restarted has a different forwarder under the same
+  // name.
+  if (it == tracks_.end() || it->second.forwarder.get() != forwarder) {
+    return;
+  }
+  it->second.cancelSource.requestCancellation();
+  tracks_.erase(it);
 }
 
 folly::coro::Task<MoQSession::SubscribeResult> MoQTestPublisher::subscribe(
@@ -70,64 +109,52 @@ folly::coro::Task<MoQSession::SubscribeResult> MoQTestPublisher::subscribe(
   }
 
   auto session = MoQSession::getRequestSession();
-  auto forwarder = std::make_shared<MoQForwarder>(sub.fullTrackName);
-  forwarder->setTrackAlias(TrackAlias(sub.requestID.value));
-
-  // Advertise the priority even-numbered groups are published at, so the
-  // draft-15+ subgroup and datagram encodings elide it for those and write it
-  // explicitly for the odd ones.  The framer downgrades the extension to a
-  // PUBLISHER_PRIORITY param for draft 15; earlier drafts have no way to carry
-  // it, so the priority always stays on the wire instead.
-  auto version = session->getNegotiatedVersion();
-  if (version && getDraftMajorVersion(*version) >= 15) {
-    Extensions trackProperties;
-    trackProperties.insertMutableExtension(
-        Extension{kPublisherPriorityExtensionType, kMoQTestPublisherPriority});
-    forwarder->setExtensions(std::move(trackProperties));
-  }
-
-  SubKey subKey{session.get(), sub.requestID.value};
-  auto& state = activeSubscriptions_[subKey];
-  state.forwarder = forwarder;
-  auto token = state.cancelSource.getToken();
-
-  struct EmptyCb : public MoQForwarder::Callback {
-    std::weak_ptr<MoQTestPublisher> publisher;
-    SubKey key;
-    void onEmpty(MoQForwarder*) override {
-      if (auto p = publisher.lock()) {
-        p->removeSubscription(key);
-      }
-    }
-  };
-  auto cb = std::make_shared<EmptyCb>();
-  cb->publisher = shared_from_this();
-  cb->key = subKey;
-  forwarder->setCallback(std::move(cb));
+  auto trackIt = tracks_.find(sub.fullTrackName);
+  const bool isNewTrack = (trackIt == tracks_.end());
+  auto forwarder = isNewTrack ? makeForwarder(sub.fullTrackName, *session)
+                              : trackIt->second.forwarder;
 
   auto subscriber = forwarder->addSubscriber(session, sub, std::move(callback));
+  if (!subscriber) {
+    co_return folly::makeUnexpected(
+        SubscribeError{
+            sub.requestID,
+            SubscribeErrorCode::INTERNAL_ERROR,
+            "failed to add subscriber"});
+  }
+  if (!isNewTrack) {
+    co_return subscriber;
+  }
 
+  // Register only once the first subscriber is attached, so a failed subscribe
+  // can't leave an entry with no generator behind it.
+  auto* executor = co_await folly::coro::co_current_executor;
+  auto& state = tracks_[sub.fullTrackName];
+  state.forwarder = forwarder;
   co_withCancellation(
-      token,
+      state.cancelSource.getToken(),
       co_withExecutor(
-          co_await folly::coro::co_current_executor,
-          onSubscribe(sub, forwarder)))
+          executor,
+          runTrack(
+              sub.fullTrackName,
+              std::move(forwarder),
+              res.value(),
+              sub.requestID)))
       .start();
 
   co_return subscriber;
 }
 
-// Perform Co-routine
-folly::coro::Task<void> MoQTestPublisher::onSubscribe(
-    SubscribeRequest sub,
-    std::shared_ptr<TrackConsumer> callback) {
-  // Make a MoQTestParams (Only valid params are passed through from subscribe
-  // function)
-  auto res = moxygen::convertTrackNamespaceToMoqTestParam(
-      &sub.fullTrackName.trackNamespace);
-  XCHECK(res.hasValue())
-      << "Only valid params must be passed into this function";
-  co_await sendTrackData(res.value(), sub.requestID, std::move(callback));
+folly::coro::Task<void> MoQTestPublisher::runTrack(
+    FullTrackName ftn,
+    std::shared_ptr<MoQForwarder> forwarder,
+    MoQTestParameters params,
+    RequestID requestID) {
+  auto unregister =
+      folly::makeGuard([self = shared_from_this(), ftn, fwd = forwarder.get()] {
+        self->retireTrack(ftn, fwd);
+      });
+  co_await sendTrackData(params, requestID, forwarder);
 }
 
 folly::coro::Task<void> MoQTestPublisher::sendTrackData(
@@ -288,7 +315,7 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerGroup(
 
       // If there are send end of group markers and j == lastObjectID, send
       // the end of group
-      if (objectId < params.lastObjectInTrack ||
+      if (objectId < lastObjectInGroup(params) ||
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         std::string p = std::string(objectSize, 't');
@@ -345,7 +372,7 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerObject(
 
       // If there are send end of group markers and j == lastObjectID, send
       // the end of group
-      if (objectId < params.lastObjectInTrack ||
+      if (objectId < lastObjectInGroup(params) ||
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         std::string p = std::string(objectSize, 't');
@@ -423,7 +450,7 @@ folly::coro::Task<void> MoQTestPublisher::sendTwoSubgroupsPerGroup(
 
       // If there are send end of group markers and j == lastObjectID, send
       // the end of group
-      if (objectId < params.lastObjectInTrack ||
+      if (objectId < lastObjectInGroup(params) ||
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
         int index = objectId % 2;
@@ -469,8 +496,6 @@ folly::coro::Task<void> MoQTestPublisher::sendDatagram(
     RequestID requestID,
     MoQTestParameters params,
     std::shared_ptr<TrackConsumer> callback) {
-  auto alias = TrackAlias(requestID.value);
-  callback->setTrackAlias(alias);
   auto token = co_await folly::coro::co_current_cancellation_token;
   const auto lastObject = lastObjectInGroup(params);
   // Iterate through Objects
@@ -490,27 +515,39 @@ folly::coro::Task<void> MoQTestPublisher::sendDatagram(
         callback->publishDone(std::move(done));
         co_return;
       }
-      // Add Integer/Variable Extensions if needed
-      std::vector<Extension> extensions = getExtensions(
-          params.testIntegerExtension,
-          params.testVariableExtension,
-          includeTimestampExtension_);
-
-      // Find Object Size
-      int objectSize = getObjectSize(objectId, &params);
-
-      std::string p = std::string(objectSize, 't');
-      auto objectPayload = folly::IOBuf::copyBuffer(p);
-
       // Build object header
       ObjectHeader header;
       header.group = groupNum;
       header.id = objectId;
       header.priority = publisherPriorityForGroup(groupNum);
-      header.extensions = Extensions(extensions, {});
+
+      // The datagram type byte carries either the end-of-group bit or an object
+      // status, never both.  When the track asks for markers the group's last
+      // object is sent as an END_OF_GROUP status datagram instead of a payload
+      // object, which is what the subgroup path emits.
+      const bool endOfGroupMarker =
+          params.sendEndOfGroupMarkers && objectId == lastObject;
+      Payload objectPayload;
+      if (endOfGroupMarker) {
+        // Draft 15+ rejects extensions on a non-NORMAL status object.
+        header.status = ObjectStatus::END_OF_GROUP;
+        header.length = 0;
+      } else {
+        int objectSize = getObjectSize(objectId, &params);
+        objectPayload = folly::IOBuf::copyBuffer(std::string(objectSize, 't'));
+        // Add Integer/Variable Extensions if needed
+        header.extensions = Extensions(
+            getExtensions(
+                params.testIntegerExtension,
+                params.testVariableExtension,
+                includeTimestampExtension_),
+            {});
+      }
 
       auto res = callback->datagram(
-          header, std::move(objectPayload), objectId == lastObject);
+          header,
+          std::move(objectPayload),
+          !endOfGroupMarker && objectId == lastObject);
       if (res.hasError()) {
         // If sending datagram fails, callback->publishDone with error
         PublishDone done;
@@ -529,12 +566,42 @@ folly::coro::Task<void> MoQTestPublisher::sendDatagram(
   co_return;
 }
 
+folly::Expected<StandaloneFetch, FetchError>
+MoQTestPublisher::resolveJoiningFetch(
+    const Fetch& fetch,
+    const JoiningFetch& joining) {
+  auto trackIt = tracks_.find(fetch.fullTrackName);
+  if (trackIt == tracks_.end()) {
+    return folly::makeUnexpected(
+        FetchError{
+            fetch.requestID,
+            FetchErrorCode::DOES_NOT_EXIST,
+            "No subscription for joining FETCH"});
+  }
+  auto& forwarder = *trackIt->second.forwarder;
+  // A joining FETCH is anchored on the subscription's Largest, so a track that
+  // has published nothing has nothing to anchor to.
+  if (!forwarder.largest()) {
+    return folly::makeUnexpected(
+        FetchError{
+            fetch.requestID,
+            FetchErrorCode::INVALID_RANGE,
+            "No objects published for track"});
+  }
+  auto range =
+      forwarder.resolveJoiningFetch(MoQSession::getRequestSession(), joining);
+  if (range.hasError()) {
+    auto error = range.error();
+    error.requestID = fetch.requestID;
+    return folly::makeUnexpected(error);
+  }
+  return StandaloneFetch(range->start, range->end);
+}
+
 // Fetch Methods
 folly::coro::Task<MoQSession::FetchResult> MoQTestPublisher::fetch(
     Fetch fetch,
     std::shared_ptr<FetchConsumer> fetchCallback) {
-  XLOG(INFO) << "Recieved Fetch Request";
-
   // Ensure Params are valid according to spec, if not return FetchError
   auto res = moxygen::convertTrackNamespaceToMoqTestParam(
       &fetch.fullTrackName.trackNamespace);
@@ -546,84 +613,116 @@ folly::coro::Task<MoQSession::FetchResult> MoQTestPublisher::fetch(
     co_return folly::makeUnexpected(error);
   }
 
-  // Declare cancellation source
-  folly::CancellationSource cancelSource;
+  // The generators only walk the track forwards.
+  if (fetch.groupOrder == GroupOrder::NewestFirst) {
+    co_return folly::makeUnexpected(
+        FetchError{
+            fetch.requestID,
+            FetchErrorCode::NOT_SUPPORTED,
+            "Descending group order not supported"});
+  }
+
+  auto [standalone, joining] = fetchType(fetch);
+  const bool isJoining = joining != nullptr;
+  if (isJoining) {
+    auto range = resolveJoiningFetch(fetch, *joining);
+    if (range.hasError()) {
+      co_return folly::makeUnexpected(range.error());
+    }
+    fetch.args = range.value();
+    standalone = fetchType(fetch).first;
+  }
+
+  auto params = res.value();
+  const auto window = resolveFetchWindow(params, *standalone);
+  XLOG(INFO) << (isJoining ? "Joining FETCH " : "FETCH ") << standalone->start
+             << ".." << standalone->end;
+  if (window.empty()) {
+    XLOG(INFO) << "Requested range misses the track, sending no objects";
+  } else {
+    XLOG(INFO) << "Serving " << window.first << ".." << window.last;
+  }
+
+  // A backfill paced at the live rate would never catch the subscription up.
+  if (isJoining) {
+    params.objectFrequency = 0;
+  }
+
+  auto cancelSource = std::make_shared<folly::CancellationSource>();
+  activeFetches_.push_back(cancelSource);
 
   // Start a Co-routine with cancellation support
   co_withCancellation(
-      cancelSource.getToken(),
+      cancelSource->getToken(),
       co_withExecutor(
           co_await folly::coro::co_current_executor,
-          onFetch(fetch, fetchCallback)))
+          runFetch(cancelSource, params, window, std::move(fetchCallback))))
       .start();
 
   FetchOk ok;
   ok.requestID = fetch.requestID;
-  ok.groupOrder = fetch.groupOrder;
+  ok.groupOrder = GroupOrder::OldestFirst;
+  ok.endOfTrack = window.endOfTrack ? 1 : 0;
+  ok.endLocation = fetchEndLocation(params, *standalone);
 
   co_return std::make_shared<MoQTestFetchHandle>(ok, std::move(cancelSource));
 }
 
-folly::coro::Task<void> MoQTestPublisher::onFetch(
-    Fetch fetch,
-    std::shared_ptr<FetchConsumer> fetchCallback) {
-  // Make a MoQTestParams (Only valid params are passed through from fetch
-  // function)
-  auto res = moxygen::convertTrackNamespaceToMoqTestParam(
-      &fetch.fullTrackName.trackNamespace);
-  XCHECK(res.hasValue())
-      << "Only valid params must be passed into this function";
-  MoQTestParameters params = res.value();
+folly::coro::Task<void> MoQTestPublisher::runFetch(
+    std::shared_ptr<folly::CancellationSource> cancelSource,
+    MoQTestParameters params,
+    MoQTestFetchWindow window,
+    std::shared_ptr<FetchConsumer> callback) {
+  // Drop the registration however the fetch ends, so a long-lived publisher
+  // doesn't accumulate one entry per completed fetch.  The self-reference keeps
+  // the publisher alive for the detached coroutine.  This erase and cancelAll()
+  // both run on the publisher's EventBase, so they never interleave.
+  auto unregister = folly::makeGuard([self = shared_from_this(), cancelSource] {
+    std::erase(self->activeFetches_, cancelSource);
+  });
+  co_await onFetch(params, window, std::move(callback));
+}
 
-  // Publish Objects in Accordance to params
+folly::coro::Task<void> MoQTestPublisher::onFetch(
+    MoQTestParameters params,
+    MoQTestFetchWindow window,
+    std::shared_ptr<FetchConsumer> fetchCallback) {
+  if (window.empty()) {
+    // FETCH_OK has already gone out, so close the fetch without any objects.
+    fetchCallback->endOfFetch();
+    co_return;
+  }
 
   // Publisher Delivery Timeout (To be implemented later)
 
-  // Switch based on forwarding preference
-  switch (params.forwardingPreference) {
-    case (ForwardingPreference::ONE_SUBGROUP_PER_GROUP): {
-      co_await fetchOneSubgroupPerGroup(params, fetchCallback);
-      break;
-    }
-
-    case (ForwardingPreference::ONE_SUBGROUP_PER_OBJECT):
-    case (ForwardingPreference::DATAGRAM): {
-      co_await fetchOneSubgroupPerObject(params, fetchCallback);
-      break;
-    }
-
-    case (ForwardingPreference::TWO_SUBGROUPS_PER_GROUP): {
-      co_await fetchTwoSubgroupsPerGroup(params, fetchCallback);
-      break;
-    }
-
-    default: {
-      break;
-    }
-  }
-
-  co_return;
+  co_await fetchObjects(params, std::move(fetchCallback), window);
 }
 
-folly::coro::Task<void> MoQTestPublisher::fetchOneSubgroupPerGroup(
+folly::coro::Task<void> MoQTestPublisher::fetchObjects(
     MoQTestParameters params,
-    std::shared_ptr<FetchConsumer> callback) {
-  // Iterate through Groups
+    std::shared_ptr<FetchConsumer> callback,
+    MoQTestFetchWindow window) {
   auto token = co_await folly::coro::co_current_cancellation_token;
-  for (uint64_t groupNum = params.startGroup;
-       groupNum <= params.lastGroupInTrack;
+  // A datagram track fetches back through here because its objects have no
+  // subgroup.  From draft 16 the flag tells the framer to omit the subgroup
+  // field entirely; on draft 15 there is no flag and subgroup 0 is written.
+  const bool isDatagram =
+      params.forwardingPreference == ForwardingPreference::DATAGRAM;
+  // FetchConsumer::endOfGroup() has no datagram flag to set, so a marker here
+  // would advertise a second forwarding preference inside the group.  The
+  // subscribe path marks the group on a status datagram instead.
+  const bool sendEndOfGroupMarkers =
+      params.sendEndOfGroupMarkers && !isDatagram;
+  for (uint64_t groupNum = window.first.group; groupNum <= window.last.group;
        groupNum += params.groupIncrement) {
-    // Iterate Through Objects in SubGroup
-    for (uint64_t objectId = params.startObject;
-         objectId <= params.lastObjectInTrack;
+    const uint64_t lastObject = window.lastObjectIn(groupNum);
+    for (uint64_t objectId = window.firstObjectIn(groupNum);
+         objectId <= lastObject;
          objectId += params.objectIncrement) {
       if (token.isCancellationRequested()) {
         co_return;
       }
-      // Find Object Size
-      int objectSize = getObjectSize(objectId, &params);
-
-      // Add Integer/Variable Extensions if needed
+      const uint64_t subgroupId = fetchSubgroupID(params, objectId);
       std::vector<Extension> extensions = getExtensions(
           params.testIntegerExtension,
           params.testVariableExtension,
@@ -631,128 +730,36 @@ folly::coro::Task<void> MoQTestPublisher::fetchOneSubgroupPerGroup(
 
       // If there are send end of group markers and j == lastObjectID, send
       // the end of group
-      if (objectId < params.lastObjectInTrack ||
-          !params.sendEndOfGroupMarkers) {
-        // Begin Delivering Object With Payload
-        std::string p = std::string(objectSize, 't');
-        auto objectPayload = folly::IOBuf::copyBuffer(p);
-        callback->object(
-            groupNum,
-            0 /* subgroupId */,
-            objectId,
-            std::move(objectPayload),
-            Extensions(extensions, {}),
-            false);
-      } else {
-        callback->endOfGroup(groupNum, 0 /* subgroupId */, objectId, false);
-      }
-
-      // Set Delay Based on Object Frequency
-      co_await delay(params.objectFrequency);
-    }
-  }
-
-  // Inform Consumer that fetch is completed
-  callback->endOfFetch();
-}
-
-folly::coro::Task<void> MoQTestPublisher::fetchOneSubgroupPerObject(
-    MoQTestParameters params,
-    std::shared_ptr<FetchConsumer> callback) {
-  // Iterate through Groups
-  auto token = co_await folly::coro::co_current_cancellation_token;
-  for (uint64_t groupNum = params.startGroup;
-       groupNum <= params.lastGroupInTrack;
-       groupNum += params.groupIncrement) {
-    // Iterate Through Objects
-    for (uint64_t objectId = params.startObject;
-         objectId <= params.lastObjectInTrack;
-         objectId += params.objectIncrement) {
-      if (token.isCancellationRequested()) {
-        co_return;
-      }
-      // Find Object Size
-      int objectSize = getObjectSize(objectId, &params);
-
-      // Add Integer/Variable Extensions if needed
-      std::vector<Extension> extensions = getExtensions(
-          params.testIntegerExtension,
-          params.testVariableExtension,
-          includeTimestampExtension_);
-
-      // If there are send end of group markers and j == lastObjectID, send
-      // the end of group
-      if (objectId < params.lastObjectInTrack ||
-          !params.sendEndOfGroupMarkers) {
-        // Begin Delivering Object With Payload
-        std::string p = std::string(objectSize, 't');
-        auto objectPayload = folly::IOBuf::copyBuffer(p);
-        callback->object(
-            groupNum,
-            objectId,
-            objectId,
-            std::move(objectPayload),
-            Extensions(extensions, {}),
-            false);
-      } else {
-        callback->endOfGroup(groupNum, objectId, objectId, false);
-      }
-
-      // Set Delay Based on Object Frequency
-      co_await delay(params.objectFrequency);
-    }
-  }
-
-  // Inform Consumer that fetch is completed
-  callback->endOfFetch();
-}
-
-folly::coro::Task<void> MoQTestPublisher::fetchTwoSubgroupsPerGroup(
-    MoQTestParameters params,
-    std::shared_ptr<FetchConsumer> callback) {
-  // Iterate through Groups
-  auto token = co_await folly::coro::co_current_cancellation_token;
-  for (uint64_t groupNum = params.startGroup;
-       groupNum <= params.lastGroupInTrack;
-       groupNum += params.groupIncrement) {
-    // Iterate Through Objects in SubGroup
-    for (uint64_t objectId = params.startObject;
-         objectId <= params.lastObjectInTrack;
-         objectId += params.objectIncrement) {
-      if (token.isCancellationRequested()) {
-        co_return;
-      }
-      // Find Object Size
-      int objectSize = getObjectSize(objectId, &params);
-
-      // Add Integer/Variable Extensions if needed
-      std::vector<Extension> extensions = getExtensions(
-          params.testIntegerExtension,
-          params.testVariableExtension,
-          includeTimestampExtension_);
-
-      int subgroupId;
-      if (params.objectsPerGroup > 1) {
-        subgroupId = (objectId - params.startObject) % 2;
-      } else {
-        subgroupId = 0;
-      }
-      // If there are send end of group markers and j == lastObjectID, send
-      // the end of group
-      if (objectId < params.lastObjectInTrack ||
-          !params.sendEndOfGroupMarkers) {
-        // Begin Delivering Object With Payload
-        std::string p = std::string(objectSize, 't');
-        auto objectPayload = folly::IOBuf::copyBuffer(p);
-        callback->object(
+      auto res = folly::makeExpected<MoQPublishError>(folly::unit);
+      if (objectId < lastObjectInGroup(params) || !sendEndOfGroupMarkers) {
+        int objectSize = getObjectSize(objectId, &params);
+        auto objectPayload =
+            folly::IOBuf::copyBuffer(std::string(objectSize, 't'));
+        res = callback->object(
             groupNum,
             subgroupId,
             objectId,
             std::move(objectPayload),
             Extensions(extensions, {}),
-            false);
+            false,
+            isDatagram);
       } else {
-        callback->endOfGroup(groupNum, subgroupId, objectId, false);
+        res = callback->endOfGroup(groupNum, subgroupId, objectId, false);
+      }
+      if (res.hasError()) {
+        if (res.error().code != MoQPublishError::BLOCKED) {
+          XLOG(ERR) << "Fetch consumer error: " << res.error().describe();
+          co_return;
+        }
+        // BLOCKED means the consumer took this object but has no room for the
+        // next one, so wait for it to drain rather than resending.
+        auto ready = callback->awaitReadyToConsume();
+        if (ready.hasError()) {
+          XLOG(ERR) << "Fetch consumer will not drain: "
+                    << ready.error().describe();
+          co_return;
+        }
+        co_await std::move(ready.value());
       }
 
       // Set Delay Based on Object Frequency
