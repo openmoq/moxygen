@@ -1102,7 +1102,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
           std::move(payload), finFetch && proxyFin_);
     }
     auto& group = fetchRangeIt_.track->getOrCreateGroupWithEviction(
-        fetchRangeIt_->group, cache_);
+        fetchRangeIt_->group, cache_, ftn_);
     // Only the fetch's first group is pinned, so a later one can be evicted
     // out from under an object in progress.
     auto objectIt = group.objects.find(fetchRangeIt_->object);
