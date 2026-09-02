@@ -6,6 +6,7 @@
 
 #include "moxygen/MoQSession.h"
 #include <folly/Chrono.h>
+#include <folly/coro/Baton.h>
 #include <folly/coro/Collect.h>
 #include <folly/coro/FutureUtil.h>
 #include <quic/common/CircularDeque.h>
@@ -18,6 +19,7 @@
 #include <folly/logging/xlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <utility>
 
 namespace {
@@ -1087,7 +1089,12 @@ class ControlStreamReplyContext : public ReplyContext {
   folly::IOBufQueue& writeBuf() override {
     return controlWriteBuf_;
   }
-  void flush(bool /*fin*/ = false) override {
+  void flush(
+      bool /*fin*/ = false,
+      proxygen::WebTransport::ByteEventCallback* deliveryCallback =
+          nullptr) override {
+    XCHECK(!deliveryCallback)
+        << "Control-stream delivery callbacks are attached by the write loop";
     if (!cancelled()) {
       controlWriteEvent_.signal();
     }
@@ -1096,6 +1103,43 @@ class ControlStreamReplyContext : public ReplyContext {
  private:
   folly::IOBufQueue& controlWriteBuf_;
   moxygen::TimedBaton& controlWriteEvent_;
+};
+
+class OneShotDeliveryCallback final
+    : public proxygen::WebTransport::ByteEventCallback {
+ public:
+  OneShotDeliveryCallback(
+      std::shared_ptr<MoQExecutor> exec,
+      folly::Function<void()> callback)
+      : exec_(std::move(exec)), callback_(std::move(callback)) {}
+
+  void onByteEvent(quic::StreamId, uint64_t) noexcept override {
+    finish();
+  }
+
+  void onByteEventCanceled(quic::StreamId, uint64_t) noexcept override {
+    finish();
+  }
+
+ private:
+  void finish() noexcept {
+    if (finished_.exchange(true)) {
+      return;
+    }
+    auto callback = std::move(callback_);
+    std::unique_ptr<OneShotDeliveryCallback> self(this);
+    auto exec = exec_;
+    exec_->add([callback = std::move(callback),
+                self = std::move(self),
+                exec = std::move(exec)]() mutable {
+      callback();
+      self.reset();
+    });
+  }
+
+  std::shared_ptr<MoQExecutor> exec_;
+  folly::Function<void()> callback_;
+  std::atomic_bool finished_{false};
 };
 
 // Fold a newer REQUEST_UPDATE into an accumulated one for draft-18+ coalescing:
@@ -1625,6 +1669,20 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
   void setLogger(std::shared_ptr<MLogger> logger) {
     logger_ = logger;
   }
+
+  void trackLatestRequestUpdate(const RequestUpdate& requestUpdate) {
+    // Only tracked for draft 18+, where onRequestUpdate consumes/resets it;
+    // pre-18 there is no coalescing, so avoid growing state that is never read.
+    if (getDraftMajorVersion(*session_->getNegotiatedVersion()) < 18) {
+      return;
+    }
+    if (latestRequest_.has_value()) {
+      mergeRequestUpdate(latestRequest_.value(), requestUpdate);
+    } else {
+      latestRequest_ = requestUpdate;
+    }
+  }
+
   folly::coro::Task<void> onRequestUpdate(RequestUpdate requestUpdate) {
     if (!handle_) {
       XLOG(ERR) << "Received RequestUpdate before sending FETCH_OK id="
@@ -1643,10 +1701,41 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
     auto existingRequestID = requestID_;
     auto updateRequestID = requestUpdate.requestID;
 
+    // Newer update supersedes this one
+    if (getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 18 &&
+        latestRequest_.has_value() &&
+        updateRequestID != latestRequest_.value().requestID) {
+      requestOks_.push_back(RequestOk{.requestID = updateRequestID});
+      co_return;
+    }
+
+    std::vector<RequestOk> currentOks;
+    if (getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 18 &&
+        latestRequest_.has_value()) {
+      requestUpdate = std::move(latestRequest_.value());
+      currentOks = std::move(requestOks_);
+      latestRequest_.reset();
+      requestOks_.clear();
+    }
+
+    // Claim this burst's place in the response order before the handler can
+    // suspend. Draft-18 responses carry no requestID, so the peer matches them
+    // to its outstanding updates in arrival order.
+    auto myTurn = std::make_shared<folly::coro::Baton>();
+    auto priorTurn = std::exchange(responseTurn_, myTurn);
+    SCOPE_EXIT {
+      myTurn->post();
+    };
+
     // Call the handle's requestUpdate
     auto updateResult = co_await co_awaitTry(co_withCancellation(
         session_->cancellationSource_.getToken(),
         handle_->requestUpdate(std::move(requestUpdate))));
+
+    // Bursts can finish out of order, so wait for every earlier one to respond.
+    if (priorTurn) {
+      co_await *priorTurn;
+    }
 
     if (!session_) {
       co_return;
@@ -1668,8 +1757,13 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
         updateErr.requestID = updateRequestID; // In case app got it wrong
         session_->requestUpdateError(updateErr, existingRequestID);
       } else {
-        RequestOk requestOk{.requestID = updateRequestID};
-        session_->requestUpdateOk(requestOk, existingRequestID);
+        // Newest succeeded: flush the held acks for the whole coalesced burst.
+        // On error/exception currentOks is dropped, so nothing is acked after a
+        // failed coalesced update.
+        currentOks.push_back(RequestOk{.requestID = updateRequestID});
+        for (const RequestOk& reqOk : currentOks) {
+          session_->requestUpdateOk(reqOk, existingRequestID);
+        }
       }
     }
   }
@@ -1679,6 +1773,14 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
   std::shared_ptr<Publisher::FetchHandle> handle_;
   std::shared_ptr<StreamPublisherImpl> streamPublisher_;
   bool cancelled_{false};
+  // Cumulative newest REQUEST_UPDATE; older queued handlers coalesce into it.
+  folly::Optional<RequestUpdate> latestRequest_;
+  // Held REQUEST_OKs for coalesced updates: flushed together once the newest
+  // update succeeds, or dropped if it fails, so none is acked prematurely.
+  std::vector<RequestOk> requestOks_;
+  // Posted by the most recent burst once it has responded; the next burst
+  // waits on it so responses stay in arrival order.
+  std::shared_ptr<folly::coro::Baton> responseTurn_;
 };
 
 // TrackPublisherImpl
@@ -2074,8 +2176,14 @@ class MoQSession::SubscribeTrackReceiveState
   }
 
   void processSubscribeOK(SubscribeOk subscribeOK) {
+    established_ = true;
     alias_ = subscribeOK.trackAlias;
     subscribePromise_.setValue(std::move(subscribeOK));
+  }
+
+  bool markEstablished() {
+    established_ = true;
+    return endedBeforeEstablished_;
   }
 
   void subscribeError(SubscribeError subErr) {
@@ -2159,8 +2267,12 @@ class MoQSession::SubscribeTrackReceiveState
             << "deliverPublishDoneAndRemove: Delivering PUBLISH_DONE to app; statusCode="
             << folly::to_underlying(pendingPublishDone_->statusCode)
             << " alias=" << alias_ << " requestID=" << requestID_;
-        MOQ_SUBSCRIBER_STATS(
-            session_->subscriberStatsCallback_, onSubscriptionEnd);
+        if (established_ && session_) {
+          MOQ_SUBSCRIBER_STATS(
+              session_->subscriberStatsCallback_, onSubscriptionEnd);
+        } else if (!established_) {
+          endedBeforeEstablished_ = true;
+        }
         auto token = cancelSource_.getToken();
         auto cb = std::exchange(callback_, nullptr);
         cb->publishDone(std::move(*pendingPublishDone_));
@@ -2214,6 +2326,8 @@ class MoQSession::SubscribeTrackReceiveState
 
   // Indicates whether receiveState is for Publish
   bool publish_;
+  bool established_{false};
+  bool endedBeforeEstablished_{false};
 
   // Publisher priority from SUBSCRIBE_OK or PUBLISH parameter
   // Stored as optional; if not set from SUBSCRIBE_OK, defaults to
@@ -2555,14 +2669,14 @@ quic::PriorityQueue::Priority MoQSession::controlPriority() const {
 }
 
 void MoQSession::startControlWriteLoop(
-    proxygen::WebTransport::StreamWriteHandle* writeHandle) {
-  writeHandle->setPriority(controlPriority());
+    proxygen::WebTransport::StreamWriteHandle& writeHandle) {
+  writeHandle.setPriority(controlPriority());
   if (logger_) {
     logger_->logStreamTypeSet(
-        writeHandle->getID(), MOQTStreamType::CONTROL, Owner::LOCAL);
+        writeHandle.getID(), MOQTStreamType::CONTROL, Owner::LOCAL);
   }
   auto mergeToken = folly::cancellation_token_merge(
-      cancellationSource_.getToken(), writeHandle->getCancelToken());
+      cancellationSource_.getToken(), writeHandle.getCancelToken());
   co_withExecutor(
       exec_.get(),
       co_withCancellation(std::move(mergeToken), controlWriteLoop(writeHandle)))
@@ -2580,7 +2694,7 @@ void MoQSession::start() {
       wt_->closeSession();
       return;
     }
-    startControlWriteLoop(us.value());
+    startControlWriteLoop(*us.value());
     // controlReadLoop starts when the peer's uni stream arrives via
     // onNewUniStream -> handlePreSetupUniStream
   } else if (dir_ == MoQControlCodec::Direction::CLIENT) {
@@ -2591,7 +2705,12 @@ void MoQSession::start() {
       return;
     }
     auto controlStream = cs.value();
-    startControlWriteLoop(controlStream.writeHandle);
+    if (!controlStream.writeHandle || !controlStream.readHandle) {
+      XLOG(ERR) << "Incomplete control stream sess=" << this;
+      wt_->closeSession();
+      return;
+    }
+    startControlWriteLoop(*controlStream.writeHandle);
 
     proxygen::WebTransport::StreamData streamData{nullptr, false};
     co_withExecutor(
@@ -2718,6 +2837,22 @@ void MoQSession::checkForCloseOnDrain() {
   }
 }
 
+void MoQSession::completeDrainCloseDelivery() {
+  XCHECK_GT(pendingDrainCloseDeliveries_, 0);
+  --pendingDrainCloseDeliveries_;
+  checkForCloseOnDrain();
+}
+
+proxygen::WebTransport::ByteEventCallback*
+MoQSession::makeDrainCloseDeliveryCallback() {
+  auto weakSession = weak_from_this();
+  return new OneShotDeliveryCallback(exec_, [weakSession]() mutable {
+    if (auto session = weakSession.lock()) {
+      session->completeDrainCloseDelivery();
+    }
+  });
+}
+
 void MoQSession::scheduleGoawayTimeout(uint64_t timeoutMs) {
   cancelGoawayTimeout();
   goawayTimeout_ = std::make_unique<GoawayTimeoutCallback>(*this);
@@ -2839,6 +2974,9 @@ void MoQSession::onGoawayTimeoutExpired() {
 }
 
 bool MoQSession::hasOpenRequestsForDrain() const {
+  if (pendingDrainCloseDeliveries_ > 0) {
+    return true;
+  }
   if (negotiatedVersion_ && getDraftMajorVersion(*negotiatedVersion_) >= 18) {
     return hasOpenRequestsForGoaway();
   }
@@ -2875,7 +3013,7 @@ void MoQSession::close(
 }
 
 folly::coro::Task<void> MoQSession::controlWriteLoop(
-    proxygen::WebTransport::StreamWriteHandle* controlStream) {
+    proxygen::WebTransport::StreamWriteHandle& controlStream) {
   XLOG(DBG1) << __func__ << " sess=" << this;
   auto g = folly::makeGuard([func = __func__, this] {
     XLOG(DBG1) << "exit " << func << " sess=" << this;
@@ -2895,14 +3033,24 @@ folly::coro::Task<void> MoQSession::controlWriteLoop(
       }
     }
     co_await folly::coro::co_safe_point;
-    auto writeRes =
-        controlStream->writeStreamData(controlWriteBuf_.move(), false, nullptr);
+    auto* deliveryCallback = closeAfterControlWriteDelivery_
+        ? makeDrainCloseDeliveryCallback()
+        : nullptr;
+    closeAfterControlWriteDelivery_ = false;
+    auto writeRes = controlStream.writeStreamData(
+        controlWriteBuf_.move(), false, deliveryCallback);
     if (!writeRes) {
+      if (deliveryCallback) {
+        deliveryCallback->onByteEventCanceled(controlStream.getID(), 0);
+      }
       XLOG(ERR) << "Write error: " << uint64_t(writeRes.error());
       break;
     }
-    auto awaitRes = controlStream->awaitWritable();
+    auto awaitRes = controlStream.awaitWritable();
     if (!awaitRes) {
+      if (deliveryCallback) {
+        deliveryCallback->onByteEventCanceled(controlStream.getID(), 0);
+      }
       XLOG(ERR) << "Control stream write error";
       break;
     }
@@ -4077,10 +4225,12 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
   codec.setCallback(&dcb);
   codec.setStreamId(id);
 
+  bool codecBlocked = false;
   while (readHandle && !token.isCancellationRequested()) {
-    // First iteration may use initialBufferedData; subsequent iterations
-    // read from the stream
-    if (!(streamData.data || streamData.fin)) {
+    // First iteration may use initialBufferedData; subsequent iterations read
+    // from the stream.  While the codec holds buffered ingress from a BLOCKED
+    // parse, skip the read so the next onIngress drains it instead.
+    if (!codecBlocked && !streamData.data && !streamData.fin) {
       auto streamDataTry = co_await co_awaitTry(
           folly::coro::co_withCancellation(
               token, readHandle->readStreamData().via(exec_.get())));
@@ -4113,59 +4263,64 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
       }
       streamData = std::move(*streamDataTry);
     }
-    if (streamData.data || streamData.fin) {
-      MoQCodec::ParseResult result = MoQCodec::ParseResult::ERROR_TERMINATE;
-      try {
-        result = codec.onIngress(std::move(streamData.data), streamData.fin);
 
-        // Handle BLOCKED state
-        if (result == MoQCodec::ParseResult::BLOCKED) {
-          XLOG(DBG4) << "Parser returned BLOCKED, waiting for signal id=" << id;
-          // Merged token for baton waits (session + readHandle)
-          auto batonWaitToken = folly::cancellation_token_merge(
-              cancellationSource_.getToken(), rhToken);
-          auto waitRes = co_await co_awaitTry(co_withCancellation(
-              batonWaitToken,
-              aliasBaton.wait(moqSettings_.unknownAliasTimeout)));
-          if (waitRes.hasException()) {
-            XLOG(ERR) << "Timed out waiting for subscription state id=" << id
-                      << " sess=" << this;
-            removeBufferedSubgroupBaton(deferredAlias, &aliasBaton);
-            break;
-          }
-          result = dcb.onSubgroup(
-              deferredAlias,
-              deferredGroup,
-              deferredSubgroup,
-              deferredPriority,
-              deferredOptions);
+    // An empty read has nothing to parse.  Only re-enter the codec with no
+    // bytes when it still holds ingress buffered by a BLOCKED parse.
+    const bool drainBuffered = std::exchange(codecBlocked, false);
+    if (!streamData.data && !streamData.fin && !drainBuffered) {
+      continue;
+    }
 
-          if (result == MoQCodec::ParseResult::CONTINUE) {
-            // codec may have buffered excess ingress while blocked
-            result = codec.onIngress(nullptr, streamData.fin);
-          }
-          if (result == MoQCodec::ParseResult::BLOCKED) {
-            // state was deleted (unsubscribe)
-            result = MoQCodec::ParseResult::ERROR_TERMINATE;
-          }
+    MoQCodec::ParseResult result = MoQCodec::ParseResult::ERROR_TERMINATE;
+    try {
+      result = codec.onIngress(std::move(streamData.data), streamData.fin);
+
+      // Handle BLOCKED state (subgroup alias not yet known)
+      if (result == MoQCodec::ParseResult::BLOCKED) {
+        XLOG(DBG4) << "Parser returned BLOCKED, waiting for signal id=" << id;
+        // Merged token for baton waits (session + readHandle)
+        auto batonWaitToken = folly::cancellation_token_merge(
+            cancellationSource_.getToken(), rhToken);
+        auto waitRes = co_await co_awaitTry(co_withCancellation(
+            batonWaitToken, aliasBaton.wait(moqSettings_.unknownAliasTimeout)));
+        if (waitRes.hasException()) {
+          XLOG(ERR) << "Timed out waiting for subscription state id=" << id
+                    << " sess=" << this;
+          removeBufferedSubgroupBaton(deferredAlias, &aliasBaton);
+          break;
         }
-      } catch (const std::exception& ex) {
-        XLOG(ERR) << "Exception in stream processing: "
-                  << folly::exceptionStr(ex) << " id=" << id
-                  << " sess=" << this;
-        result = MoQCodec::ParseResult::ERROR_TERMINATE;
-      }
+        result = dcb.onSubgroup(
+            deferredAlias,
+            deferredGroup,
+            deferredSubgroup,
+            deferredPriority,
+            deferredOptions);
 
-      if (streamData.fin) {
-        XLOG(DBG3) << "End of stream id=" << id << " sess=" << this;
-        readHandle = nullptr;
-      } else if (result == MoQCodec::ParseResult::ERROR_TERMINATE) {
-        XLOG(ERR) << "Error parsing/consuming stream id=" << id
-                  << " sess=" << this;
-        dcb.reset(ResetStreamErrorCode::INTERNAL_ERROR);
-        break;
+        if (result == MoQCodec::ParseResult::CONTINUE) {
+          // codec may have buffered excess ingress — next iteration drains it
+          codecBlocked = true;
+          continue;
+        }
+        if (result == MoQCodec::ParseResult::BLOCKED) {
+          // state was deleted (unsubscribe)
+          result = MoQCodec::ParseResult::ERROR_TERMINATE;
+        }
       }
-    } // else empty read
+    } catch (const std::exception& ex) {
+      XLOG(ERR) << "Exception in stream processing: " << folly::exceptionStr(ex)
+                << " id=" << id << " sess=" << this;
+      result = MoQCodec::ParseResult::ERROR_TERMINATE;
+    }
+
+    if (streamData.fin) {
+      XLOG(DBG3) << "End of stream id=" << id << " sess=" << this;
+      readHandle = nullptr;
+    } else if (result == MoQCodec::ParseResult::ERROR_TERMINATE) {
+      XLOG(ERR) << "Error parsing/consuming stream id=" << id
+                << " sess=" << this;
+      dcb.reset(ResetStreamErrorCode::INTERNAL_ERROR);
+      break;
+    }
   }
   // stopSendingGuard will handle stopSending if needed
 }
@@ -4472,6 +4627,8 @@ void MoQSession::handleFetchRequestUpdate(
     XLOG(DBG1) << __func__ << " No publisher callback set";
     return;
   }
+
+  fetchPublisher->trackLatestRequestUpdate(requestUpdate);
 
   // Simple passthrough - just deliver to application and relay response
   co_withExecutor(
@@ -4928,9 +5085,23 @@ folly::coro::Task<void> MoQSession::handlePublish(
   auto publisherPriority =
       getPublisherPriorityProperty(publish.extensions, publish.params);
 
+  if (reqIdToTrackAlias_.find(requestID) != reqIdToTrackAlias_.end()) {
+    XLOG(ERR) << "PUBLISH request ID already mapped id=" << requestID
+              << " sess=" << this;
+    close(SessionCloseErrorCode::INVALID_REQUEST_ID);
+    co_return;
+  }
+  if (subTracks_.find(alias) != subTracks_.end()) {
+    XLOG(ERR) << "PUBLISH track alias already in use alias=" << alias
+              << " sess=" << this;
+    close(SessionCloseErrorCode::DUPLICATE_TRACK_ALIAS);
+    co_return;
+  }
+
   // PubError if error occurs
   auto publishErr =
       PublishError{requestID, PublishErrorCode::INTERNAL_ERROR, ""};
+  std::shared_ptr<SubscribeTrackReceiveState> trackReceiveState;
 
   try {
     // Call publish handler synchronously (now returns PublishResult)
@@ -4940,11 +5111,40 @@ folly::coro::Task<void> MoQSession::handlePublish(
     if (publishResult.hasError()) {
       XLOG(DBG1) << "Application publish error err="
                  << publishResult.error().reasonPhrase;
-      publishErr.errorCode = publishResult.error().errorCode;
-      publishErr.reasonPhrase = publishResult.error().reasonPhrase;
+      publishErr = std::move(publishResult.error());
+      publishErr.requestID = requestID;
     } else {
       // Extract the initiator and process reply with co_await
       auto& initiator = publishResult.value();
+
+      // publish() returns its consumer synchronously so data can arrive before
+      // PUBLISH_OK. Install it before awaiting the asynchronous reply; unknown
+      // alias buffering is bounded and is not an application-level media
+      // buffer.
+      trackReceiveState = std::make_shared<SubscribeTrackReceiveState>(
+          ftn, requestID, initiator.consumer, this, alias, logger_, true);
+      applyResolvedPublisherPriority(publisherPriority, trackReceiveState);
+      auto aliasResult = initiator.consumer->setTrackAlias(alias);
+      if (aliasResult.hasError()) {
+        publishErr.reasonPhrase = aliasResult.error().describe();
+        publishError(publishErr, *replyContext);
+        co_return;
+      }
+      auto [requestIt, requestInserted] =
+          reqIdToTrackAlias_.try_emplace(requestID, alias);
+      if (!requestInserted) {
+        close(SessionCloseErrorCode::INVALID_REQUEST_ID);
+        co_return;
+      }
+      auto trackInserted =
+          subTracks_.try_emplace(alias, trackReceiveState).second;
+      if (!trackInserted) {
+        reqIdToTrackAlias_.erase(requestIt);
+        close(SessionCloseErrorCode::DUPLICATE_TRACK_ALIAS);
+        co_return;
+      }
+      deliverBufferedData(alias);
+
       // Process the async reply - this is the only async part
       auto replyResult =
           co_await folly::coro::co_awaitTry(std::move(initiator.reply));
@@ -4953,26 +5153,19 @@ folly::coro::Task<void> MoQSession::handlePublish(
                   << replyResult.exception().what().toStdString();
         publishErr.reasonPhrase = replyResult.exception().what().toStdString();
       } else if (replyResult->hasError()) {
-        publishErr.reasonPhrase = replyResult->error().reasonPhrase;
+        publishErr = std::move(replyResult->error());
+        publishErr.requestID = requestID;
       } else {
-        // Create SubscribeTrackReceiveState
-        // Need in order to obtain Alias Later on
-        reqIdToTrackAlias_.emplace(requestID, alias);
-
-        // Add ReceiveState to subTracks_
-        auto trackReceiveState = std::make_shared<SubscribeTrackReceiveState>(
-            ftn, requestID, initiator.consumer, this, alias, logger_, true);
-
-        applyResolvedPublisherPriority(publisherPriority, trackReceiveState);
-
-        initiator.consumer->setTrackAlias(alias);
-        subTracks_.emplace(alias, trackReceiveState);
         // Ensure the PublishOk we send back corresponds to the inbound
         // publish request (requestID), not the republish's requestID.
         auto pubOk = replyResult->value();
         pubOk.requestID = requestID;
+        const bool endedBeforeEstablished =
+            trackReceiveState->markEstablished();
         publishOk(pubOk, *replyContext);
-        deliverBufferedData(alias);
+        if (endedBeforeEstablished) {
+          MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscriptionEnd);
+        }
         co_return;
       }
     }
@@ -5970,21 +6163,39 @@ void MoQSession::publishError(
   if (logger_) {
     logger_->logPublishError(publishError, ControlMessageType::CREATED);
   }
+
+  auto aliasRes = reqIdToTrackAlias_.find(publishError.requestID);
+  bool removedState = false;
+  if (aliasRes != reqIdToTrackAlias_.end()) {
+    auto trackIt = subTracks_.find(aliasRes->second);
+    if (trackIt != subTracks_.end()) {
+      trackIt->second->cancel();
+      subTracks_.erase(trackIt);
+    }
+    reqIdToTrackAlias_.erase(aliasRes);
+    removedState = true;
+  }
   auto res = moqFrameWriter_.writeRequestError(
       replyContext.writeBuf(), publishError, FrameType::PUBLISH_ERROR);
   if (!res) {
     XLOG(ERR) << "writePublishError failed sess=" << this;
+    if (removedState) {
+      checkForCloseOnDrain();
+    }
     return;
   }
-  replyContext.flushFinal();
-
-  auto aliasRes = reqIdToTrackAlias_.find(publishError.requestID);
-  if (aliasRes == reqIdToTrackAlias_.end()) {
-    XLOG(ERR) << "No track alias found for requestId="
-              << publishError.requestID;
-    return;
+  if (!removedState) {
+    replyContext.flushFinal();
+  } else if (&replyContext == controlStreamReplyContext_.get()) {
+    if (!closeAfterControlWriteDelivery_) {
+      closeAfterControlWriteDelivery_ = true;
+      ++pendingDrainCloseDeliveries_;
+    }
+    replyContext.flushFinal();
+  } else {
+    ++pendingDrainCloseDeliveries_;
+    replyContext.flushFinal(makeDrainCloseDeliveryCallback());
   }
-  removeSubscriptionState(aliasRes->second, publishError.requestID);
 }
 
 RequestID MoQSession::getNextRequestID() {
@@ -6806,6 +7017,11 @@ void MoQSession::handleClientSetup(
     proxygen::WebTransport::BidiStreamHandle bh,
     proxygen::WebTransport::StreamData initialData) noexcept {
   // TODO: prevent second control stream?
+  if (!bh.writeHandle || !bh.readHandle) {
+    XLOG(ERR) << "Incomplete bidi stream sess=" << this;
+    close(SessionCloseErrorCode::INTERNAL_ERROR);
+    return;
+  }
   if (dir_ == MoQControlCodec::Direction::CLIENT) {
     XLOG(ERR) << "Received bidi stream on client, kill it sess=" << this;
     bh.writeHandle->resetStream(/*error=*/0);
@@ -6828,7 +7044,7 @@ void MoQSession::handleClientSetup(
     co_withExecutor(
         exec_.get(),
         co_withCancellation(
-            std::move(mergeToken), controlWriteLoop(bh.writeHandle)))
+            std::move(mergeToken), controlWriteLoop(*bh.writeHandle)))
         .start();
   }
 }
