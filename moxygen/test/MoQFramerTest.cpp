@@ -4515,6 +4515,148 @@ TEST_P(MoQFramerV16PlusTest, NamespaceRoundtrip) {
   EXPECT_EQ(parseResult->trackNamespaceSuffix, ns.trackNamespaceSuffix);
 }
 
+TEST_P(MoQFramerV16PlusTest, RelayHopsSetupOptionRoundtrip) {
+  ClientSetup setup;
+  ASSERT_TRUE(
+      setup.params
+          .insertParam(Parameter(
+              folly::to_underlying(SetupKey::RELAY_HOPS), std::string{}))
+          .hasValue());
+
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  ASSERT_TRUE(writeClientSetup(writeBuf, setup, GetParam()).hasValue());
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = parser_.decodeVarint(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  auto parsed = parser_.parseClientSetup(cursor, frameLength(cursor));
+  ASSERT_TRUE(parsed.hasValue());
+  ASSERT_EQ(parsed->params.size(), 1);
+  EXPECT_EQ(
+      parsed->params.at(0).key, folly::to_underlying(SetupKey::RELAY_HOPS));
+  EXPECT_TRUE(parsed->params.at(0).asString.empty());
+}
+
+TEST_P(MoQFramerV16PlusTest, RelayHopPathRoundtrip) {
+  auto singleton = encodeRelayHopPath({1}, GetParam());
+  ASSERT_TRUE(singleton.hasValue());
+  auto decodedSingleton = decodeRelayHopPath(*singleton, GetParam());
+  ASSERT_TRUE(decodedSingleton.hasValue());
+  EXPECT_EQ(*decodedSingleton, (std::vector<uint64_t>{1}));
+
+  const std::vector<uint64_t> expected = {
+      1, 63, 64, (uint64_t{1} << 30), quic::kEightByteLimit};
+  auto encoded = encodeRelayHopPath(expected, GetParam());
+  ASSERT_TRUE(encoded.hasValue());
+
+  auto decoded = decodeRelayHopPath(*encoded, GetParam());
+  ASSERT_TRUE(decoded.hasValue());
+  EXPECT_EQ(*decoded, expected);
+}
+
+TEST_P(MoQFramerV16PlusTest, RelayHopPathRejectsEmptyAndTruncatedValues) {
+  auto empty = decodeRelayHopPath({}, GetParam());
+  ASSERT_TRUE(empty.hasError());
+  EXPECT_EQ(empty.error(), ErrorCode::PROTOCOL_VIOLATION);
+
+  const std::string truncated = getDraftMajorVersion(GetParam()) >= 17
+      ? std::string("\x80", 1)
+      : std::string("\x40", 1);
+  auto malformed = decodeRelayHopPath(truncated, GetParam());
+  ASSERT_TRUE(malformed.hasError());
+  EXPECT_EQ(malformed.error(), ErrorCode::PROTOCOL_VIOLATION);
+
+  auto validPrefix = encodeRelayHopPath({7}, GetParam());
+  ASSERT_TRUE(validPrefix.hasValue());
+  validPrefix->append(truncated);
+  auto trailingPartial = decodeRelayHopPath(*validPrefix, GetParam());
+  ASSERT_TRUE(trailingPartial.hasError());
+  EXPECT_EQ(trailingPartial.error(), ErrorCode::PROTOCOL_VIOLATION);
+}
+
+TEST_P(MoQFramerV16PlusTest, ExcludeHopRoundtrip) {
+  SubscribeNamespace subNs;
+  subNs.requestID = RequestID(42);
+  subNs.trackNamespacePrefix = TrackNamespace({"relay"});
+  subNs.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::EXCLUDE_HOP),
+      quic::kEightByteLimit));
+
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  ASSERT_TRUE(writer_.writeSubscribeNamespace(writeBuf, subNs).hasValue());
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = parser_.decodeVarint(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  auto parsed = parser_.parseSubscribeNamespace(cursor, frameLength(cursor));
+  ASSERT_TRUE(parsed.hasValue());
+  ASSERT_EQ(parsed->params.size(), 1);
+  EXPECT_EQ(
+      parsed->params.at(0).key,
+      folly::to_underlying(TrackRequestParamKey::EXCLUDE_HOP));
+  EXPECT_EQ(parsed->params.at(0).asUint64, quic::kEightByteLimit);
+}
+
+TEST_P(
+    MoQFramerV16PlusTest,
+    NamespaceRelayHopParametersRoundtripWhenNegotiated) {
+  SetupExtensions extensions;
+  extensions.add(SetupExtension::RelayHops);
+  parser_.setNegotiatedExtensions(extensions);
+  writer_.setNegotiatedExtensions(extensions);
+
+  Namespace ns;
+  ns.trackNamespaceSuffix = TrackNamespace({"suffix"});
+  auto encodedPath = encodeRelayHopPath({11, 22, 33}, GetParam());
+  ASSERT_TRUE(encodedPath.hasValue());
+  ASSERT_TRUE(ns.params
+                  .insertParam(Parameter(
+                      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+                      *encodedPath))
+                  .hasValue());
+
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  ASSERT_TRUE(writer_.writeNamespace(writeBuf, ns).hasValue());
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = parser_.decodeVarint(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::NAMESPACE));
+  auto parsed = parser_.parseNamespace(cursor, frameLength(cursor));
+  ASSERT_TRUE(parsed.hasValue());
+  ASSERT_EQ(parsed->params.size(), 1);
+  EXPECT_EQ(
+      parsed->params.at(0).key,
+      folly::to_underlying(TrackRequestParamKey::HOP_PATH));
+  EXPECT_EQ(parsed->params.at(0).asString, *encodedPath);
+}
+
+TEST_P(
+    MoQFramerV16PlusTest,
+    NamespaceWithoutNegotiationRetainsLegacyWireFormat) {
+  Namespace ns;
+  ns.trackNamespaceSuffix = TrackNamespace({"suffix"});
+  ASSERT_TRUE(ns.params
+                  .insertParam(Parameter(
+                      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+                      std::string("ignored")))
+                  .hasValue());
+
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  ASSERT_TRUE(writer_.writeNamespace(writeBuf, ns).hasValue());
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = parser_.decodeVarint(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  auto parsed = parser_.parseNamespace(cursor, frameLength(cursor));
+  ASSERT_TRUE(parsed.hasValue());
+  EXPECT_TRUE(parsed->params.empty());
+}
+
 // Test Namespace message with empty suffix
 TEST_P(MoQFramerV16PlusTest, NamespaceEmptySuffix) {
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
@@ -5037,6 +5179,169 @@ TEST_P(MoQFramerV16PlusTest, CalculateExtensionVectorSizeMatchesWritten) {
   auto parseResult = parser_.parseExtensions(parseCursor, parseLen, obj);
   ASSERT_TRUE(parseResult.hasValue()) << "Extensions should parse successfully";
   EXPECT_EQ(obj.extensions.size(), 3);
+}
+
+// Test TRACK_FILTER parameter parsing and writing for SubscribeNamespace (v16+)
+TEST_P(MoQFramerV16PlusTest, SubscribeNamespaceWithTrackFilter) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  SubscribeNamespace subscribeNamespace;
+  subscribeNamespace.requestID = RequestID(42);
+  subscribeNamespace.trackNamespacePrefix =
+      TrackNamespace(std::vector<std::string>{"conference", "room1"});
+  subscribeNamespace.options = SubscribeNamespaceOptions::PUBLISH;
+  subscribeNamespace.forward = true;
+
+  // Add TRACK_FILTER parameter: propType=0x10 (audio level), maxSelected=5
+  TrackFilter trackFilter{0x10, 5};
+  Parameter trackFilterParam(
+      folly::to_underlying(TrackRequestParamKey::TRACK_FILTER), trackFilter);
+  subscribeNamespace.params.insertParam(trackFilterParam);
+
+  auto writeResult =
+      writer_.writeSubscribeNamespace(writeBuf, subscribeNamespace);
+  ASSERT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto majorVersion = getDraftMajorVersion(GetParam());
+  // Draft 16/17 use the legacy SUBSCRIBE_NAMESPACE wire type 0x11
+  // (draft-ietf-moq-transport-16 section 9.25); draft 18 renumbers it to
+  // 0x50 via the LEGACY_SUBSCRIBE_NAMESPACE / SUBSCRIBE_NAMESPACE split.
+  // This test runs for both draft 16 and draft 18. Use decodeMoQVarint so the
+  // 0x50 type (which has a 2-byte QUIC varint prefix) decodes correctly.
+  auto frameType = decodeMoQVarint(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  EXPECT_EQ(
+      frameType->first,
+      folly::to_underlying(
+          majorVersion >= 18 ? FrameType::SUBSCRIBE_NAMESPACE
+                             : FrameType::LEGACY_SUBSCRIBE_NAMESPACE));
+
+  auto parseResult =
+      parser_.parseSubscribeNamespace(cursor, frameLength(cursor));
+  ASSERT_TRUE(parseResult.hasValue());
+
+  EXPECT_EQ(parseResult->requestID, subscribeNamespace.requestID);
+  EXPECT_EQ(
+      parseResult->trackNamespacePrefix,
+      subscribeNamespace.trackNamespacePrefix);
+  EXPECT_EQ(parseResult->forward, subscribeNamespace.forward);
+  // Draft 18 dropped the Subscribe Options field from the wire; the parser
+  // restores the NAMESPACE default. Pre-18 carries the PUBLISH option set above.
+  EXPECT_EQ(
+      parseResult->options,
+      majorVersion >= 18 ? SubscribeNamespaceOptions::NAMESPACE
+                         : SubscribeNamespaceOptions::PUBLISH);
+
+  // Check TRACK_FILTER was parsed correctly
+  ASSERT_EQ(parseResult->params.size(), 1);
+  auto& parsedParam = parseResult->params.at(0);
+  EXPECT_EQ(
+      parsedParam.key, folly::to_underlying(TrackRequestParamKey::TRACK_FILTER));
+  EXPECT_EQ(parsedParam.asTrackFilter.propertyType, 0x10);
+  EXPECT_EQ(parsedParam.asTrackFilter.maxSelected, 5);
+}
+
+// Test extractTrackFilter utility function (v16+)
+TEST_P(MoQFramerV16PlusTest, ExtractTrackFilter) {
+  std::vector<Parameter> params;
+
+  // Add a TRACK_FILTER parameter
+  TrackFilter trackFilter{0x22, 10};
+  Parameter trackFilterParam(
+      folly::to_underlying(TrackRequestParamKey::TRACK_FILTER), trackFilter);
+  params.push_back(trackFilterParam);
+
+  // Add another random parameter
+  Parameter otherParam(
+      folly::to_underlying(TrackRequestParamKey::FORWARD), uint64_t{1});
+  params.push_back(otherParam);
+
+  // Extract should find the track filter
+  auto extracted = parser_.extractTrackFilter(params);
+  ASSERT_TRUE(extracted.has_value());
+  EXPECT_EQ(extracted->propertyType, 0x22);
+  EXPECT_EQ(extracted->maxSelected, 10);
+}
+
+// Test extractTrackFilter returns nullopt when not present (v16+)
+TEST_P(MoQFramerV16PlusTest, ExtractTrackFilterNotPresent) {
+  std::vector<Parameter> params;
+
+  // Add a non-TRACK_FILTER parameter
+  Parameter otherParam(
+      folly::to_underlying(TrackRequestParamKey::FORWARD), uint64_t{1});
+  params.push_back(otherParam);
+
+  // Extract should return nullopt
+  auto extracted = parser_.extractTrackFilter(params);
+  EXPECT_FALSE(extracted.has_value());
+}
+
+// Test TRACK_FILTER with large values (v16+)
+TEST_P(MoQFramerV16PlusTest, TrackFilterLargeValues) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  SubscribeNamespace subscribeNamespace;
+  subscribeNamespace.requestID = RequestID(1);
+  subscribeNamespace.trackNamespacePrefix =
+      TrackNamespace(std::vector<std::string>{"ns"});
+  subscribeNamespace.options = SubscribeNamespaceOptions::BOTH;
+  subscribeNamespace.forward = true;
+
+  // Use large varint values
+  TrackFilter trackFilter{0x3FFFFFFFFFFF, 15};
+  Parameter trackFilterParam(
+      folly::to_underlying(TrackRequestParamKey::TRACK_FILTER), trackFilter);
+  subscribeNamespace.params.insertParam(trackFilterParam);
+
+  auto writeResult =
+      writer_.writeSubscribeNamespace(writeBuf, subscribeNamespace);
+  ASSERT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto majorVersion = getDraftMajorVersion(GetParam());
+  // 0x11 pre-18, 0x50 in draft 18 — see SubscribeNamespaceWithTrackFilter.
+  auto frameType = decodeMoQVarint(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  EXPECT_EQ(
+      frameType->first,
+      folly::to_underlying(
+          majorVersion >= 18 ? FrameType::SUBSCRIBE_NAMESPACE
+                             : FrameType::LEGACY_SUBSCRIBE_NAMESPACE));
+
+  auto parseResult =
+      parser_.parseSubscribeNamespace(cursor, frameLength(cursor));
+  ASSERT_TRUE(parseResult.hasValue());
+
+  // Check TRACK_FILTER with large propType was parsed correctly
+  ASSERT_EQ(parseResult->params.size(), 1);
+  auto& parsedParam = parseResult->params.at(0);
+  EXPECT_EQ(parsedParam.asTrackFilter.propertyType, 0x3FFFFFFFFFFF);
+  EXPECT_EQ(parsedParam.asTrackFilter.maxSelected, 15);
+}
+
+// Test TrackFilter struct equality operator
+TEST(TrackFilterTest, Equality) {
+  TrackFilter a{0x10, 5};
+  TrackFilter b{0x10, 5};
+  TrackFilter c{0x10, 6};
+  TrackFilter d{0x20, 5};
+
+  EXPECT_EQ(a, b);
+  EXPECT_NE(a, c);
+  EXPECT_NE(a, d);
+}
+
+// Test TrackFilter default constructor
+TEST(TrackFilterTest, DefaultConstructor) {
+  TrackFilter filter;
+  EXPECT_EQ(filter.propertyType, 0);
+  EXPECT_EQ(filter.maxSelected, 0);
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -6223,8 +6528,148 @@ TEST(MoQFramerV16DeathTest, PublishNamespaceCancelWithoutRequestIDDies) {
       "RequestID required for v16\\+ PublishNamespaceCancel");
 }
 
+// Tests for Parameters::getFirstParam() / hasParam()
+class ParametersLookupTest : public ::testing::Test {};
+
+TEST_F(ParametersLookupTest, GetFirstParamReturnsEarliestMatch) {
+  Parameters params(FrameType::SUBSCRIBE);
+  ASSERT_TRUE(params
+                  .insertParam(Parameter(
+                      folly::to_underlying(
+                          TrackRequestParamKey::DELIVERY_TIMEOUT),
+                      1))
+                  .hasValue());
+  ASSERT_TRUE(params
+                  .insertParam(Parameter(
+                      folly::to_underlying(
+                          TrackRequestParamKey::MAX_CACHE_DURATION),
+                      2))
+                  .hasValue());
+  ASSERT_TRUE(params
+                  .insertParam(Parameter(
+                      folly::to_underlying(
+                          TrackRequestParamKey::DELIVERY_TIMEOUT),
+                      3))
+                  .hasValue());
+
+  const auto* found =
+      params.getFirstParam(TrackRequestParamKey::DELIVERY_TIMEOUT);
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found->asUint64, 1);
+  EXPECT_TRUE(params.hasParam(
+      folly::to_underlying(TrackRequestParamKey::MAX_CACHE_DURATION)));
+}
+
+TEST_F(ParametersLookupTest, GetFirstParamReturnsNullWhenAbsent) {
+  Parameters params(FrameType::SUBSCRIBE);
+  EXPECT_EQ(
+      params.getFirstParam(TrackRequestParamKey::DELIVERY_TIMEOUT), nullptr);
+  EXPECT_FALSE(params.hasParam(
+      folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT)));
+}
+
+TEST_F(ParametersLookupTest, GetFirstParamAcceptsSetupKeys) {
+  SetupParameters params(FrameType::CLIENT_SETUP);
+  ASSERT_TRUE(params
+                  .insertParam(SetupParameter(
+                      folly::to_underlying(SetupKey::MAX_REQUEST_ID), 17))
+                  .hasValue());
+
+  const auto* found = params.getFirstParam(SetupKey::MAX_REQUEST_ID);
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found->asUint64, 17);
+  EXPECT_EQ(params.getFirstParam(SetupKey::PATH), nullptr);
+}
+
+// Tests for applySetupParameters()
+class ApplySetupParametersTest : public ::testing::Test {};
+
+TEST_F(ApplySetupParametersTest, AppendsUnknownKeys) {
+  SetupParameters params(FrameType::CLIENT_SETUP);
+  ASSERT_TRUE(params
+                  .insertParam(SetupParameter(
+                      folly::to_underlying(SetupKey::MAX_REQUEST_ID), 100))
+                  .hasValue());
+
+  constexpr uint64_t kExtensionKey = 0x40B55;
+  applySetupParameters(
+      params, {SetupParameter(kExtensionKey, std::string{})});
+
+  EXPECT_EQ(params.size(), 2);
+  EXPECT_EQ(params.getFirstParam(SetupKey::MAX_REQUEST_ID)->asUint64, 100);
+  ASSERT_NE(params.getFirstParam(kExtensionKey), nullptr);
+  EXPECT_TRUE(params.getFirstParam(kExtensionKey)->asString.empty());
+}
+
+TEST_F(ApplySetupParametersTest, OverrideReplacesRatherThanDuplicates) {
+  SetupParameters params(FrameType::CLIENT_SETUP);
+  ASSERT_TRUE(params
+                  .insertParam(SetupParameter(
+                      folly::to_underlying(SetupKey::MAX_REQUEST_ID), 100))
+                  .hasValue());
+  ASSERT_TRUE(
+      params
+          .insertParam(SetupParameter(
+              folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16))
+          .hasValue());
+
+  applySetupParameters(
+      params,
+      {SetupParameter(folly::to_underlying(SetupKey::MAX_REQUEST_ID), 500)});
+
+  EXPECT_EQ(params.size(), 2);
+  EXPECT_EQ(params.getFirstParam(SetupKey::MAX_REQUEST_ID)->asUint64, 500);
+  EXPECT_EQ(
+      params.getFirstParam(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE)->asUint64, 16);
+}
+
+TEST_F(ApplySetupParametersTest, LastWriterWinsAmongExtraParams) {
+  SetupParameters params(FrameType::CLIENT_SETUP);
+  constexpr uint64_t kExtensionKey = 0x40B55;
+
+  applySetupParameters(
+      params,
+      {SetupParameter(kExtensionKey, std::string("first")),
+       SetupParameter(kExtensionKey, std::string("second"))});
+
+  EXPECT_EQ(params.size(), 1);
+  EXPECT_EQ(params.getFirstParam(kExtensionKey)->asString, "second");
+}
+
+TEST_F(ApplySetupParametersTest, EmptyExtraParamsLeavesParamsUntouched) {
+  SetupParameters params(FrameType::CLIENT_SETUP);
+  ASSERT_TRUE(params
+                  .insertParam(SetupParameter(
+                      folly::to_underlying(SetupKey::MAX_REQUEST_ID), 100))
+                  .hasValue());
+
+  applySetupParameters(params, {});
+
+  EXPECT_EQ(params.size(), 1);
+  EXPECT_EQ(params.getFirstParam(SetupKey::MAX_REQUEST_ID)->asUint64, 100);
+}
+
 // Tests for Parameters::isParamAllowed()
 class ParametersIsParamAllowedTest : public ::testing::Test {};
+
+TEST_F(ParametersIsParamAllowedTest, FindsFirstParameterByKey) {
+  Parameters params(FrameType::PUBLISH_NAMESPACE);
+  ASSERT_TRUE(
+      params
+          .insertParam(Parameter(
+              folly::to_underlying(TrackRequestParamKey::HOP_PATH), "first"))
+          .hasValue());
+  ASSERT_TRUE(
+      params
+          .insertParam(Parameter(
+              folly::to_underlying(TrackRequestParamKey::HOP_PATH), "second"))
+          .hasValue());
+
+  const auto* found = params.getFirstParam(TrackRequestParamKey::HOP_PATH);
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found->asString, "first");
+  EXPECT_EQ(params.getFirstParam(TrackRequestParamKey::EXCLUDE_HOP), nullptr);
+}
 
 TEST_F(ParametersIsParamAllowedTest, ParamAllowedForFrameType) {
   Parameters params(FrameType::SUBSCRIBE);
@@ -6237,6 +6682,39 @@ TEST_F(ParametersIsParamAllowedTest, ParamNotAllowedForFrameType) {
   Parameters params(FrameType::FETCH);
   EXPECT_FALSE(params.isParamAllowed(TrackRequestParamKey::DELIVERY_TIMEOUT));
   EXPECT_FALSE(params.isParamAllowed(TrackRequestParamKey::EXPIRES));
+}
+
+TEST_F(ParametersIsParamAllowedTest, TrackFilterAllowedOnlyForSubscribeNamespace) {
+  // TRACK_FILTER should only be allowed for SUBSCRIBE_NAMESPACE
+  Parameters paramsSubNs(FrameType::SUBSCRIBE_NAMESPACE);
+  EXPECT_TRUE(paramsSubNs.isParamAllowed(TrackRequestParamKey::TRACK_FILTER));
+
+  // Not allowed for other frame types
+  Parameters paramsSubscribe(FrameType::SUBSCRIBE);
+  EXPECT_FALSE(
+      paramsSubscribe.isParamAllowed(TrackRequestParamKey::TRACK_FILTER));
+
+  Parameters paramsFetch(FrameType::FETCH);
+  EXPECT_FALSE(paramsFetch.isParamAllowed(TrackRequestParamKey::TRACK_FILTER));
+
+  Parameters paramsPublishOk(FrameType::PUBLISH_OK);
+  EXPECT_FALSE(
+      paramsPublishOk.isParamAllowed(TrackRequestParamKey::TRACK_FILTER));
+}
+
+TEST_F(ParametersIsParamAllowedTest, RelayHopParametersUseDraftMessageScopes) {
+  Parameters publishNamespace(FrameType::PUBLISH_NAMESPACE);
+  Parameters namespaceParams(FrameType::NAMESPACE);
+  Parameters subscribeNamespace(FrameType::SUBSCRIBE_NAMESPACE);
+  Parameters subscribe(FrameType::SUBSCRIBE);
+
+  EXPECT_TRUE(publishNamespace.isParamAllowed(TrackRequestParamKey::HOP_PATH));
+  EXPECT_TRUE(namespaceParams.isParamAllowed(TrackRequestParamKey::HOP_PATH));
+  EXPECT_FALSE(
+      subscribeNamespace.isParamAllowed(TrackRequestParamKey::HOP_PATH));
+  EXPECT_TRUE(
+      subscribeNamespace.isParamAllowed(TrackRequestParamKey::EXCLUDE_HOP));
+  EXPECT_FALSE(subscribe.isParamAllowed(TrackRequestParamKey::EXCLUDE_HOP));
 }
 
 TEST_F(ParametersIsParamAllowedTest, ParamAllowedForAllFrameTypes) {

@@ -352,6 +352,16 @@ const folly::F14FastSet<FrameType> kAllowedFramesForFillTimeout = {
 const folly::F14FastSet<FrameType> kAllowedFramesForTrackNamespacePrefix = {
     FrameType::REQUEST_UPDATE};
 
+const folly::F14FastSet<FrameType> kAllowedFramesForTrackFilter = {
+    FrameType::SUBSCRIBE_NAMESPACE};
+
+const folly::F14FastSet<FrameType> kAllowedFramesForHopPath = {
+    FrameType::PUBLISH_NAMESPACE,
+    FrameType::NAMESPACE};
+
+const folly::F14FastSet<FrameType> kAllowedFramesForExcludeHop = {
+    FrameType::SUBSCRIBE_NAMESPACE};
+
 // Allowlist mapping: TrackRequestParamKey -> set of allowed FrameTypes
 // Empty set means allowed for all frame types
 const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
@@ -376,6 +386,9 @@ const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
         {TrackRequestParamKey::FILL_TIMEOUT, kAllowedFramesForFillTimeout},
         {TrackRequestParamKey::TRACK_NAMESPACE_PREFIX,
          kAllowedFramesForTrackNamespacePrefix},
+        {TrackRequestParamKey::TRACK_FILTER, kAllowedFramesForTrackFilter},
+        {TrackRequestParamKey::HOP_PATH, kAllowedFramesForHopPath},
+        {TrackRequestParamKey::EXCLUDE_HOP, kAllowedFramesForExcludeHop},
 };
 
 // Frame types that allow all parameters (no validation)
@@ -553,6 +566,27 @@ Fetch::Fetch(
     auto result = params.insertParam(param);
     if (result.hasError()) {
       XLOG(ERR) << "Fetch: param not allowed, key=" << param.key;
+    }
+  }
+}
+
+SetupExtensionNegotiator bothAdvertise(uint64_t key) {
+  return [key](
+             const SetupParameters& local,
+             const SetupParameters& peer,
+             uint64_t /*version*/) {
+    return local.hasParam(key) && peer.hasParam(key);
+  };
+}
+
+void applySetupParameters(
+    SetupParameters& params,
+    const std::vector<SetupParameter>& extraParams) {
+  for (const auto& param : extraParams) {
+    params.eraseAllParamsOfType(param.key);
+    auto result = params.insertParam(param);
+    if (result.hasError()) {
+      XLOG(ERR) << "Setup param not allowed, key=" << param.key;
     }
   }
 }
