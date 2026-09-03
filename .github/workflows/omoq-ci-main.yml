@@ -64,7 +64,13 @@ jobs:
         if: ${{ !contains(toJSON(matrix.runner), 'linode') }}
         uses: actions/cache@v4
         with:
-          path: _build/_deps
+          # Sources only. The sibling *-build trees are ~18x larger and are not
+          # reused: _build/CMakeCache.txt is not cached, so CMake regenerates
+          # and every dep recompiles regardless. Caching them only consumed the
+          # repo-wide cache budget that ccache needs.
+          path: |
+            _build/_deps/*-src
+            _build/_deps/*-subbuild
           key: ${{ matrix.cache_prefix }}-deps-${{ hashFiles('build/deps/github_hashes/**/*-rev.txt', 'standalone/patches/**') }}
           restore-keys: |
             ${{ matrix.cache_prefix }}-deps-
@@ -74,7 +80,9 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1
         with:
           key: ${{ matrix.cache_prefix }}
-          max-size: 500M
+          # The standalone build compiles the whole dependency stack, ~1958 TUs.
+          # 500M evicted mid-build (50 cleanups on linux, 308 on macOS).
+          max-size: 2G
 
       - name: Configure
         run: |
@@ -210,7 +218,10 @@ jobs:
         if: ${{ !contains(toJSON(matrix.runner), 'linode') }}
         uses: actions/cache@v4
         with:
-          path: _build/_deps
+          # Sources only; see the note on the build lane's cache above.
+          path: |
+            _build/_deps/*-src
+            _build/_deps/*-subbuild
           key: publish-ninja-${{ matrix.name }}-deps-${{ hashFiles('build/deps/github_hashes/**/*-rev.txt', 'standalone/patches/**') }}
           restore-keys: |
             publish-ninja-${{ matrix.name }}-deps-
