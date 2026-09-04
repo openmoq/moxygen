@@ -4437,7 +4437,8 @@ bool includeSetupParam(uint64_t version, SetupKey key) {
   }
   return key == SetupKey::MAX_REQUEST_ID || key == SetupKey::PATH ||
       key == SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE ||
-      key == SetupKey::AUTHORIZATION_TOKEN || key == SetupKey::RELAY_HOPS;
+      key == SetupKey::AUTHORIZATION_TOKEN || key == SetupKey::AUTHORITY ||
+      key == SetupKey::MOQT_IMPLEMENTATION || key == SetupKey::RELAY_HOPS;
 }
 
 WriteResult writeSetup(
