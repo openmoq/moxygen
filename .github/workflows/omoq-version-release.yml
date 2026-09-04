@@ -211,7 +211,10 @@ jobs:
       - name: Cache FetchContent downloads
         uses: actions/cache@v4
         with:
-          path: _build/_deps
+          # Sources only; the sibling *-build trees are not reused across runs.
+          path: |
+            _build/_deps/*-src
+            _build/_deps/*-subbuild
           key: portable-${{ matrix.name }}-deps-${{ hashFiles('build/deps/github_hashes/**/*-rev.txt', 'standalone/patches/**') }}
           restore-keys: |
             portable-${{ matrix.name }}-deps-
