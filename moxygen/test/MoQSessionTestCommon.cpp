@@ -348,6 +348,10 @@ folly::Try<moxygen::Setup> MoQSessionTest::onClientSetup(
           SetupParameter{
               folly::to_underlying(SetupKey::AUTHORITY), "moq.example"});
     }
+    if (relayHopsSupported_ || serverRelayHopsSupported_) {
+      ss.params.insertParam(SetupParameter{
+          folly::to_underlying(SetupKey::RELAY_HOPS), std::string{}});
+    }
     return ss;
   }());
 }
