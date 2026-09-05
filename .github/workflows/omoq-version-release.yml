@@ -189,12 +189,20 @@ jobs:
           #               RPi 3/4/5, Rockchip RK3399 + RK3588 / Orange Pi)
           - name: linux-amd64
             runner: ubuntu-22.04
+            cc: gcc
+            cxx: g++
             cxx_flags: "-march=x86-64-v2 -fno-omit-frame-pointer -fasynchronous-unwind-tables"
             artifact: moxygen-linux-amd64.tar.gz
             debug_artifact: moxygen-linux-amd64-dbg.tar.gz
 
           - name: linux-arm64
             runner: ubuntu-22.04-arm
+            # gcc-11 ICEs (strlen-pass segfault) on proxygen HTTPSession.cpp
+            # at -O3 on aarch64; gcc-12 compiles the same code cleanly. The
+            # glibc-2.35 baseline, not the compiler, is the 22.04 artifact
+            # identity.
+            cc: gcc-12
+            cxx: g++-12
             cxx_flags: "-march=armv8-a -fno-omit-frame-pointer -fasynchronous-unwind-tables"
             artifact: moxygen-linux-arm64.tar.gz
             debug_artifact: moxygen-linux-arm64-dbg.tar.gz
@@ -207,6 +215,10 @@ jobs:
 
       - name: Install system dependencies
         run: bash standalone/install-system-deps.sh
+
+      - name: Install compiler
+        if: matrix.cxx != 'g++'
+        run: sudo apt-get install -y ${{ matrix.cc }} ${{ matrix.cxx }}
 
       - name: Cache FetchContent downloads
         uses: actions/cache@v4
@@ -239,6 +251,8 @@ jobs:
           # lib/cmake/GTest/GTestConfig.cmake which moqx's test/CMakeLists.txt
           # consumes. No tests run because BUILD_TESTING=OFF.
           cmake -B _build -S standalone -G Ninja \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_BUILD_TYPE=Release \
