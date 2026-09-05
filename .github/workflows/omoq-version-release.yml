@@ -34,6 +34,10 @@ on:
         description: 'Release version (e.g. 1.2.3)'
         required: true
         type: string
+      rev:
+        description: 'Commit to release (default: the branch rolling snapshot). Must be on the dispatched branch with a published snapshot.'
+        required: false
+        type: string
 
 # Serialize per-version dispatches: prevents two runs with the same
 # version from both passing validate's tag-doesn't-exist check and
@@ -60,7 +64,11 @@ jobs:
       snapshot_sha: ${{ steps.v.outputs.snapshot_sha }}
       promote_tag: ${{ steps.v.outputs.promote_tag }}
     steps:
+      # Full history + tags: the tag-exists check and the rev ancestry check
+      # are both meaningless against a shallow, tag-less clone.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Validate inputs and resolve refs
         id: v
@@ -78,7 +86,7 @@ jobs:
             exit 1
           fi
 
-          # Snapshot derived from dispatched ref.
+          # Snapshot namespace from dispatched ref.
           BRANCH="${{ github.ref_name }}"
           if [ "$BRANCH" = "main" ]; then
             SNAPSHOT_TAG="snapshot-latest"
@@ -87,23 +95,48 @@ jobs:
             SNAPSHOT_TAG="snapshot-${LABEL}-latest"
           fi
 
-          # Resolve snapshot SHA (the commit ci-main built from).
-          SNAPSHOT_SHA=$(gh api repos/{owner}/{repo}/releases \
-            --jq ".[] | select(.tag_name == \"$SNAPSHOT_TAG\") | .target_commitish")
-          if [[ -z "$SNAPSHOT_SHA" ]]; then
-            echo "Error: $SNAPSHOT_TAG release not found. Push to the dispatched branch first to produce a snapshot." >&2
-            exit 1
-          fi
-
-          # Assets live on the pinned per-rev release; the alias is an
-          # asset-less pointer. Fall back to the alias for snapshots published
-          # before pinned releases existed (it still carries assets there).
-          PIN_TAG="snapshot-${SNAPSHOT_SHA:0:12}"
-          if gh api "repos/{owner}/{repo}/releases/tags/$PIN_TAG" --jq .id >/dev/null 2>&1; then
+          REV_INPUT="${{ inputs.rev }}"
+          if [ -n "$REV_INPUT" ]; then
+            # Explicit rev: release exactly this commit. This is how an
+            # orchestrated cross-repo release pins the tag to a consumer's
+            # MOXYGEN_REV rather than whatever the branch tip is.
+            SNAPSHOT_SHA=$(git rev-parse --verify "${REV_INPUT}^{commit}" 2>/dev/null) || {
+              echo "Error: rev '$REV_INPUT' is not a commit in this repository" >&2
+              exit 1
+            }
+            if ! git merge-base --is-ancestor "$SNAPSHOT_SHA" "origin/$BRANCH"; then
+              echo "Error: rev ${SNAPSHOT_SHA:0:12} is not on $BRANCH" >&2
+              exit 1
+            fi
+            # An explicit rev must have its pinned snapshot with assets —
+            # no alias fallback, since the alias may name a different commit.
+            PIN_TAG="snapshot-${SNAPSHOT_SHA:0:12}"
+            N=$(gh api "repos/{owner}/{repo}/releases/tags/$PIN_TAG" \
+                  --jq '.assets | length' 2>/dev/null) || N=0
+            if [ "${N:-0}" -eq 0 ]; then
+              echo "Error: $PIN_TAG has no published assets — ci-main must publish this rev before it can be released" >&2
+              exit 1
+            fi
             PROMOTE_TAG="$PIN_TAG"
           else
-            echo "Note: $PIN_TAG not found — promoting from $SNAPSHOT_TAG (pre-pinned-snapshot build)"
-            PROMOTE_TAG="$SNAPSHOT_TAG"
+            # Resolve snapshot SHA (the commit ci-main built from).
+            SNAPSHOT_SHA=$(gh api repos/{owner}/{repo}/releases \
+              --jq ".[] | select(.tag_name == \"$SNAPSHOT_TAG\") | .target_commitish")
+            if [[ -z "$SNAPSHOT_SHA" ]]; then
+              echo "Error: $SNAPSHOT_TAG release not found. Push to the dispatched branch first to produce a snapshot." >&2
+              exit 1
+            fi
+
+            # Assets live on the pinned per-rev release; the alias is an
+            # asset-less pointer. Fall back to the alias for snapshots published
+            # before pinned releases existed (it still carries assets there).
+            PIN_TAG="snapshot-${SNAPSHOT_SHA:0:12}"
+            if gh api "repos/{owner}/{repo}/releases/tags/$PIN_TAG" --jq .id >/dev/null 2>&1; then
+              PROMOTE_TAG="$PIN_TAG"
+            else
+              echo "Note: $PIN_TAG not found — promoting from $SNAPSHOT_TAG (pre-pinned-snapshot build)"
+              PROMOTE_TAG="$SNAPSHOT_TAG"
+            fi
           fi
 
           {
@@ -142,13 +175,27 @@ jobs:
           SNAPSHOT_SHA: ${{ needs.validate.outputs.snapshot_sha }}
           PROMOTE_TAG: ${{ needs.validate.outputs.promote_tag }}
         run: |
+          # A failed prior run leaves an invisible draft; a second create with
+          # the same tag_name would not collide (drafts hold no tag ref) and
+          # uploads-by-tag would then be ambiguous. Remove it first.
+          gh api "repos/{owner}/{repo}/releases" \
+            --jq ".[] | select(.tag_name == \"$TAG\" and .draft) | .id" | \
+            while read -r id; do
+              echo "Deleting stale draft release id $id for $TAG"
+              gh api -X DELETE "repos/{owner}/{repo}/releases/$id"
+            done
+
           # Mark prereleases (1.2.3-rc1) as such so GitHub's "latest"
           # algorithm correctly excludes them.
           PRERELEASE_FLAG=()
           if [[ "$VERSION" == *-* ]]; then
             PRERELEASE_FLAG=(--prerelease)
           fi
+          # --draft: invisible to consumers (and to by-tag lookups) until
+          # finalize flips it, so a release either exists complete or not at
+          # all — never public with assets still uploading.
           gh release create "$TAG" \
+            --draft \
             --target "$SNAPSHOT_SHA" \
             --title "moxygen $VERSION" \
             "${PRERELEASE_FLAG[@]}" \
@@ -211,7 +258,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
+      # Build the resolved commit, not the branch tip — the tip can move
+      # between dispatch and here, and the promoted assets are the resolved
+      # commit's.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.snapshot_sha }}
 
       - name: Install system dependencies
         run: bash standalone/install-system-deps.sh
@@ -366,8 +418,8 @@ jobs:
             xargs -0 -n1 -P 6 -I{} gh release upload "$TAG" --repo "$REPO" {} --clobber
 
   # ════════════════════════════════════════════════════════════════════════════
-  # Finalize: confirm the release is fully published once all assets are
-  # up. Runs only if both upload jobs succeeded.
+  # Finalize: publish the draft once all assets are up. Runs only if both
+  # upload jobs succeeded, so consumers never see a partial release.
   # ════════════════════════════════════════════════════════════════════════════
 
   finalize:
@@ -381,16 +433,20 @@ jobs:
           app-id: ${{ secrets.OMOQ_APP_ID }}
           private-key: ${{ secrets.OMOQ_APP_PRIV_KEY }}
 
-      - name: Confirm release published
+      - name: Publish release
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
+          # Flip the draft: the release (and its tag) becomes visible only
+          # now, with every asset already attached.
+          #
           # No --latest flag here. Let GitHub's auto-latest algorithm
           # pick the highest non-prerelease semver tag. Forcing --latest
           # would mark a hotfix patch from a release/vM.m branch as
           # latest even when a newer vM.(m+1) line exists.
+          gh release edit "$TAG" --repo "$REPO" --draft=false
           echo "Released: $TAG"
           # isLatest is not a --json field on `gh release view` (only on
           # `gh release list`), so derive it from the releases/latest API.
