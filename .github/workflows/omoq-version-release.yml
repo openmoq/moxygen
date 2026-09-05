@@ -235,7 +235,9 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1
         with:
           key: portable-${{ matrix.name }}
-          max-size: 500M
+          # Same ~1958-TU compile as the dev lanes; 500M thrashed mid-build.
+          # 1G fits the working set now that dep build trees left the budget.
+          max-size: 1G
 
       - name: Configure
         shell: bash
