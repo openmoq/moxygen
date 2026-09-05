@@ -54,6 +54,14 @@ jobs:
           sudo rm -rf "$GITHUB_WORKSPACE/_build" "$GITHUB_WORKSPACE/_install"
           sudo chown -R $(id -u):$(id -g) "$GITHUB_WORKSPACE"
 
+      # Pin ccache to the box's persistent cache; env overrides any ccache.conf
+      # a stray ccache-action run may have left in the runner user's home.
+      - name: Pin ccache location (self-hosted)
+        if: ${{ contains(toJSON(matrix.runner), 'linode') }}
+        run: |
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=25G" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
@@ -231,7 +239,9 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1
         with:
           key: publish-${{ matrix.name }}
-          max-size: 500M
+          # Same ~1958-TU compile as the dev lanes; 500M thrashed mid-build.
+          # 1G fits the working set now that dep build trees left the budget.
+          max-size: 1G
 
       - name: Configure
         shell: bash
