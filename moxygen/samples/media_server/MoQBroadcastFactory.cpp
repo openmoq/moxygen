@@ -15,12 +15,14 @@ namespace moxygen::media_server {
 MoQBroadcastFactory::MoQBroadcastFactory(
     std::string fileInput,
     std::chrono::milliseconds fragmentInterval,
+    std::chrono::milliseconds catalogUpdateInterval,
     bool loop,
     folly::Executor* loopExecutor)
     : fileResolver_(
           std::make_shared<FileMediaSourceResolver>(
               std::move(fileInput),
               fragmentInterval,
+              catalogUpdateInterval,
               loop)),
       loopExecutor_(loopExecutor) {}
 
@@ -31,9 +33,9 @@ std::shared_ptr<MoQBroadcast> MoQBroadcastFactory::makeBroadcast(
 
 std::shared_ptr<MediaSourceResolver> MoQBroadcastFactory::resolverFor(
     const TrackNamespace& /*ns*/) {
-  // Route by the namespace's backend prefix. Today only the file backend
-  // exists, so every namespace maps to it (the file resolver rejects non-file
-  // namespaces itself). Add backends here, e.g.:
+  // Both file modes share a resolver; it selects reliable vs simulated-loss
+  // behavior from the namespace and rejects other prefixes. Add backends here,
+  // e.g.:
   //   if (!ns.trackNamespace.empty() && ns.trackNamespace.front() == "oil") {
   //     return oilResolver_;
   //   }
