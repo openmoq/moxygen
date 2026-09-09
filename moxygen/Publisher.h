@@ -167,6 +167,10 @@ class Publisher {
    public:
     virtual ~NamespacePublishHandle() = default;
 
+    virtual void namespaceMsg(const Namespace& ns) {
+      namespaceMsg(ns.trackNamespaceSuffix);
+    }
+
     virtual void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) = 0;
 
     virtual void namespaceDoneMsg(

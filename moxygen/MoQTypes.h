@@ -13,6 +13,7 @@
 #include <proxygen/lib/http/webtransport/WebTransport.h>
 #include <algorithm>
 #include <limits>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -321,7 +322,8 @@ enum class SetupKey : uint64_t {
   AUTHORIZATION_TOKEN = 3,
   MAX_AUTH_TOKEN_CACHE_SIZE = 4,
   AUTHORITY = 5,
-  MOQT_IMPLEMENTATION = 7
+  MOQT_IMPLEMENTATION = 7,
+  RELAY_HOPS = 0x40B55,
 };
 
 constexpr uint64_t kDefaultMaxRequestID = 100;
@@ -500,12 +502,30 @@ struct SubscriptionFilter {
       : filterType(ft), location(loc), endGroup(std::move(eg)) {}
 };
 
+// TRACK_FILTER parameter for SUBSCRIBE_NAMESPACE (0x29)
+// Used to filter tracks based on a property value, selecting the top N tracks.
+struct TrackFilter {
+  uint64_t propertyType{0}; // Property type to filter on (e.g., audio level)
+  uint64_t maxSelected{0};  // Maximum number of tracks to select (N)
+
+  TrackFilter() = default;
+  TrackFilter(uint64_t pt, uint64_t ms) : propertyType(pt), maxSelected(ms) {}
+
+  bool operator==(const TrackFilter& other) const {
+    return propertyType == other.propertyType && maxSelected == other.maxSelected;
+  }
+};
+
+// TODO: Consider refactoring to std::variant<std::string, uint64_t,
+// AuthToken, SubscriptionFilter, TrackFilter, AbsoluteLocation> to
+// reduce memory footprint and clarify semantics.
 struct Parameter {
   uint64_t key = 0;
   std::string asString;
   uint64_t asUint64 = 0;
   AuthToken asAuthToken;
   SubscriptionFilter asSubscriptionFilter;
+  TrackFilter asTrackFilter;
   std::optional<AbsoluteLocation> largestObject;
 
   // Constructors for Parameter for each type, provided the key and the type
@@ -517,6 +537,7 @@ struct Parameter {
         asUint64(0),
         asAuthToken(),
         asSubscriptionFilter(),
+        asTrackFilter(),
         largestObject() {}
 
   // uint64_t parameter
@@ -526,6 +547,7 @@ struct Parameter {
         asUint64(uint64),
         asAuthToken(),
         asSubscriptionFilter(),
+        asTrackFilter(),
         largestObject() {}
 
   // AuthToken parameter
@@ -535,6 +557,7 @@ struct Parameter {
         asUint64(0),
         asAuthToken(token),
         asSubscriptionFilter(),
+        asTrackFilter(),
         largestObject() {}
 
   // SubscriptionFilter parameter
@@ -544,6 +567,17 @@ struct Parameter {
         asUint64(0),
         asAuthToken(),
         asSubscriptionFilter(filter),
+        asTrackFilter(),
+        largestObject() {}
+
+  // TrackFilter parameter
+  Parameter(uint64_t keyIn, const TrackFilter& filter)
+      : key(keyIn),
+        asString(),
+        asUint64(0),
+        asAuthToken(),
+        asSubscriptionFilter(),
+        asTrackFilter(filter),
         largestObject() {}
 
   // LargestObject parameter (std::optional<AbsoluteLocation>)
@@ -553,6 +587,7 @@ struct Parameter {
         asUint64(0),
         asAuthToken(),
         asSubscriptionFilter(),
+        asTrackFilter(),
         largestObject(loc) {}
 
   // Default constructor
@@ -581,8 +616,11 @@ enum class TrackRequestParamKey : uint64_t {
   LARGEST_OBJECT = 0x9,
   FILL_TIMEOUT = 0x0A,
   FORWARD = 0x10,
+  TRACK_FILTER = 0x29,
   NEW_GROUP_REQUEST = 0x32,
   TRACK_NAMESPACE_PREFIX = 0x34,
+  HOP_PATH = 0x40B57,
+  EXCLUDE_HOP = 0x40B58,
 };
 
 inline bool isRendezvousTimeoutParam(uint64_t key, uint64_t majorVersion) {
@@ -618,6 +656,28 @@ class Parameters {
 
   const Parameter& at(size_t position) const {
     return params_.at(position);
+  }
+
+  // Returns the first parameter with `key`, or nullptr. Invalidated by any
+  // subsequent mutation.
+  const Parameter* getFirstParam(uint64_t key) const {
+    auto it = std::find_if(
+        params_.begin(), params_.end(), [key](const Parameter& param) {
+          return param.key == key;
+        });
+    return it == params_.end() ? nullptr : &*it;
+  }
+
+  const Parameter* getFirstParam(TrackRequestParamKey key) const {
+    return getFirstParam(folly::to_underlying(key));
+  }
+
+  const Parameter* getFirstParam(SetupKey key) const {
+    return getFirstParam(folly::to_underlying(key));
+  }
+
+  bool hasParam(uint64_t key) const {
+    return getFirstParam(key) != nullptr;
   }
 
   folly::Expected<folly::Unit, ErrorCode> insertParam(Parameter&& param) {
@@ -660,7 +720,10 @@ class Parameters {
   }
 
   void eraseAllParamsOfType(TrackRequestParamKey key) {
-    const auto targetKey = static_cast<uint64_t>(key);
+    eraseAllParamsOfType(folly::to_underlying(key));
+  }
+
+  void eraseAllParamsOfType(uint64_t targetKey) {
     params_.erase(
         std::remove_if(
             params_.begin(),
@@ -724,13 +787,65 @@ std::optional<uint64_t> getFirstIntParam(
 inline std::string getFirstStringParam(
     const SetupParameters& params,
     uint64_t key) {
-  for (const auto& param : params) {
-    if (param.key == key) {
-      return param.asString;
-    }
-  }
-  return {};
+  const auto* param = params.getFirstParam(key);
+  return param ? param->asString : std::string();
 }
+
+// Applies extraParams onto params, replacing any parameter with the same key
+// so a SETUP never carries a key twice.
+void applySetupParameters(
+    SetupParameters& params,
+    const std::vector<SetupParameter>& extraParams);
+
+// A protocol extension that is off unless the two SETUPs negotiate it on. Each
+// extension owns one bit; MoQSession::kSetupExtensions says how a bit is won.
+enum class SetupExtension : uint32_t {
+  None = 0,
+  RelayHops = 1u << 0,
+};
+
+// The set of extensions in force on a session.
+class SetupExtensions {
+ public:
+  SetupExtensions() = default;
+
+  bool has(SetupExtension extension) const {
+    auto bit = folly::to_underlying(extension);
+    return bit != 0 && (bits_ & bit) == bit;
+  }
+
+  void add(SetupExtension extension) {
+    bits_ |= folly::to_underlying(extension);
+  }
+
+  bool empty() const {
+    return bits_ == 0;
+  }
+
+  bool operator==(const SetupExtensions& other) const {
+    return bits_ == other.bits_;
+  }
+
+ private:
+  uint32_t bits_{0};
+};
+
+// Decides whether one extension is on, given both SETUPs and the negotiated
+// draft. Free to look at values rather than presence, to apply an asymmetric
+// rule, and to turn itself off on drafts it doesn't apply to.
+using SetupExtensionNegotiator = std::function<bool(
+    const SetupParameters& local,
+    const SetupParameters& peer,
+    uint64_t version)>;
+
+// Ties an extension bit to the rule that wins it.
+struct SetupExtensionDescriptor {
+  SetupExtension extension;
+  SetupExtensionNegotiator negotiate;
+};
+
+// Negotiator for the simplest rule: both peers carry `key`, whatever its value.
+SetupExtensionNegotiator bothAdvertise(uint64_t key);
 
 struct Setup {
   SetupParameters params{FrameType::CLIENT_SETUP};
@@ -1372,6 +1487,7 @@ struct NamespaceDone {
 // Only used in draft-16 and above
 struct Namespace {
   TrackNamespace trackNamespaceSuffix;
+  TrackRequestParameters params{FrameType::NAMESPACE};
 };
 
 // SubscribeNamespaceError is now an alias for RequestError - see below
