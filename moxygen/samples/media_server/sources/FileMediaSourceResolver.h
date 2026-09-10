@@ -16,14 +16,15 @@
 
 namespace moxygen::media_server {
 
-// Resolves namespaces whose first tuple field is "file" from fragmented MP4
-// media on disk. Other namespaces are not handled. A single configured catalog
-// is used for every matching namespace.
+// Resolver for the file-backed modes: "file" serves a static full catalog,
+// "file_pr" also simulates media loss, and "file_abr" progressively advertises
+// the authored video tracks. Other prefixes resolve to nothing.
 class FileMediaSourceResolver : public MediaSourceResolver {
  public:
   FileMediaSourceResolver(
       std::string catalogPath,
       std::chrono::milliseconds fragmentInterval,
+      std::chrono::milliseconds catalogUpdateInterval,
       bool loop);
 
   folly::coro::Task<std::shared_ptr<SegmentSource>> openTrack(
@@ -31,10 +32,13 @@ class FileMediaSourceResolver : public MediaSourceResolver {
       const std::string& trackName) override;
 
  private:
-  // True if `ns` selects the file backend (first tuple field == "file").
+  // True if `ns` selects a file-backed mode.
   static bool isFileNamespace(const TrackNamespace& ns);
+  static bool isPartiallyReliableNamespace(const TrackNamespace& ns);
+  static bool isAbrNamespace(const TrackNamespace& ns);
 
   Fmp4MediaSource source_;
+  std::chrono::milliseconds catalogUpdateInterval_;
 };
 
 } // namespace moxygen::media_server

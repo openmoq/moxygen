@@ -4862,7 +4862,7 @@ class MoQSession::ReceiverSubscriptionHandle
     if (session_->shouldFailNewLocalRequestDueToGoaway()) {
       co_return folly::makeUnexpected(
           RequestError{
-              session_->peekNextRequestID(),
+              MoQSession::failedLocalRequestID(),
               RequestErrorCode::GOING_AWAY,
               "Session received GOAWAY"});
     }
@@ -5587,7 +5587,7 @@ folly::coro::Task<MoQSession::TrackStatusResult> MoQSession::trackStatus(
     XLOG(DBG1) << "Rejecting track status request, received GOAWAY sess="
                << this;
     TrackStatusError trackStatusError{
-        peekNextRequestID(),
+        failedLocalRequestID(),
         TrackStatusErrorCode::GOING_AWAY,
         "Session received GOAWAY"};
     co_return folly::makeUnexpected(trackStatusError);
@@ -5869,7 +5869,7 @@ Subscriber::PublishResult MoQSession::publish(
     XLOG(DBG1) << "Rejecting publish request, received GOAWAY sess=" << this;
     return folly::makeUnexpected(
         PublishError{
-            peekNextRequestID(),
+            failedLocalRequestID(),
             PublishErrorCode::GOING_AWAY,
             "Session received GOAWAY"});
   }
@@ -6095,7 +6095,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
   }
   if (shouldFailNewLocalRequestDueToGoaway()) {
     SubscribeError subscribeError = {
-        peekNextRequestID(),
+        failedLocalRequestID(),
         SubscribeErrorCode::GOING_AWAY,
         "Session received GOAWAY"};
     MOQ_SUBSCRIBER_STATS(
@@ -6574,7 +6574,7 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
   }
   if (shouldFailNewLocalRequestDueToGoaway()) {
     FetchError fetchError = {
-        peekNextRequestID(),
+        failedLocalRequestID(),
         FetchErrorCode::GOING_AWAY,
         "Session received GOAWAY"};
     MOQ_SUBSCRIBER_STATS(
