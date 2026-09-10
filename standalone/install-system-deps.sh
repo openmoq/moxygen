@@ -49,6 +49,7 @@ install_ubuntu() {
         cmake \
         ninja-build \
         git \
+        patch \
         pkg-config \
         libssl-dev \
         libunwind-dev \
@@ -76,6 +77,7 @@ install_fedora() {
     sudo dnf install -y \
         cmake \
         git \
+        patch \
         openssl-devel \
         glog-devel \
         gflags-devel \
