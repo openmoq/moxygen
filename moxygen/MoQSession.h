@@ -471,6 +471,11 @@ class MoQSession : public Subscriber,
 
     virtual void onStreamComplete(const ObjectHeader& finalHeader) = 0;
 
+    // While this is true the publisher must stay in MoQSession::pubTracks_:
+    // its data streams still route buffer accounting, stats and stream-close
+    // notifications through session_.
+    virtual bool hasOpenDataStreams() const = 0;
+
     virtual void onTooManyBytesBuffered() = 0;
 
     bool canBufferBytes(uint64_t numBytes) {
@@ -566,6 +571,16 @@ class MoQSession : public Subscriber,
       return wasEstablished;
     }
 
+    // Whether sendPublishDone has run, so the peer is owed no further reply
+    // even if the write failed. Distinct from isDone(), which teardown sets
+    // without writing anything; those publishers still owe a PUBLISH_DONE.
+    bool publishDoneSent() const {
+      return publishDoneSent_;
+    }
+    void markPublishDoneSent() {
+      publishDoneSent_ = true;
+    }
+
     bool markRequestStreamGoawaySent() {
       return !std::exchange(requestStreamGoawaySent_, true);
     }
@@ -591,6 +606,7 @@ class MoQSession : public Subscriber,
     std::shared_ptr<ReplyContext> replyContext_;
     std::shared_ptr<BidiStreamControl> bidiControl_;
     State state_{State::PENDING};
+    bool publishDoneSent_{false};
     bool requestStreamGoawaySent_{false};
 
    private:
@@ -854,10 +870,13 @@ class MoQSession : public Subscriber,
   void sendMaxRequestID(bool signalWriteLoop);
   void fetchComplete(RequestID requestID);
 
+  // Retire a publisher's write-side state once it has no open data streams
+  // left. Idempotent: several teardown paths can reach retirement.
+  void publisherDrained(RequestID requestID);
+
   // Drop a SUBSCRIBE publisher's state after its request stream was reset for a
-  // request-stream GOAWAY timeout. Mirrors onUnsubscribe's accounting (stats,
-  // retireRequestID, checkForCloseOnDrain) but emits no PUBLISH_DONE, since the
-  // reset itself signals the subscriber.
+  // request-stream GOAWAY timeout. Mirrors onUnsubscribe's accounting but emits
+  // no PUBLISH_DONE, since the reset itself signals the subscriber.
   void cleanupSubscribePublisherAfterGoawayReset(RequestID requestID);
 
   // Get the max requestID from the setup params. If MAX_REQUEST_ID key
@@ -1317,8 +1336,7 @@ class MoQSession : public Subscriber,
   void scheduleGoawayTimeout(uint64_t timeoutMs);
   void cancelGoawayTimeout();
   void onGoawayTimeoutExpired();
-  bool hasOpenRequestsForDrain() const;
-  bool hasOpenRequestsForGoaway() const;
+  bool hasOpenRequests() const;
 
   // Private session state
   std::optional<SetupParameters> localSetupParams_;

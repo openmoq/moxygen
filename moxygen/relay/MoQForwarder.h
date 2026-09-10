@@ -410,6 +410,7 @@ class MoQForwarder : public TrackConsumer {
 
   // onEmpty may destroy this forwarder, so a live OnEmptyGuard defers it until
   // iteration unwinds; the outermost guard re-checks emptiness and fires once.
+  // Only onEmpty is deferred; another callback that frees us still dangles.
   uint32_t deferOnEmptyDepth_{0};
   bool onEmptyPending_{false};
   struct OnEmptyGuard {
@@ -427,6 +428,8 @@ class MoQForwarder : public TrackConsumer {
     }
     OnEmptyGuard(const OnEmptyGuard&) = delete;
     OnEmptyGuard& operator=(const OnEmptyGuard&) = delete;
+    OnEmptyGuard(OnEmptyGuard&&) = delete;
+    OnEmptyGuard& operator=(OnEmptyGuard&&) = delete;
     MoQForwarder* forwarder_;
   };
 
