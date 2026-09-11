@@ -289,19 +289,22 @@ jobs:
             --output "${{ matrix.artifact }}" \
             --debug-output "${{ matrix.debug_artifact }}"
 
+      # Handoff to the release job within this run; the release then holds the
+      # same tarballs on free storage. The week is re-run headroom: a failed
+      # release job can be retried without rebuilding, over a weekend included.
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
-          retention-days: 90
+          retention-days: 7
 
       - name: Upload debug artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.debug_artifact }}
           path: ${{ matrix.debug_artifact }}
-          retention-days: 90
+          retention-days: 7
 
   # ════════════════════════════════════════════════════════════════════════════
   # Release: create/update branch-derived snapshot pre-release (all green)
