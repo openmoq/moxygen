@@ -68,16 +68,18 @@ jobs:
           echo "ARTIFACT=$ARTIFACT" >> $GITHUB_ENV
           echo "DEBUG_ARTIFACT=$DEBUG_ARTIFACT" >> $GITHUB_ENV
 
+      # No release backs these, so they keep a working window — but a dev build
+      # is reproducible, and 90 days of them dominated the storage bill.
       - name: Upload tarball
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT }}
           path: ${{ env.ARTIFACT }}
-          retention-days: 90
+          retention-days: 7
 
       - name: Upload debug tarball
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.DEBUG_ARTIFACT }}
           path: ${{ env.DEBUG_ARTIFACT }}
-          retention-days: 90
+          retention-days: 7
