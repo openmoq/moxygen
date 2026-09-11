@@ -68,16 +68,18 @@ jobs:
           echo "ARTIFACT=$ARTIFACT" >> $GITHUB_ENV
           echo "DEBUG_ARTIFACT=$DEBUG_ARTIFACT" >> $GITHUB_ENV
 
+      # Longer than the ci-main lanes: no release carries these, so the artifact
+      # is the only copy. Dev builds are rare enough that the storage is noise.
       - name: Upload tarball
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT }}
           path: ${{ env.ARTIFACT }}
-          retention-days: 90
+          retention-days: 30
 
       - name: Upload debug tarball
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.DEBUG_ARTIFACT }}
           path: ${{ env.DEBUG_ARTIFACT }}
-          retention-days: 90
+          retention-days: 30

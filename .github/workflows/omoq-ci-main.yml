@@ -42,26 +42,34 @@ jobs:
           - runner: macos-15
             name: macos
             cache_prefix: ci-ninja-macos-15
-          - runner: [self-hosted, linode]
+          - runner: [self-hosted, build]
             name: asan debug
             cache_prefix: ci-asan-ubuntu-22.04
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Fix workspace ownership (self-hosted)
-        if: ${{ contains(toJSON(matrix.runner), 'linode') }}
+        if: ${{ contains(toJSON(matrix.runner), 'self-hosted') }}
         run: |
           sudo rm -rf "$GITHUB_WORKSPACE/_build" "$GITHUB_WORKSPACE/_install"
           sudo chown -R $(id -u):$(id -g) "$GITHUB_WORKSPACE"
 
+      # Pin ccache to the box's persistent cache; env overrides any ccache.conf
+      # a stray ccache-action run may have left in the runner user's home.
+      - name: Pin ccache location (self-hosted)
+        if: ${{ contains(toJSON(matrix.runner), 'self-hosted') }}
+        run: |
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=25G" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
-        if: ${{ !contains(toJSON(matrix.runner), 'linode') }}
+        if: ${{ !contains(toJSON(matrix.runner), 'self-hosted') }}
         run: bash standalone/install-system-deps.sh
 
       - name: Cache FetchContent downloads
-        if: ${{ !contains(toJSON(matrix.runner), 'linode') }}
+        if: ${{ !contains(toJSON(matrix.runner), 'self-hosted') }}
         uses: actions/cache@v4
         with:
           # Sources only. The sibling *-build trees are ~18x larger and are not
@@ -76,7 +84,7 @@ jobs:
             ${{ matrix.cache_prefix }}-deps-
 
       - name: Set up ccache
-        if: ${{ !contains(toJSON(matrix.runner), 'linode') }}
+        if: ${{ !contains(toJSON(matrix.runner), 'self-hosted') }}
         uses: hendrikmuhs/ccache-action@v1
         with:
           key: ${{ matrix.cache_prefix }}
@@ -97,7 +105,7 @@ jobs:
           fi
           # On self-hosted: persist FetchContent outside workspace (namespaced
           # per job to avoid collisions with other builds on the same runner)
-          if echo '${{ toJSON(matrix.runner) }}' | grep -q linode; then
+          if echo '${{ toJSON(matrix.runner) }}' | grep -q self-hosted; then
             EXTRA_FLAGS+=(-DFETCHCONTENT_BASE_DIR="$HOME/.cache/moxygen-${{ matrix.cache_prefix }}/_deps")
           fi
           cmake -B _build -S standalone -G Ninja \
@@ -110,7 +118,7 @@ jobs:
             "${ASAN_FLAGS[@]}" "${EXTRA_FLAGS[@]}"
 
       - name: Build
-        # Linode (asan debug): -j(n-2) reserves 2 cores for co-resident workloads.
+        # Self-hosted (asan debug): -j(n-2) reserves 2 cores for co-resident workloads.
         run: |
           if [ "${{ matrix.name }}" = "asan debug" ]; then
             cmake --build _build -j$(( $(getconf _NPROCESSORS_ONLN) - 2 ))
@@ -181,7 +189,7 @@ jobs:
             container: ""
 
           - name: bookworm-amd64
-            runner: [self-hosted, linode]
+            runner: [self-hosted, build]
             artifact: moxygen-bookworm-amd64.tar.gz
             debug_artifact: moxygen-bookworm-amd64-dbg.tar.gz
             container: debian:bookworm
@@ -211,11 +219,11 @@ jobs:
             git ca-certificates curl pkg-config sudo bash ccache
 
       - name: Install system dependencies
-        if: ${{ !contains(toJSON(matrix.runner), 'linode') || matrix.container != '' }}
+        if: ${{ !contains(toJSON(matrix.runner), 'self-hosted') || matrix.container != '' }}
         run: bash standalone/install-system-deps.sh
 
       - name: Cache FetchContent downloads
-        if: ${{ !contains(toJSON(matrix.runner), 'linode') }}
+        if: ${{ !contains(toJSON(matrix.runner), 'self-hosted') }}
         uses: actions/cache@v4
         with:
           # Sources only; see the note on the build lane's cache above.
@@ -227,11 +235,13 @@ jobs:
             publish-ninja-${{ matrix.name }}-deps-
 
       - name: Set up ccache
-        if: ${{ !contains(toJSON(matrix.runner), 'linode') }}
+        if: ${{ !contains(toJSON(matrix.runner), 'self-hosted') }}
         uses: hendrikmuhs/ccache-action@v1
         with:
           key: publish-${{ matrix.name }}
-          max-size: 500M
+          # Same ~1958-TU compile as the dev lanes; 500M thrashed mid-build.
+          # 1G fits the working set now that dep build trees left the budget.
+          max-size: 1G
 
       - name: Configure
         shell: bash
@@ -242,7 +252,7 @@ jobs:
             mkdir -p /cache/_deps /cache/ccache
             export CCACHE_DIR=/cache/ccache
             EXTRA_FLAGS+=(-DFETCHCONTENT_BASE_DIR=/cache/_deps)
-          elif echo '${{ toJSON(matrix.runner) }}' | grep -q linode; then
+          elif echo '${{ toJSON(matrix.runner) }}' | grep -q self-hosted; then
             # Self-hosted without container: use home dir
             EXTRA_FLAGS+=(-DFETCHCONTENT_BASE_DIR="$HOME/.cache/moxygen-publish-${{ matrix.name }}/_deps")
           fi
@@ -261,9 +271,9 @@ jobs:
             "${EXTRA_FLAGS[@]}"
 
       - name: Build
-        # Linode: -j(n-2) reserves cores for co-resident workloads (e.g. relay).
+        # Self-hosted: -j(n-2) reserves cores for co-resident workloads (e.g. relay).
         run: |
-          if echo '${{ toJSON(matrix.runner) }}' | grep -q linode; then
+          if echo '${{ toJSON(matrix.runner) }}' | grep -q self-hosted; then
             cmake --build _build -j$(( $(getconf _NPROCESSORS_ONLN) - 2 ))
           else
             cmake --build _build -j$(getconf _NPROCESSORS_ONLN)
@@ -279,19 +289,22 @@ jobs:
             --output "${{ matrix.artifact }}" \
             --debug-output "${{ matrix.debug_artifact }}"
 
+      # Handoff to the release job within this run; the release then holds the
+      # same tarballs on free storage. The week is re-run headroom: a failed
+      # release job can be retried without rebuilding, over a weekend included.
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
-          retention-days: 90
+          retention-days: 7
 
       - name: Upload debug artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.debug_artifact }}
           path: ${{ matrix.debug_artifact }}
-          retention-days: 90
+          retention-days: 7
 
   # ════════════════════════════════════════════════════════════════════════════
   # Release: create/update branch-derived snapshot pre-release (all green)
