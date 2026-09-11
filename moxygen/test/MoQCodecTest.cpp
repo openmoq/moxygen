@@ -1471,7 +1471,9 @@ TEST(MoQCodecTest, BidiCodecRejectsDuplicateRequestOnSameStreamV18) {
 TEST(MoQCodecTest, ClusterAdvertisementUpdatesPreserveStreamRequestID) {
   for (bool changeID : {false, true}) {
     MoQFrameWriter writer;
-    writer.initializeVersion(kVersionDraft18);
+    SetupExtensions extensions;
+    extensions.add(SetupExtension::RelayHops);
+    writer.initializeVersion(kVersionDraft18, extensions);
     folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
     PublishNamespace ann{RequestID(0), TrackNamespace({"test"})};
     ann.params.insertParam(Parameter(
@@ -1484,8 +1486,6 @@ TEST(MoQCodecTest, ClusterAdvertisementUpdatesPreserveStreamRequestID) {
     ASSERT_TRUE(writer.writePublishNamespace(buf, ann).hasValue());
     testing::NiceMock<MockMoQCodecCallback> callback;
     MoQBidiStreamCodec codec(&callback, {FrameType::PUBLISH_NAMESPACE});
-    SetupExtensions extensions;
-    extensions.add(SetupExtension::RelayHops);
     codec.initializeVersion(kVersionDraft18, extensions);
     EXPECT_CALL(callback, onPublishNamespace(testing::_))
         .Times(changeID ? 1 : 2);

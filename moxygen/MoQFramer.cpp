@@ -593,9 +593,23 @@ folly::Expected<uint64_t, ErrorCode> decodeRelayHopID(
 }
 
 namespace {
-bool validClusterAdvertisement(const Parameters& params, uint64_t version) {
+bool validClusterAdvertisement(
+    const Parameters& params,
+    uint64_t version,
+    bool negotiated = true) {
+  size_t paths = 0;
+  size_t costs = 0;
+  for (const auto& param : params) {
+    paths += param.key == folly::to_underlying(TrackRequestParamKey::HOP_PATH);
+    costs +=
+        param.key == folly::to_underlying(TrackRequestParamKey::ROUTE_COST);
+  }
+  if (!negotiated) {
+    return paths == 0 && costs == 0;
+  }
   const auto* path = params.getFirstParam(TrackRequestParamKey::HOP_PATH);
-  return path && decodeRelayHopPath(path->asString, version).hasValue();
+  return getDraftMajorVersion(version) >= 18 && paths == 1 && costs <= 1 &&
+      decodeRelayHopPath(path->asString, version).hasValue();
 }
 } // namespace
 
@@ -2961,8 +2975,11 @@ MoQFrameParser::parsePublishNamespace(folly::io::Cursor& cursor, size_t length)
   if (length > 0) {
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
-  if (hasExtension(SetupExtension::RelayHops) &&
-      !validClusterAdvertisement(publishNamespace.params, *version_)) {
+  if (getDraftMajorVersion(*version_) >= 16 &&
+      !validClusterAdvertisement(
+          publishNamespace.params,
+          *version_,
+          hasExtension(SetupExtension::RelayHops))) {
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   return publishNamespace;
@@ -6030,8 +6047,11 @@ WriteResult MoQFrameWriter::writePublishNamespace(
     const PublishNamespace& publishNamespace) const noexcept {
   XCHECK(version_.has_value())
       << "Version needs to be set to write publishNamespace";
-  if (hasExtension(SetupExtension::RelayHops) &&
-      !validClusterAdvertisement(publishNamespace.params, *version_)) {
+  if (getDraftMajorVersion(*version_) >= 16 &&
+      !validClusterAdvertisement(
+          publishNamespace.params,
+          *version_,
+          hasExtension(SetupExtension::RelayHops))) {
     return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
   }
   size_t size = 0;

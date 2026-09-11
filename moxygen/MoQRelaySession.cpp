@@ -12,12 +12,117 @@
 #include <moxygen/MoQRelaySession.h>
 #include <moxygen/ReplyContext.h>
 
+#include <deque>
 #include <utility>
 
 using folly::coro::co_awaitTry;
 using folly::coro::co_error;
 
 namespace moxygen {
+
+// A namespace has one advertisement stream owner in each session direction.
+// Owners outlive asynchronous application callbacks, but reset permanently when
+// their stream ends so retained handles cannot claim namespaces again.
+struct ClusterNamespaceRegistry {
+  bool active{true};
+  folly::F14FastMap<
+      TrackNamespace,
+      const ClusterNamespaceOwner*,
+      TrackNamespace::hash>
+      owners;
+};
+
+class ClusterNamespaceOwner {
+ public:
+  ClusterNamespaceOwner(
+      std::shared_ptr<ClusterNamespaceRegistry> registry,
+      TrackNamespace prefix)
+      : registry_(std::move(registry)), prefix_(std::move(prefix)) {}
+  ClusterNamespaceOwner(const ClusterNamespaceOwner&) = delete;
+  ClusterNamespaceOwner& operator=(const ClusterNamespaceOwner&) = delete;
+  ~ClusterNamespaceOwner() {
+    reset();
+  }
+
+  bool claim(const TrackNamespace& suffix) {
+    if (!active_ || !registry_->active) {
+      return false;
+    }
+    auto [it, inserted] =
+        registry_->owners.emplace(fullNamespace(suffix), this);
+    return inserted || it->second == this;
+  }
+  bool owns(const TrackNamespace& suffix) const {
+    auto it = registry_->owners.find(fullNamespace(suffix));
+    return active_ && registry_->active && it != registry_->owners.end() &&
+        it->second == this;
+  }
+  bool release(const TrackNamespace& suffix) {
+    if (!owns(suffix)) {
+      return false;
+    }
+    registry_->owners.erase(fullNamespace(suffix));
+    return true;
+  }
+  void reset() {
+    active_ = false;
+    for (auto it = registry_->owners.begin(); it != registry_->owners.end();) {
+      if (it->second == this) {
+        it = registry_->owners.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  void setPrefix(TrackNamespace prefix) {
+    prefix_ = std::move(prefix);
+  }
+  void queuePrefix(std::optional<TrackNamespace> prefix) {
+    pendingPrefixes_.push_back(std::move(prefix));
+  }
+  void acceptPrefix() {
+    if (pendingPrefixes_.empty()) {
+      return;
+    }
+    if (pendingPrefixes_.front()) {
+      setPrefix(std::move(*pendingPrefixes_.front()));
+    }
+    pendingPrefixes_.pop_front();
+  }
+  void discardPendingPrefix() {
+    if (!pendingPrefixes_.empty()) {
+      pendingPrefixes_.pop_back();
+    }
+  }
+
+ private:
+  TrackNamespace fullNamespace(const TrackNamespace& suffix) const {
+    auto full = prefix_;
+    for (const auto& token : suffix.trackNamespace) {
+      full.append(token);
+    }
+    return full;
+  }
+  std::shared_ptr<ClusterNamespaceRegistry> registry_;
+  TrackNamespace prefix_;
+  bool active_{true};
+  std::deque<std::optional<TrackNamespace>> pendingPrefixes_;
+};
+
+std::shared_ptr<ClusterNamespaceOwner>
+MoQRelaySession::makeClusterNamespaceOwner(
+    bool incoming,
+    TrackNamespace prefix) {
+  if (!negotiatedSetupExtension(SetupExtension::RelayHops)) {
+    return nullptr;
+  }
+  auto& registry =
+      incoming ? incomingNamespaceRegistry_ : outgoingNamespaceRegistry_;
+  if (!registry) {
+    registry = std::make_shared<ClusterNamespaceRegistry>();
+  }
+  return std::make_shared<ClusterNamespaceOwner>(registry, std::move(prefix));
+}
 
 std::function<std::shared_ptr<MoQSession>(
     folly::MaybeManagedPtr<proxygen::WebTransport>,
@@ -144,11 +249,13 @@ class MoQRelaySession::SubscribeNamespaceHandle
       std::shared_ptr<MoQRelaySession> session,
       TrackNamespace trackNamespacePrefix,
       SubscribeNamespaceOk subAnnOk,
-      std::shared_ptr<BidiStreamControl> control = nullptr)
+      std::shared_ptr<BidiStreamControl> control = nullptr,
+      std::shared_ptr<ClusterNamespaceOwner> namespaceOwner = nullptr)
       : Publisher::SubscribeNamespaceHandle(std::move(subAnnOk)),
         trackNamespacePrefix_(std::move(trackNamespacePrefix)),
         session_(std::move(session)),
-        control_(std::move(control)) {}
+        control_(std::move(control)),
+        namespaceOwner_(std::move(namespaceOwner)) {}
   SubscribeNamespaceHandle(const SubscribeNamespaceHandle&) = delete;
   SubscribeNamespaceHandle& operator=(const SubscribeNamespaceHandle&) = delete;
   SubscribeNamespaceHandle(SubscribeNamespaceHandle&&) = delete;
@@ -158,6 +265,9 @@ class MoQRelaySession::SubscribeNamespaceHandle
   }
 
   void unsubscribeNamespace() override {
+    if (namespaceOwner_) {
+      namespaceOwner_->reset();
+    }
     if (session_) {
       if (session_->isClosed()) {
         session_.reset();
@@ -196,23 +306,42 @@ class MoQRelaySession::SubscribeNamespaceHandle
     // 16+; earlier drafts have no such message for it.
     auto version = session_->getNegotiatedVersion();
     if (!version || getDraftMajorVersion(*version) < 16) {
-      co_return folly::makeUnexpected(
-          RequestError{
-              reqUpdate.requestID,
-              RequestErrorCode::NOT_SUPPORTED,
-              "REQUEST_UPDATE for SUBSCRIBE_NAMESPACE requires draft 16+"});
+      co_return folly::makeUnexpected(RequestError{
+          reqUpdate.requestID,
+          RequestErrorCode::NOT_SUPPORTED,
+          "REQUEST_UPDATE for SUBSCRIBE_NAMESPACE requires draft 16+"});
     }
-    // Forward the update to the peer on this subscription's own bidi stream.
-    // The prefix (or other mutable state) is carried in reqUpdate.params and
-    // decoded by the responder; this side is a pure forwarder.
-    co_return co_await session_->sendRequestUpdateOnBidi(
+    // The response callback applies the prefix at REQUEST_OK, before parsing
+    // any NAMESPACE frames that follow it in the same read.
+    std::optional<TrackNamespace> prefix;
+    if (namespaceOwner_) {
+      if (const auto* param = reqUpdate.params.getFirstParam(
+              TrackRequestParamKey::TRACK_NAMESPACE_PREFIX)) {
+        auto decoded = MoQFrameParser::parseTrackNamespacePrefixParam(
+            param->asString, *version);
+        if (!decoded) {
+          co_return folly::makeUnexpected(RequestError{
+              reqUpdate.requestID,
+              RequestErrorCode::INTERNAL_ERROR,
+              "Invalid namespace prefix"});
+        }
+        prefix = std::move(*decoded);
+      }
+      namespaceOwner_->queuePrefix(std::move(prefix));
+    }
+    auto result = co_await session_->sendRequestUpdateOnBidi(
         std::move(reqUpdate), subscribeNamespaceOk_->requestID, control_);
+    if (!result && namespaceOwner_) {
+      namespaceOwner_->discardPendingPrefix();
+    }
+    co_return result;
   }
 
  private:
   TrackNamespace trackNamespacePrefix_;
   std::shared_ptr<MoQRelaySession> session_;
   std::shared_ptr<BidiStreamControl> control_;
+  std::shared_ptr<ClusterNamespaceOwner> namespaceOwner_;
 };
 
 // Draft 18+: handle returned to subscribers from
@@ -423,6 +552,15 @@ class MoQRelaySession::MoQRelayPendingRequestState
 };
 
 void MoQRelaySession::cleanupRelayState() {
+  if (incomingNamespaceRegistry_) {
+    incomingNamespaceRegistry_->active = false;
+    incomingNamespaceRegistry_->owners.clear();
+  }
+  if (outgoingNamespaceRegistry_) {
+    outgoingNamespaceRegistry_->active = false;
+    outgoingNamespaceRegistry_->owners.clear();
+  }
+  outgoingNamespaceOwners_.clear();
   incomingClusterAdvertisements_.clear();
   outgoingClusterAdvertisements_.clear();
   // Clean up publishNamespace maps
@@ -723,6 +861,29 @@ void MoQRelaySession::handleSubscribeNamespaceRequestUpdate(
                existingRequestID,
                updateRequestID]() mutable -> folly::coro::Task<void> {
                 co_await folly::coro::co_safe_point;
+                std::optional<TrackNamespace> prefix;
+                auto ownerIt = outgoingNamespaceOwners_.find(existingRequestID);
+                auto owner = ownerIt == outgoingNamespaceOwners_.end()
+                    ? nullptr
+                    : ownerIt->second;
+                if (owner) {
+                  if (const auto* param = update.params.getFirstParam(
+                          TrackRequestParamKey::TRACK_NAMESPACE_PREFIX)) {
+                    auto decoded =
+                        MoQFrameParser::parseTrackNamespacePrefixParam(
+                            param->asString, *negotiatedVersion_);
+                    if (!decoded) {
+                      requestUpdateError(
+                          RequestError{
+                              updateRequestID,
+                              RequestErrorCode::INTERNAL_ERROR,
+                              "Invalid namespace prefix"},
+                          existingRequestID);
+                      co_return;
+                    }
+                    prefix = std::move(*decoded);
+                  }
+                }
                 // Call the handle's requestUpdate
                 auto updateResult = co_await co_awaitTry(co_withCancellation(
                     cancellationSource_.getToken(),
@@ -748,6 +909,9 @@ void MoQRelaySession::handleSubscribeNamespaceRequestUpdate(
                         .requestID = updateRequestID,
                         .requestSpecificParams = {}};
                     requestUpdateOk(requestOk, existingRequestID);
+                    if (owner && prefix) {
+                      owner->setPrefix(std::move(*prefix));
+                    }
                   }
                 }
               })))
@@ -880,21 +1044,19 @@ MoQRelaySession::publishNamespace(
          "Session received GOAWAY"}));
   }
   const bool cluster = negotiatedSetupExtension(SetupExtension::RelayHops);
-  if (cluster) {
-    for (const auto& [id, ns] : outgoingClusterAdvertisements_) {
-      if (ns == ann.trackNamespace) {
-        co_return folly::makeUnexpected(PublishNamespaceError{
-            ann.requestID,
-            PublishNamespaceErrorCode::INTERNAL_ERROR,
-            "Namespace already advertised; update its existing handle"});
-      }
-    }
+  auto namespaceOwner = makeClusterNamespaceOwner(false);
+  if (namespaceOwner && !namespaceOwner->claim(ann.trackNamespace)) {
+    co_return folly::makeUnexpected(PublishNamespaceError{
+        ann.requestID,
+        PublishNamespaceErrorCode::INTERNAL_ERROR,
+        "Namespace already advertised; update its existing handle"});
   }
   aliasifyAuthTokens(ann.params);
   ann.requestID = getNextRequestID();
   bool accepted = false;
   if (cluster) {
-    outgoingClusterAdvertisements_.emplace(ann.requestID, ann.trackNamespace);
+    outgoingClusterAdvertisements_.emplace(
+        ann.requestID, std::move(namespaceOwner));
   }
   SCOPE_EXIT {
     if (!accepted) {
@@ -1220,12 +1382,11 @@ void MoQRelaySession::onPublishNamespaceImpl(
       }
       return;
     }
-    for (const auto& [id, advertisement] : incomingClusterAdvertisements_) {
-      if (advertisement.trackNamespace == ann.trackNamespace) {
-        close(ErrorCode::PROTOCOL_VIOLATION);
-        return;
-      }
-    }
+  }
+  auto namespaceOwner = makeClusterNamespaceOwner(true);
+  if (namespaceOwner && !namespaceOwner->claim(ann.trackNamespace)) {
+    close(ErrorCode::PROTOCOL_VIOLATION);
+    return;
   }
   if (closeSessionIfRequestIDInvalid(ann.requestID, false, true)) {
     return;
@@ -1256,7 +1417,10 @@ void MoQRelaySession::onPublishNamespaceImpl(
     incomingClusterAdvertisements_.emplace(
         ann.requestID,
         IncomingClusterAdvertisement{
-            ann.trackNamespace, replyContext, std::nullopt});
+            ann.trackNamespace,
+            replyContext,
+            std::nullopt,
+            std::move(namespaceOwner)});
   }
   co_withExecutor(
       exec_.get(),
@@ -1452,23 +1616,44 @@ class SubNsStreamCallback : public MoQControlCodec::ControlCallback {
  public:
   explicit SubNsStreamCallback(
       MoQSession* session,
-      std::shared_ptr<Publisher::NamespacePublishHandle> namespacePublishHandle)
-      : session_(session), namespacePublishHandle_(namespacePublishHandle) {}
+      std::shared_ptr<Publisher::NamespacePublishHandle> namespacePublishHandle,
+      std::shared_ptr<ClusterNamespaceOwner> namespaceOwner)
+      : session_(session),
+        namespacePublishHandle_(std::move(namespacePublishHandle)),
+        namespaceOwner_(std::move(namespaceOwner)) {}
+
+  ~SubNsStreamCallback() override {
+    if (namespaceOwner_) {
+      namespaceOwner_->reset();
+    }
+  }
 
   void onConnectionError(ErrorCode error) override {
     session_->close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
   }
 
   void onNamespace(Namespace ns) override {
+    if (namespaceOwner_ && !namespaceOwner_->claim(ns.trackNamespaceSuffix)) {
+      onConnectionError(ErrorCode::PROTOCOL_VIOLATION);
+      return;
+    }
     namespacePublishHandle_->namespaceMsg(ns);
   }
 
   void onNamespaceDone(NamespaceDone namespaceDone) override {
+    if (namespaceOwner_ &&
+        !namespaceOwner_->release(namespaceDone.trackNamespaceSuffix)) {
+      onConnectionError(ErrorCode::PROTOCOL_VIOLATION);
+      return;
+    }
     namespacePublishHandle_->namespaceDoneMsg(
         namespaceDone.trackNamespaceSuffix);
   }
 
   void onRequestOk(RequestOk ok, FrameType frameType) override {
+    if (namespaceOwner_) {
+      namespaceOwner_->acceptPrefix();
+    }
     session_->onRequestOk(ok, FrameType::SUBSCRIBE_NAMESPACE_OK);
   }
 
@@ -1479,6 +1664,7 @@ class SubNsStreamCallback : public MoQControlCodec::ControlCallback {
  private:
   MoQSession* session_;
   std::shared_ptr<Publisher::NamespacePublishHandle> namespacePublishHandle_;
+  std::shared_ptr<ClusterNamespaceOwner> namespaceOwner_;
 };
 
 class SubTracksStreamCallback : public MoQControlCodec::ControlCallback {
@@ -1539,6 +1725,8 @@ MoQRelaySession::subscribeNamespace(
          SubscribeNamespaceErrorCode::INTERNAL_ERROR,
          "local write failed"}));
   }
+  auto namespaceOwner =
+      makeClusterNamespaceOwner(true, sa.trackNamespacePrefix);
   auto sendResult = sendRequest(
       buf,
       FrameType::REQUEST_OK,
@@ -1549,7 +1737,13 @@ MoQRelaySession::subscribeNamespace(
        FrameType::REQUEST_ERROR},
       sa.requestID,
       /*minBidiDraftVersion=*/16,
-      std::make_unique<SubNsStreamCallback>(this, namespacePublishHandle));
+      std::make_unique<SubNsStreamCallback>(
+          this, namespacePublishHandle, namespaceOwner),
+      [namespaceOwner](RequestID) {
+        if (namespaceOwner) {
+          namespaceOwner->reset();
+        }
+      });
   if (sendResult.hasError()) {
     co_return folly::makeUnexpected(SubscribeNamespaceError(
         {RequestID(0),
@@ -1580,7 +1774,8 @@ MoQRelaySession::subscribeNamespace(
         std::static_pointer_cast<MoQRelaySession>(shared_from_this()),
         trackNamespace,
         std::move(subAnnResult.value()),
-        std::move(sendResult.value()));
+        std::move(sendResult.value()),
+        std::move(namespaceOwner));
   }
 }
 
@@ -1658,13 +1853,24 @@ class MoQNamespacePublishHandle : public Publisher::NamespacePublishHandle {
   MoQNamespacePublishHandle(
       std::shared_ptr<SubNSReply> subNsReply,
       uint64_t negotiatedVersion,
-      SetupExtensions extensions)
-      : subNsReply_(std::move(subNsReply)) {
+      SetupExtensions extensions,
+      std::shared_ptr<ClusterNamespaceOwner> namespaceOwner)
+      : subNsReply_(std::move(subNsReply)),
+        namespaceOwner_(std::move(namespaceOwner)) {
     moqFrameWriter_.initializeVersion(negotiatedVersion, extensions);
   }
 
   void namespaceMsg(const Namespace& ns) override {
+    bool owned =
+        namespaceOwner_ && namespaceOwner_->owns(ns.trackNamespaceSuffix);
+    if (namespaceOwner_ && !namespaceOwner_->claim(ns.trackNamespaceSuffix)) {
+      XLOG(ERR) << "Namespace belongs to another advertisement stream";
+      return;
+    }
     auto writeResult = subNsReply_->namespaceMsg(ns);
+    if (!writeResult && namespaceOwner_ && !owned) {
+      namespaceOwner_->release(ns.trackNamespaceSuffix);
+    }
     if (!writeResult) {
       XLOG(ERR) << "writeNamespace failed";
       return;
@@ -1678,6 +1884,10 @@ class MoQNamespacePublishHandle : public Publisher::NamespacePublishHandle {
   }
 
   void namespaceDoneMsg(const TrackNamespace& trackNamespaceSuffix) override {
+    if (namespaceOwner_ && !namespaceOwner_->owns(trackNamespaceSuffix)) {
+      XLOG(ERR) << "Namespace does not belong to this advertisement stream";
+      return;
+    }
     NamespaceDone namespaceDone;
     namespaceDone.trackNamespaceSuffix = trackNamespaceSuffix;
     auto writeResult = subNsReply_->namespaceDoneMsg(namespaceDone);
@@ -1685,10 +1895,14 @@ class MoQNamespacePublishHandle : public Publisher::NamespacePublishHandle {
       XLOG(ERR) << "writeNamespaceDone failed";
       return;
     }
+    if (namespaceOwner_) {
+      namespaceOwner_->release(trackNamespaceSuffix);
+    }
   }
 
  private:
   std::shared_ptr<SubNSReply> subNsReply_;
+  std::shared_ptr<ClusterNamespaceOwner> namespaceOwner_;
   MoQFrameWriter moqFrameWriter_;
 };
 
@@ -1696,12 +1910,31 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
     SubscribeNamespace subAnn,
     std::shared_ptr<SubNSReply> subNsReply) {
   co_await folly::coro::co_safe_point;
+  if (negotiatedSetupExtension(SetupExtension::RelayHops) &&
+      subNsReply->replyContext()->cancelled()) {
+    co_return;
+  }
   folly::RequestContextScopeGuard guard;
   setRequestSession();
+  auto namespaceOwner =
+      makeClusterNamespaceOwner(false, subAnn.trackNamespacePrefix);
+  if (namespaceOwner) {
+    outgoingNamespaceOwners_[subAnn.requestID] = namespaceOwner;
+  }
+  bool accepted = false;
+  SCOPE_EXIT {
+    if (namespaceOwner && !accepted) {
+      namespaceOwner->reset();
+      outgoingNamespaceOwners_.erase(subAnn.requestID);
+    }
+  };
   std::shared_ptr<MoQNamespacePublishHandle> publishHandle;
   if (getDraftMajorVersion(*negotiatedVersion_) >= 16) {
     publishHandle = std::make_shared<MoQNamespacePublishHandle>(
-        subNsReply, *negotiatedVersion_, getNegotiatedExtensions());
+        subNsReply,
+        *negotiatedVersion_,
+        getNegotiatedExtensions(),
+        namespaceOwner);
   }
   auto subAnnResult = co_await co_awaitTry(co_withCancellation(
       cancellationSource_.getToken(),
@@ -1726,6 +1959,13 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
     subscribeNamespaceError(subAnnErr, std::move(subNsReply));
   } else {
     auto handle = std::move(subAnnResult->value());
+    if (namespaceOwner &&
+        (isClosed() || !outgoingNamespaceOwners_.contains(subAnn.requestID) ||
+         subNsReply->replyContext()->cancelled())) {
+      handle->unsubscribeNamespace();
+      co_return;
+    }
+    accepted = true;
     auto subAnnOk = handle->subscribeNamespaceOk();
     std::shared_ptr<ReplyContext> replyContext;
     if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
@@ -1805,6 +2045,11 @@ void MoQRelaySession::onUnsubscribeNamespace(UnsubscribeNamespace unsub) {
     legacySubscribeNamespaceToReqId_.erase(nsIt);
   }
 
+  auto ownerIt = outgoingNamespaceOwners_.find(requestID);
+  if (ownerIt != outgoingNamespaceOwners_.end()) {
+    ownerIt->second->reset();
+    outgoingNamespaceOwners_.erase(ownerIt);
+  }
   auto saIt = subscribeNamespaceHandles_.find(requestID);
   if (saIt == subscribeNamespaceHandles_.end()) {
     XLOG(ERR) << "Invalid unsub publishNamespace requestID=" << requestID;

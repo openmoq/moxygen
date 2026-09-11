@@ -329,7 +329,8 @@ CO_TEST_P_X(Draft18Test, ClusterRejectsIncomingNamespaceOnSecondStream) {
       folly::to_underlying(TrackRequestParamKey::HOP_PATH),
       *encodeRelayHopPath({42}, GetParam().serverVersion)));
   MoQFrameWriter writer;
-  writer.initializeVersion(GetParam().serverVersion);
+  writer.initializeVersion(
+      GetParam().serverVersion, clientSession_->getNegotiatedExtensions());
   for (uint64_t id : {0, 2}) {
     auto stream = clientWt_->createBidiStream();
     EXPECT_TRUE(stream.hasValue());
@@ -376,7 +377,8 @@ CO_TEST_P_X(Draft18Test, ClusterQueuesUpdateUntilInitialAcceptance) {
       folly::to_underlying(TrackRequestParamKey::HOP_PATH),
       *encodeRelayHopPath({42}, kVersionDraft18)));
   MoQFrameWriter writer;
-  writer.initializeVersion(kVersionDraft18);
+  writer.initializeVersion(
+      kVersionDraft18, clientSession_->getNegotiatedExtensions());
   folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
   EXPECT_TRUE(writer.writePublishNamespace(buf, ann).hasValue());
   stream->writeHandle->writeStreamData(buf.move(), false, nullptr);
@@ -428,7 +430,8 @@ CO_TEST_P_X(Draft18Test, ClusterFinBeforeAcceptanceCannotReviveAdvertisement) {
       folly::to_underlying(TrackRequestParamKey::HOP_PATH),
       *encodeRelayHopPath({42}, kVersionDraft18)));
   MoQFrameWriter writer;
-  writer.initializeVersion(kVersionDraft18);
+  writer.initializeVersion(
+      kVersionDraft18, clientSession_->getNegotiatedExtensions());
   folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
   EXPECT_TRUE(writer.writePublishNamespace(buf, ann).hasValue());
   stream->writeHandle->writeStreamData(buf.move(), false, nullptr);

@@ -407,6 +407,8 @@ static bool isV18OnlyParamKey(TrackRequestParamKey key) {
     case TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT:
     case TrackRequestParamKey::FILL_TIMEOUT:
     case TrackRequestParamKey::TRACK_NAMESPACE_PREFIX:
+    case TrackRequestParamKey::HOP_PATH:
+    case TrackRequestParamKey::ROUTE_COST:
       return true;
     default:
       return false;
@@ -460,8 +462,12 @@ bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
   }
 
   // v18-only parameter keys.
+  const bool clusterKey = key == TrackRequestParamKey::HOP_PATH ||
+      key == TrackRequestParamKey::ROUTE_COST;
   if (isV18OnlyParamKey(key) &&
-      (!majorVersion_.has_value() || *majorVersion_ < 18)) {
+      (majorVersion_
+           ? (*majorVersion_ < 18 && (!clusterKey || *majorVersion_ >= 16))
+           : !clusterKey)) {
     return false;
   }
 

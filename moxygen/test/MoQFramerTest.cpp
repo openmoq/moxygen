@@ -4766,6 +4766,13 @@ TEST_P(MoQFramerV16PlusTest, RelayHopPathRejectsEmptyAndTruncatedValues) {
 }
 
 TEST_P(MoQFramerV16PlusTest, RouteCostRoundtrip) {
+  if (getDraftMajorVersion(GetParam()) < 18) {
+    return;
+  }
+  SetupExtensions extensions;
+  extensions.add(SetupExtension::RelayHops);
+  writer_.setNegotiatedExtensions(extensions);
+  parser_.setNegotiatedExtensions(extensions);
   PublishNamespace subNs;
   subNs.requestID = RequestID(42);
   subNs.trackNamespace = TrackNamespace({"relay"});
@@ -4773,6 +4780,9 @@ TEST_P(MoQFramerV16PlusTest, RouteCostRoundtrip) {
       folly::to_underlying(TrackRequestParamKey::ROUTE_COST),
       quic::kEightByteLimit));
 
+  subNs.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+      std::string("\x01", 1)));
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
   ASSERT_TRUE(writer_.writePublishNamespace(writeBuf, subNs).hasValue());
   auto serialized = writeBuf.move();
@@ -4782,16 +4792,19 @@ TEST_P(MoQFramerV16PlusTest, RouteCostRoundtrip) {
   ASSERT_TRUE(frameType.has_value());
   auto parsed = parser_.parsePublishNamespace(cursor, frameLength(cursor));
   ASSERT_TRUE(parsed.hasValue());
-  ASSERT_EQ(parsed->params.size(), 1);
+  ASSERT_EQ(parsed->params.size(), 2);
   EXPECT_EQ(
-      parsed->params.at(0).key,
+      parsed->params.at(1).key,
       folly::to_underlying(TrackRequestParamKey::ROUTE_COST));
-  EXPECT_EQ(parsed->params.at(0).asUint64, quic::kEightByteLimit);
+  EXPECT_EQ(parsed->params.at(1).asUint64, quic::kEightByteLimit);
 }
 
 TEST_P(
     MoQFramerV16PlusTest,
     NamespaceRelayHopParametersRoundtripWhenNegotiated) {
+  if (getDraftMajorVersion(GetParam()) < 18) {
+    return;
+  }
   SetupExtensions extensions;
   extensions.add(SetupExtension::RelayHops);
   parser_.setNegotiatedExtensions(extensions);
@@ -7595,4 +7608,131 @@ TEST_P(MoQFramerTest, SubgroupObjectUnderflowDoesNotCorruptDeltaState) {
       cursor, cursor.totalLength(), hdr->value.objectHeader, sgOptions);
   ASSERT_TRUE(r1.hasValue());
   EXPECT_EQ(r1->value.id, 1);
+}
+
+namespace {
+std::unique_ptr<folly::IOBuf> clusterAdvertisementPayload(
+    MoQFrameWriter& writer,
+    const Parameters& params) {
+  folly::IOBufQueue payload{folly::IOBufQueue::cacheChainLength()};
+  size_t size = 0;
+  bool error = false;
+  writer.writeVarint(payload, 0, size, error);
+  writer.writeVarint(payload, 1, size, error);
+  writer.writeVarint(payload, 7, size, error);
+  payload.append("cluster", 7);
+  size += 7;
+  writer.writeVarint(payload, params.size(), size, error);
+  uint64_t previous = 0;
+  for (const auto& param : params) {
+    writer.writeVarint(payload, param.key - previous, size, error);
+    previous = param.key;
+    if (param.key & 1) {
+      writer.writeVarint(payload, param.asString.size(), size, error);
+      payload.append(param.asString);
+      size += param.asString.size();
+    } else {
+      writer.writeVarint(payload, param.asUint64, size, error);
+    }
+  }
+  EXPECT_FALSE(error);
+  return payload.move();
+}
+} // namespace
+
+TEST_P(
+    MoQFramerV16PlusTest,
+    ClusterParametersRequireNegotiationAndCardinality) {
+  if (getDraftMajorVersion(GetParam()) < 18) {
+    return;
+  }
+  for (const auto key :
+       {TrackRequestParamKey::HOP_PATH, TrackRequestParamKey::ROUTE_COST}) {
+    PublishNamespace ann;
+    ann.trackNamespace = TrackNamespace({"cluster"});
+    ann.params.insertParam(
+        key == TrackRequestParamKey::HOP_PATH
+            ? Parameter(folly::to_underlying(key), std::string("\x01", 1))
+            : Parameter(folly::to_underlying(key), uint64_t{0}));
+    folly::IOBufQueue output{folly::IOBufQueue::cacheChainLength()};
+    EXPECT_TRUE(writer_.writePublishNamespace(output, ann).hasError());
+
+    auto bytes = clusterAdvertisementPayload(writer_, ann.params);
+    folly::io::Cursor cursor(bytes.get());
+    EXPECT_TRUE(
+        parser_.parsePublishNamespace(cursor, bytes->computeChainDataLength())
+            .hasError());
+  }
+  SetupExtensions extensions;
+  extensions.add(SetupExtension::RelayHops);
+  writer_.setNegotiatedExtensions(extensions);
+  parser_.setNegotiatedExtensions(extensions);
+  for (const auto duplicate :
+       {TrackRequestParamKey::HOP_PATH, TrackRequestParamKey::ROUTE_COST}) {
+    PublishNamespace ann;
+    ann.trackNamespace = TrackNamespace({"cluster"});
+    ann.params.insertParam(Parameter(
+        folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+        std::string("\x01", 1)));
+    for (int i = 0; i < (duplicate == TrackRequestParamKey::HOP_PATH ? 1 : 2);
+         ++i) {
+      ann.params.insertParam(
+          duplicate == TrackRequestParamKey::HOP_PATH
+              ? Parameter(
+                    folly::to_underlying(duplicate), std::string("\x02", 1))
+              : Parameter(folly::to_underlying(duplicate), uint64_t{0}));
+    }
+    folly::IOBufQueue output{folly::IOBufQueue::cacheChainLength()};
+    EXPECT_TRUE(writer_.writePublishNamespace(output, ann).hasError());
+    Namespace ns;
+    ns.trackNamespaceSuffix = ann.trackNamespace;
+    for (const auto& param : ann.params) {
+      ns.params.insertParam(param);
+    }
+    EXPECT_TRUE(writer_.writeNamespace(output, ns).hasError());
+    auto bytes = clusterAdvertisementPayload(writer_, ann.params);
+    folly::io::Cursor cursor(bytes.get());
+    EXPECT_TRUE(
+        parser_.parsePublishNamespace(cursor, bytes->computeChainDataLength())
+            .hasError());
+    folly::io::Cursor namespaceCursor(bytes.get());
+    namespaceCursor.skip(1); // The zero request ID is absent from NAMESPACE.
+    EXPECT_TRUE(parser_
+                    .parseNamespace(
+                        namespaceCursor, bytes->computeChainDataLength() - 1)
+                    .hasError());
+  }
+}
+
+TEST(ClusterSetupTest, AdvertisementKeysRequireDraft18) {
+  for (const auto version : {16, 17}) {
+    EXPECT_FALSE(Parameters::isKnownParamKey(
+        folly::to_underlying(TrackRequestParamKey::HOP_PATH), version));
+    EXPECT_FALSE(Parameters::isKnownParamKey(
+        folly::to_underlying(TrackRequestParamKey::ROUTE_COST), version));
+  }
+}
+
+TEST(ClusterSetupTest, LegacyAdvertisementParametersFollowDraftRules) {
+  for (uint64_t version : {kVersionDraft15, kVersionDraft16, kVersionDraft17}) {
+    MoQFrameWriter writer;
+    writer.initializeVersion(version);
+    MoQFrameParser parser;
+    parser.initializeVersion(version);
+    PublishNamespace ann;
+    ann.trackNamespace = TrackNamespace({"cluster"});
+    ann.params.insertParam(Parameter(
+        folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+        std::string("\x01", 1)));
+    auto bytes = clusterAdvertisementPayload(writer, ann.params);
+    folly::io::Cursor cursor(bytes.get());
+    EXPECT_EQ(
+        parser.parsePublishNamespace(cursor, bytes->computeChainDataLength())
+            .hasValue(),
+        version == kVersionDraft15);
+    folly::IOBufQueue output{folly::IOBufQueue::cacheChainLength()};
+    EXPECT_EQ(
+        writer.writePublishNamespace(output, ann).hasValue(),
+        version == kVersionDraft15);
+  }
 }
