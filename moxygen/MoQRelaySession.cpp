@@ -102,6 +102,26 @@ class MoQRelaySession::PublisherPublishNamespaceHandle
     }
   }
 
+  folly::Expected<folly::Unit, ErrorCode> publishNamespaceUpdate(
+      PublishNamespace ann) override {
+    if (!session_ || session_->isClosed() || !replyCtx_ ||
+        replyCtx_->cancelled() ||
+        !session_->negotiatedSetupExtension(SetupExtension::RelayHops) ||
+        ann.trackNamespace != trackNamespace_ ||
+        !session_->outgoingClusterAdvertisements_.contains(
+            publishNamespaceOk().requestID)) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+    ann.requestID = publishNamespaceOk().requestID;
+    auto result = session_->moqFrameWriter_.writePublishNamespace(
+        replyCtx_->writeBuf(), ann);
+    if (!result) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+    replyCtx_->flush();
+    return folly::unit;
+  }
+
   folly::coro::Task<RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) override {
     co_return folly::makeUnexpected(
@@ -403,6 +423,8 @@ class MoQRelaySession::MoQRelayPendingRequestState
 };
 
 void MoQRelaySession::cleanupRelayState() {
+  incomingClusterAdvertisements_.clear();
+  outgoingClusterAdvertisements_.clear();
   // Clean up publishNamespace maps
   for (auto& ann : publishNamespaceCallbacks_) {
     if (ann.second) {
@@ -857,11 +879,36 @@ MoQRelaySession::publishNamespace(
          PublishNamespaceErrorCode::GOING_AWAY,
          "Session received GOAWAY"}));
   }
+  const bool cluster = negotiatedSetupExtension(SetupExtension::RelayHops);
+  if (cluster) {
+    for (const auto& [id, ns] : outgoingClusterAdvertisements_) {
+      if (ns == ann.trackNamespace) {
+        co_return folly::makeUnexpected(PublishNamespaceError{
+            ann.requestID,
+            PublishNamespaceErrorCode::INTERNAL_ERROR,
+            "Namespace already advertised; update its existing handle"});
+      }
+    }
+  }
   aliasifyAuthTokens(ann.params);
   ann.requestID = getNextRequestID();
+  bool accepted = false;
+  if (cluster) {
+    outgoingClusterAdvertisements_.emplace(ann.requestID, ann.trackNamespace);
+  }
+  SCOPE_EXIT {
+    if (!accepted) {
+      outgoingClusterAdvertisements_.erase(ann.requestID);
+    }
+  };
 
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
-  moqFrameWriter_.writePublishNamespace(writeBuf, ann);
+  if (!moqFrameWriter_.writePublishNamespace(writeBuf, ann)) {
+    co_return folly::makeUnexpected(PublishNamespaceError{
+        ann.requestID,
+        PublishNamespaceErrorCode::INTERNAL_ERROR,
+        "Invalid namespace advertisement"});
+  }
   auto sendResult = sendRequest(
       writeBuf,
       FrameType::REQUEST_OK,
@@ -904,6 +951,7 @@ MoQRelaySession::publishNamespace(
     co_return folly::makeUnexpected(publishNamespaceResult.error());
   } else {
     MOQ_PUBLISHER_STATS(publisherStatsCallback_, onPublishNamespaceSuccess);
+    accepted = true;
     co_return std::make_shared<PublisherPublishNamespaceHandle>(
         std::static_pointer_cast<MoQRelaySession>(shared_from_this()),
         trackNamespace,
@@ -1018,6 +1066,7 @@ void MoQRelaySession::onPublishNamespaceCancel(
     legacyPublisherNamespaceToReqId_.erase(nsIt);
   }
 
+  outgoingClusterAdvertisements_.erase(reqId);
   auto it = publishNamespaceCallbacks_.find(reqId);
   if (it == publishNamespaceCallbacks_.end()) {
     XLOG(ERR) << "Invalid publishNamespace cancel requestID=" << reqId;
@@ -1078,6 +1127,9 @@ void MoQRelaySession::publishNamespaceDone(
     // If not found, reqId remains nullopt - will search pending by namespace
   }
 
+  if (reqId) {
+    outgoingClusterAdvertisements_.erase(*reqId);
+  }
   // Find and remove publishNamespace
   if (reqId.has_value()) {
     auto it = publishNamespaceCallbacks_.find(*reqId);
@@ -1146,6 +1198,35 @@ void MoQRelaySession::onPublishNamespaceImpl(
         ann, MOQTByteStringType::STRING_VALUE, ControlMessageType::PARSED);
   }
 
+  if (negotiatedSetupExtension(SetupExtension::RelayHops)) {
+    auto existing = incomingClusterAdvertisements_.find(ann.requestID);
+    if (existing != incomingClusterAdvertisements_.end()) {
+      if (existing->second.context != replyContext ||
+          existing->second.trackNamespace != ann.trackNamespace) {
+        close(ErrorCode::PROTOCOL_VIOLATION);
+        return;
+      }
+      auto handleIt = publishNamespaceHandles_.find(ann.requestID);
+      if (handleIt == publishNamespaceHandles_.end()) {
+        existing->second.pendingUpdate = std::move(ann);
+      } else {
+        auto handle = handleIt->second;
+        folly::RequestContextScopeGuard guard;
+        setRequestSession();
+        auto result = handle->publishNamespaceUpdate(std::move(ann));
+        if (!result) {
+          close(result.error());
+        }
+      }
+      return;
+    }
+    for (const auto& [id, advertisement] : incomingClusterAdvertisements_) {
+      if (advertisement.trackNamespace == ann.trackNamespace) {
+        close(ErrorCode::PROTOCOL_VIOLATION);
+        return;
+      }
+    }
+  }
   if (closeSessionIfRequestIDInvalid(ann.requestID, false, true)) {
     return;
   }
@@ -1171,6 +1252,12 @@ void MoQRelaySession::onPublishNamespaceImpl(
         *replyContext);
     return;
   }
+  if (negotiatedSetupExtension(SetupExtension::RelayHops)) {
+    incomingClusterAdvertisements_.emplace(
+        ann.requestID,
+        IncomingClusterAdvertisement{
+            ann.trackNamespace, replyContext, std::nullopt});
+  }
   co_withExecutor(
       exec_.get(),
       co_withCancellation(
@@ -1193,6 +1280,19 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
   auto publishNamespaceResult = co_await co_awaitTry(co_withCancellation(
       cancellationSource_.getToken(),
       subscribeHandler_->publishNamespace(publishNamespace, std::move(annCb))));
+  if (negotiatedSetupExtension(SetupExtension::RelayHops) &&
+      (!incomingClusterAdvertisements_.contains(publishNamespace.requestID) ||
+       replyContext->cancelled() || isClosed())) {
+    if (publishNamespaceResult.hasValue() &&
+        publishNamespaceResult->hasValue()) {
+      publishNamespaceResult->value()->publishNamespaceDone();
+    }
+    co_return;
+  }
+  if (publishNamespaceResult.hasException() ||
+      publishNamespaceResult->hasError()) {
+    incomingClusterAdvertisements_.erase(publishNamespace.requestID);
+  }
   if (publishNamespaceResult.hasException()) {
     XLOG(ERR) << "Exception in Subscriber callback ex="
               << publishNamespaceResult.exception().what().toStdString();
@@ -1216,6 +1316,23 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
     auto publishNamespaceOkMsg = handle->publishNamespaceOk();
     publishNamespaceOk(publishNamespaceOkMsg, *replyContext);
     publishNamespaceHandles_[publishNamespace.requestID] = std::move(handle);
+    auto advertisement =
+        incomingClusterAdvertisements_.find(publishNamespace.requestID);
+    if (advertisement != incomingClusterAdvertisements_.end() &&
+        advertisement->second.pendingUpdate) {
+      auto update = std::move(*advertisement->second.pendingUpdate);
+      advertisement->second.pendingUpdate.reset();
+      auto updateHandle =
+          publishNamespaceHandles_.at(publishNamespace.requestID);
+      auto result = updateHandle->publishNamespaceUpdate(std::move(update));
+      if (!result) {
+        close(result.error());
+        co_return;
+      }
+      if (isClosed()) {
+        co_return;
+      }
+    }
     if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
       // Retain the bidi reply context so a failed REQUEST_UPDATE can close it.
       requestUpdateReplyContexts_[publishNamespace.requestID] = replyContext;
@@ -1267,6 +1384,7 @@ void MoQRelaySession::publishNamespaceCancel(
   }
 
   if (annCan.requestID.has_value()) {
+    incomingClusterAdvertisements_.erase(*annCan.requestID);
     publishNamespaceHandles_.erase(*annCan.requestID);
     requestUpdateReplyContexts_.erase(*annCan.requestID);
   }
@@ -1314,6 +1432,7 @@ void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone unAnn) {
     legacySubscriberNamespaceToReqId_.erase(nsIt);
   }
 
+  incomingClusterAdvertisements_.erase(reqId);
   auto it = publishNamespaceHandles_.find(reqId);
   if (it == publishNamespaceHandles_.end()) {
     XLOG(ERR) << "PublishNamespaceDone for unknown requestID=" << reqId;

@@ -359,8 +359,9 @@ const folly::F14FastSet<FrameType> kAllowedFramesForHopPath = {
     FrameType::PUBLISH_NAMESPACE,
     FrameType::NAMESPACE};
 
-const folly::F14FastSet<FrameType> kAllowedFramesForExcludeHop = {
-    FrameType::SUBSCRIBE_NAMESPACE};
+const folly::F14FastSet<FrameType> kAllowedFramesForRouteCost = {
+    FrameType::PUBLISH_NAMESPACE,
+    FrameType::NAMESPACE};
 
 // Allowlist mapping: TrackRequestParamKey -> set of allowed FrameTypes
 // Empty set means allowed for all frame types
@@ -388,7 +389,7 @@ const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
          kAllowedFramesForTrackNamespacePrefix},
         {TrackRequestParamKey::TRACK_FILTER, kAllowedFramesForTrackFilter},
         {TrackRequestParamKey::HOP_PATH, kAllowedFramesForHopPath},
-        {TrackRequestParamKey::EXCLUDE_HOP, kAllowedFramesForExcludeHop},
+        {TrackRequestParamKey::ROUTE_COST, kAllowedFramesForRouteCost},
 };
 
 // Frame types that allow all parameters (no validation)

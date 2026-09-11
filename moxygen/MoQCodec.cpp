@@ -719,6 +719,10 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
     case FrameType::PUBLISH_NAMESPACE: {
       auto res = moqFrameParser_.parsePublishNamespace(cursor, curFrameLength_);
       if (res) {
+        if (auto requestID = getStreamRequestID();
+            requestID && *requestID != res->requestID) {
+          return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+        }
         setStreamRequestID(res->requestID);
         if (callback_) {
           callback_->onPublishNamespace(std::move(res.value()));

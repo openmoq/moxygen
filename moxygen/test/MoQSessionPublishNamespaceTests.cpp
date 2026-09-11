@@ -226,3 +226,222 @@ CO_TEST_P_X(Draft18Test, PublishNamespaceFailsOnPeerFinWithoutReply) {
   releaseHandler.post();
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+
+namespace {
+class ClusterUpdateHandle : public Subscriber::PublishNamespaceHandle {
+ public:
+  explicit ClusterUpdateHandle(RequestID id)
+      : PublishNamespaceHandle(PublishNamespaceOk{.requestID = id}) {}
+  folly::Expected<folly::Unit, ErrorCode> publishNamespaceUpdate(
+      PublishNamespace ann) override {
+    latest = std::move(ann);
+    received.post();
+    return folly::unit;
+  }
+  void publishNamespaceDone() override {
+    ++withdrawals;
+  }
+  PublishNamespace latest;
+  folly::coro::Baton received;
+  unsigned withdrawals{0};
+};
+} // namespace
+
+CO_TEST_P_X(Draft18Test, ClusterPublishNamespaceUpdatesExistingStream) {
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  std::shared_ptr<ClusterUpdateHandle> incoming;
+  EXPECT_CALL(*serverSubscriber, publishNamespace(_, _))
+      .Times(1)
+      .WillOnce(
+          [&incoming](
+              auto ann,
+              auto) -> folly::coro::Task<Subscriber::PublishNamespaceResult> {
+            incoming = std::make_shared<ClusterUpdateHandle>(ann.requestID);
+            co_return incoming;
+          });
+  EXPECT_CALL(*clientPublisherStatsCallback_, onPublishNamespaceSuccess())
+      .Times(1);
+  EXPECT_CALL(*serverSubscriberStatsCallback_, onPublishNamespaceSuccess())
+      .Times(1);
+  auto ann = getPublishNamespace();
+  ann.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+      *encodeRelayHopPath({42}, GetParam().serverVersion)));
+  auto result = co_await clientSession_->publishNamespace(ann);
+  EXPECT_TRUE(result.hasValue());
+  if (!result.hasValue()) {
+    co_return;
+  }
+  ann.params.insertParam(Parameter(0x40B58, uint64_t{7}));
+  auto updated = (*result)->publishNamespaceUpdate(ann);
+  EXPECT_TRUE(updated.hasValue());
+  if (!updated) {
+    clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+    co_return;
+  }
+  co_await incoming->received;
+  EXPECT_EQ(
+      incoming->latest.requestID, (*result)->publishNamespaceOk().requestID);
+  EXPECT_EQ(incoming->latest.params.getFirstParam(0x40B58)->asUint64, 7);
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(Draft18Test, ClusterRejectsSecondStreamForAdvertisedNamespace) {
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  EXPECT_CALL(*serverSubscriber, publishNamespace(_, _))
+      .WillRepeatedly(
+          [](auto ann,
+             auto) -> folly::coro::Task<Subscriber::PublishNamespaceResult> {
+            co_return makePublishNamespaceOkResult(ann);
+          });
+  EXPECT_CALL(*clientPublisherStatsCallback_, onPublishNamespaceSuccess())
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*serverSubscriberStatsCallback_, onPublishNamespaceSuccess())
+      .Times(testing::AnyNumber());
+  auto ann = getPublishNamespace();
+  ann.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+      *encodeRelayHopPath({42}, GetParam().serverVersion)));
+  auto first = co_await clientSession_->publishNamespace(ann);
+  EXPECT_TRUE(first.hasValue());
+  auto second = co_await clientSession_->publishNamespace(ann);
+  EXPECT_TRUE(second.hasError());
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(Draft18Test, ClusterRejectsIncomingNamespaceOnSecondStream) {
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  EXPECT_CALL(*serverSubscriber, publishNamespace(_, _))
+      .WillRepeatedly(
+          [](auto ann,
+             auto) -> folly::coro::Task<Subscriber::PublishNamespaceResult> {
+            co_return makePublishNamespaceOkResult(ann);
+          });
+  EXPECT_CALL(*serverSubscriberStatsCallback_, onPublishNamespaceSuccess())
+      .Times(testing::AnyNumber());
+  auto ann = getPublishNamespace();
+  ann.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+      *encodeRelayHopPath({42}, GetParam().serverVersion)));
+  MoQFrameWriter writer;
+  writer.initializeVersion(GetParam().serverVersion);
+  for (uint64_t id : {0, 2}) {
+    auto stream = clientWt_->createBidiStream();
+    EXPECT_TRUE(stream.hasValue());
+    if (!stream) {
+      co_return;
+    }
+    ann.requestID = RequestID(id);
+    folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+    EXPECT_TRUE(writer.writePublishNamespace(buf, ann).hasValue());
+    stream->writeHandle->writeStreamData(buf.move(), false, nullptr);
+    for (int i = 0; i < 50; ++i) {
+      co_await folly::coro::co_reschedule_on_current_executor;
+    }
+  }
+  EXPECT_TRUE(serverWt_->isSessionClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(Draft18Test, ClusterQueuesUpdateUntilInitialAcceptance) {
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  folly::coro::Baton started;
+  folly::coro::Baton accept;
+  std::shared_ptr<ClusterUpdateHandle> incoming;
+  EXPECT_CALL(*serverSubscriber, publishNamespace(_, _))
+      .Times(1)
+      .WillOnce(
+          [&](auto ann,
+              auto) -> folly::coro::Task<Subscriber::PublishNamespaceResult> {
+            incoming = std::make_shared<ClusterUpdateHandle>(ann.requestID);
+            started.post();
+            co_await accept;
+            co_return incoming;
+          });
+  EXPECT_CALL(*serverSubscriberStatsCallback_, onPublishNamespaceSuccess())
+      .Times(1);
+  auto stream = clientWt_->createBidiStream();
+  EXPECT_TRUE(stream.hasValue());
+  if (!stream) {
+    co_return;
+  }
+  auto ann = getPublishNamespace();
+  ann.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+      *encodeRelayHopPath({42}, kVersionDraft18)));
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft18);
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  EXPECT_TRUE(writer.writePublishNamespace(buf, ann).hasValue());
+  stream->writeHandle->writeStreamData(buf.move(), false, nullptr);
+  co_await started;
+  ann.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::ROUTE_COST), uint64_t{9}));
+  EXPECT_TRUE(writer.writePublishNamespace(buf, ann).hasValue());
+  stream->writeHandle->writeStreamData(buf.move(), false, nullptr);
+  for (int i = 0; i < 50; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  EXPECT_EQ(incoming->withdrawals, 0);
+  accept.post();
+  co_await incoming->received;
+  EXPECT_EQ(
+      incoming->latest.params.getFirstParam(TrackRequestParamKey::ROUTE_COST)
+          ->asUint64,
+      9);
+  EXPECT_EQ(incoming->withdrawals, 0);
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(Draft18Test, ClusterFinBeforeAcceptanceCannotReviveAdvertisement) {
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  folly::coro::Baton started;
+  folly::coro::Baton accept;
+  std::shared_ptr<ClusterUpdateHandle> incoming;
+  EXPECT_CALL(*serverSubscriber, publishNamespace(_, _))
+      .Times(1)
+      .WillOnce(
+          [&](auto ann,
+              auto) -> folly::coro::Task<Subscriber::PublishNamespaceResult> {
+            incoming = std::make_shared<ClusterUpdateHandle>(ann.requestID);
+            started.post();
+            co_await accept;
+            co_return incoming;
+          });
+  EXPECT_CALL(*serverSubscriberStatsCallback_, onPublishNamespaceSuccess())
+      .Times(0);
+  auto stream = clientWt_->createBidiStream();
+  EXPECT_TRUE(stream.hasValue());
+  if (!stream) {
+    co_return;
+  }
+  auto ann = getPublishNamespace();
+  ann.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+      *encodeRelayHopPath({42}, kVersionDraft18)));
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft18);
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  EXPECT_TRUE(writer.writePublishNamespace(buf, ann).hasValue());
+  stream->writeHandle->writeStreamData(buf.move(), false, nullptr);
+  co_await started;
+  stream->writeHandle->writeStreamData(nullptr, true, nullptr);
+  for (int i = 0; i < 50; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  accept.post();
+  for (int i = 0; i < 50; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  EXPECT_EQ(incoming->withdrawals, 1);
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}

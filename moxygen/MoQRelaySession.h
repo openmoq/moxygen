@@ -267,6 +267,16 @@ class MoQRelaySession : public MoQSession {
   folly::F14FastMap<TrackNamespace, RequestID, TrackNamespace::hash>
       legacySubscribeNamespaceToReqId_;
 
+  struct IncomingClusterAdvertisement {
+    TrackNamespace trackNamespace;
+    std::shared_ptr<ReplyContext> context;
+    std::optional<PublishNamespace> pendingUpdate;
+  };
+  folly::F14FastMap<RequestID, IncomingClusterAdvertisement, RequestID::hash>
+      incomingClusterAdvertisements_;
+  folly::F14FastMap<RequestID, TrackNamespace, RequestID::hash>
+      outgoingClusterAdvertisements_;
+
   // Extended PendingRequestState for publishNamespace support
   class MoQRelayPendingRequestState;
 };

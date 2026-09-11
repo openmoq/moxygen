@@ -63,10 +63,50 @@ INSTANTIATE_TEST_SUITE_P(
 CO_TEST_P_X(RelayHopsNegotiationTest, NegotiatesWhenBothPeersAdvertise) {
   relayHopsSupported_ = true;
   co_await setupMoQSession();
-  EXPECT_TRUE(
-      clientSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
-  EXPECT_TRUE(
-      serverSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
+  const bool supported = getDraftMajorVersion(GetParam().serverVersion) >= 18;
+  EXPECT_EQ(
+      clientSession_->negotiatedSetupExtension(SetupExtension::RelayHops),
+      supported);
+  EXPECT_EQ(
+      serverSession_->negotiatedSetupExtension(SetupExtension::RelayHops),
+      supported);
+}
+
+CO_TEST_P_X(
+    RelayHopsNegotiationTest,
+    ClusterNegotiatesPeerIdentityAndDefaultCost) {
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  const uint64_t expected =
+      getDraftMajorVersion(GetParam().serverVersion) >= 18 ? 42 : 0;
+  EXPECT_EQ(clientSession_->getPeerHopID(), expected);
+  EXPECT_EQ(serverSession_->getPeerHopID(), expected);
+  EXPECT_EQ(clientSession_->getRelayLinkCost(), 1);
+  EXPECT_EQ(serverSession_->getRelayLinkCost(), 1);
+}
+
+CO_TEST_P_X(Draft18Test, ClusterClientOwnsZeroLinkCost) {
+  clientSession_->start();
+  serverSession_->start();
+  moxygen::Setup serverSetup;
+  serverSetup.params.insertParam(SetupParameter(
+      folly::to_underlying(SetupKey::MAX_REQUEST_ID), initialMaxRequestID_));
+  serverSetup.params.insertParam(SetupParameter(
+      folly::to_underlying(SetupKey::RELAY_HOPS),
+      *encodeRelayHopID(23, kVersionDraft18)));
+  serverSession_->sendSetup(std::move(serverSetup));
+  auto clientSetup = getClientSetup(initialMaxRequestID_);
+  clientSetup.params.insertParam(SetupParameter(
+      folly::to_underlying(SetupKey::RELAY_HOPS),
+      *encodeRelayHopID(41, kVersionDraft18)));
+  clientSetup.params.insertParam(
+      SetupParameter(folly::to_underlying(SetupKey::RELAY_COST), uint64_t{0}));
+  co_await clientSession_->setup(std::move(clientSetup));
+  EXPECT_EQ(clientSession_->getPeerHopID(), 23);
+  EXPECT_EQ(serverSession_->getPeerHopID(), 41);
+  EXPECT_EQ(clientSession_->getRelayLinkCost(), 0);
+  EXPECT_EQ(serverSession_->getRelayLinkCost(), 0);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
 CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWithoutAdvertisement) {
@@ -234,7 +274,9 @@ TEST_F(SetupExtensionsTest, NoneIsNeverHeld) {
 }
 
 TEST_F(SetupExtensionsTest, ShippedTableNegotiatesRelayHops) {
-  auto both = params({flag(folly::to_underlying(SetupKey::RELAY_HOPS))});
+  auto both = params({SetupParameter(
+      folly::to_underlying(SetupKey::RELAY_HOPS),
+      *encodeRelayHopID(42, kVersion))});
   auto relayHops =
       MoQSession::computeNegotiatedExtensions(both, both, kVersion);
   EXPECT_TRUE(relayHops.has(SetupExtension::RelayHops));
@@ -245,7 +287,7 @@ TEST_F(SetupExtensionsTest, ShippedTableNegotiatesRelayHops) {
 
   auto draft17 =
       MoQSession::computeNegotiatedExtensions(both, both, kVersionDraft17);
-  EXPECT_TRUE(draft17.has(SetupExtension::RelayHops));
+  EXPECT_FALSE(draft17.has(SetupExtension::RelayHops));
 
   auto draft15 =
       MoQSession::computeNegotiatedExtensions(both, both, kVersionDraft15);
