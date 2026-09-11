@@ -407,7 +407,8 @@ CO_TEST_P_X(V16PlusSubscribeNamespaceTest, ClusterNamespaceStreamOwnership) {
   request.trackNamespacePrefix = TrackNamespace({"cluster"});
   auto first =
       co_await clientSession_->subscribeNamespace(request, firstReceiver);
-  request.trackNamespacePrefix = TrackNamespace({"cluster", "nested"});
+  request.trackNamespacePrefix =
+      TrackNamespace(std::vector<std::string>{"cluster", "nested"});
   auto second =
       co_await clientSession_->subscribeNamespace(request, secondReceiver);
   EXPECT_TRUE(first.hasValue());
@@ -416,7 +417,8 @@ CO_TEST_P_X(V16PlusSubscribeNamespaceTest, ClusterNamespaceStreamOwnership) {
     co_return;
   }
   Namespace outer;
-  outer.trackNamespaceSuffix = TrackNamespace({"nested", "leaf"});
+  outer.trackNamespaceSuffix =
+      TrackNamespace(std::vector<std::string>{"nested", "leaf"});
   outer.params.insertParam(Parameter(
       folly::to_underlying(TrackRequestParamKey::HOP_PATH),
       std::string("\x01", 1)));
@@ -462,7 +464,8 @@ CO_TEST_P_X(V16PlusSubscribeNamespaceTest, ClusterNamespaceStreamOwnership) {
   RequestUpdate update;
   update.params.setMajorVersion(18);
   update.params.insertParam(MoQFrameWriter::encodeTrackNamespacePrefixParam(
-      TrackNamespace({"cluster", "nested"}), GetParam().serverVersion));
+      TrackNamespace(std::vector<std::string>{"cluster", "nested"}),
+      GetParam().serverVersion));
   auto updated = co_await first.value()->requestUpdate(std::move(update));
   EXPECT_TRUE(updated.hasValue());
   firstReceiver->namespaceDoneBaton.reset();
@@ -502,7 +505,8 @@ CO_TEST_P_X(
       firstStream = std::max(firstStream, id);
     }
   }
-  request.trackNamespacePrefix = TrackNamespace({"cluster", "nested"});
+  request.trackNamespacePrefix =
+      TrackNamespace(std::vector<std::string>{"cluster", "nested"});
   auto second = co_await clientSession_->subscribeNamespace(request, receiver);
   uint64_t secondStream = firstStream;
   for (const auto& [id, handle] : serverWt_->writeHandles) {
@@ -512,7 +516,8 @@ CO_TEST_P_X(
   }
   EXPECT_NE(firstStream, secondStream);
   Namespace ns;
-  ns.trackNamespaceSuffix = TrackNamespace({"nested", "leaf"});
+  ns.trackNamespaceSuffix =
+      TrackNamespace(std::vector<std::string>{"nested", "leaf"});
   ns.params.insertParam(Parameter(
       folly::to_underlying(TrackRequestParamKey::HOP_PATH),
       std::string("\x01", 1)));
@@ -566,7 +571,8 @@ CO_TEST_P_X(
     }
   }
   Namespace ns;
-  ns.trackNamespaceSuffix = TrackNamespace({"nested", "leaf"});
+  ns.trackNamespaceSuffix =
+      TrackNamespace(std::vector<std::string>{"nested", "leaf"});
   ns.params.insertParam(Parameter(
       folly::to_underlying(TrackRequestParamKey::HOP_PATH),
       std::string("\x01", 1)));
@@ -626,7 +632,8 @@ CO_TEST_P_X(
       firstStream = std::max(firstStream, id);
     }
   }
-  request.trackNamespacePrefix = TrackNamespace({"cluster", "nested"});
+  request.trackNamespacePrefix =
+      TrackNamespace(std::vector<std::string>{"cluster", "nested"});
   auto second = co_await clientSession_->subscribeNamespace(request, receiver);
   uint64_t secondStream = firstStream;
   for (const auto& [id, handle] : serverWt_->writeHandles) {
@@ -636,7 +643,8 @@ CO_TEST_P_X(
   }
   EXPECT_NE(firstStream, secondStream);
   Namespace ns;
-  ns.trackNamespaceSuffix = TrackNamespace({"nested", "leaf"});
+  ns.trackNamespaceSuffix =
+      TrackNamespace(std::vector<std::string>{"nested", "leaf"});
   ns.params.insertParam(Parameter(
       folly::to_underlying(TrackRequestParamKey::HOP_PATH),
       std::string("\x01", 1)));
@@ -696,7 +704,8 @@ CO_TEST_P_X(
       firstStream = std::max(firstStream, id);
     }
   }
-  request.trackNamespacePrefix = TrackNamespace({"cluster", "nested"});
+  request.trackNamespacePrefix =
+      TrackNamespace(std::vector<std::string>{"cluster", "nested"});
   auto second = co_await clientSession_->subscribeNamespace(request, receiver);
   uint64_t secondStream = firstStream;
   for (const auto& [id, handle] : serverWt_->writeHandles) {
@@ -706,7 +715,8 @@ CO_TEST_P_X(
   }
   EXPECT_NE(firstStream, secondStream);
   Namespace ns;
-  ns.trackNamespaceSuffix = TrackNamespace({"nested", "leaf"});
+  ns.trackNamespaceSuffix =
+      TrackNamespace(std::vector<std::string>{"nested", "leaf"});
   ns.params.insertParam(Parameter(
       folly::to_underlying(TrackRequestParamKey::HOP_PATH),
       std::string("\x01", 1)));
