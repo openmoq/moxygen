@@ -50,6 +50,14 @@ jobs:
           sudo rm -rf "$GITHUB_WORKSPACE/_build" "$GITHUB_WORKSPACE/_install"
           sudo chown -R $(id -u):$(id -g) "$GITHUB_WORKSPACE"
 
+      # Pin ccache to the box's persistent cache; env overrides any ccache.conf
+      # a stray ccache-action run may have left in the runner user's home.
+      - name: Pin ccache location (self-hosted)
+        if: env.USE_LINODE == 'true'
+        run: |
+          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=25G" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
