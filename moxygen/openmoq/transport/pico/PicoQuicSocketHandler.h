@@ -42,9 +42,10 @@ class PicoQuicSocketHandler
 
   /**
    * Bind the socket to addr, set socket options, and begin receiving.
-   * Must be called from the EventBase thread.
+   * Must be called from the EventBase thread. reusePort sets SO_REUSEPORT
+   * so multiple sockets can share addr for sharded deployments.
    */
-  void start(const folly::SocketAddress& addr);
+  void start(const folly::SocketAddress& addr, bool reusePort = false);
 
   /**
    * Cancel the wake timer, pause reads, and unbind from the EventBase.

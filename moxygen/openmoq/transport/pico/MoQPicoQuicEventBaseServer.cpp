@@ -25,7 +25,8 @@ MoQPicoQuicEventBaseServer::MoQPicoQuicEventBaseServer(
     folly::Executor::KeepAlive<folly::EventBase> evb,
     std::string versions,
     PicoTransportConfig transportConfig,
-    PicoWebTransportConfig wtConfig)
+    PicoWebTransportConfig wtConfig,
+    bool reusePort)
     : MoQPicoServerBase(
           std::move(cert),
           std::move(key),
@@ -34,7 +35,8 @@ MoQPicoQuicEventBaseServer::MoQPicoQuicEventBaseServer(
           std::move(transportConfig),
           std::move(wtConfig)),
       impl_(std::make_unique<Impl>()),
-      evb_(std::move(evb)) {}
+      evb_(std::move(evb)),
+      reusePort_(reusePort) {}
 
 MoQPicoQuicEventBaseServer::~MoQPicoQuicEventBaseServer() {
   stop();
@@ -60,7 +62,11 @@ void MoQPicoQuicEventBaseServer::start(const folly::SocketAddress& addr) {
   if (auto* cb = statsCallbackRaw()) {
     impl_->handler->setStatsCallback(cb);
   }
-  impl_->handler->start(addr);
+  impl_->handler->start(addr, reusePort_);
+}
+
+folly::SocketAddress MoQPicoQuicEventBaseServer::getBoundAddress() const {
+  return impl_->handler->boundAddress();
 }
 
 void MoQPicoQuicEventBaseServer::onWebTransportCreated(

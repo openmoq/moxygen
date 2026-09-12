@@ -43,7 +43,8 @@ class MoQPicoQuicEventBaseServer : public MoQPicoServerBase {
       folly::Executor::KeepAlive<folly::EventBase> evb,
       std::string versions = "",
       PicoTransportConfig transportConfig = {},
-      PicoWebTransportConfig wtConfig = {});
+      PicoWebTransportConfig wtConfig = {},
+      bool reusePort = false);
 
   MoQPicoQuicEventBaseServer(const MoQPicoQuicEventBaseServer&) = delete;
   MoQPicoQuicEventBaseServer(MoQPicoQuicEventBaseServer&&) = delete;
@@ -64,6 +65,11 @@ class MoQPicoQuicEventBaseServer : public MoQPicoServerBase {
    */
   void stop() override;
 
+  /**
+   * The local address the socket is bound to. Valid only after start().
+   */
+  folly::SocketAddress getBoundAddress() const;
+
  protected:
   void onWebTransportCreated(PicoWebTransportBase& wt) noexcept override;
 
@@ -72,6 +78,7 @@ class MoQPicoQuicEventBaseServer : public MoQPicoServerBase {
   std::unique_ptr<Impl> impl_;
 
   folly::Executor::KeepAlive<folly::EventBase> evb_;
+  bool reusePort_;
 };
 
 } // namespace moxygen

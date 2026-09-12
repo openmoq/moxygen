@@ -556,6 +556,13 @@ if(BUILD_PICOQUIC)
     set(_SAVED_BUILD_TESTING ${BUILD_TESTING})
     set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
     set(PICOQUIC_FETCH_PTLS ON CACHE BOOL "Build picotls from source" FORCE)
+    if(MOXYGEN_SANITIZER OR CMAKE_BUILD_TYPE STREQUAL "Debug")
+        # Aborts if a picoquic_quic_t is touched from a thread other than the
+        # one that created it — the invariant sharded (SO_REUSEPORT) servers
+        # depend on. moxygen's own call site must also define
+        # PICOQUIC_WITH_THREAD_CHECK; see openmoq/transport/pico/CMakeLists.txt.
+        set(WITH_THREAD_CHECK ON CACHE BOOL "" FORCE)
+    endif()
 
     FetchContent_GetProperties(picoquic)
     if(NOT picoquic_POPULATED)

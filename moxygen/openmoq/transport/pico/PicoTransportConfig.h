@@ -50,6 +50,11 @@ struct PicoTransportConfig {
   uint8_t defaultStreamPriority{2};   // default stream priority
   uint8_t defaultDatagramPriority{1}; // default datagram priority
   std::string ccAlgo{"bbr"};          // congestion control algorithm name
+
+  // Required when sharding contexts across a shared SO_REUSEPORT port:
+  // the kernel's 4-tuple hash can route a migrated connection's packets
+  // to a shard that has never seen its connection ID.
+  bool disableMigration{false};
 };
 
 } // namespace moxygen
