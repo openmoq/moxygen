@@ -77,17 +77,11 @@ PicoQuicSocketHandler::~PicoQuicSocketHandler() {
 void PicoQuicSocketHandler::start(const folly::SocketAddress& addr) {
   XLOG(DBG1) << "PicoQuicSocketHandler::start called, addr=" << addr.describe();
 
-  if (addr.getFamily() == AF_INET6) {
-    // Enable dual-stack (accept both IPv4 and IPv6) by setting IPV6_V6ONLY=0
-    // before bind. AsyncUDPSocket supports this via init() +
-    // applyOptions(PRE_BIND).
-    socket_.init(addr.getFamily());
-    socket_.applyOptions(
-        {{folly::SocketOptionKey{IPPROTO_IPV6, IPV6_V6ONLY}, 0}},
-        folly::SocketOptionKey::ApplyPos::PRE_BIND);
-    XLOG(DBG3) << "Dual-stack enabled (IPV6_V6ONLY=0)";
-  }
-  socket_.bind(addr);
+  // bindV6Only defaults to true, which leaves a "::" listener unreachable from
+  // IPv4 peers. Only init() applies it, so it must ride on the bind call.
+  folly::AsyncUDPSocket::BindOptions bindOptions;
+  bindOptions.bindV6Only = false;
+  socket_.bind(addr, bindOptions);
   fd_ = socket_.getNetworkSocket().toFd();
   socketFamily_ = addr.getFamily();
   localPort_ = socket_.address().getPort();
