@@ -99,7 +99,10 @@ class MoQPicoQuicShardedServer : public MoQServerBase {
 
   std::vector<folly::EventBase*> workerEvbs_;
   std::vector<std::unique_ptr<folly::ScopedEventBaseThread>> ownedWorkers_;
-  std::vector<std::unique_ptr<ShardServer>> shards_;
+  // shared_ptr: handleClientSession's shared_from_this() keep-alive silently
+  // no-ops for a unique_ptr-owned server, letting stop() free a shard out
+  // from under a still-running session coroutine.
+  std::vector<std::shared_ptr<ShardServer>> shards_;
   folly::SocketAddress boundAddr_;
   bool started_{false};
   bool stopped_{false};

@@ -118,7 +118,7 @@ void MoQPicoQuicShardedServer::start(
 
   shards_.reserve(workerEvbs_.size());
   for (auto* workerEvb : workerEvbs_) {
-    auto shard = std::make_unique<ShardServer>(
+    auto shard = std::make_shared<ShardServer>(
         this,
         cert_,
         key_,
@@ -156,9 +156,16 @@ void MoQPicoQuicShardedServer::stop() {
   }
   stopped_ = true;
 
+  // Drop our reference on the shard's own EventBase thread, not just stop()
+  // it there: a lingering session may still hold its own shared_ptr, but if
+  // this is the last one, ~MoQPicoServerBase drops statsCallback_ — and that
+  // thread's loop is still running, so freeing it elsewhere races a
+  // concurrent stats sample against the shard's own thread.
   for (size_t i = 0; i < shards_.size(); ++i) {
-    workerEvbs_[i]->runImmediatelyOrRunInEventBaseThreadAndWait(
-        [&] { shards_[i]->stop(); });
+    workerEvbs_[i]->runImmediatelyOrRunInEventBaseThreadAndWait([&] {
+      shards_[i]->stop();
+      shards_[i].reset();
+    });
   }
   shards_.clear();
   ownedWorkers_.clear();
