@@ -182,10 +182,8 @@ void PicoQuicSocketHandler::start(
   // ECN receive (sets IP_RECVTOS + IPV6_RECVTCLASS).
   socket_.setRecvTos(true);
 
-  // GRO if available.
-  if (socket_.getGRO() >= 0) {
-    socket_.setGRO(true);
-  }
+  // No GRO: splitting a coalesced read needs the UDP_GRO cmsg and a buffer per
+  // train, and the receive path has stack buffers sized for one datagram.
 
   // GSO availability.
   gsoSupported_ = (socket_.getGSO() >= 0);
