@@ -111,6 +111,7 @@ PicoQuicSocketHandler::PicoQuicSocketHandler(
   // A batch with no slot to fill or no packet to pull never drains.
   XCHECK_GE(config_.maxMsgsPerBatch, 1u);
   XCHECK_GE(config_.maxPacketsPerDrain, 1u);
+  XCHECK_GE(config_.maxPacketsPerRead, 1u);
   XCHECK_GE(config_.maxSegmentsPerMsg, 1u);
   // One prepare call's worth of headroom past the byte budget, so the last
   // packet of a batch always has somewhere to land.
@@ -277,6 +278,11 @@ void PicoQuicSocketHandler::onNotifyDataAvailable(
       msgs[i].msg_hdr.msg_controllen = kCmsgBufSize;
       msgs[i].msg_hdr.msg_flags = 0;
       msgs[i].msg_len = 0;
+    }
+
+    // Level-triggered: what is left wakes us again after the send path runs.
+    if (totalReceived >= static_cast<int>(config_.maxPacketsPerRead)) {
+      break;
     }
   }
 

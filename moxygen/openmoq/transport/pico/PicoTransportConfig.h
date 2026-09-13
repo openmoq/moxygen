@@ -56,6 +56,11 @@ struct PicoSocketConfig {
   // A drain checks this between batches, so one batch may overshoot it.
   size_t maxPacketsPerDrain{64};
 
+  // Packets taken from the socket per readable notification, the receive-side
+  // mirror of maxPacketsPerDrain. Checked between recvmmsg calls, so one call
+  // may overshoot it.
+  size_t maxPacketsPerRead{64};
+
   // SO_SNDBUF/SO_RCVBUF for the shared socket, matching MoQServer's default.
   // The kernel clamps this to wmem_max/rmem_max, which is often far lower.
   int socketBufferBytes{1024 * 1024};
