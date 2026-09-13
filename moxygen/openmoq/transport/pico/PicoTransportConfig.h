@@ -27,6 +27,41 @@ struct PicoWebTransportConfig {
 };
 
 /**
+ * UDP send-path tuning for PicoQuicSocketHandler.
+ *
+ * These bound one sendmmsg batch and one drain pass. Raising them trades
+ * responsiveness for fewer syscalls: a batch is only flushed once it fills or
+ * picoquic runs dry, and the EventBase loop is not serviced until the drain
+ * yields. The defaults are far above picoquic's own sockloop, which sends at
+ * most PICOQUIC_PACKET_LOOP_SEND_MAX (10) packets per call; lower them to sit
+ * closer to it.
+ */
+struct PicoSocketConfig {
+  // mmsghdr slots per sendmmsg call, and the packet bytes one batch may hold.
+  // The arena is allocated with a further packet train's worth of headroom, so
+  // a batch always has room for one more prepare call.
+  size_t maxMsgsPerBatch{32};
+  size_t maxBatchBytes{64 * 1024};
+
+  // Ceiling on one GSO run. The kernel caps a GSO datagram at 64KB of payload
+  // and at UDP_MAX_SEGMENTS segments; these stay well inside both.
+  size_t maxSegmentsPerMsg{32};
+  size_t maxGsoRunBytes{45000};
+
+  // Packets pulled from picoquic per drainOutgoing call, which bounds how long
+  // one drain may starve the other handlers: on hitting it the drain returns
+  // and reschedules through the loop rather than pulling further. Not a
+  // per-loop-iteration ceiling — a readable socket, an expired wake timer and
+  // EPOLLOUT each drain separately, so one iteration may run several.
+  // A drain checks this between batches, so one batch may overshoot it.
+  size_t maxPacketsPerDrain{64};
+
+  // SO_SNDBUF/SO_RCVBUF for the shared socket, matching MoQServer's default.
+  // The kernel clamps this to wmem_max/rmem_max, which is often far lower.
+  int socketBufferBytes{1024 * 1024};
+};
+
+/**
  * QUIC transport parameter configuration for picoquic.
  *
  * Used by both server (MoQPicoServerBase) and client contexts to configure
@@ -61,6 +96,10 @@ struct PicoTransportConfig {
   // the kernel's 4-tuple hash can route a migrated connection's packets
   // to a shard that has never seen its connection ID.
   bool disableMigration{false};
+
+  // UDP send-path tuning, applied to the socket handler rather than to the
+  // picoquic context.
+  PicoSocketConfig socket{};
 };
 
 } // namespace moxygen
