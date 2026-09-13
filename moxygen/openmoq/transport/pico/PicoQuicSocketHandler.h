@@ -8,6 +8,7 @@
 
 #include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/AsyncUDPSocket.h>
+#include <folly/io/async/STTimerFDTimeoutManager.h>
 #include <moxygen/openmoq/transport/pico/PicoQuicStatsCallback.h>
 
 // Forward declaration — avoids picoquic.h in this header
@@ -29,12 +30,11 @@ namespace moxygen {
  * Outgoing packets are sent via ::sendmsg with IP_PKTINFO for per-packet
  * source address control and UDP_SEGMENT for GSO coalescing.
  *
- * The picoquic wake timer uses AsyncTimeout::scheduleTimeoutHighRes
- * driven by picoquic_get_next_wake_delay.
+ * The wake timer runs on a timerfd-backed manager because EventBase's
+ * scheduleTimeoutHighRes() ceils to whole ms, too coarse for picoquic pacing.
  */
 class PicoQuicSocketHandler
     : public folly::AsyncUDPSocket::ReadCallback,
-      public folly::AsyncTimeout,
       public folly::AsyncUDPSocket::ErrMessageCallback {
  public:
   PicoQuicSocketHandler(folly::EventBase* evb, picoquic_quic_t* quic);
@@ -98,8 +98,8 @@ class PicoQuicSocketHandler
   void onReadError(const folly::AsyncSocketException& ex) noexcept override;
   void onReadClosed() noexcept override;
 
-  // AsyncTimeout
-  void timeoutExpired() noexcept override;
+  // Wake timer
+  void onWakeTimeout() noexcept;
 
   // AsyncUDPSocket::ErrMessageCallback
   void errMessage(const cmsghdr& cmsg) noexcept override;
@@ -119,6 +119,20 @@ class PicoQuicSocketHandler
                   size_t sendMsgSize);
   void rescheduleTimer();
 
+  // Nested rather than inherited: an AsyncTimeout base would have to bind to
+  // wakeTimeoutManager_ before that member finishes constructing.
+  class WakeTimeout : public folly::AsyncTimeout {
+   public:
+    WakeTimeout(folly::TimeoutManager* mgr, PicoQuicSocketHandler* handler)
+        : folly::AsyncTimeout(mgr), handler_(handler) {}
+    void timeoutExpired() noexcept override {
+      handler_->onWakeTimeout();
+    }
+
+   private:
+    PicoQuicSocketHandler* handler_;
+  };
+
   folly::AsyncUDPSocket socket_;
   picoquic_quic_t* quic_; // non-owning
   folly::EventBase* evb_; // non-owning
@@ -127,6 +141,9 @@ class PicoQuicSocketHandler
   int socketFamily_{AF_UNSPEC}; // AF_INET or AF_INET6, set in start()
   bool gsoSupported_{false};
   uint16_t localPort_{0}; // actual bound port, for addrTo in parseCmsgsAndDeliver
+  // Order matters: the manager must construct before wakeTimeout_ binds to it.
+  folly::STTimerFDTimeoutManager wakeTimeoutManager_;
+  WakeTimeout wakeTimeout_;
 };
 
 } // namespace moxygen

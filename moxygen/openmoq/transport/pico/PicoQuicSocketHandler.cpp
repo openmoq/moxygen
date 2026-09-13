@@ -68,7 +68,11 @@ sockaddr_storage toMappedV6(const sockaddr_storage& in) {
 PicoQuicSocketHandler::PicoQuicSocketHandler(
     folly::EventBase* evb,
     picoquic_quic_t* quic)
-    : folly::AsyncTimeout(evb), socket_(evb), quic_(quic), evb_(evb) {}
+    : socket_(evb),
+      quic_(quic),
+      evb_(evb),
+      wakeTimeoutManager_(evb),
+      wakeTimeout_(&wakeTimeoutManager_, this) {}
 
 PicoQuicSocketHandler::~PicoQuicSocketHandler() {
   stop();
@@ -132,7 +136,7 @@ void PicoQuicSocketHandler::stop() {
     return;
   }
   stopped_ = true;
-  cancelTimeout();
+  wakeTimeout_.cancelTimeout();
   drainOutgoing();
   pauseRead();
 }
@@ -238,10 +242,10 @@ void PicoQuicSocketHandler::onReadClosed() noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// AsyncTimeout — picoquic wake timer
+// Wake timer — picoquic's next wake delay
 // ---------------------------------------------------------------------------
 
-void PicoQuicSocketHandler::timeoutExpired() noexcept {
+void PicoQuicSocketHandler::onWakeTimeout() noexcept {
   drainOutgoing();
   if (pendingClose_) {
     stop();
@@ -494,7 +498,7 @@ void PicoQuicSocketHandler::updateWakeTimeout() {
   // reschedule: rescheduleTimer will call evb_->add() for delay<=0, which is
   // effectively immediate since the EVB passes 0 to epoll when tasks are
   // pending.
-  cancelTimeout();
+  wakeTimeout_.cancelTimeout();
   rescheduleTimer();
 }
 
@@ -508,7 +512,8 @@ void PicoQuicSocketHandler::rescheduleTimer() {
       rescheduleTimer();
     });
   } else {
-    scheduleTimeoutHighRes(std::chrono::microseconds(delayUs));
+    // Honors microsecond delays; the EventBase's own version ceils to ms.
+    wakeTimeout_.scheduleTimeoutHighRes(std::chrono::microseconds(delayUs));
   }
 }
 
