@@ -50,6 +50,7 @@ struct PicoTransportConfig {
   uint8_t defaultStreamPriority{2};   // default stream priority
   uint8_t defaultDatagramPriority{1}; // default datagram priority
   std::string ccAlgo{"bbr"};          // congestion control algorithm name
+  uint32_t mtuMax{1500};              // EMSGSIZE if above real link MTU
 };
 
 } // namespace moxygen
