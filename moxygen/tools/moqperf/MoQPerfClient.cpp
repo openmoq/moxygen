@@ -92,12 +92,19 @@ MoQPerfClient::MoQPerfClient(
       transactionTimeout_(transactionTimeout) {}
 
 folly::coro::Task<void> MoQPerfClient::connect() {
+  // Debugging aid for openmoq/moqx#347: advertise near-unbounded flow
+  // control so the relay's egress never sees real backpressure, isolating
+  // whether a run's throughput collapse is FC-related.
+  quic::TransportSettings ts;
+  constexpr uint64_t kHugeWindow = 1ull << 30; // 1 GiB
+  ts.advertisedInitialConnectionFlowControlWindow = kHugeWindow;
+  ts.advertisedInitialBidiLocalStreamFlowControlWindow = kHugeWindow;
+  ts.advertisedInitialBidiRemoteStreamFlowControlWindow = kHugeWindow;
+  ts.advertisedInitialUniStreamFlowControlWindow = kHugeWindow;
+  ts.advertisedInitialMaxStreamsBidi = 1ull << 20;
+  ts.advertisedInitialMaxStreamsUni = 1ull << 20;
   return moqClient_.setupMoQSession(
-      connectTimeout_,
-      transactionTimeout_,
-      nullptr,
-      shared_from_this(),
-      quic::TransportSettings());
+      connectTimeout_, transactionTimeout_, nullptr, shared_from_this(), ts);
 }
 
 folly::coro::Task<MoQSession::SubscribeResult> MoQPerfClient::subscribe(
