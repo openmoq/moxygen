@@ -7,6 +7,7 @@
 #include "moxygen/openmoq/transport/pico/MoQPicoQuicEventBaseClient.h"
 #include <folly/String.h>
 #include <folly/logging/xlog.h>
+#include <gflags/gflags.h>
 #include <moxygen/MoQFramer.h>
 #include <moxygen/MoQSession.h>
 #include <moxygen/MoQVersions.h>
@@ -15,6 +16,11 @@
 #include <moxygen/openmoq/transport/pico/PicoQuicSocketHandler.h>
 #include <picoquic.h>
 #include <picoquic_bbr.h>
+
+DEFINE_int32(
+    pico_mtu_max,
+    1500,
+    "Real L2 MTU of the sending interface (see PicoTransportConfig::mtuMax)");
 
 namespace moxygen {
 
@@ -148,6 +154,7 @@ void MoQPicoQuicEventBaseClient::connect(const folly::SocketAddress& addr,
 
   picoquic_set_default_congestion_algorithm(impl_->quic,
                                             picoquic_bbr_algorithm);
+  picoquic_set_mtu_max(impl_->quic, FLAGS_pico_mtu_max);
 
   // Initiate the outgoing connection before starting the socket handler so
   // that the initial rescheduleTimer() call in start() sees the connection
