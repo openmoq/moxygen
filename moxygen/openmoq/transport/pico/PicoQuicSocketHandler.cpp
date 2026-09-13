@@ -506,6 +506,11 @@ void PicoQuicSocketHandler::updateWakeTimeout() {
 }
 
 void PicoQuicSocketHandler::rescheduleTimer() {
+  if (stopped_) {
+    // updateWakeTimeout() can still arrive from a WebTransport tearing down
+    // inside picoquic_free, where quic_ is already going away.
+    return;
+  }
   uint64_t now = picoquic_current_time();
   int64_t rawDelayUs = picoquic_get_next_wake_delay(quic_, now, INT64_MAX);
   int64_t delayUs = std::min(rawDelayUs, kMaxWakeDelayUs);
