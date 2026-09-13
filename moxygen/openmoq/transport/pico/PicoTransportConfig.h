@@ -51,6 +51,12 @@ struct PicoTransportConfig {
   uint8_t defaultDatagramPriority{1}; // default datagram priority
   std::string ccAlgo{"bbr"};          // congestion control algorithm name
 
+  // Real L2 MTU of the sending interface, passed to picoquic_set_mtu_max().
+  // Unset, picoquic's PMTU discovery probes UDP payload sizes up to 1500
+  // without reserving room for the IP/UDP header, so a standard 1500-MTU
+  // link rejects every such packet with EMSGSIZE (invisible on loopback).
+  uint32_t mtuMax{1500};
+
   // Required when sharding contexts across a shared SO_REUSEPORT port:
   // the kernel's 4-tuple hash can route a migrated connection's packets
   // to a shard that has never seen its connection ID.

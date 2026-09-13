@@ -353,6 +353,7 @@ bool MoQPicoServerBase::createQuicContext() {
 
   picoquic_set_alpn_select_fn_v2(quic_, alpnSelectCallback);
   picoquic_set_cookie_mode(quic_, 2);
+  picoquic_set_mtu_max(quic_, transportConfig_.mtuMax);
   if (picoquic_get_congestion_algorithm(transportConfig_.ccAlgo.c_str()) ==
       nullptr) {
     XLOG(WARN) << "Unknown congestion control algorithm '"

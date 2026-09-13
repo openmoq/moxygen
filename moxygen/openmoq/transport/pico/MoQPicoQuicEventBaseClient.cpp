@@ -148,6 +148,9 @@ void MoQPicoQuicEventBaseClient::connect(const folly::SocketAddress& addr,
 
   picoquic_set_default_congestion_algorithm(impl_->quic,
                                             picoquic_bbr_algorithm);
+  // See PicoTransportConfig::mtuMax: without this, PMTU discovery probes
+  // UDP payload sizes that overflow a real 1500-MTU link and get EMSGSIZE'd.
+  picoquic_set_mtu_max(impl_->quic, 1500);
 
   // Initiate the outgoing connection before starting the socket handler so
   // that the initial rescheduleTimer() call in start() sees the connection
