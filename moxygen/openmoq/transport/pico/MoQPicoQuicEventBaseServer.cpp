@@ -65,6 +65,8 @@ void MoQPicoQuicEventBaseServer::start(const folly::SocketAddress& addr) {
 
 void MoQPicoQuicEventBaseServer::onWebTransportCreated(
     PicoWebTransportBase& wt) noexcept {
+  // Raw capture: stop() holds the handler alive across picoquic_free, and
+  // rescheduleTimer() no-ops once stopped.
   wt.setUpdateWakeTimeoutCallback(
       [handler = impl_->handler.get()] { handler->updateWakeTimeout(); });
 }
@@ -77,11 +79,15 @@ void MoQPicoQuicEventBaseServer::stop() {
   XLOG(INFO) << "Stopping MoQPicoQuicEventBaseServer";
 
   if (impl_->handler) {
+    // Stop I/O before freeing quic. stopped_ flag makes this idempotent so
+    // ~PicoQuicSocketHandler won't re-enter drainOutgoing() on freed memory.
     impl_->handler->stop();
-    impl_->handler.reset();
   }
-
+  // Free quic before resetting the handler: close callbacks fired from inside
+  // picoquic_free() still use the raw pointer onWebTransportCreated captured.
   destroyQuicContext();
+  impl_->handler.reset();
+
   executor_.reset();
   evb_ = {}; // release KeepAlive so EVB destructor doesn't spin
 
