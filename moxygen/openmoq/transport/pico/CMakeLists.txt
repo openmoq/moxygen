@@ -66,6 +66,11 @@ moxygen_add_library(openmoq_pico_server_base
     moxygen_events_moq_executor
     Folly::folly_function
 )
+if(WITH_THREAD_CHECK)
+  # picoquic defines PICOQUIC_WITH_THREAD_CHECK PRIVATE to its own targets, so
+  # define it here too or picoquic_internal.h hides the thread-check setter.
+  target_compile_definitions(openmoq_pico_server_base PRIVATE PICOQUIC_WITH_THREAD_CHECK)
+endif()
 
 # HTTP/3 WebTransport adapter for picoquic (h3 ALPN, browser clients).
 # Depends on picohttp/h3zero; linked separately to avoid exporting picohttp
@@ -110,6 +115,16 @@ moxygen_add_library(openmoq_pico_evb_server_transport
     openmoq_pico_evb_base
     openmoq_pico_server_base
     moxygen_events_moq_folly_executor_impl
+)
+
+# Sharded EventBase server: N independent picoquic contexts, one per
+# EventBase, bound to the same address via SO_REUSEPORT.
+moxygen_add_library(openmoq_pico_evb_sharded_server_transport
+  SRCS
+    MoQPicoQuicShardedServer.cpp
+  EXPORTED_DEPS
+    openmoq_pico_evb_server_transport
+    Folly::folly_io_async_scoped_event_base_thread
 )
 
 # EventBase client: outgoing QUIC connection + MoQ session on a folly::EventBase.

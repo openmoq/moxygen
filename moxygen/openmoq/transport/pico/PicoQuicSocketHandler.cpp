@@ -74,8 +74,14 @@ PicoQuicSocketHandler::~PicoQuicSocketHandler() {
   stop();
 }
 
-void PicoQuicSocketHandler::start(const folly::SocketAddress& addr) {
+void PicoQuicSocketHandler::start(
+    const folly::SocketAddress& addr,
+    bool reusePort) {
   XLOG(DBG1) << "PicoQuicSocketHandler::start called, addr=" << addr.describe();
+
+  // Must precede init()/bind() below — AsyncUDPSocket applies it at fd
+  // creation time.
+  socket_.setReusePort(reusePort);
 
   if (addr.getFamily() == AF_INET6) {
     // Enable dual-stack (accept both IPv4 and IPv6) by setting IPV6_V6ONLY=0

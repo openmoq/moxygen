@@ -556,6 +556,11 @@ if(BUILD_PICOQUIC)
     set(_SAVED_BUILD_TESTING ${BUILD_TESTING})
     set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
     set(PICOQUIC_FETCH_PTLS ON CACHE BOOL "Build picotls from source" FORCE)
+    if(MOXYGEN_SANITIZER OR CMAKE_BUILD_TYPE STREQUAL "Debug")
+        # Sharded servers rely on each picoquic_quic_t being touched only by
+        # its own thread; this aborts on the first violation.
+        set(WITH_THREAD_CHECK ON CACHE BOOL "" FORCE)
+    endif()
 
     FetchContent_GetProperties(picoquic)
     if(NOT picoquic_POPULATED)
