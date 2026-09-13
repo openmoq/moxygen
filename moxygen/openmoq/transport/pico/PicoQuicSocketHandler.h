@@ -8,6 +8,7 @@
 
 #include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/AsyncUDPSocket.h>
+#include <folly/io/async/STTimerFDTimeoutManager.h>
 #include <moxygen/openmoq/transport/pico/PicoQuicStatsCallback.h>
 
 // Forward declaration — avoids picoquic.h in this header
@@ -29,12 +30,15 @@ namespace moxygen {
  * Outgoing packets are sent via ::sendmsg with IP_PKTINFO for per-packet
  * source address control and UDP_SEGMENT for GSO coalescing.
  *
- * The picoquic wake timer uses AsyncTimeout::scheduleTimeoutHighRes
- * driven by picoquic_get_next_wake_delay.
+ * The picoquic wake timer is driven by picoquic_get_next_wake_delay and
+ * scheduled on a dedicated timerfd-backed manager (STTimerFDTimeoutManager)
+ * rather than the owning EventBase directly: EventBase's own
+ * scheduleTimeoutHighRes() silently ceils to whole milliseconds (see
+ * TimeoutManager::scheduleTimeoutHighRes), which is too coarse for
+ * picoquic's microsecond-scale pacing and causes send bursts.
  */
 class PicoQuicSocketHandler
     : public folly::AsyncUDPSocket::ReadCallback,
-      public folly::AsyncTimeout,
       public folly::AsyncUDPSocket::ErrMessageCallback {
  public:
   PicoQuicSocketHandler(folly::EventBase* evb, picoquic_quic_t* quic);
@@ -99,8 +103,8 @@ class PicoQuicSocketHandler
   void onReadError(const folly::AsyncSocketException& ex) noexcept override;
   void onReadClosed() noexcept override;
 
-  // AsyncTimeout
-  void timeoutExpired() noexcept override;
+  // Wake timer, fired by wakeTimeout_ via the timerfd-backed manager.
+  void onWakeTimeout() noexcept;
 
   // AsyncUDPSocket::ErrMessageCallback
   void errMessage(const cmsghdr& cmsg) noexcept override;
@@ -120,6 +124,21 @@ class PicoQuicSocketHandler
                   size_t sendMsgSize);
   void rescheduleTimer();
 
+  // Fires onWakeTimeout() on the handler; declared as a nested class so the
+  // handler itself need not inherit AsyncTimeout (which would force it to
+  // bind to wakeTimeoutManager_ before that member finishes constructing).
+  class WakeTimeout : public folly::AsyncTimeout {
+   public:
+    WakeTimeout(folly::TimeoutManager* mgr, PicoQuicSocketHandler* handler)
+        : folly::AsyncTimeout(mgr), handler_(handler) {}
+    void timeoutExpired() noexcept override {
+      handler_->onWakeTimeout();
+    }
+
+   private:
+    PicoQuicSocketHandler* handler_;
+  };
+
   folly::AsyncUDPSocket socket_;
   picoquic_quic_t* quic_; // non-owning
   folly::EventBase* evb_; // non-owning
@@ -128,6 +147,10 @@ class PicoQuicSocketHandler
   int socketFamily_{AF_UNSPEC}; // AF_INET or AF_INET6, set in start()
   bool gsoSupported_{false};
   uint16_t localPort_{0}; // actual bound port, for addrTo in parseCmsgsAndDeliver
+  // Declaration order matters: wakeTimeoutManager_ must construct (and
+  // register its timerfd) before wakeTimeout_ attaches to it.
+  folly::STTimerFDTimeoutManager wakeTimeoutManager_;
+  WakeTimeout wakeTimeout_;
 };
 
 } // namespace moxygen
