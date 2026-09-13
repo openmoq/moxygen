@@ -1468,6 +1468,33 @@ TEST(MoQCodecTest, BidiCodecRejectsDuplicateRequestOnSameStreamV18) {
   bidiCodec.onIngress(buf.move(), false);
 }
 
+TEST(MoQCodecTest, ClusterAdvertisementUpdatesPreserveStreamRequestID) {
+  for (bool changeID : {false, true}) {
+    MoQFrameWriter writer;
+    SetupExtensions extensions;
+    extensions.add(SetupExtension::RelayHops);
+    writer.initializeVersion(kVersionDraft18, extensions);
+    folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+    PublishNamespace ann{RequestID(0), TrackNamespace({"test"})};
+    ann.params.insertParam(Parameter(
+        folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+        *encodeRelayHopPath({42}, kVersionDraft18)));
+    ASSERT_TRUE(writer.writePublishNamespace(buf, ann).hasValue());
+    if (changeID) {
+      ann.requestID = RequestID(2);
+    }
+    ASSERT_TRUE(writer.writePublishNamespace(buf, ann).hasValue());
+    testing::NiceMock<MockMoQCodecCallback> callback;
+    MoQBidiStreamCodec codec(&callback, {FrameType::PUBLISH_NAMESPACE});
+    codec.initializeVersion(kVersionDraft18, extensions);
+    EXPECT_CALL(callback, onPublishNamespace(testing::_))
+        .Times(changeID ? 1 : 2);
+    EXPECT_CALL(callback, onConnectionError(ErrorCode::PROTOCOL_VIOLATION))
+        .Times(changeID ? 1 : 0);
+    codec.onIngress(buf.move(), false);
+  }
+}
+
 TEST(MoQCodecTest, BidiCodecSetsExistingRequestIdOnRequestUpdateV18) {
   MoQFrameWriter writer;
   writer.initializeVersion(kVersionDraft18);

@@ -65,7 +65,7 @@ ParamValueEncoding paramEncodingV18(uint64_t key) {
     case K::FILL_TIMEOUT:
     case K::EXPIRES:
     case K::NEW_GROUP_REQUEST:
-    case K::EXCLUDE_HOP:
+    case K::ROUTE_COST:
     // PUBLISHER_PRIORITY is extensions-only in v16+; parsed as varint so the
     // caller's allowlist check can reject it cleanly.
     case K::PUBLISHER_PRIORITY:
@@ -535,7 +535,11 @@ folly::Expected<std::string, ErrorCode> encodeRelayHopPath(
   writer.initializeVersion(version);
   size_t size = 0;
   bool error = false;
+  folly::F14FastSet<uint64_t> seen;
   for (const auto hop : hopPath) {
+    if (hop != 0 && !seen.insert(hop).second) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
     writer.writeVarint(encoded, hop, size, error);
     if (error) {
       return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
@@ -555,6 +559,7 @@ folly::Expected<std::vector<uint64_t>, ErrorCode> decodeRelayHopPath(
   folly::io::Cursor cursor(buffer.get());
   size_t remaining = encoded.size();
   std::vector<uint64_t> hopPath;
+  folly::F14FastSet<uint64_t> seen;
   while (remaining > 0) {
     const auto decoded = getDraftMajorVersion(version) >= 17
         ? decodeMoQVarint(cursor, remaining)
@@ -562,11 +567,51 @@ folly::Expected<std::vector<uint64_t>, ErrorCode> decodeRelayHopPath(
     if (!decoded) {
       return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
+    if (decoded->first != 0 && !seen.insert(decoded->first).second) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
     hopPath.push_back(decoded->first);
     remaining -= decoded->second;
   }
   return hopPath;
 }
+
+folly::Expected<std::string, ErrorCode> encodeRelayHopID(
+    uint64_t hopID,
+    uint64_t version) noexcept {
+  return encodeRelayHopPath({hopID}, version);
+}
+
+folly::Expected<uint64_t, ErrorCode> decodeRelayHopID(
+    std::string_view encoded,
+    uint64_t version) noexcept {
+  auto hops = decodeRelayHopPath(encoded, version);
+  if (!hops || hops->size() != 1) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+  return hops->front();
+}
+
+namespace {
+bool validClusterAdvertisement(
+    const Parameters& params,
+    uint64_t version,
+    bool negotiated = true) {
+  size_t paths = 0;
+  size_t costs = 0;
+  for (const auto& param : params) {
+    paths += param.key == folly::to_underlying(TrackRequestParamKey::HOP_PATH);
+    costs +=
+        param.key == folly::to_underlying(TrackRequestParamKey::ROUTE_COST);
+  }
+  if (!negotiated) {
+    return paths == 0 && costs == 0;
+  }
+  const auto* path = params.getFirstParam(TrackRequestParamKey::HOP_PATH);
+  return getDraftMajorVersion(version) >= 18 && paths == 1 && costs <= 1 &&
+      decodeRelayHopPath(path->asString, version).hasValue();
+}
+} // namespace
 
 folly::Expected<std::optional<AuthToken>, ErrorCode>
 MoQFrameParser::parseAuthToken(
@@ -1054,6 +1099,19 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseSetupParams(
       param.emplace(*key, value.value());
     }
 
+    if (getDraftMajorVersion(version) >= 18 &&
+        *key == folly::to_underlying(SetupKey::RELAY_HOPS)) {
+      if (params.hasParam(*key) ||
+          !decodeRelayHopID(param->asString, version)) {
+        return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+      }
+    } else if (
+        getDraftMajorVersion(version) >= 18 &&
+        *key == folly::to_underlying(SetupKey::RELAY_COST)) {
+      if (!isClientSetup || params.hasParam(*key)) {
+        return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+      }
+    }
     if (params.insertParam(std::move(*param)).hasError()) {
       XLOG(ERR) << "parseSetupParams: rejected setup option at index=" << i
                 << ", key=" << *key;
@@ -2917,6 +2975,13 @@ MoQFrameParser::parsePublishNamespace(folly::io::Cursor& cursor, size_t length)
   if (length > 0) {
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
+  if (getDraftMajorVersion(*version_) >= 16 &&
+      !validClusterAdvertisement(
+          publishNamespace.params,
+          *version_,
+          hasExtension(SetupExtension::RelayHops))) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
   return publishNamespace;
 }
 
@@ -3816,9 +3881,13 @@ folly::Expected<Namespace, ErrorCode> MoQFrameParser::parseNamespace(
       return folly::makeUnexpected(paramsResult.error());
     }
   } else if (hasExtension(SetupExtension::RelayHops)) {
-    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   if (length > 0) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+  if (hasExtension(SetupExtension::RelayHops) &&
+      !validClusterAdvertisement(ns.params, *version_)) {
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   return ns;
@@ -4429,6 +4498,11 @@ std::string MoQFrameWriter::encodeTokenValue(
 }
 
 bool includeSetupParam(uint64_t version, SetupKey key) {
+  // Cluster advertisements require owned request streams in both directions.
+  if (getDraftMajorVersion(version) < 18 &&
+      (key == SetupKey::RELAY_HOPS || key == SetupKey::RELAY_COST)) {
+    return false;
+  }
   // Draft 18+ delivers requests on independent bidi streams, so auth token
   // aliasing (which relies on request ordering) is disabled. Strip the param.
   if (key == SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE &&
@@ -4438,7 +4512,8 @@ bool includeSetupParam(uint64_t version, SetupKey key) {
   return key == SetupKey::MAX_REQUEST_ID || key == SetupKey::PATH ||
       key == SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE ||
       key == SetupKey::AUTHORIZATION_TOKEN || key == SetupKey::AUTHORITY ||
-      key == SetupKey::MOQT_IMPLEMENTATION || key == SetupKey::RELAY_HOPS;
+      key == SetupKey::MOQT_IMPLEMENTATION || key == SetupKey::RELAY_HOPS ||
+      key == SetupKey::RELAY_COST;
 }
 
 WriteResult writeSetup(
@@ -4446,6 +4521,10 @@ WriteResult writeSetup(
     const Setup& setup,
     uint64_t version,
     bool isClient) noexcept {
+  if (getDraftMajorVersion(version) >= 18 && !isClient &&
+      setup.params.getFirstParam(SetupKey::RELAY_COST)) {
+    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
+  }
   // Setup is version-agnostic, so we spin up a local MoQFrameWriter to
   // dispatch to version-aware writeVarint / writeFrameHeader /
   // writeFixedString.
@@ -4928,8 +5007,8 @@ void MoQFrameWriter::writeV18ParamValue(
           folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
         // TRACK_FILTER (0x29) is a fork-local length-prefixed param; its value
         // lives in asTrackFilter, not asString. Mirror the draft-16 path in
-        // writeParamValue so the v18 wire form round-trips (see parseTrackFilter
-        // via parseV18ParamValue -> parseVariableParam).
+        // writeParamValue so the v18 wire form round-trips (see
+        // parseTrackFilter via parseV18ParamValue -> parseVariableParam).
         folly::IOBufQueue tmpBuf{folly::IOBufQueue::cacheChainLength()};
         size_t tmpSize = 0;
         writeTrackFilter(tmpBuf, param.asTrackFilter, tmpSize, error);
@@ -5968,6 +6047,13 @@ WriteResult MoQFrameWriter::writePublishNamespace(
     const PublishNamespace& publishNamespace) const noexcept {
   XCHECK(version_.has_value())
       << "Version needs to be set to write publishNamespace";
+  if (getDraftMajorVersion(*version_) >= 16 &&
+      !validClusterAdvertisement(
+          publishNamespace.params,
+          *version_,
+          hasExtension(SetupExtension::RelayHops))) {
+    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
+  }
   size_t size = 0;
   bool error = false;
   auto sizePtr =
@@ -6358,6 +6444,10 @@ WriteResult MoQFrameWriter::writeNamespace(
   XCHECK_GE(getDraftMajorVersion(*version_), 16)
       << "NAMESPACE message doesn't exist for version 15 and below, this function "
       << "shouldn't be called";
+  if (hasExtension(SetupExtension::RelayHops) &&
+      !validClusterAdvertisement(ns.params, *version_)) {
+    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
+  }
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::NAMESPACE, error);

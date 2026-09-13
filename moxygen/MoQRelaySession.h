@@ -11,6 +11,9 @@
 
 namespace moxygen {
 
+struct ClusterNamespaceRegistry;
+class ClusterNamespaceOwner;
+
 class SeparateStreamSubNsReply : public SubNSReply {
  public:
   SeparateStreamSubNsReply(
@@ -266,6 +269,31 @@ class MoQRelaySession : public MoQSession {
       legacySubscriberNamespaceToReqId_;
   folly::F14FastMap<TrackNamespace, RequestID, TrackNamespace::hash>
       legacySubscribeNamespaceToReqId_;
+
+  std::shared_ptr<ClusterNamespaceOwner> makeClusterNamespaceOwner(
+      bool incoming,
+      TrackNamespace prefix = {});
+  std::shared_ptr<ClusterNamespaceRegistry> incomingNamespaceRegistry_;
+  std::shared_ptr<ClusterNamespaceRegistry> outgoingNamespaceRegistry_;
+  folly::F14FastMap<
+      RequestID,
+      std::shared_ptr<ClusterNamespaceOwner>,
+      RequestID::hash>
+      outgoingNamespaceOwners_;
+
+  struct IncomingClusterAdvertisement {
+    TrackNamespace trackNamespace;
+    std::shared_ptr<ReplyContext> context;
+    std::optional<PublishNamespace> pendingUpdate;
+    std::shared_ptr<ClusterNamespaceOwner> owner;
+  };
+  folly::F14FastMap<RequestID, IncomingClusterAdvertisement, RequestID::hash>
+      incomingClusterAdvertisements_;
+  folly::F14FastMap<
+      RequestID,
+      std::shared_ptr<ClusterNamespaceOwner>,
+      RequestID::hash>
+      outgoingClusterAdvertisements_;
 
   // Extended PendingRequestState for publishNamespace support
   class MoQRelayPendingRequestState;

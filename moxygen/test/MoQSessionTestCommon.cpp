@@ -350,7 +350,8 @@ folly::Try<moxygen::Setup> MoQSessionTest::onClientSetup(
     }
     if (relayHopsSupported_ || serverRelayHopsSupported_) {
       ss.params.insertParam(SetupParameter{
-          folly::to_underlying(SetupKey::RELAY_HOPS), std::string{}});
+          folly::to_underlying(SetupKey::RELAY_HOPS),
+          *encodeRelayHopID(42, getServerSelectedVersion())});
     }
     return ss;
   }());
@@ -375,7 +376,8 @@ folly::coro::Task<void> MoQSessionTest::setupMoQSession() {
             initialMaxRequestID_});
     if (relayHopsSupported_ || serverRelayHopsSupported_) {
       serverSetupMsg.params.insertParam(SetupParameter{
-          folly::to_underlying(SetupKey::RELAY_HOPS), std::string{}});
+          folly::to_underlying(SetupKey::RELAY_HOPS),
+          *encodeRelayHopID(42, getServerSelectedVersion())});
     }
     serverSession_->sendSetup(std::move(serverSetupMsg));
   }
@@ -637,7 +639,8 @@ moxygen::Setup MoQSessionTest::getClientSetup(uint64_t initialMaxRequestID) {
           folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
   if (relayHopsSupported_ || clientRelayHopsSupported_) {
     setup.params.insertParam(SetupParameter{
-        folly::to_underlying(SetupKey::RELAY_HOPS), std::string{}});
+        folly::to_underlying(SetupKey::RELAY_HOPS),
+        *encodeRelayHopID(42, getServerSelectedVersion())});
   }
   return setup;
 }

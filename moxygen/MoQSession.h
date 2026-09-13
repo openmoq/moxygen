@@ -236,6 +236,13 @@ class MoQSession : public Subscriber,
     return negotiatedVersion_;
   }
 
+  virtual uint64_t getPeerHopID() const noexcept {
+    return peerHopID_;
+  }
+  virtual uint64_t getRelayLinkCost() const noexcept {
+    return relayLinkCost_;
+  }
+
   // Every extension this build knows how to negotiate, and the rule that wins
   // each one. Adding one is a bit in SetupExtension plus a row here.
   static const std::vector<SetupExtensionDescriptor>& kSetupExtensions();
@@ -1420,6 +1427,8 @@ class MoQSession : public Subscriber,
   std::optional<SetupParameters> localSetupParams_;
   std::optional<SetupParameters> peerSetupParams_;
   SetupExtensions negotiatedExtensions_;
+  uint64_t peerHopID_{0};
+  uint64_t relayLinkCost_{1};
   folly::F14FastMap<RequestID, std::shared_ptr<PublisherImpl>, RequestID::hash>
       pubTracks_;
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingPublishTracks_;

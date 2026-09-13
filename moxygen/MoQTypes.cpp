@@ -359,8 +359,9 @@ const folly::F14FastSet<FrameType> kAllowedFramesForHopPath = {
     FrameType::PUBLISH_NAMESPACE,
     FrameType::NAMESPACE};
 
-const folly::F14FastSet<FrameType> kAllowedFramesForExcludeHop = {
-    FrameType::SUBSCRIBE_NAMESPACE};
+const folly::F14FastSet<FrameType> kAllowedFramesForRouteCost = {
+    FrameType::PUBLISH_NAMESPACE,
+    FrameType::NAMESPACE};
 
 // Allowlist mapping: TrackRequestParamKey -> set of allowed FrameTypes
 // Empty set means allowed for all frame types
@@ -388,7 +389,7 @@ const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
          kAllowedFramesForTrackNamespacePrefix},
         {TrackRequestParamKey::TRACK_FILTER, kAllowedFramesForTrackFilter},
         {TrackRequestParamKey::HOP_PATH, kAllowedFramesForHopPath},
-        {TrackRequestParamKey::EXCLUDE_HOP, kAllowedFramesForExcludeHop},
+        {TrackRequestParamKey::ROUTE_COST, kAllowedFramesForRouteCost},
 };
 
 // Frame types that allow all parameters (no validation)
@@ -406,6 +407,8 @@ static bool isV18OnlyParamKey(TrackRequestParamKey key) {
     case TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT:
     case TrackRequestParamKey::FILL_TIMEOUT:
     case TrackRequestParamKey::TRACK_NAMESPACE_PREFIX:
+    case TrackRequestParamKey::HOP_PATH:
+    case TrackRequestParamKey::ROUTE_COST:
       return true;
     default:
       return false;
@@ -459,8 +462,12 @@ bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
   }
 
   // v18-only parameter keys.
+  const bool clusterKey = key == TrackRequestParamKey::HOP_PATH ||
+      key == TrackRequestParamKey::ROUTE_COST;
   if (isV18OnlyParamKey(key) &&
-      (!majorVersion_.has_value() || *majorVersion_ < 18)) {
+      (majorVersion_
+           ? (*majorVersion_ < 18 && (!clusterKey || *majorVersion_ >= 16))
+           : !clusterKey)) {
     return false;
   }
 
