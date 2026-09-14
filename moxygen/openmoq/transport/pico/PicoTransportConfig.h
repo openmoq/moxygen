@@ -45,6 +45,7 @@ struct PicoTransportConfig {
   uint64_t idleTimeoutMs{30000};       // idle timeout (ms); handshake = /2 us
   uint32_t maxAckDelayUs{100000};      // max ACK delay (microseconds)
   uint32_t minAckDelayUs{1000};        // min ACK delay (microseconds)
+  bool disableMigration{false};        // disable active connection migration
 
   // Context-level defaults
   uint8_t defaultStreamPriority{2};   // default stream priority

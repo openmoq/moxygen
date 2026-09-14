@@ -78,9 +78,13 @@ PicoQuicSocketHandler::~PicoQuicSocketHandler() {
   stop();
 }
 
-void PicoQuicSocketHandler::start(const folly::SocketAddress& addr) {
+void PicoQuicSocketHandler::start(
+    const folly::SocketAddress& addr,
+    bool reusePort) {
   XLOG(DBG1) << "PicoQuicSocketHandler::start called, addr=" << addr.describe();
 
+  // Must precede the bind — AsyncUDPSocket applies it at fd creation time.
+  socket_.setReusePort(reusePort);
   // Only init() applies bindV6Only, so it has to ride on the bind call.
   folly::AsyncUDPSocket::BindOptions bindOptions;
   bindOptions.bindV6Only = false;
