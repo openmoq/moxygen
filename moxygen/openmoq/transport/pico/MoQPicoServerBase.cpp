@@ -632,6 +632,13 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
       .webTransport = webTransport, .moqSession = moqSession};
   streamCtx->path_callback_ctx = sessionCtx;
 
+  if (statsCallback_) {
+    // Counts WT sessions: wtMaxSessions allows several per connection.
+    statsCallback_->onConnectionCreated();
+    sessionCtx->statsCallback = statsCallback_.get();
+    webTransport->setStatsCallback(statsCallback_.get());
+  }
+
   // NOTE: h3zero automatically sends 200 response and sets is_upgraded=1
   // when we return 0 from this callback (see h3zero_common.c:1138).
   // Do NOT send duplicate response here!
