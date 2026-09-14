@@ -16,6 +16,7 @@
 #include <moxygen/openmoq/transport/pico/PicoProtocolDispatcher.h>
 #include <pico_webtransport.h>
 #include <picoquic.h>
+#include <picoquic_internal.h> // for picoquic_debug_multithread_set
 
 namespace moxygen {
 
@@ -343,6 +344,8 @@ bool MoQPicoServerBase::createQuicContext() {
               << ", key=" << key_ << ")";
     return false;
   }
+  // Expands to nothing unless picoquic was built with WITH_THREAD_CHECK.
+  PICOQUIC_THREAD_SET_CHECK(quic_);
 
   picoquic_register_all_congestion_control_algorithms();
   XLOG(INFO)
@@ -402,6 +405,9 @@ bool MoQPicoServerBase::createQuicContext() {
       quic_, picoquic_tp_max_ack_delay, transportConfig_.maxAckDelayUs);
   picoquic_set_default_tp_value(
       quic_, picoquic_tp_min_ack_delay, transportConfig_.minAckDelayUs);
+  if (transportConfig_.disableMigration) {
+    picoquic_set_default_tp_value(quic_, picoquic_tp_disable_migration, 1);
+  }
 
   // Idle and handshake timeouts
   picoquic_set_default_idle_timeout(quic_, transportConfig_.idleTimeoutMs);
