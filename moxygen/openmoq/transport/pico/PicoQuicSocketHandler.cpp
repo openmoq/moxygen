@@ -139,6 +139,7 @@ void PicoQuicSocketHandler::stop() {
   }
   stopped_ = true;
   wakeTimeout_.cancelTimeout();
+  wakeLoop_.cancelLoopCallback();
   drainOutgoing();
   pauseRead();
 }
@@ -497,8 +498,8 @@ void PicoQuicSocketHandler::sendPacket(
 void PicoQuicSocketHandler::updateWakeTimeout() {
   // Called via WakeTimeGuard when picoquic's next wake time decreases (e.g.
   // after marking a stream or datagram active). Cancel the current timer and
-  // reschedule: rescheduleTimer will call evb_->add() for delay<=0, which is
-  // effectively immediate since the EVB passes 0 to epoll when tasks are
+  // reschedule: rescheduleTimer runs wakeLoop_ in the loop for delay<=0, which
+  // is effectively immediate since the EVB passes 0 to epoll when tasks are
   // pending.
   wakeTimeout_.cancelTimeout();
   rescheduleTimer();
@@ -514,14 +515,18 @@ void PicoQuicSocketHandler::rescheduleTimer() {
   int64_t rawDelayUs = picoquic_get_next_wake_delay(quic_, now, INT64_MAX);
   int64_t delayUs = std::min(rawDelayUs, kMaxWakeDelayUs);
   if (delayUs <= 0) {
-    evb_->add([this] {
-      drainOutgoing();
-      rescheduleTimer();
-    });
+    if (!wakeLoop_.isLoopCallbackScheduled()) {
+      evb_->runInLoop(&wakeLoop_);
+    }
   } else {
     // Honors microsecond delays; the EventBase's own version ceils to ms.
     wakeTimeout_.scheduleTimeoutHighRes(std::chrono::microseconds(delayUs));
   }
+}
+
+void PicoQuicSocketHandler::WakeLoopCallback::runLoopCallback() noexcept {
+  handler_->drainOutgoing();
+  handler_->rescheduleTimer();
 }
 
 } // namespace moxygen

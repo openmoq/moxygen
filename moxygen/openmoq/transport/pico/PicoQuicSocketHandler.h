@@ -8,6 +8,7 @@
 
 #include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/AsyncUDPSocket.h>
+#include <folly/io/async/EventBase.h>
 #include <folly/io/async/STTimerFDTimeoutManager.h>
 #include <moxygen/openmoq/transport/pico/PicoQuicStatsCallback.h>
 
@@ -134,6 +135,18 @@ class PicoQuicSocketHandler
     PicoQuicSocketHandler* handler_;
   };
 
+  // The EventBase outlives the handler, so a queued wake has to stay
+  // cancellable: once it runs, handler_ may already be gone.
+  class WakeLoopCallback : public folly::EventBase::LoopCallback {
+   public:
+    explicit WakeLoopCallback(PicoQuicSocketHandler* handler)
+        : handler_(handler) {}
+    void runLoopCallback() noexcept override;
+
+   private:
+    PicoQuicSocketHandler* handler_;
+  };
+
   folly::AsyncUDPSocket socket_;
   picoquic_quic_t* quic_; // non-owning
   folly::EventBase* evb_; // non-owning
@@ -145,6 +158,7 @@ class PicoQuicSocketHandler
   // Order matters: the manager must construct before wakeTimeout_ binds to it.
   folly::STTimerFDTimeoutManager wakeTimeoutManager_;
   WakeTimeout wakeTimeout_;
+  WakeLoopCallback wakeLoop_{this};
 };
 
 } // namespace moxygen
