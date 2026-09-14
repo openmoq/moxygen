@@ -16,6 +16,7 @@
 #include <folly/io/async/EventBaseLocal.h>
 #include <folly/io/async/EventBaseManager.h>
 
+#include <chrono>
 #include <utility>
 
 #include "moxygen/MoQSession.h"
@@ -35,6 +36,15 @@ class MoQServer : public MoQServerBase {
     std::function<bool()> useQuicWtSession;
     size_t udpSendBufferBytes{0};
     size_t udpRecvBufferBytes{0};
+    // Idle timeout of every HTTP/3 transaction, including the CONNECT that
+    // carries a WebTransport MoQ session. Nothing flows on that stream once
+    // the session is up (MoQ control and media ride their own QUIC streams),
+    // so this bounds the life of every WebTransport session: it is torn down
+    // this long after it opened, however busy it was. A relay should set it
+    // well above the longest session it expects to carry. Must be > 0:
+    // proxygen's HQStreamDispatcher schedules it unguarded, so zero rejects
+    // every new stream a tick after it opens rather than disabling anything.
+    std::chrono::milliseconds txnTimeout{std::chrono::seconds(60)};
   };
 
   // What a server uses when Options carries no transport settings.
