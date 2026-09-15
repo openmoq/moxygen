@@ -324,6 +324,7 @@ enum class SetupKey : uint64_t {
   AUTHORITY = 5,
   MOQT_IMPLEMENTATION = 7,
   RELAY_HOPS = 0x40B55,
+  RELAY_COST = 0x40B56,
 };
 
 constexpr uint64_t kDefaultMaxRequestID = 100;
@@ -620,7 +621,7 @@ enum class TrackRequestParamKey : uint64_t {
   NEW_GROUP_REQUEST = 0x32,
   TRACK_NAMESPACE_PREFIX = 0x34,
   HOP_PATH = 0x40B57,
-  EXCLUDE_HOP = 0x40B58,
+  ROUTE_COST = 0x40B58,
 };
 
 inline bool isRendezvousTimeoutParam(uint64_t key, uint64_t majorVersion) {

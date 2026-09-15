@@ -54,6 +54,12 @@ class Subscriber {
     // can be an uninteresting message
     virtual void publishNamespaceDone() {}
 
+    // Replace the advertisement on its existing stream, without another OK.
+    virtual folly::Expected<folly::Unit, ErrorCode> publishNamespaceUpdate(
+        PublishNamespace /*advertisement*/) {
+      return folly::unit;
+    }
+
     using RequestUpdateResult = folly::Expected<RequestOk, RequestError>;
     virtual folly::coro::Task<RequestUpdateResult> requestUpdate(
         RequestUpdate reqUpdate) {
