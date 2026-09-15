@@ -7365,16 +7365,32 @@ void MoQSession::onSetupParams(SetupParameters params, bool local) {
       close(ErrorCode::PROTOCOL_VIOLATION);
       return;
     }
-    peerHopID_ = *peerID;
-    const auto& clientParams = dir_ == MoQControlCodec::Direction::CLIENT
-        ? *localSetupParams_
-        : *peerSetupParams_;
-    if (const auto* cost = clientParams.getFirstParam(SetupKey::RELAY_COST)) {
-      relayLinkCost_ = cost->asUint64;
-    }
   }
   moqFrameWriter_.setNegotiatedExtensions(negotiatedExtensions_);
   controlCodec_->setNegotiatedExtensions(negotiatedExtensions_);
+}
+
+uint64_t MoQSession::getPeerHopID() const noexcept {
+  if (!negotiatedExtensions_.has(SetupExtension::RelayHops)) {
+    return kMoQClusterAnonHopId;
+  }
+  // onSetupParams validated this and closed the session if it failed.
+  auto peerID = decodeRelayHopID(
+      peerSetupParams_->getFirstParam(SetupKey::RELAY_HOPS)->asString,
+      *negotiatedVersion_);
+  return peerID.value_or(kMoQClusterAnonHopId);
+}
+
+uint64_t MoQSession::getRelayLinkCost() const noexcept {
+  if (!negotiatedExtensions_.has(SetupExtension::RelayHops)) {
+    return 1;
+  }
+  // The client dictates the link cost.
+  const auto& clientParams = dir_ == MoQControlCodec::Direction::CLIENT
+      ? *localSetupParams_
+      : *peerSetupParams_;
+  const auto* cost = clientParams.getFirstParam(SetupKey::RELAY_COST);
+  return cost ? cost->asUint64 : 1;
 }
 
 /*static*/

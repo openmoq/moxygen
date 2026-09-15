@@ -537,7 +537,7 @@ folly::Expected<std::string, ErrorCode> encodeRelayHopPath(
   bool error = false;
   folly::F14FastSet<uint64_t> seen;
   for (const auto hop : hopPath) {
-    if (hop != 0 && !seen.insert(hop).second) {
+    if (hop != kMoQClusterAnonHopId && !seen.insert(hop).second) {
       return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     writer.writeVarint(encoded, hop, size, error);
@@ -567,7 +567,8 @@ folly::Expected<std::vector<uint64_t>, ErrorCode> decodeRelayHopPath(
     if (!decoded) {
       return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
-    if (decoded->first != 0 && !seen.insert(decoded->first).second) {
+    if (decoded->first != kMoQClusterAnonHopId &&
+        !seen.insert(decoded->first).second) {
       return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     hopPath.push_back(decoded->first);
