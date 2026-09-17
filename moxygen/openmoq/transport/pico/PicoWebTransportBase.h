@@ -160,6 +160,16 @@ class PicoWebTransportBase : public proxygen::WebTransport {
   virtual size_t getMaxDatagramPayload() const;
 
   /**
+   * Buffer to write `length` bytes of stream payload into, or nullptr if the
+   * transport can't take them. The datagram counterpart is below.
+   */
+  virtual uint8_t* getStreamDataBuffer(
+      uint8_t* picoContext,
+      size_t length,
+      bool fin,
+      bool isStillActive);
+
+  /**
    * Provide a datagram buffer for writing, or signal defer/stop.
    *
    * Called from onJitProvideDatagram with the transport-specific context
@@ -258,6 +268,19 @@ class PicoWebTransportBase : public proxygen::WebTransport {
   PicoQuicStatsCallback* statsCallback_{nullptr};
 
  private:
+  /**
+   * Dispatch and clear WtStreamManager's queued control events. eventsAvailable
+   * is edge-triggered on (writable streams || queued events), and pico keeps
+   * streams queued for a whole burst, so it never fires mid-burst.
+   */
+  void drainEgressEvents();
+
+  /**
+   * Hand the head of the writable queue to picoquic. Only one stream is marked
+   * active at a time, so if nothing starts the next one the connection stalls.
+   */
+  void markNextWritableStreamActive();
+
   // WtStreamManager callbacks
   class EgressCallback
       : public proxygen::detail::WtStreamManager::EgressCallback {

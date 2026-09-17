@@ -142,3 +142,5 @@ if(BUILD_SAMPLES)
   add_subdirectory(sample)
 endif()
 
+add_subdirectory(test)
+
