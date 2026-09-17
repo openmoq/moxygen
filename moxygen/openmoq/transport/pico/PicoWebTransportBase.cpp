@@ -5,6 +5,7 @@
  */
 
 #include "moxygen/openmoq/transport/pico/PicoWebTransportBase.h"
+#include <folly/ScopeGuard.h>
 #include <folly/logging/xlog.h>
 #include <picoquic.h>
 
@@ -318,12 +319,7 @@ void PicoWebTransportBase::IngressCallback::onNewPeerStream(
 
 // Egress event processing
 
-void PicoWebTransportBase::processEgressEvents() {
-  XCHECK(cnx_);
-
-  XLOG(DBG4) << "processEgressEvents: processing egress events";
-  WakeTimeGuard guard(cnx_, updateWakeTimeoutCallback_);
-
+void PicoWebTransportBase::drainEgressEvents() {
   auto events = streamManager_->moveEvents();
 
   for (auto& event : events) {
@@ -369,33 +365,72 @@ void PicoWebTransportBase::processEgressEvents() {
                 &event)) {
       XLOG(DBG1) << "Unhandled MaxStreamsUni event, maxStreams="
                  << maxStreamsUni->maxStreams;
+    } else if (
+        auto* egressPriority =
+            std::get_if<proxygen::detail::WtStreamManager::EgressPriority>(
+                &event)) {
+      // Nothing to apply: priorityQueue_ is the manager's writable-stream
+      // queue, and WriteHandle::setPriority has already reordered it.
+      XLOG(DBG5) << "EgressPriority event, streamId="
+                 << egressPriority->streamId;
     } else {
-      XLOG(ERR) << "Unknown event type in processEgressEvents";
-    }
-  }
-
-  // Check for writable streams in the priority queue and mark one active
-  if (!priorityQueue_.empty()) {
-    auto nextId = priorityQueue_.peekNextScheduledID();
-    if (nextId.isStreamID()) {
-      uint64_t streamId = nextId.asStreamID();
-      XLOG(DBG5) << "processEgressEvents: marking writable stream " << streamId
-                 << " as active";
-      markStreamActiveImpl(streamId);
+      XLOG(ERR) << "Unknown event type in drainEgressEvents";
     }
   }
 }
 
+void PicoWebTransportBase::markNextWritableStreamActive() {
+  if (priorityQueue_.empty()) {
+    return;
+  }
+  auto nextId = priorityQueue_.peekNextScheduledID();
+  if (!nextId.isStreamID()) {
+    return;
+  }
+  XLOG(DBG5) << "marking writable stream " << nextId.asStreamID()
+             << " as active";
+  markStreamActiveImpl(nextId.asStreamID());
+}
+
+void PicoWebTransportBase::processEgressEvents() {
+  XCHECK(cnx_);
+
+  XLOG(DBG4) << "processEgressEvents: processing egress events";
+  WakeTimeGuard guard(cnx_, updateWakeTimeoutCallback_);
+
+  drainEgressEvents();
+  markNextWritableStreamActive();
+}
+
 // JIT send path
+
+uint8_t* PicoWebTransportBase::getStreamDataBuffer(
+    uint8_t* picoContext,
+    size_t length,
+    bool fin,
+    bool isStillActive) {
+  return picoquic_provide_stream_data_buffer(
+      picoContext, length, fin ? 1 : 0, isStillActive ? 1 : 0);
+}
 
 bool PicoWebTransportBase::onJitProvideData(
     uint64_t streamId,
     uint8_t* picoContext,
     size_t maxLength) {
+  // Every exit path owes picoquic a hand-off to the next stream. Declared
+  // first so it runs last: dispatching CloseSession can destroy `this`.
+  bool isStillActive = false;
+  SCOPE_EXIT {
+    if (!isStillActive) {
+      markNextWritableStreamActive();
+    }
+    drainEgressEvents();
+  };
+
   auto* handle = streamManager_->getOrCreateEgressHandle(streamId);
   if (!handle) {
     XLOG(DBG2) << "onJitProvideData: no handle for stream " << streamId;
-    picoquic_provide_stream_data_buffer(picoContext, 0, 0, 0);
+    getStreamDataBuffer(picoContext, 0, false, false);
     return false;
   }
 
@@ -406,21 +441,20 @@ bool PicoWebTransportBase::onJitProvideData(
       streamData.data ? streamData.data->computeChainDataLength() : 0;
   bool fin = streamData.fin;
   // Stream is still active if we sent data and have more, or filled the buffer
-  bool isStillActive = (dataLen > 0 && !fin) || (dataLen >= maxLength);
+  isStillActive = (dataLen > 0 && !fin) || (dataLen >= maxLength);
 
   XLOG(DBG6) << "onJitProvideData: stream=" << streamId
              << " dequeued=" << dataLen << " fin=" << fin
              << " isStillActive=" << isStillActive;
 
   // Get buffer from picoquic via JIT API
-  uint8_t* buffer = picoquic_provide_stream_data_buffer(
-      picoContext, dataLen, fin ? 1 : 0, isStillActive ? 1 : 0);
+  uint8_t* buffer =
+      getStreamDataBuffer(picoContext, dataLen, fin, isStillActive);
 
   if (buffer == nullptr) {
     if (dataLen > 0) {
-      XLOG(ERR)
-          << "picoquic_provide_stream_data_buffer returned null for stream "
-          << streamId << " size=" << dataLen;
+      XLOG(ERR) << "getStreamDataBuffer returned null for stream " << streamId
+                << " size=" << dataLen;
     }
     return false;
   }
@@ -444,16 +478,6 @@ bool PicoWebTransportBase::onJitProvideData(
         streamId, streamData.lastByteStreamOffset);
   }
 
-  // If this stream is no longer active, check for next writable stream
-  if (!isStillActive && !priorityQueue_.empty()) {
-    auto nextId = priorityQueue_.peekNextScheduledID();
-    if (nextId.isStreamID()) {
-      uint64_t nextStreamId = nextId.asStreamID();
-      XLOG(DBG5) << "onJitProvideData: marking next writable stream "
-                 << nextStreamId << " as active after stream " << streamId;
-      markStreamActiveImpl(nextStreamId);
-    }
-  }
   return fin;
 }
 
