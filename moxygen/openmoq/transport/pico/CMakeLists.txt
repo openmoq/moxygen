@@ -100,6 +100,7 @@ moxygen_add_library(openmoq_pico_evb_base
     openmoq_pico_base
     Folly::folly_io_async_async_udp_socket
     Folly::folly_io_async_timerfd
+    Folly::folly_net_net_ops
 )
 if(APPLE)
   # RFC 3542 advanced IPv6 API (IPV6_PKTINFO, in6_pktinfo) must be unlocked

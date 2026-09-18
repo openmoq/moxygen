@@ -27,6 +27,33 @@ struct PicoWebTransportConfig {
 };
 
 /**
+ * UDP send-path tuning for PicoQuicSocketHandler.
+ *
+ * These bound one sendmmsg batch and one drain pass. Raising them trades
+ * responsiveness for fewer syscalls, since the EventBase loop is not serviced
+ * until a drain yields. The defaults sit well above picoquic's own sockloop,
+ * which sends at most PICOQUIC_PACKET_LOOP_SEND_MAX (10) packets per call.
+ */
+struct PicoSocketConfig {
+  // A msg is one mmsghdr slot; a batch is one sendmmsg call.
+  size_t maxMsgsPerBatch{32};
+  size_t maxBytesPerBatch{64 * 1024};
+
+  // The kernel caps a GSO datagram at 64KB of payload and at UDP_MAX_SEGMENTS
+  // segments; these stay well inside both.
+  size_t maxSegmentsPerMsg{32};
+  size_t maxBytesPerMsg{45000};
+
+  // Packets pulled per drainOutgoing call, bounding how long one drain may
+  // starve the other handlers.
+  size_t maxPacketsPerDrain{64};
+
+  // SO_SNDBUF/SO_RCVBUF for the shared socket, matching MoQServer's default.
+  // The kernel clamps this to wmem_max/rmem_max, which is often far lower.
+  int socketBufferBytes{1024 * 1024};
+};
+
+/**
  * QUIC transport parameter configuration for picoquic.
  *
  * Used by both server (MoQPicoServerBase) and client contexts to configure
@@ -52,6 +79,8 @@ struct PicoTransportConfig {
   uint8_t defaultDatagramPriority{1}; // default datagram priority
   std::string ccAlgo{"bbr"};          // congestion control algorithm name
   uint32_t mtuMax{1500};              // EMSGSIZE if above real link MTU
+
+  PicoSocketConfig socket{}; // socket handler tuning, not passed to picoquic
 };
 
 } // namespace moxygen
