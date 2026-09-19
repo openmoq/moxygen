@@ -18,8 +18,13 @@ on:
   push:
     branches: [main, 'release/**']
 
+# A group holds one running and one pending run; a newer push cancels the
+# pending one, so a burst of merges skips snapshots. Runs on main therefore
+# get their own group and run in parallel: everything they write is per-commit
+# except the rolling alias, which only moves forward (see the release job).
+# release/** branches keep serializing.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -144,11 +149,11 @@ jobs:
         run: cmake --install _build
 
   # ════════════════════════════════════════════════════════════════════════════
-  # Publish: BUNDLE_DEPS artifact builds (needs verify to pass)
+  # Publish: BUNDLE_DEPS artifact builds. Runs alongside verify; release needs
+  # both, so nothing is published for a commit that fails verify.
   # ════════════════════════════════════════════════════════════════════════════
 
   publish:
-    needs: [build]
     strategy:
       fail-fast: false
       matrix:
@@ -357,7 +362,29 @@ jobs:
             --branch "${{ github.ref_name }}" \
             --prune-days 30
 
+      # Parallel runs finish in any order; the alias only moves to a descendant
+      # of the commit it points at now.
+      - name: Check alias ordering
+        id: order
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          CUR=$(gh release view "$TAG" --json targetCommitish --jq .targetCommitish 2>/dev/null || true)
+          STATUS=identical
+          if [ -n "$CUR" ]; then
+            STATUS=$(gh api "repos/${{ github.repository }}/compare/${CUR}...${GITHUB_SHA}" --jq .status)
+          fi
+          case "$STATUS" in
+            ahead|identical)
+              echo "advance=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::notice::$TAG points at ${CUR:0:12}, which is $STATUS of this commit; leaving it"
+              echo "advance=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       - name: Publish rolling alias (asset-less pointer)
+        if: steps.order.outputs.advance == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
