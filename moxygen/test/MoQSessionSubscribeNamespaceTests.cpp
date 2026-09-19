@@ -81,10 +81,13 @@ class RelayHopNamespacePublishHandle
   }
 
   void namespaceMsg(const TrackNamespace&) override {}
-  void namespaceDoneMsg(const TrackNamespace&) override {}
+  void namespaceDoneMsg(const TrackNamespace&) override {
+    namespaceDoneBaton.post();
+  }
 
   std::optional<Namespace> message;
   folly::coro::Baton namespaceBaton;
+  folly::coro::Baton namespaceDoneBaton;
 };
 
 // Verifies that after NAMESPACE + NAMESPACE_DONE, a second NAMESPACE
@@ -172,6 +175,9 @@ CO_TEST_P_X(V16PlusSubscribeNamespaceTest, NamespaceDoneDoesNotCloseStream) {
 CO_TEST_P_X(
     V16PlusSubscribeNamespaceTest,
     NamespacePreservesRelayHopParameters) {
+  if (getDraftMajorVersion(GetParam().serverVersion) < 18) {
+    co_return;
+  }
   relayHopsSupported_ = true;
   co_await setupMoQSession();
   EXPECT_TRUE(
@@ -235,6 +241,18 @@ CO_TEST_P_X(
       EXPECT_EQ(hopPath.value(), (std::vector<uint64_t>{11, 22, 33}));
     }
   }
+
+  clientNamespacePublishHandle->namespaceBaton.reset();
+  outgoing.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::ROUTE_COST), uint64_t{8}));
+  serverPublishHandle->namespaceMsg(outgoing);
+  co_await clientNamespacePublishHandle->namespaceBaton;
+  EXPECT_EQ(
+      clientNamespacePublishHandle->message->params
+          .getFirstParam(TrackRequestParamKey::ROUTE_COST)
+          ->asUint64,
+      8);
+  EXPECT_FALSE(clientSession_->isClosed());
 
   EXPECT_CALL(*clientSubscriberStatsCallback_, onUnsubscribeNamespace());
   EXPECT_CALL(*serverPublisherStatsCallback_, onUnsubscribeNamespace());
@@ -357,5 +375,366 @@ CO_TEST_P_X(MoQSessionTest, SubscribeNamespaceError) {
       getSubscribeNamespace(), nullptr);
   EXPECT_TRUE(subAnnResult.hasError());
 
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(V16PlusSubscribeNamespaceTest, ClusterNamespaceStreamOwnership) {
+  if (getDraftMajorVersion(GetParam().serverVersion) < 18) {
+    co_return;
+  }
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  std::vector<std::shared_ptr<Publisher::NamespacePublishHandle>> senders;
+  auto accept = [&](auto request, auto handler)
+      -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+    senders.push_back(std::move(handler));
+    auto handle =
+        std::make_shared<testing::NiceMock<MockSubscribeNamespaceHandle>>(
+            SubscribeNamespaceOk{.requestID = request.requestID});
+    ON_CALL(*handle, requestUpdateResult())
+        .WillByDefault(testing::Return(RequestOk{}));
+    co_return handle;
+  };
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillRepeatedly(testing::Invoke(std::ref(accept)));
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeNamespaceSuccess())
+      .Times(2);
+  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeNamespaceSuccess())
+      .Times(2);
+  auto firstReceiver = std::make_shared<RelayHopNamespacePublishHandle>();
+  auto secondReceiver = std::make_shared<RelayHopNamespacePublishHandle>();
+  auto request = getSubscribeNamespace();
+  request.trackNamespacePrefix = TrackNamespace({"cluster"});
+  auto first =
+      co_await clientSession_->subscribeNamespace(request, firstReceiver);
+  request.trackNamespacePrefix =
+      TrackNamespace(std::vector<std::string>{"cluster", "nested"});
+  auto second =
+      co_await clientSession_->subscribeNamespace(request, secondReceiver);
+  EXPECT_TRUE(first.hasValue());
+  EXPECT_TRUE(second.hasValue());
+  if (!first || !second) {
+    co_return;
+  }
+  Namespace outer;
+  outer.trackNamespaceSuffix =
+      TrackNamespace(std::vector<std::string>{"nested", "leaf"});
+  outer.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+      std::string("\x01", 1)));
+  Namespace inner;
+  inner.trackNamespaceSuffix = TrackNamespace({"leaf"});
+  inner.params.insertParam(outer.params.at(0));
+  senders[0]->namespaceMsg(outer);
+  co_await firstReceiver->namespaceBaton;
+  senders[1]->namespaceDoneMsg(inner.trackNamespaceSuffix);
+  senders[1]->namespaceMsg(inner);
+  for (int i = 0; i < 25; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  EXPECT_FALSE(secondReceiver->message.has_value());
+  EXPECT_FALSE(clientSession_->isClosed());
+
+  PublishNamespace conflicting;
+  conflicting.trackNamespace = TrackNamespace({"cluster", "nested", "leaf"});
+  conflicting.params.insertParam(outer.params.at(0));
+  auto duplicate =
+      co_await serverSession_->publishNamespace(conflicting, nullptr);
+  EXPECT_TRUE(duplicate.hasError());
+
+  senders[0]->namespaceDoneMsg(outer.trackNamespaceSuffix);
+  senders[1]->namespaceMsg(inner);
+  co_await secondReceiver->namespaceBaton;
+  EXPECT_TRUE(secondReceiver->message.has_value());
+  EXPECT_FALSE(clientSession_->isClosed());
+
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onUnsubscribeNamespace())
+      .Times(1);
+  EXPECT_CALL(*serverPublisherStatsCallback_, onUnsubscribeNamespace())
+      .Times(2);
+  second.value()->unsubscribeNamespace();
+  for (int i = 0; i < 25; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  firstReceiver->namespaceBaton.reset();
+  senders[0]->namespaceMsg(outer);
+  co_await firstReceiver->namespaceBaton;
+  EXPECT_FALSE(clientSession_->isClosed());
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate());
+  RequestUpdate update;
+  update.params.setMajorVersion(18);
+  update.params.insertParam(MoQFrameWriter::encodeTrackNamespacePrefixParam(
+      TrackNamespace(std::vector<std::string>{"cluster", "nested"}),
+      GetParam().serverVersion));
+  auto updated = co_await first.value()->requestUpdate(std::move(update));
+  EXPECT_TRUE(updated.hasValue());
+  firstReceiver->namespaceDoneBaton.reset();
+  senders[0]->namespaceDoneMsg(inner.trackNamespaceSuffix);
+  co_await firstReceiver->namespaceDoneBaton;
+  EXPECT_FALSE(clientSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    V16PlusSubscribeNamespaceTest,
+    ClusterRejectsNamespaceOnSecondResponseStream) {
+  if (getDraftMajorVersion(GetParam().serverVersion) < 18) {
+    co_return;
+  }
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillRepeatedly(testing::Invoke(
+          [](auto request,
+             auto) -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+            co_return std::make_shared<
+                testing::NiceMock<MockSubscribeNamespaceHandle>>(
+                SubscribeNamespaceOk{.requestID = request.requestID});
+          }));
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeNamespaceSuccess())
+      .Times(2);
+  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeNamespaceSuccess())
+      .Times(2);
+  auto receiver = std::make_shared<RelayHopNamespacePublishHandle>();
+  auto request = getSubscribeNamespace();
+  request.trackNamespacePrefix = TrackNamespace({"cluster"});
+  auto first = co_await clientSession_->subscribeNamespace(request, receiver);
+  uint64_t firstStream = 0;
+  for (const auto& [id, handle] : serverWt_->writeHandles) {
+    if (id % 4 == 0) {
+      firstStream = std::max(firstStream, id);
+    }
+  }
+  request.trackNamespacePrefix =
+      TrackNamespace(std::vector<std::string>{"cluster", "nested"});
+  auto second = co_await clientSession_->subscribeNamespace(request, receiver);
+  uint64_t secondStream = firstStream;
+  for (const auto& [id, handle] : serverWt_->writeHandles) {
+    if (id % 4 == 0) {
+      secondStream = std::max(secondStream, id);
+    }
+  }
+  EXPECT_NE(firstStream, secondStream);
+  Namespace ns;
+  ns.trackNamespaceSuffix =
+      TrackNamespace(std::vector<std::string>{"nested", "leaf"});
+  ns.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+      std::string("\x01", 1)));
+  MoQFrameWriter writer;
+  writer.initializeVersion(
+      GetParam().serverVersion, serverSession_->getNegotiatedExtensions());
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  EXPECT_TRUE(writer.writeNamespace(buf, ns).hasValue());
+  serverWt_->writeHandles.at(firstStream)
+      ->writeStreamData(buf.move(), false, nullptr);
+  co_await receiver->namespaceBaton;
+  ns.trackNamespaceSuffix = TrackNamespace({"leaf"});
+  EXPECT_TRUE(writer.writeNamespace(buf, ns).hasValue());
+  serverWt_->writeHandles.at(secondStream)
+      ->writeStreamData(buf.move(), false, nullptr);
+  for (int i = 0; i < 50; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  EXPECT_TRUE(clientSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    V16PlusSubscribeNamespaceTest,
+    ClusterRejectsPublishNamespaceClaimedByResponseStream) {
+  if (getDraftMajorVersion(GetParam().serverVersion) < 18) {
+    co_return;
+  }
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillRepeatedly(testing::Invoke(
+          [](auto request,
+             auto) -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+            co_return std::make_shared<
+                testing::NiceMock<MockSubscribeNamespaceHandle>>(
+                SubscribeNamespaceOk{.requestID = request.requestID});
+          }));
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeNamespaceSuccess())
+      .Times(1);
+  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeNamespaceSuccess())
+      .Times(1);
+  auto receiver = std::make_shared<RelayHopNamespacePublishHandle>();
+  auto request = getSubscribeNamespace();
+  request.trackNamespacePrefix = TrackNamespace({"cluster"});
+  auto first = co_await clientSession_->subscribeNamespace(request, receiver);
+  uint64_t firstStream = 0;
+  for (const auto& [id, handle] : serverWt_->writeHandles) {
+    if (id % 4 == 0) {
+      firstStream = std::max(firstStream, id);
+    }
+  }
+  Namespace ns;
+  ns.trackNamespaceSuffix =
+      TrackNamespace(std::vector<std::string>{"nested", "leaf"});
+  ns.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+      std::string("\x01", 1)));
+  MoQFrameWriter writer;
+  writer.initializeVersion(
+      GetParam().serverVersion, serverSession_->getNegotiatedExtensions());
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  EXPECT_TRUE(writer.writeNamespace(buf, ns).hasValue());
+  serverWt_->writeHandles.at(firstStream)
+      ->writeStreamData(buf.move(), false, nullptr);
+  co_await receiver->namespaceBaton;
+  PublishNamespace ann;
+  ann.requestID = RequestID(1);
+  ann.trackNamespace = TrackNamespace({"cluster", "nested", "leaf"});
+  ann.params.insertParam(ns.params.at(0));
+  auto stream = serverWt_->createBidiStream();
+  EXPECT_TRUE(stream.hasValue());
+  if (!stream) {
+    co_return;
+  }
+  EXPECT_TRUE(writer.writePublishNamespace(buf, ann).hasValue());
+  stream->writeHandle->writeStreamData(buf.move(), false, nullptr);
+  for (int i = 0; i < 50; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  EXPECT_TRUE(clientSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    V16PlusSubscribeNamespaceTest,
+    ClusterNamespaceOwnerReleasedOnPeerFin) {
+  if (getDraftMajorVersion(GetParam().serverVersion) < 18) {
+    co_return;
+  }
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillRepeatedly(testing::Invoke(
+          [](auto request,
+             auto) -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+            co_return std::make_shared<
+                testing::NiceMock<MockSubscribeNamespaceHandle>>(
+                SubscribeNamespaceOk{.requestID = request.requestID});
+          }));
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeNamespaceSuccess())
+      .Times(2);
+  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeNamespaceSuccess())
+      .Times(2);
+  auto receiver = std::make_shared<RelayHopNamespacePublishHandle>();
+  auto request = getSubscribeNamespace();
+  request.trackNamespacePrefix = TrackNamespace({"cluster"});
+  auto first = co_await clientSession_->subscribeNamespace(request, receiver);
+  uint64_t firstStream = 0;
+  for (const auto& [id, handle] : serverWt_->writeHandles) {
+    if (id % 4 == 0) {
+      firstStream = std::max(firstStream, id);
+    }
+  }
+  request.trackNamespacePrefix =
+      TrackNamespace(std::vector<std::string>{"cluster", "nested"});
+  auto second = co_await clientSession_->subscribeNamespace(request, receiver);
+  uint64_t secondStream = firstStream;
+  for (const auto& [id, handle] : serverWt_->writeHandles) {
+    if (id % 4 == 0) {
+      secondStream = std::max(secondStream, id);
+    }
+  }
+  EXPECT_NE(firstStream, secondStream);
+  Namespace ns;
+  ns.trackNamespaceSuffix =
+      TrackNamespace(std::vector<std::string>{"nested", "leaf"});
+  ns.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+      std::string("\x01", 1)));
+  MoQFrameWriter writer;
+  writer.initializeVersion(
+      GetParam().serverVersion, serverSession_->getNegotiatedExtensions());
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  EXPECT_TRUE(writer.writeNamespace(buf, ns).hasValue());
+  serverWt_->writeHandles.at(firstStream)
+      ->writeStreamData(buf.move(), false, nullptr);
+  co_await receiver->namespaceBaton;
+  serverWt_->writeHandles.at(firstStream)
+      ->writeStreamData(nullptr, true, nullptr);
+  for (int i = 0; i < 25; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  receiver->namespaceBaton.reset();
+  ns.trackNamespaceSuffix = TrackNamespace({"leaf"});
+  EXPECT_TRUE(writer.writeNamespace(buf, ns).hasValue());
+  serverWt_->writeHandles.at(secondStream)
+      ->writeStreamData(buf.move(), false, nullptr);
+  for (int i = 0; i < 50; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  co_await receiver->namespaceBaton;
+  EXPECT_FALSE(clientSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    V16PlusSubscribeNamespaceTest,
+    ClusterRejectsNamespaceDoneOnAnotherResponseStream) {
+  if (getDraftMajorVersion(GetParam().serverVersion) < 18) {
+    co_return;
+  }
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillRepeatedly(testing::Invoke(
+          [](auto request,
+             auto) -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+            co_return std::make_shared<
+                testing::NiceMock<MockSubscribeNamespaceHandle>>(
+                SubscribeNamespaceOk{.requestID = request.requestID});
+          }));
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeNamespaceSuccess())
+      .Times(2);
+  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeNamespaceSuccess())
+      .Times(2);
+  auto receiver = std::make_shared<RelayHopNamespacePublishHandle>();
+  auto request = getSubscribeNamespace();
+  request.trackNamespacePrefix = TrackNamespace({"cluster"});
+  auto first = co_await clientSession_->subscribeNamespace(request, receiver);
+  uint64_t firstStream = 0;
+  for (const auto& [id, handle] : serverWt_->writeHandles) {
+    if (id % 4 == 0) {
+      firstStream = std::max(firstStream, id);
+    }
+  }
+  request.trackNamespacePrefix =
+      TrackNamespace(std::vector<std::string>{"cluster", "nested"});
+  auto second = co_await clientSession_->subscribeNamespace(request, receiver);
+  uint64_t secondStream = firstStream;
+  for (const auto& [id, handle] : serverWt_->writeHandles) {
+    if (id % 4 == 0) {
+      secondStream = std::max(secondStream, id);
+    }
+  }
+  EXPECT_NE(firstStream, secondStream);
+  Namespace ns;
+  ns.trackNamespaceSuffix =
+      TrackNamespace(std::vector<std::string>{"nested", "leaf"});
+  ns.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+      std::string("\x01", 1)));
+  MoQFrameWriter writer;
+  writer.initializeVersion(
+      GetParam().serverVersion, serverSession_->getNegotiatedExtensions());
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  EXPECT_TRUE(writer.writeNamespace(buf, ns).hasValue());
+  serverWt_->writeHandles.at(firstStream)
+      ->writeStreamData(buf.move(), false, nullptr);
+  co_await receiver->namespaceBaton;
+  NamespaceDone done{TrackNamespace({"leaf"})};
+  EXPECT_TRUE(writer.writeNamespaceDone(buf, done).hasValue());
+  serverWt_->writeHandles.at(secondStream)
+      ->writeStreamData(buf.move(), false, nullptr);
+  for (int i = 0; i < 50; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  EXPECT_TRUE(clientSession_->isClosed());
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }

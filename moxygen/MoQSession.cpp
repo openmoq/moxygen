@@ -3350,7 +3350,14 @@ void MoQSession::BidiRequestCallback::onPublishDone(PublishDone publishDone) {
 
 void MoQSession::BidiRequestCallback::onPublishNamespace(
     PublishNamespace pubNs) {
-  if (handleFirstFrame(pubNs.requestID)) {
+  if (requestID_) {
+    if (!session_->negotiatedSetupExtension(SetupExtension::RelayHops) ||
+        *requestID_ != pubNs.requestID) {
+      session_->close(ErrorCode::PROTOCOL_VIOLATION);
+      return;
+    }
+    session_->onPublishNamespaceImpl(std::move(pubNs), replyContext_);
+  } else if (handleFirstFrame(pubNs.requestID)) {
     session_->onPublishNamespaceImpl(std::move(pubNs), replyContext_);
   }
 }
@@ -7392,7 +7399,7 @@ const std::vector<SetupExtensionDescriptor>& MoQSession::kSetupExtensions() {
           const SetupParameters& peer,
           uint64_t version) {
          const auto draft = getDraftMajorVersion(version);
-         return draft >= 16 &&
+         return draft >= 18 &&
              local.hasParam(folly::to_underlying(SetupKey::RELAY_HOPS)) &&
              peer.hasParam(folly::to_underlying(SetupKey::RELAY_HOPS));
        }}};
@@ -7427,8 +7434,43 @@ void MoQSession::onSetupParams(SetupParameters params, bool local) {
   XCHECK(negotiatedVersion_) << "Setup complete without a version sess=" << this;
   negotiatedExtensions_ = computeNegotiatedExtensions(
       *localSetupParams_, *peerSetupParams_, *negotiatedVersion_);
+  if (negotiatedExtensions_.has(SetupExtension::RelayHops)) {
+    auto peerID = decodeRelayHopID(
+        peerSetupParams_->getFirstParam(SetupKey::RELAY_HOPS)->asString,
+        *negotiatedVersion_);
+    auto localID = decodeRelayHopID(
+        localSetupParams_->getFirstParam(SetupKey::RELAY_HOPS)->asString,
+        *negotiatedVersion_);
+    if (!peerID || !localID) {
+      close(ErrorCode::PROTOCOL_VIOLATION);
+      return;
+    }
+  }
   moqFrameWriter_.setNegotiatedExtensions(negotiatedExtensions_);
   controlCodec_->setNegotiatedExtensions(negotiatedExtensions_);
+}
+
+uint64_t MoQSession::getPeerHopID() const noexcept {
+  if (!negotiatedExtensions_.has(SetupExtension::RelayHops)) {
+    return kMoQClusterAnonHopId;
+  }
+  // onSetupParams validated this and closed the session if it failed.
+  auto peerID = decodeRelayHopID(
+      peerSetupParams_->getFirstParam(SetupKey::RELAY_HOPS)->asString,
+      *negotiatedVersion_);
+  return peerID.value_or(kMoQClusterAnonHopId);
+}
+
+uint64_t MoQSession::getRelayLinkCost() const noexcept {
+  if (!negotiatedExtensions_.has(SetupExtension::RelayHops)) {
+    return 1;
+  }
+  // The client dictates the link cost.
+  const auto& clientParams = dir_ == MoQControlCodec::Direction::CLIENT
+      ? *localSetupParams_
+      : *peerSetupParams_;
+  const auto* cost = clientParams.getFirstParam(SetupKey::RELAY_COST);
+  return cost ? cost->asUint64 : 1;
 }
 
 /*static*/

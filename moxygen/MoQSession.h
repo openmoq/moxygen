@@ -240,6 +240,11 @@ class MoQSession : public Subscriber,
     return negotiatedVersion_;
   }
 
+  // Derived from the retained SETUPs rather than stored. Anonymous (0) and a
+  // link cost of 1 unless RelayHops was negotiated.
+  virtual uint64_t getPeerHopID() const noexcept;
+  virtual uint64_t getRelayLinkCost() const noexcept;
+
   // Every extension this build knows how to negotiate, and the rule that wins
   // each one. Adding one is a bit in SetupExtension plus a row here.
   static const std::vector<SetupExtensionDescriptor>& kSetupExtensions();
