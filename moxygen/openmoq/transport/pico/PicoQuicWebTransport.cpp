@@ -161,9 +161,29 @@ int PicoQuicWebTransport::handlePicoEvent(
       break;
 
     case picoquic_callback_close:
-    case picoquic_callback_application_close:
+    case picoquic_callback_application_close: {
+      uint64_t localReason = 0;
+      uint64_t remoteReason = 0;
+      uint64_t localAppReason = 0;
+      uint64_t remoteAppReason = 0;
+      picoquic_get_close_reasons(
+          cnx_, &localReason, &remoteReason, &localAppReason, &remoteAppReason);
+      XLOG(DBG1) << "picoCallback: "
+                 << (fin_or_event == picoquic_callback_close
+                         ? "close"
+                         : "application_close")
+                 << " length(errorCode)=" << length
+                 << " local_error=" << picoquic_get_local_error(cnx_)
+                 << " remote_error=" << picoquic_get_remote_error(cnx_)
+                 << " application_error="
+                 << picoquic_get_application_error(cnx_)
+                 << " local_reason=" << localReason
+                 << " remote_reason=" << remoteReason
+                 << " local_app_reason=" << localAppReason
+                 << " remote_app_reason=" << remoteAppReason;
       onSessionCloseCommon(static_cast<uint32_t>(length));
       break;
+    }
 
     case picoquic_callback_prepare_to_send: {
       // JIT callback - picoquic is ready to send data on this stream

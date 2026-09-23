@@ -499,6 +499,56 @@ TEST_P(MoQCodecTest, TruncatedObjectPayload) {
   objectStreamCodec_.onIngress(writeBuf.move(), true);
 }
 
+TEST(MoQCodecTest, RejectsOversizedIncompleteExtensionBlock) {
+  constexpr auto kVersion = kVersionDraft18;
+  constexpr size_t kOversizedValueLength = 64 * 1024;
+  const std::string marker = "oversized-extension-value";
+  std::string extensionValue;
+  extensionValue.reserve(kOversizedValueLength);
+  while (extensionValue.size() < kOversizedValueLength) {
+    extensionValue.append(marker);
+  }
+  extensionValue.resize(kOversizedValueLength);
+
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersion);
+  ObjectHeader object(2, 3, 4, 5);
+  object.extensions.insertMutableExtension(
+      Extension{13, folly::IOBuf::copyBuffer(extensionValue)});
+
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  auto streamType =
+      getSubgroupStreamType(kVersion, SubgroupIDFormat::Present, true, false);
+  ASSERT_TRUE(writer
+                  .writeSubgroupHeader(
+                      writeBuf,
+                      TrackAlias(1),
+                      object,
+                      SubgroupOptions{.hasExtensions = true})
+                  .hasValue());
+  ASSERT_TRUE(writer.writeStreamObject(writeBuf, streamType, object, nullptr)
+                  .hasValue());
+
+  auto wire = writeBuf.move()->moveToFbString().toStdString();
+  auto extensionValueOffset = wire.find(marker);
+  ASSERT_NE(extensionValueOffset, std::string::npos);
+  auto incompleteHeader =
+      folly::IOBuf::copyBuffer(wire.data(), extensionValueOffset);
+  EXPECT_LT(incompleteHeader->computeChainDataLength(), 64);
+
+  testing::StrictMock<MockMoQCodecCallback> callback;
+  MoQObjectStreamCodec codec(&callback);
+  codec.initializeVersion(kVersion);
+  EXPECT_CALL(
+      callback,
+      onSubgroup(TrackAlias(1), 2, 3, std::optional<uint8_t>(5), testing::_));
+  EXPECT_CALL(callback, onConnectionError(ErrorCode::PROTOCOL_VIOLATION));
+
+  EXPECT_EQ(
+      codec.onIngress(std::move(incompleteHeader), false),
+      MoQCodec::ParseResult::ERROR_TERMINATE);
+}
+
 TEST_P(MoQCodecTest, StreamTypeUnderflow) {
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
   uint8_t big = 0xff;
@@ -531,28 +581,32 @@ TEST_P(MoQCodecTest, Fetch) {
   obj.length = 5;
   res = moqFrameWriter_.writeStreamObject(
       writeBuf, streamType, obj, folly::IOBuf::copyBuffer("hello"));
-  obj.group++;
-  obj.id = 0;
-  obj.status = ObjectStatus::END_OF_TRACK;
-  obj.length = 0;
-  res = moqFrameWriter_.writeStreamObject(writeBuf, streamType, obj, nullptr);
-  obj.id++;
-  obj.status = ObjectStatus::END_OF_GROUP;
-  obj.length = 0;
-  res = moqFrameWriter_.writeStreamObject(writeBuf, streamType, obj, nullptr);
 
   EXPECT_CALL(objectStreamCodecCallback_, onFetchHeader(testing::_));
   EXPECT_CALL(
       objectStreamCodecCallback_,
       onObjectBegin(2, 3, 4, testing::_, 5, _, true, false, testing::_));
-  EXPECT_CALL(
-      objectStreamCodecCallback_,
-      onObjectStatus(
-          3, 3, 0, std::optional<uint8_t>(5), ObjectStatus::END_OF_TRACK));
-  // object after terminal status
-  EXPECT_CALL(
-      objectStreamCodecCallback_,
-      onConnectionError(ErrorCode::PROTOCOL_VIOLATION));
+
+  if (fetchObjectsHaveStatus(GetParam())) {
+    obj.group++;
+    obj.id = 0;
+    obj.status = ObjectStatus::END_OF_TRACK;
+    obj.length = 0;
+    res = moqFrameWriter_.writeStreamObject(writeBuf, streamType, obj, nullptr);
+    obj.id++;
+    obj.status = ObjectStatus::END_OF_GROUP;
+    obj.length = 0;
+    res = moqFrameWriter_.writeStreamObject(writeBuf, streamType, obj, nullptr);
+
+    EXPECT_CALL(
+        objectStreamCodecCallback_,
+        onObjectStatus(
+            3, 3, 0, std::optional<uint8_t>(5), ObjectStatus::END_OF_TRACK));
+    // object after terminal status
+    EXPECT_CALL(
+        objectStreamCodecCallback_,
+        onConnectionError(ErrorCode::PROTOCOL_VIOLATION));
+  }
   objectStreamCodec_.onIngress(writeBuf.move(), false);
 }
 
@@ -1002,7 +1056,18 @@ TEST_P(MoQCodecTest, ZeroLengthObjectFollowedByNormalObject) {
   EXPECT_CALL(
       objectStreamCodecCallback_,
       onObjectBegin(2, 3, 4, testing::_, 0, testing::_, true, false, false))
-      .WillOnce(testing::Return(MoQCodec::ParseResult::CONTINUE));
+      .WillOnce([](uint64_t,
+                   uint64_t,
+                   uint64_t,
+                   const Extensions&,
+                   uint64_t,
+                   Payload payload,
+                   bool,
+                   bool,
+                   bool) {
+        EXPECT_EQ(payload, nullptr);
+        return MoQCodec::ParseResult::CONTINUE;
+      });
 
   // Expect onObjectBegin for the normal object (this would crash without the
   // fix)
@@ -1765,6 +1830,9 @@ TEST_P(MoQCodecTest, ObjectPayloadBlockedPropagation) {
 
 // Test that onObjectStatus returning BLOCKED propagates on a fetch stream
 TEST_P(MoQCodecTest, FetchObjectStatusBlockedPropagation) {
+  if (!fetchObjectsHaveStatus(GetParam())) {
+    GTEST_SKIP() << "FETCH objects have no Object Status in draft 16+";
+  }
   testing::NiceMock<MockMoQCodecCallback> callback;
   MoQObjectStreamCodec codec(&callback);
   codec.initializeVersion(GetParam());

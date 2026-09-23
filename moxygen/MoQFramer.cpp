@@ -16,6 +16,7 @@
 
 namespace {
 constexpr uint64_t kMaxExtensionLength = 1024;
+constexpr uint64_t kMaxExtensionBlockLength = 64 * 1024;
 
 enum class FetchHeaderSerializationBits : uint8_t {
   // Draft-15: 0xC0 reserved.
@@ -701,7 +702,8 @@ MoQFrameParser::parseAuthToken(
       } else {
         XLOG(WARN)
             << "Converting too-large CLIENT_SETUP register to USE_VALUE alias="
-            << *token->alias << " value=" << token->tokenValue;
+            << *token->alias << " tokenType=" << token->tokenType
+            << " tokenLength=" << token->tokenValue.size();
       }
     } break;
     case AliasType::USE_VALUE: {
@@ -1758,7 +1760,8 @@ MoQFrameParser::parseFetchObjectDraft15(
   // If flag not set, no extensions (extensions remain empty)
 
   // Parse Object Status and Length
-  auto res = parseObjectStatusAndLength(cursor, remainingLength, objectHeader);
+  auto res = parseObjectStatusAndLength(
+      cursor, remainingLength, objectHeader, fetchObjectsHaveStatus(*version_));
   if (!res) {
     XLOG(DBG4)
         << "parseFetchObjectDraft15: error in parseObjectStatusAndLength: "
@@ -1787,7 +1790,8 @@ folly::Expected<folly::Unit, ErrorCode>
 MoQFrameParser::parseObjectStatusAndLength(
     folly::io::Cursor& cursor,
     size_t& length,
-    ObjectHeader& objectHeader) const noexcept {
+    ObjectHeader& objectHeader,
+    bool hasStatus) const noexcept {
   auto payloadLength = decodeVarint(cursor, length);
   if (!payloadLength) {
     XLOG(DBG4) << "parseObjectStatusAndLength: UNDERFLOW on payloadLength";
@@ -1796,7 +1800,7 @@ MoQFrameParser::parseObjectStatusAndLength(
   length -= payloadLength->second;
   objectHeader.length = payloadLength->first;
 
-  if (objectHeader.length == 0) {
+  if (hasStatus && objectHeader.length == 0) {
     auto objectStatus = decodeVarint(cursor, length);
     if (!objectStatus) {
       XLOG(DBG4) << "parseObjectStatusAndLength: UNDERFLOW on objectStatus";
@@ -2304,6 +2308,15 @@ folly::Expected<RequestUpdate, ErrorCode> MoQFrameParser::parseRequestUpdate(
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   handleRequestSpecificParams(requestUpdate, requestSpecificParams);
+  // TRACK_NAMESPACE_PREFIX carries a Track Namespace tuple, so a malformed
+  // tuple is a protocol violation like any other bad field. The parameter
+  // value is self-contained: a short tuple inside it is malformed, not a
+  // signal to wait for more bytes.
+  if (getDraftMajorVersion(*version_) >= 18 &&
+      !findTrackNamespacePrefixParam(requestUpdate.params, *version_)) {
+    XLOG(DBG4) << "parseRequestUpdate: malformed TRACK_NAMESPACE_PREFIX";
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
   if (length > 0) {
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
@@ -3939,6 +3952,10 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseExtensions(
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= extLen->second;
+  if (extLen->first > kMaxExtensionBlockLength) {
+    XLOG(ERR) << "Extension block length exceeds maximum: " << extLen->first;
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
   if (extLen->first > length) {
     XLOG(DBG4) << "Extension block length provided exceeds remaining length";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -4148,6 +4165,25 @@ MoQFrameParser::parseTrackNamespacePrefixParam(
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   return TrackNamespace(std::move(tuple.value()));
+}
+
+/*static*/ folly::Expected<std::optional<TrackNamespace>, ErrorCode>
+MoQFrameParser::findTrackNamespacePrefixParam(
+    const TrackRequestParameters& params,
+    uint64_t version) {
+  const auto prefixKey =
+      folly::to_underlying(TrackRequestParamKey::TRACK_NAMESPACE_PREFIX);
+  for (const auto& param : params) {
+    if (param.key != prefixKey) {
+      continue;
+    }
+    auto decoded = parseTrackNamespacePrefixParam(param.asString, version);
+    if (decoded.hasError()) {
+      return folly::makeUnexpected(decoded.error());
+    }
+    return std::move(decoded.value());
+  }
+  return std::optional<TrackNamespace>{};
 }
 
 /*static*/ Parameter MoQFrameWriter::encodeTrackNamespacePrefixParam(
@@ -5413,6 +5449,13 @@ WriteResult MoQFrameWriter::writeStreamObject(
     bool forwardingPreferenceIsDatagram) const noexcept {
   XCHECK(version_.has_value())
       << "The version must be set before writing stream object";
+  const bool fetchOmitsStatus = streamType == StreamType::FETCH_HEADER &&
+      !fetchObjectsHaveStatus(*version_);
+  if (fetchOmitsStatus && objectHeader.status != ObjectStatus::NORMAL) {
+    XLOG(ERR) << "No encoding for status on a FETCH stream, status="
+              << folly::to_underlying(objectHeader.status);
+    return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
+  }
   size_t size = 0;
   bool error = false;
   if (streamType == StreamType::FETCH_HEADER) {
@@ -5467,8 +5510,10 @@ WriteResult MoQFrameWriter::writeStreamObject(
     XCHECK(!objectPayload || objectPayload->computeChainDataLength() == 0)
         << "non-empty objectPayload with no header length";
     writeVarint(writeBuf, 0, size, error);
-    writeVarint(
-        writeBuf, folly::to_underlying(objectHeader.status), size, error);
+    if (!fetchOmitsStatus) {
+      writeVarint(
+          writeBuf, folly::to_underlying(objectHeader.status), size, error);
+    }
   }
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);

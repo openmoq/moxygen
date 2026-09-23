@@ -16,6 +16,7 @@
 #include <moxygen/openmoq/transport/pico/PicoProtocolDispatcher.h>
 #include <pico_webtransport.h>
 #include <picoquic.h>
+#include <picoquic_internal.h> // for picoquic_debug_multithread_set
 
 namespace moxygen {
 
@@ -343,6 +344,8 @@ bool MoQPicoServerBase::createQuicContext() {
               << ", key=" << key_ << ")";
     return false;
   }
+  // Expands to nothing unless picoquic was built with WITH_THREAD_CHECK.
+  PICOQUIC_THREAD_SET_CHECK(quic_);
 
   picoquic_register_all_congestion_control_algorithms();
   XLOG(INFO)
@@ -350,6 +353,7 @@ bool MoQPicoServerBase::createQuicContext() {
 
   picoquic_set_alpn_select_fn_v2(quic_, alpnSelectCallback);
   picoquic_set_cookie_mode(quic_, 2);
+  picoquic_set_mtu_max(quic_, transportConfig_.mtuMax);
   if (picoquic_get_congestion_algorithm(transportConfig_.ccAlgo.c_str()) ==
       nullptr) {
     XLOG(WARN) << "Unknown congestion control algorithm '"
@@ -401,6 +405,9 @@ bool MoQPicoServerBase::createQuicContext() {
       quic_, picoquic_tp_max_ack_delay, transportConfig_.maxAckDelayUs);
   picoquic_set_default_tp_value(
       quic_, picoquic_tp_min_ack_delay, transportConfig_.minAckDelayUs);
+  if (transportConfig_.disableMigration) {
+    picoquic_set_default_tp_value(quic_, picoquic_tp_disable_migration, 1);
+  }
 
   // Idle and handshake timeouts
   picoquic_set_default_idle_timeout(quic_, transportConfig_.idleTimeoutMs);
@@ -624,6 +631,13 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
   auto* sessionCtx = new PicoH3SessionContext{
       .webTransport = webTransport, .moqSession = moqSession};
   streamCtx->path_callback_ctx = sessionCtx;
+
+  if (statsCallback_) {
+    // Counts WT sessions: wtMaxSessions allows several per connection.
+    statsCallback_->onConnectionCreated();
+    sessionCtx->statsCallback = statsCallback_.get();
+    webTransport->setStatsCallback(statsCallback_.get());
+  }
 
   // NOTE: h3zero automatically sends 200 response and sets is_upgraded=1
   // when we return 0 from this callback (see h3zero_common.c:1138).

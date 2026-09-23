@@ -87,6 +87,15 @@ struct PicoH3SessionContext {
   uint32_t magic{kMagic};
   std::shared_ptr<PicoH3WebTransport> webTransport;
   std::shared_ptr<MoQSession> moqSession; // keepalive
+
+  // Owned by the server, which outlives this context.
+  PicoQuicStatsCallback* statsCallback{nullptr};
+
+  ~PicoH3SessionContext() {
+    if (statsCallback) {
+      statsCallback->onConnectionClosed();
+    }
+  }
 };
 
 // Dispatches an H3 WebTransport event to the appropriate PicoH3WebTransport.

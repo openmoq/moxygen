@@ -25,7 +25,8 @@ MoQPicoQuicEventBaseServer::MoQPicoQuicEventBaseServer(
     folly::Executor::KeepAlive<folly::EventBase> evb,
     std::string versions,
     PicoTransportConfig transportConfig,
-    PicoWebTransportConfig wtConfig)
+    PicoWebTransportConfig wtConfig,
+    bool reusePort)
     : MoQPicoServerBase(
           std::move(cert),
           std::move(key),
@@ -34,7 +35,8 @@ MoQPicoQuicEventBaseServer::MoQPicoQuicEventBaseServer(
           std::move(transportConfig),
           std::move(wtConfig)),
       impl_(std::make_unique<Impl>()),
-      evb_(std::move(evb)) {}
+      evb_(std::move(evb)),
+      reusePort_(reusePort) {}
 
 MoQPicoQuicEventBaseServer::~MoQPicoQuicEventBaseServer() {
   stop();
@@ -56,15 +58,24 @@ void MoQPicoQuicEventBaseServer::start(const folly::SocketAddress& addr) {
 
   XLOG(INFO) << "Starting MoQPicoQuicEventBaseServer on " << addr.describe();
 
-  impl_->handler = std::make_unique<PicoQuicSocketHandler>(evb_.get(), quic_);
+  impl_->handler = std::make_unique<PicoQuicSocketHandler>(
+      evb_.get(), quic_, transportConfig_.socket);
   if (auto* cb = statsCallbackRaw()) {
     impl_->handler->setStatsCallback(cb);
   }
-  impl_->handler->start(addr);
+  impl_->handler->start(addr, reusePort_);
+}
+
+folly::SocketAddress MoQPicoQuicEventBaseServer::getAddress() const {
+  // createQuicContext() can fail and leave the handler unset.
+  return impl_->handler ? impl_->handler->boundAddress()
+                        : folly::SocketAddress();
 }
 
 void MoQPicoQuicEventBaseServer::onWebTransportCreated(
     PicoWebTransportBase& wt) noexcept {
+  // Raw capture: stop() holds the handler alive across picoquic_free, and
+  // rescheduleTimer() no-ops once stopped.
   wt.setUpdateWakeTimeoutCallback(
       [handler = impl_->handler.get()] { handler->updateWakeTimeout(); });
 }
@@ -77,11 +88,15 @@ void MoQPicoQuicEventBaseServer::stop() {
   XLOG(INFO) << "Stopping MoQPicoQuicEventBaseServer";
 
   if (impl_->handler) {
+    // Stop I/O before freeing quic. stopped_ flag makes this idempotent so
+    // ~PicoQuicSocketHandler won't re-enter drainOutgoing() on freed memory.
     impl_->handler->stop();
-    impl_->handler.reset();
   }
-
+  // Free quic before resetting the handler: close callbacks fired from inside
+  // picoquic_free() still use the raw pointer onWebTransportCreated captured.
   destroyQuicContext();
+  impl_->handler.reset();
+
   executor_.reset();
   evb_ = {}; // release KeepAlive so EVB destructor doesn't spin
 

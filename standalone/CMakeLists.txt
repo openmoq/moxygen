@@ -305,9 +305,10 @@ set(FASTFLOAT_INCLUDE_DIR
 # fmt: build from source to guarantee static libfmt.a.
 # Ubuntu 22.04's libfmt-dev only ships .so; CONFIG-mode find_package
 # hardcodes .so paths, so CMAKE_FIND_LIBRARY_SUFFIXES can't help.
+set(_FMT_REV 10.2.1)
 FetchContent_Declare(fmt
     GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-    GIT_TAG 10.2.1
+    GIT_TAG ${_FMT_REV}
 )
 
 # Allow overriding folly repo/rev via -DFOLLY_REPO_OVERRIDE and
@@ -486,6 +487,7 @@ endif()
 # each add_subdirectory so configs land in lib/cmake/<dep>/.
 FetchContent_GetProperties(fmt)
 if(NOT fmt_POPULATED)
+    stash_dep_edits(fmt ${_FMT_REV})
     FetchContent_Populate(fmt)
     apply_dep_patches(fmt "${fmt_SOURCE_DIR}")
     set(CMAKE_INSTALL_DIR "lib/cmake/fmt" CACHE STRING "" FORCE)
@@ -499,6 +501,7 @@ set(fmt_CONFIG "${fmt_SOURCE_DIR}/CMakeLists.txt")
 
 FetchContent_GetProperties(folly)
 if(NOT folly_POPULATED)
+    stash_dep_edits(folly ${_FOLLY_REV})
     FetchContent_Populate(folly)
     apply_dep_patches(folly "${folly_SOURCE_DIR}")
     set(CMAKE_INSTALL_DIR "lib/cmake/folly" CACHE STRING "" FORCE)
@@ -512,6 +515,7 @@ endif()
 
 FetchContent_GetProperties(fizz)
 if(NOT fizz_POPULATED)
+    stash_dep_edits(fizz ${_FIZZ_REV})
     FetchContent_Populate(fizz)
     apply_dep_patches(fizz "${fizz_SOURCE_DIR}")
     set(CMAKE_INSTALL_DIR "lib/cmake/fizz" CACHE STRING "" FORCE)
@@ -522,6 +526,7 @@ endif()
 
 FetchContent_GetProperties(wangle)
 if(NOT wangle_POPULATED)
+    stash_dep_edits(wangle ${_WANGLE_REV})
     FetchContent_Populate(wangle)
     apply_dep_patches(wangle "${wangle_SOURCE_DIR}")
     set(CMAKE_INSTALL_DIR "lib/cmake/wangle" CACHE STRING "" FORCE)
@@ -532,6 +537,7 @@ endif()
 
 FetchContent_GetProperties(mvfst)
 if(NOT mvfst_POPULATED)
+    stash_dep_edits(mvfst ${_MVFST_REV})
     FetchContent_Populate(mvfst)
     apply_dep_patches(mvfst "${mvfst_SOURCE_DIR}")
     # mvfst uses CMAKE_INSTALL_MODULE_DIR, not CMAKE_INSTALL_DIR — no conflict
@@ -543,6 +549,7 @@ endif()
 
 FetchContent_GetProperties(proxygen)
 if(NOT proxygen_POPULATED)
+    stash_dep_edits(proxygen ${_PROXYGEN_REV})
     FetchContent_Populate(proxygen)
     apply_dep_patches(proxygen "${proxygen_SOURCE_DIR}")
     set(CMAKE_INSTALL_DIR "lib/cmake/proxygen" CACHE STRING "" FORCE)
@@ -556,6 +563,11 @@ if(BUILD_PICOQUIC)
     set(_SAVED_BUILD_TESTING ${BUILD_TESTING})
     set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
     set(PICOQUIC_FETCH_PTLS ON CACHE BOOL "Build picotls from source" FORCE)
+    if(MOXYGEN_SANITIZER OR CMAKE_BUILD_TYPE STREQUAL "Debug")
+        # Sharded servers rely on each picoquic_quic_t being touched only by
+        # its own thread; this aborts on the first violation.
+        set(WITH_THREAD_CHECK ON CACHE BOOL "" FORCE)
+    endif()
 
     FetchContent_GetProperties(picoquic)
     if(NOT picoquic_POPULATED)

@@ -158,6 +158,10 @@ class MoQSession : public Subscriber,
 
   static std::shared_ptr<MoQSession> getRequestSession();
 
+  SessionId sessionId() const {
+    return id_;
+  }
+
   void setServerMaxTokenCacheSizeGuess(size_t size);
 
   class ServerSetupCallback {
@@ -450,6 +454,9 @@ class MoQSession : public Subscriber,
     }
 
     void setSession(MoQSession* session) {
+      if (!session) {
+        cancelGoawayResetTimer();
+      }
       session_ = session;
     }
 
@@ -464,10 +471,9 @@ class MoQSession : public Subscriber,
         PublishDone pubDone,
         ResetStreamErrorCode error = ResetStreamErrorCode::INTERNAL_ERROR) = 0;
 
-    // Spec draft-18 §10.4: on request-stream GOAWAY timeout, reset the request
-    // (bidi) stream and the data streams with the given code (no PUBLISH_DONE),
-    // then clean up publisher state. Parallels terminatePublish but resets the
-    // request stream instead of gracefully closing it.
+    // End the request after a draft-18 request-stream GOAWAY timeout.
+    // Subscriptions use PUBLISH_DONE; FETCH resets its request and data
+    // streams.
     virtual void resetForGoaway(ResetStreamErrorCode code) = 0;
 
     virtual void onStreamCreated() {}
@@ -591,10 +597,9 @@ class MoQSession : public Subscriber,
       return !std::exchange(requestStreamGoawaySent_, true);
     }
 
-    // Spec draft-18 §10.4: after sending a request-stream GOAWAY, the sender
-    // SHOULD reset the stream with GOING_AWAY once the advertised timeout
-    // elapses. Arming is the caller's responsibility (only when timeout > 0);
-    // the timer is cancelled on any teardown via ~PublisherImpl.
+    // Expire an established request after its request-stream GOAWAY timeout.
+    // Arming is the caller's responsibility (only when timeout > 0), and
+    // logical request completion cancels the timer.
     void armGoawayResetTimer(std::chrono::milliseconds timeout);
     void cancelGoawayResetTimer();
 
@@ -614,6 +619,7 @@ class MoQSession : public Subscriber,
     State state_{State::PENDING};
     bool publishDoneSent_{false};
     bool requestStreamGoawaySent_{false};
+    bool goawayResetPending_{false};
 
    private:
     class GoawayResetTimeoutCallback;
@@ -714,7 +720,8 @@ class MoQSession : public Subscriber,
 
   struct BidiStreamConfig {
     std::vector<FrameType> allowedFrames;
-    folly::Function<void(RequestID)> onPeerTermination;
+    folly::Function<void(RequestID, std::optional<ResetStreamErrorCode>)>
+        onPeerTermination;
     // If true, peer FIN fires onPeerTermination (FIN-cancels-the-request, per
     // SUBSCRIBE_NAMESPACE spec). If false, only peer RST fires it.
     bool finIsCancellation{false};
@@ -763,7 +770,8 @@ class MoQSession : public Subscriber,
     BidiRequestCallback(
         MoQSession* session,
         std::shared_ptr<BidiStreamControl> control,
-        folly::Function<void(RequestID)> onPeerTermination)
+        folly::Function<void(RequestID, std::optional<ResetStreamErrorCode>)>
+            onPeerTermination)
         : session_(session),
           control_(std::move(control)),
           onPeerTerminationFn_(std::move(onPeerTermination)) {}
@@ -791,7 +799,8 @@ class MoQSession : public Subscriber,
 
     MoQSession* session_;
     std::shared_ptr<BidiStreamControl> control_;
-    folly::Function<void(RequestID)> onPeerTerminationFn_;
+    folly::Function<void(RequestID, std::optional<ResetStreamErrorCode>)>
+        onPeerTerminationFn_;
     std::optional<RequestID> requestID_;
     std::shared_ptr<ReplyContext> replyContext_;
   };
@@ -826,7 +835,8 @@ class MoQSession : public Subscriber,
       uint64_t minBidiDraftVersion = 18,
       std::unique_ptr<MoQControlCodec::ControlCallback> senderCallback =
           nullptr,
-      folly::Function<void(RequestID)> onPeerTermination = nullptr);
+      folly::Function<void(RequestID, std::optional<ResetStreamErrorCode>)>
+          onPeerTermination = nullptr);
 
   // Fail a pending sender request when its bidi closes before the terminal
   // reply. No-op if the entry is already gone.
@@ -834,6 +844,10 @@ class MoQSession : public Subscriber,
 
  private:
   static const folly::RequestToken& sessionRequestToken();
+
+  static SessionId makeSessionId();
+
+  const SessionId id_{makeSessionId()};
 
   folly::coro::Task<void> controlWriteLoop(
       proxygen::WebTransport::StreamWriteHandle* writeHandle);
@@ -907,6 +921,13 @@ class MoQSession : public Subscriber,
       PublishRequest publish,
       std::shared_ptr<Publisher::SubscriptionHandle> publishHandle,
       std::shared_ptr<ReplyContext> replyContext);
+  // Returns false if the peer reused a live track alias.
+  bool installPublishReceiveState(
+      const FullTrackName& fullTrackName,
+      RequestID requestID,
+      TrackAlias alias,
+      std::optional<uint64_t> publisherPriority,
+      const std::shared_ptr<TrackConsumer>& consumer);
   void publishOk(const PublishOk& pubOk, ReplyContext& replyContext);
   void publishError(
       const PublishError& publishError,

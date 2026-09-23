@@ -79,6 +79,8 @@ moxygen_add_library(moxygen_moq
     mvfst::mvfst_common_circular_deque
     mvfst::mvfst_priority_http_priority_queue
     Folly::folly_chrono
+    Folly::folly_concurrency_process_local_unique_id
+    Folly::folly_coro_baton
     Folly::folly_coro_collect
     Folly::folly_coro_future_util
     Folly::folly_utility
@@ -251,6 +253,7 @@ moxygen_add_library(moxygen_moq_folly_qmux_transport_factory
   DEPS
     moxygen_events_moq_folly_executor_impl
     proxygen::proxygen_transport_qmux_folly_qmux_transport
+    Folly::folly_cancellation_token
     Folly::folly_coro_baton
     Folly::folly_coro_current_executor
     Folly::folly_io_async_async_socket
@@ -340,6 +343,7 @@ add_subdirectory(flv_parser)
 add_subdirectory(mlog)
 add_subdirectory(moq_mi)
 add_subdirectory(moq_mi_to_flv)
+add_subdirectory(msf)
 add_subdirectory(proxy)
 add_subdirectory(stats)
 add_subdirectory(util)

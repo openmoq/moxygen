@@ -414,6 +414,73 @@ TEST_F(OpenMOQForwarderTest, ChannelSubscriberDrainsWhenSubgroupsOpen) {
   EXPECT_TRUE(forwarder->empty());
 }
 
+// A draining channel subscriber has a null session, so it has to be retired by
+// its map key once its last open subgroup gets STOP_SENDING.
+TEST_F(OpenMOQForwarderTest, DrainingChannelSubscriberRetiredOnSoftError) {
+  auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
+  auto cb = std::make_shared<ForwardChangedTracker>();
+  forwarder->setCallback(cb);
+  auto consumer = createMockConsumer();
+  DummyExecutor exec;
+
+  std::shared_ptr<MockSubgroupConsumer> sg;
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce([this, &sg](uint64_t, uint64_t, uint8_t, BeginSubgroupOptions) {
+        sg = createMockSubgroupConsumer();
+        EXPECT_CALL(*sg, object(1, _, _, false))
+            .WillOnce(Return(folly::makeUnexpected(
+                MoQPublishError(MoQPublishError::CANCELLED, "STOP_SENDING"))));
+        return folly::
+            makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                sg);
+      });
+
+  forwarder->addChannelSubscriber(&exec, /*forward=*/true, consumer);
+  auto pubSg = forwarder->beginSubgroup(0, 0, 0).value();
+
+  forwarder->publishDone(PublishDone{
+      RequestID(0), PublishDoneStatusCode::SUBSCRIPTION_ENDED, 0, ""});
+  EXPECT_EQ(forwarder->subscriberCount(), 1u);
+
+  pubSg->object(1, test::makeBuf(4));
+
+  EXPECT_TRUE(forwarder->empty());
+  EXPECT_EQ(cb->emptyCalls, 1);
+}
+
+// Same as above, but the draining channel subscriber's last subgroup is closed
+// by a duplicate beginSubgroup.
+TEST_F(OpenMOQForwarderTest, DrainingChannelSubscriberRetiredOnDuplicate) {
+  auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
+  auto cb = std::make_shared<ForwardChangedTracker>();
+  forwarder->setCallback(cb);
+  auto consumer = createMockConsumer();
+  DummyExecutor exec;
+
+  std::shared_ptr<MockSubgroupConsumer> sg;
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce([this, &sg](uint64_t, uint64_t, uint8_t, BeginSubgroupOptions) {
+        sg = createMockSubgroupConsumer();
+        EXPECT_CALL(*sg, reset(ResetStreamErrorCode::CANCELLED));
+        return folly::
+            makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                sg);
+      });
+
+  forwarder->addChannelSubscriber(&exec, /*forward=*/true, consumer);
+  ASSERT_TRUE(forwarder->beginSubgroup(0, 0, 0).hasValue());
+
+  forwarder->publishDone(PublishDone{
+      RequestID(0), PublishDoneStatusCode::SUBSCRIPTION_ENDED, 0, ""});
+  EXPECT_EQ(forwarder->subscriberCount(), 1u);
+
+  auto dupRes = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(dupRes.hasError());
+  EXPECT_EQ(dupRes.error().code, MoQPublishError::CANCELLED);
+  EXPECT_TRUE(forwarder->empty());
+  EXPECT_EQ(cb->emptyCalls, 1);
+}
+
 TEST_F(
     OpenMOQForwarderTest,
     ChannelSubscriberRequestUpdateInvalidRangeNoCrash) {

@@ -332,6 +332,39 @@ INSTANTIATE_TEST_SUITE_P(
     CurrentVersionOnly,
     testing::Values(
         VersionParams{{kVersionDraftCurrent}, kVersionDraftCurrent}));
+namespace {
+std::shared_ptr<MoQRelaySession> makeBareSession(
+    const std::shared_ptr<MoQFollyExecutorImpl>& exec,
+    proxygen::WebTransport* wt) {
+  return std::make_shared<MoQRelaySession>(
+      folly::MaybeManagedPtr<proxygen::WebTransport>(wt), exec);
+}
+} // namespace
+
+// Ids key maps that can outlive the session they name, so two sessions must
+// never share one -- including a session created where an earlier one was
+// freed.
+TEST(MoQSessionTest, SessionIdsAreDistinct) {
+  folly::EventBase eventBase;
+  auto exec = std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+  auto [clientWt, serverWt] =
+      proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
+
+  auto first = makeBareSession(exec, clientWt.get());
+  auto second = makeBareSession(exec, clientWt.get());
+  EXPECT_NE(first->sessionId(), second->sessionId());
+  // Callers use kUnsetSessionId to mean "no peer yet", so a live session must
+  // never collide with it.
+  EXPECT_NE(first->sessionId(), kUnsetSessionId);
+  EXPECT_NE(second->sessionId(), kUnsetSessionId);
+
+  auto firstId = first->sessionId();
+  first.reset();
+  auto third = makeBareSession(exec, clientWt.get());
+  EXPECT_NE(third->sessionId(), firstId);
+  EXPECT_NE(third->sessionId(), second->sessionId());
+}
+
 TEST(MoQSessionTest, SetVersionFromAlpnLegacy) {
   folly::EventBase eventBase;
   auto MoQExecutor = std::make_shared<MoQFollyExecutorImpl>(&eventBase);
@@ -1241,16 +1274,11 @@ CO_TEST_P_X(
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
-// Spec draft-18 §10.4: after sending a request-stream GOAWAY with a positive
-// timeout, the publisher resets that request's (bidi) stream with GOING_AWAY
-// once the timeout elapses -- it does NOT send PUBLISH_DONE. The subscriber
-// observes the peer reset as a synthesized PUBLISH_DONE with status
-// SUBSCRIPTION_ENDED. On the publisher side the request state is cleaned up
-// (onSubscriptionEnd fires, so pubTracks_ no longer holds the request), and the
-// session is not drained/closed.
+// After a request-stream GOAWAY timeout, a subscription ends gracefully with
+// PUBLISH_DONE(GOING_AWAY). The session itself remains open.
 CO_TEST_P_X(
     Draft18RequestStreamGoawayTest,
-    PublisherResetsSubscribeStreamAfterTimeout) {
+    PublisherSendsPublishDoneAfterTimeout) {
   co_await setupMoQSession();
   std::shared_ptr<MockSubscriptionHandle> pubHandle;
   expectSubscribe(
@@ -1263,8 +1291,6 @@ CO_TEST_P_X(
   EXPECT_FALSE(result.hasError());
 
   EXPECT_CALL(*subscribeCallback_, goaway(_)).WillOnce(testing::Return());
-  // The publisher resets the request stream instead of sending PUBLISH_DONE;
-  // the subscriber surfaces the peer reset as SUBSCRIPTION_ENDED.
   folly::coro::Baton publishDoneReceived;
   PublishDone received;
   EXPECT_CALL(*subscribeCallback_, publishDone(_))
@@ -1276,8 +1302,7 @@ CO_TEST_P_X(
                 publishDoneReceived.post();
                 return folly::unit;
               }));
-  // Publisher-side cleanup: the reset path erases the request and accounts for
-  // it as a subscription end. This firing proves there is no pubTracks_ leak.
+  // Publisher-side cleanup accounts for the request as a subscription end.
   EXPECT_CALL(*serverPublisherStatsCallback_, onSubscriptionEnd()).Times(1);
 
   auto requestStream = serverWt_->writeHandles.at(0);
@@ -1289,13 +1314,137 @@ CO_TEST_P_X(
       std::chrono::milliseconds(1));
   co_await publishDoneReceived;
 
-  EXPECT_EQ(received.statusCode, PublishDoneStatusCode::SUBSCRIPTION_ENDED);
+  EXPECT_EQ(received.statusCode, PublishDoneStatusCode::GOING_AWAY);
   auto requestError = requestStream->getWriteErr();
-  EXPECT_TRUE(requestError.has_value());
-  if (requestError) {
-    EXPECT_EQ(*requestError, 0x4);
+  EXPECT_FALSE(requestError.has_value());
+  // PUBLISH_DONE terminates the request but does not close the session.
+  EXPECT_FALSE(clientWt_->isSessionClosed());
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    Draft18RequestStreamGoawayTest,
+    PendingSubscribeGoawayIgnoresDeferredDoneAndLateSubscribeOk) {
+  co_await setupMoQSession();
+
+  folly::coro::Baton subscribeStarted;
+  folly::coro::Baton releaseSubscribe;
+  expectSubscribe(
+      [&](auto sub, auto pub) -> TaskSubscribeResult {
+        EXPECT_TRUE(pub->publishDone(getTrackEndedPublishDone(sub.requestID))
+                        .hasValue());
+        subscribeStarted.post();
+        co_await releaseSubscribe;
+        co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+      },
+      MoQControlCodec::Direction::SERVER,
+      std::nullopt,
+      /*expectResultStat=*/false);
+
+  EXPECT_CALL(
+      *serverPublisherStatsCallback_,
+      onPublishDone(PublishDoneStatusCode::TRACK_ENDED))
+      .Times(0);
+  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscriptionBegin()).Times(0);
+  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscriptionEnd()).Times(0);
+
+  auto subscribeResult =
+      co_withExecutor(
+          &eventBase_,
+          clientSession_->subscribe(
+              getSubscribe(kTestTrackName), subscribeCallback_))
+          .start();
+  co_await subscribeStarted;
+
+  serverSession_->requestStreamGoaway(
+      kFirstRequestID,
+      "moqt://relay-b.example/path",
+      std::chrono::milliseconds(1));
+
+  auto result = co_await std::move(subscribeResult).via(&eventBase_);
+  EXPECT_TRUE(result.hasError());
+
+  releaseSubscribe.post();
+  co_await rescheduleN(4);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    Draft18RequestStreamGoawayTest,
+    DeferredPublishDoneCancelsGoawayReset) {
+  co_await setupMoQSession();
+
+  folly::coro::Baton publishDoneSent;
+  std::shared_ptr<SubgroupConsumer> subgroupPublisher;
+  expectSubscribe(
+      [this, &subgroupPublisher](auto sub, auto pub) -> TaskSubscribeResult {
+        // Keep response bytes local so this exercises sender-side timer state.
+        serverWt_->writeHandles.at(0)->setImmediateDelivery(false);
+        auto subgroup = pub->beginSubgroup(0, 0, 0);
+        EXPECT_TRUE(subgroup.hasValue());
+        subgroupPublisher = subgroup.value();
+        serverWt_->writeHandles.at(serverObjectStreamId())
+            ->setImmediateDelivery(false);
+        EXPECT_TRUE(subgroupPublisher->object(0, moxygen::test::makeBuf(10))
+                        .hasValue());
+        EXPECT_TRUE(pub->publishDone(getTrackEndedPublishDone(sub.requestID))
+                        .hasValue());
+        serverSession_->requestStreamGoaway(
+            sub.requestID,
+            "moqt://relay-b.example/path",
+            std::chrono::milliseconds(1));
+        co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+      });
+
+  EXPECT_CALL(
+      *serverPublisherStatsCallback_,
+      onPublishDone(PublishDoneStatusCode::TRACK_ENDED))
+      .WillOnce([&] { publishDoneSent.post(); });
+
+  auto subscribeResult =
+      co_withExecutor(
+          &eventBase_,
+          clientSession_->subscribe(
+              getSubscribe(kTestTrackName), subscribeCallback_))
+          .start();
+  co_await publishDoneSent;
+
+  auto requestStream = serverWt_->writeHandles.at(0);
+  auto dataStream = serverWt_->writeHandles.at(serverObjectStreamId());
+  co_await folly::coro::sleep(std::chrono::milliseconds(20));
+  EXPECT_FALSE(requestStream->getWriteErr().has_value());
+  EXPECT_FALSE(dataStream->getWriteErr().has_value());
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+  auto result = co_await std::move(subscribeResult).via(&eventBase_);
+  EXPECT_TRUE(result.hasError());
+}
+
+CO_TEST_P_X(
+    Draft18RequestStreamGoawayTest,
+    GoingAwayResetSynthesizesGoingAwayPublishDone) {
+  auto subscription = co_await openClientSubscription();
+  if (!subscription) {
+    co_return;
   }
-  // The reset tears down the request but does not close the session.
+
+  folly::coro::Baton publishDoneReceived;
+  PublishDone received;
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
+      .WillOnce(
+          testing::Invoke(
+              [&](PublishDone done)
+                  -> folly::Expected<folly::Unit, MoQPublishError> {
+                received = std::move(done);
+                publishDoneReceived.post();
+                return folly::unit;
+              }));
+
+  serverWt_->writeHandles.at(0)->resetStream(0x4);
+  co_await publishDoneReceived;
+
+  EXPECT_EQ(received.statusCode, PublishDoneStatusCode::GOING_AWAY);
   EXPECT_FALSE(clientWt_->isSessionClosed());
   EXPECT_FALSE(serverSession_->isClosed());
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
@@ -1703,7 +1852,7 @@ CO_TEST_P_X(MoQUniControlTest, UniControlSetupStreamFinBeforeSetup) {
   clientSession_->start();
 
   auto* wh = CHECK_NOTNULL(serverWt_->createUniStream().value_or(nullptr));
-  // const auto streamId = wh->getID();
+  const auto streamId = wh->getID();
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
   moxygen::Setup serverSetup;
   serverSetup.params.insertParam(
@@ -1716,10 +1865,9 @@ CO_TEST_P_X(MoQUniControlTest, UniControlSetupStreamFinBeforeSetup) {
   // Returning at all means the FIN-complete SETUP was parsed.
   co_await clientSession_->setup(getClientSetup(initialMaxRequestID_));
 
-  // TODO: restore once the proxygen pin has readCount_/stopSendingCount_.
-  // const auto* peerHandle = serverWt_->writeHandles.at(streamId).get();
-  // EXPECT_EQ(peerHandle->readCount_, 1);
-  // EXPECT_EQ(peerHandle->stopSendingCount_, 0);
+  const auto* peerHandle = serverWt_->writeHandles.at(streamId).get();
+  EXPECT_EQ(peerHandle->readCount_, 1);
+  EXPECT_EQ(peerHandle->stopSendingCount_, 0);
   EXPECT_FALSE(clientWt_->isSessionClosed());
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
@@ -1748,7 +1896,7 @@ CO_TEST_P_X(MoQUniControlTest, UniControlDataStreamFinBeforeSetup) {
   serverSession_->sendSetup(std::move(serverSetup));
 
   auto dataWh = CHECK_NOTNULL(serverWt_->createUniStream().value_or(nullptr));
-  // const auto dataStreamId = dataWh->getID();
+  const auto dataStreamId = dataWh->getID();
   folly::IOBufQueue dataBuf{folly::IOBufQueue::cacheChainLength()};
   MoQFrameWriter writer;
   writer.initializeVersion(kVersionDraft18);
@@ -1798,10 +1946,9 @@ CO_TEST_P_X(MoQUniControlTest, UniControlDataStreamFinBeforeSetup) {
 
   co_await baton;
 
-  // TODO: restore once the proxygen pin has readCount_/stopSendingCount_.
-  // const auto* peerHandle = serverWt_->writeHandles.at(dataStreamId).get();
-  // EXPECT_EQ(peerHandle->readCount_, 1);
-  // EXPECT_EQ(peerHandle->stopSendingCount_, 0);
+  const auto* peerHandle = serverWt_->writeHandles.at(dataStreamId).get();
+  EXPECT_EQ(peerHandle->readCount_, 1);
+  EXPECT_EQ(peerHandle->stopSendingCount_, 0);
 
   res.value()->unsubscribe();
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
@@ -1882,10 +2029,9 @@ CO_TEST_P_X(MoQUniControlTest, BidiRequestStreamFinWithFirstFrame) {
   // spurious post-FIN read has to have landed by the time we sample it.
   co_await rescheduleN(10);
 
-  // TODO: restore once the proxygen pin has readCount_/stopSendingCount_.
-  // const auto* peerHandle = clientWt_->writeHandles.at(streamId).get();
-  // EXPECT_EQ(peerHandle->readCount_, 1);
-  // EXPECT_EQ(peerHandle->stopSendingCount_, 0);
+  const auto* peerHandle = clientWt_->writeHandles.at(streamId).get();
+  EXPECT_EQ(peerHandle->readCount_, 1);
+  EXPECT_EQ(peerHandle->stopSendingCount_, 0);
   EXPECT_FALSE(serverWt_->isSessionClosed());
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }

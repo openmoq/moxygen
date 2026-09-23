@@ -6,6 +6,7 @@
 
 #include "moxygen/MoQSession.h"
 #include <folly/Chrono.h>
+#include <folly/concurrency/ProcessLocalUniqueId.h>
 #include <folly/coro/Baton.h>
 #include <folly/coro/Collect.h>
 #include <folly/coro/FutureUtil.h>
@@ -956,6 +957,16 @@ StreamPublisherImpl::publishStatus(
   if (!validateRes) {
     return validateRes;
   }
+  if (streamType_ == StreamType::FETCH_HEADER &&
+      !fetchObjectsHaveStatus(publisher_->getVersion())) {
+    // Nothing to serialize: leaving objectID out of the response is what tells
+    // the subscriber it doesn't exist.
+    header_.id = objectID;
+    if (finStream) {
+      return writeToStream(/*finStream=*/true);
+    }
+    return folly::unit;
+  }
   header_.status = status;
   header_.length = std::nullopt;
   return writeCurrentObject(
@@ -1429,6 +1440,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
   }
 
   void unsubscribe() {
+    cancelGoawayResetTimer();
     if (!subscriptionHandle_) {
       XLOG(ERR) << "Received Unsubscribe before sending SUBSCRIBE_OK id="
                 << requestID_ << " trackPub=" << this;
@@ -1442,12 +1454,14 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
 
   void terminatePublish(PublishDone pubDone, ResetStreamErrorCode code)
       override {
+    cancelGoawayResetTimer();
     resetAllSubgroups(code);
     auto session = std::exchange(session_, nullptr);
     // PUBLISH_DONE already went out; the publisher only lingered here to drain
     // its subgroups, so there is nothing left to tell the peer. A publisher
     // that was already retired has no session to write through either.
     if (publishDoneSent() || !session) {
+      subscriptionHandle_.reset();
       return;
     }
     if (!subscriptionHandle_) {
@@ -1462,14 +1476,23 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
   }
 
   void resetForGoaway(ResetStreamErrorCode code) override {
-    resetAllSubgroups(code);
-    subscriptionHandle_.reset();
-    if (replyContext_) {
-      replyContext_->cancel(code);
+    if (!subscriptionHandle_) {
+      resetAllSubgroups(code);
+      if (replyContext_) {
+        replyContext_->cancel(code);
+      }
+      if (auto session = std::exchange(session_, nullptr)) {
+        session->cleanupSubscribePublisherAfterGoawayReset(requestID_);
+      }
+      return;
     }
-    if (auto session = std::exchange(session_, nullptr)) {
-      session->cleanupSubscribePublisherAfterGoawayReset(requestID_);
-    }
+    terminatePublish(
+        PublishDone{
+            requestID_,
+            PublishDoneStatusCode::GOING_AWAY,
+            streamCount_,
+            "Request stream GOAWAY timeout expired"},
+        code);
   }
 
   bool hasOpenDataStreams() const override {
@@ -1595,6 +1618,7 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
   }
 
   void cancel() {
+    cancelGoawayResetTimer();
     cancelled_ = true;
     // reset -> onStreamComplete -> fetchComplete: handles pubTracks_.erase
     // and retireRequestID
@@ -1624,6 +1648,7 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
   }
 
   void onStreamComplete(const ObjectHeader&) override {
+    cancelGoawayResetTimer();
     streamPublisher_.reset();
     PublisherImpl::fetchComplete();
   }
@@ -2000,6 +2025,7 @@ MoQSession::TrackPublisherImpl::publishDone(PublishDone pubDone) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "publishDone twice or after close"));
   }
+  cancelGoawayResetTimer();
   pubDone.requestID = requestID_;
   if (!subscriptionHandle_) {
     // publishDone called from inside the subscribe handler,
@@ -2816,12 +2842,9 @@ void MoQSession::cancelGoawayTimeout() {
   }
 }
 
-// Per-request reset timer (draft-18 §10.4). Owned by the PublisherImpl whose
-// request stream it resets, so any teardown path that destroys the
-// PublisherImpl cancels it via ~PublisherImpl. The expiry callback re-hops to
-// the executor and re-checks a weak_ptr to the PublisherImpl, so it cannot fire
-// on freed state even though the reset itself destroys the PublisherImpl (and
-// this timer).
+// Per-request timeout for draft-18 §10.4. Owned by the PublisherImpl and
+// cancelled when the request completes. The expiry callback re-hops to the
+// executor and re-checks a weak_ptr to the PublisherImpl.
 class MoQSession::PublisherImpl::GoawayResetTimeoutCallback
     : public quic::QuicTimerCallback {
  public:
@@ -2859,12 +2882,14 @@ void MoQSession::PublisherImpl::armGoawayResetTimer(
     return;
   }
   goawayResetTimer_ = std::make_unique<GoawayResetTimeoutCallback>(*this);
+  goawayResetPending_ = true;
   XLOG(DBG1) << "Scheduling request-stream GOAWAY reset timeoutMs="
              << timeout.count() << " pub=" << this;
   exec->scheduleTimeout(goawayResetTimer_.get(), timeout);
 }
 
 void MoQSession::PublisherImpl::cancelGoawayResetTimer() {
+  goawayResetPending_ = false;
   if (goawayResetTimer_) {
     goawayResetTimer_->cancelTimerCallback();
     goawayResetTimer_.reset();
@@ -2872,13 +2897,13 @@ void MoQSession::PublisherImpl::cancelGoawayResetTimer() {
 }
 
 void MoQSession::PublisherImpl::onGoawayResetTimerExpired() {
-  XLOG(DBG1) << "request-stream GOAWAY reset timer expired, resetting stream "
+  if (!std::exchange(goawayResetPending_, false)) {
+    return;
+  }
+  XLOG(DBG1) << "request-stream GOAWAY timer expired, terminating request "
              << "id=" << requestID_ << " pub=" << this;
-  // Spec draft-18 §10.4: reset the request (bidi) stream and data streams with
-  // GOING_AWAY -- do NOT send PUBLISH_DONE. resetForGoaway also cleans up the
-  // publisher state (pubTracks_.erase + accounting). Safe to destroy this
-  // PublisherImpl here: the expiry callback holds a shared_ptr for the call's
-  // duration (see GoawayResetTimeoutCallback).
+  // End this request with GOING_AWAY. Subscriptions send PUBLISH_DONE, while
+  // FETCH requests reset their request and data streams.
   resetForGoaway(ResetStreamErrorCode::GOING_AWAY);
 }
 
@@ -3360,6 +3385,7 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
     std::shared_ptr<BidiStreamControl> control,
     std::unique_ptr<MoQControlCodec::ControlCallback> senderCallback) {
   XLOG(DBG1) << __func__ << " sess=" << this;
+  const auto negotiatedVersion = negotiatedVersion_;
   auto g = folly::makeGuard([func = __func__, this] {
     XLOG(DBG1) << "exit " << func << " sess=" << this;
   });
@@ -3382,6 +3408,7 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
   }
 
   bool exceptionalExit = false;
+  std::optional<ResetStreamErrorCode> peerTerminationError;
   auto token = co_await folly::coro::co_current_cancellation_token;
   while (auto* handle = readHandle.get()) {
     if (token.isCancellationRequested()) {
@@ -3394,6 +3421,13 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
       XLOG(DBG4) << folly::exceptionStr(streamData.exception())
                  << " id=" << streamId << " sess=" << this;
       exceptionalExit = true;
+      if (auto* wtEx =
+              streamData
+                  .tryGetExceptionObject<proxygen::WebTransport::Exception>();
+          negotiatedVersion && wtEx) {
+        peerTerminationError =
+            fromWireResetStreamErrorCode(wtEx->error, *negotiatedVersion);
+      }
       break;
     }
     if (!token.isCancellationRequested() &&
@@ -3426,7 +3460,7 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
       !cancellationSource_.isCancellationRequested() &&
       (exceptionalExit || fin)) {
     if (exceptionalExit || control->finIsCancellation()) {
-      control->firePeerTermination();
+      control->firePeerTermination(peerTerminationError);
     }
     if (control->requestID().has_value()) {
       // No-op if the terminal reply already resolved + erased the pending.
@@ -3489,7 +3523,8 @@ MoQSession::SendRequestResult MoQSession::sendRequest(
     RequestID requestID,
     uint64_t minBidiDraftVersion,
     std::unique_ptr<MoQControlCodec::ControlCallback> senderCallback,
-    folly::Function<void(RequestID)> onPeerTermination) {
+    folly::Function<void(RequestID, std::optional<ResetStreamErrorCode>)>
+        onPeerTermination) {
   if (getDraftMajorVersion(*negotiatedVersion_) >= minBidiDraftVersion) {
     auto bidiStream = wt_->createBidiStream();
     if (!bidiStream) {
@@ -3780,10 +3815,15 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       obj.forwardingPreferenceIsDatagram = forwardingPreferenceIsDatagram;
       if (objectComplete && subscribeState_) {
         logger_->logSubgroupObjectParsed(
-            currentStreamId_, trackAlias_, obj, initialPayload->clone());
+            currentStreamId_,
+            trackAlias_,
+            obj,
+            initialPayload ? initialPayload->clone() : nullptr);
       } else if (objectComplete && fetchState_) {
         logger_->logFetchObjectParsed(
-            currentStreamId_, obj, initialPayload->clone());
+            currentStreamId_,
+            obj,
+            initialPayload ? initialPayload->clone() : nullptr);
       } else {
         currentObj_ = std::move(obj);
       }
@@ -4357,6 +4397,11 @@ folly::coro::Task<void> MoQSession::handleSubscribe(
       publishHandler_->subscribe(
           std::move(sub),
           std::static_pointer_cast<TrackConsumer>(trackPublisher))));
+  auto publisherIt = pubTracks_.find(requestID);
+  if (publisherIt == pubTracks_.end() ||
+      publisherIt->second.get() != trackPublisher.get()) {
+    co_return;
+  }
   if (subscribeResult.hasException()) {
     XLOG(ERR) << "Exception in Publisher callback ex="
               << subscribeResult.exception().what().toStdString();
@@ -4973,6 +5018,27 @@ void MoQSession::onPublishImpl(
       .start();
 }
 
+bool MoQSession::installPublishReceiveState(
+    const FullTrackName& fullTrackName,
+    RequestID requestID,
+    TrackAlias alias,
+    std::optional<uint64_t> publisherPriority,
+    const std::shared_ptr<TrackConsumer>& consumer) {
+  auto trackReceiveState = std::make_shared<SubscribeTrackReceiveState>(
+      fullTrackName, requestID, consumer, this, alias, logger_, true);
+  auto emplaceRes = subTracks_.try_emplace(alias, trackReceiveState);
+  if (!emplaceRes.second) {
+    XLOG(ERR) << "TrackAlias already in use alias=" << alias
+              << " sess=" << this;
+    return false;
+  }
+  reqIdToTrackAlias_.emplace(requestID, alias);
+  applyResolvedPublisherPriority(publisherPriority, trackReceiveState);
+  consumer->setTrackAlias(alias);
+  deliverBufferedData(alias);
+  return true;
+}
+
 folly::coro::Task<void> MoQSession::handlePublish(
     PublishRequest publish,
     std::shared_ptr<Publisher::SubscriptionHandle> publishHandle,
@@ -5004,6 +5070,13 @@ folly::coro::Task<void> MoQSession::handlePublish(
     } else {
       // Extract the initiator and process reply with co_await
       auto& initiator = publishResult.value();
+      // A ready consumer takes objects before the reply arrives.
+      if (initiator.consumerReady &&
+          !installPublishReceiveState(
+              ftn, requestID, alias, publisherPriority, initiator.consumer)) {
+        close(SessionCloseErrorCode::DUPLICATE_TRACK_ALIAS);
+        co_return;
+      }
       // Process the async reply - this is the only async part
       auto replyResult =
           co_await folly::coro::co_awaitTry(std::move(initiator.reply));
@@ -5014,24 +5087,17 @@ folly::coro::Task<void> MoQSession::handlePublish(
       } else if (replyResult->hasError()) {
         publishErr.reasonPhrase = replyResult->error().reasonPhrase;
       } else {
-        // Create SubscribeTrackReceiveState
-        // Need in order to obtain Alias Later on
-        reqIdToTrackAlias_.emplace(requestID, alias);
-
-        // Add ReceiveState to subTracks_
-        auto trackReceiveState = std::make_shared<SubscribeTrackReceiveState>(
-            ftn, requestID, initiator.consumer, this, alias, logger_, true);
-
-        applyResolvedPublisherPriority(publisherPriority, trackReceiveState);
-
-        initiator.consumer->setTrackAlias(alias);
-        subTracks_.emplace(alias, trackReceiveState);
+        if (!initiator.consumerReady &&
+            !installPublishReceiveState(
+                ftn, requestID, alias, publisherPriority, initiator.consumer)) {
+          close(SessionCloseErrorCode::DUPLICATE_TRACK_ALIAS);
+          co_return;
+        }
         // Ensure the PublishOk we send back corresponds to the inbound
         // publish request (requestID), not the republish's requestID.
         auto pubOk = replyResult->value();
         pubOk.requestID = requestID;
         publishOk(pubOk, *replyContext);
-        deliverBufferedData(alias);
         co_return;
       }
     }
@@ -5598,7 +5664,7 @@ folly::coro::Task<MoQSession::TrackStatusResult> MoQSession::trackStatus(
       /*senderCallback=*/nullptr,
       // Peer close (FIN or RST) before sending a reply: synthesize
       // TRACK_STATUS_ERROR. (sender control finIsCancellation=true.)
-      [this](RequestID id) {
+      [this](RequestID id, std::optional<ResetStreamErrorCode>) {
         onTrackStatusError(
             TrackStatusError{
                 id,
@@ -5907,7 +5973,7 @@ Subscriber::PublishResult MoQSession::publish(
       /*minBidiDraftVersion=*/18,
       /*senderCallback=*/nullptr,
       // Peer cancelled the PUBLISH bidi: tear down the local publisher.
-      [this](RequestID id) {
+      [this](RequestID id, std::optional<ResetStreamErrorCode>) {
         auto it = pubTracks_.find(id);
         if (it == pubTracks_.end()) {
           return;
@@ -5996,10 +6062,12 @@ Subscriber::PublishResult MoQSession::publish(
         co_return result;
       });
 
-  // Return PublishConsumerAndReplyTask immediately (no co_await)
+  // Return PublishConsumerAndReplyTask immediately (no co_await). forward, not
+  // the reply, gates whether the consumer accepts writes.
   return Subscriber::PublishConsumerAndReplyTask{
       std::static_pointer_cast<TrackConsumer>(trackPublisher),
-      std::move(replyTask)};
+      std::move(replyTask),
+      /*consumerReady=*/true};
 }
 
 void MoQSession::publishOk(const PublishOk& pubOk, ReplyContext& replyContext) {
@@ -6039,9 +6107,12 @@ void MoQSession::publishError(
 
   auto aliasRes = reqIdToTrackAlias_.find(publishError.requestID);
   if (aliasRes == reqIdToTrackAlias_.end()) {
-    XLOG(ERR) << "No track alias found for requestId="
-              << publishError.requestID;
     return;
+  }
+  auto trackIt = subTracks_.find(aliasRes->second);
+  if (trackIt != subTracks_.end()) {
+    // Readers already holding this state keep writing unless it's cancelled.
+    trackIt->second->cancel();
   }
   removeSubscriptionState(aliasRes->second, publishError.requestID);
 }
@@ -6123,10 +6194,12 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
       /*minBidiDraftVersion=*/18,
       /*senderCallback=*/nullptr,
       // streamCount=max so in-flight subgroups flush; timeout delivers done.
-      [this](RequestID id) {
+      [this](RequestID id, std::optional<ResetStreamErrorCode> resetError) {
         PublishDone pd;
         pd.requestID = id;
-        pd.statusCode = PublishDoneStatusCode::SUBSCRIPTION_ENDED;
+        pd.statusCode = resetError == ResetStreamErrorCode::GOING_AWAY
+            ? PublishDoneStatusCode::GOING_AWAY
+            : PublishDoneStatusCode::SUBSCRIPTION_ENDED;
         pd.streamCount = std::numeric_limits<uint64_t>::max();
         pd.reasonPhrase = "peer closed stream before reply";
         onPublishDone(std::move(pd));
@@ -6303,6 +6376,7 @@ void MoQSession::sendPublishDone(const PublishDone& pubDone) {
     return;
   }
   auto pubTrack = it->second;
+  pubTrack->cancelGoawayResetTimer();
   endSubscriptionStat(*pubTrack);
   // A failed write still ends the request. The publisher can outlive this call
   // draining its subgroups, and teardown must not answer the request again.
@@ -6640,7 +6714,7 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
       /*senderCallback=*/nullptr,
       // After FETCH_OK we disarm in onFetchOk so the data streams own
       // completion.
-      [this](RequestID id) {
+      [this](RequestID id, std::optional<ResetStreamErrorCode>) {
         auto fetchIt = fetches_.find(id);
         if (fetchIt == fetches_.end()) {
           return;
@@ -6948,7 +7022,7 @@ std::optional<MoQSession::BidiStreamConfig> MoQSession::getBidiStreamConfig(
   auto subscribeNamespaceConfig = [this](FrameType wireType) {
     return BidiStreamConfig{
         {wireType, FrameType::REQUEST_UPDATE},
-        [this](RequestID id) {
+        [this](RequestID id, std::optional<ResetStreamErrorCode>) {
           onUnsubscribeNamespace(UnsubscribeNamespace{id, std::nullopt});
         },
         /*finIsCancellation=*/true};
@@ -6958,11 +7032,15 @@ std::optional<MoQSession::BidiStreamConfig> MoQSession::getBidiStreamConfig(
       case FrameType::SUBSCRIBE:
         return BidiStreamConfig{
             {FrameType::SUBSCRIBE, FrameType::REQUEST_UPDATE},
-            [this](RequestID id) { onUnsubscribe(Unsubscribe{id}); }};
+            [this](RequestID id, std::optional<ResetStreamErrorCode>) {
+              onUnsubscribe(Unsubscribe{id});
+            }};
       case FrameType::FETCH:
         return BidiStreamConfig{
             {FrameType::FETCH, FrameType::REQUEST_UPDATE},
-            [this](RequestID id) { onFetchCancel(FetchCancel{id}); }};
+            [this](RequestID id, std::optional<ResetStreamErrorCode>) {
+              onFetchCancel(FetchCancel{id});
+            }};
       case FrameType::PUBLISH:
         return BidiStreamConfig{
             {FrameType::PUBLISH,
@@ -6976,7 +7054,7 @@ std::optional<MoQSession::BidiStreamConfig> MoQSession::getBidiStreamConfig(
         // the announce — both signal end-of-PUBLISH_NAMESPACE.
         return BidiStreamConfig{
             {FrameType::PUBLISH_NAMESPACE, FrameType::REQUEST_UPDATE},
-            [this](RequestID id) {
+            [this](RequestID id, std::optional<ResetStreamErrorCode>) {
               PublishNamespaceDone done;
               done.requestID = id;
               onPublishNamespaceDone(std::move(done));
@@ -6993,7 +7071,9 @@ std::optional<MoQSession::BidiStreamConfig> MoQSession::getBidiStreamConfig(
         // surfaces via exceptionalExit regardless of finIsCancellation.
         return BidiStreamConfig{
             {FrameType::SUBSCRIBE_TRACKS, FrameType::REQUEST_UPDATE},
-            [this](RequestID id) { onSubscribeTracksStreamClosed(id); }};
+            [this](RequestID id, std::optional<ResetStreamErrorCode>) {
+              onSubscribeTracksStreamClosed(id);
+            }};
       default:
         return std::nullopt;
     }
@@ -7761,6 +7841,11 @@ std::shared_ptr<MoQSession> MoQSession::getRequestSession() {
   XCHECK(sessionData);
   XCHECK(sessionData->session);
   return sessionData->session;
+}
+
+SessionId MoQSession::makeSessionId() {
+  // Never returns 0, which is what kUnsetSessionId relies on.
+  return SessionId(folly::processLocalUniqueId());
 }
 
 GroupOrder MoQSession::resolveGroupOrder(

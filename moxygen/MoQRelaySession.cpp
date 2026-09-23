@@ -991,7 +991,8 @@ MoQRelaySession::publishNamespace(
       /*senderCallback=*/nullptr,
       // Peer reset the PUBLISH_NAMESPACE bidi: synthesize
       // PUBLISH_NAMESPACE_CANCEL so our announcement-handler unwinds.
-      [this, namespaceOwner](RequestID id) {
+      [this, namespaceOwner](
+          RequestID id, std::optional<ResetStreamErrorCode>) {
         if (namespaceOwner) {
           namespaceOwner->reset();
         }
@@ -1601,7 +1602,7 @@ MoQRelaySession::subscribeNamespace(
       /*minBidiDraftVersion=*/16,
       std::make_unique<SubNsStreamCallback>(
           this, namespacePublishHandle, namespaceOwner),
-      [namespaceOwner](RequestID) {
+      [namespaceOwner](RequestID, std::optional<ResetStreamErrorCode>) {
         if (namespaceOwner) {
           namespaceOwner->reset();
         }
