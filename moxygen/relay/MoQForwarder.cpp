@@ -652,6 +652,7 @@ MoQForwarder::beginSubgroup(
       XLOG(WARN) << "beginSubgroup: duplicate group=" << groupID
                  << " subgroup=" << subgroupID
                  << " - no active consumers, returning CANCELLED";
+      refusedUpstream_ = true;
       checkAndFireOnEmpty();
       return folly::makeUnexpected(MoQPublishError(
           MoQPublishError::CANCELLED,
@@ -760,7 +761,18 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::publishDone(
 }
 
 void MoQForwarder::addForwardingSubscriber() {
-  if (forwardingSubscribers_++ == 0 && callback_) {
+  if (forwardingSubscribers_++ == 0) {
+    refusedUpstream_ = false;
+    if (callback_) {
+      callback_->forwardChanged(this, true);
+    }
+  } else {
+    renewForwarding();
+  }
+}
+
+void MoQForwarder::renewForwarding() {
+  if (std::exchange(refusedUpstream_, false) && callback_) {
     callback_->forwardChanged(this, true);
   }
 }
@@ -873,7 +885,9 @@ void MoQForwarder::Subscriber::updateForwardState(bool newForward) {
   shouldForward = newForward;
   if (shouldForward && !wasForwarding) {
     forwarder->addForwardingSubscriber();
-  } else if (wasForwarding && !shouldForward) {
+  } else if (shouldForward) {
+    forwarder->renewForwarding();
+  } else if (wasForwarding) {
     forwarder->removeForwardingSubscriber();
   }
 }
@@ -1062,6 +1076,9 @@ MoQForwarder::SubgroupForwarder::cleanupOnError(
     const folly::Expected<T, MoQPublishError>& result) {
   if (result.hasError()) {
     XLOG(DBG1) << "Removing subgroup after error: " << result.error().what();
+    if (forwarder_ && result.error().code == MoQPublishError::CANCELLED) {
+      forwarder_->refusedUpstream_ = true;
+    }
     removeSubgroupAndCheckEmpty();
   }
   return result;
