@@ -583,7 +583,7 @@ void MoQForwarder::handleSubgroupError(
     // Nothing will close this subgroup now, so a draining subscriber waiting
     // only on it has to be retired here.
     if (sub.shouldRemove()) {
-      removeSubscriber(sub.session, std::nullopt, callsite);
+      removeSubscriberByKey(sub.mapKey, std::nullopt, callsite);
     }
   } else {
     // Hard error - remove the entire subscription
@@ -632,8 +632,8 @@ MoQForwarder::beginSubgroup(
           anyReset = true;
         }
         if (sub->shouldRemove()) {
-          removeSubscriber(
-              sub->session, std::nullopt, "beginSubgroup duplicate");
+          removeSubscriberByKey(
+              sub->mapKey, std::nullopt, "beginSubgroup duplicate");
         }
       } else if (
           !sub->passive &&
