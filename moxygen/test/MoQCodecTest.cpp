@@ -1468,7 +1468,7 @@ TEST(MoQCodecTest, BidiCodecRejectsDuplicateRequestOnSameStreamV18) {
   bidiCodec.onIngress(buf.move(), false);
 }
 
-TEST(MoQCodecTest, ClusterAdvertisementUpdatesPreserveStreamRequestID) {
+TEST(MoQCodecTest, ClusterRejectsRepeatedPublishNamespace) {
   for (bool changeID : {false, true}) {
     MoQFrameWriter writer;
     SetupExtensions extensions;
@@ -1487,10 +1487,9 @@ TEST(MoQCodecTest, ClusterAdvertisementUpdatesPreserveStreamRequestID) {
     testing::NiceMock<MockMoQCodecCallback> callback;
     MoQBidiStreamCodec codec(&callback, {FrameType::PUBLISH_NAMESPACE});
     codec.initializeVersion(kVersionDraft18, extensions);
-    EXPECT_CALL(callback, onPublishNamespace(testing::_))
-        .Times(changeID ? 1 : 2);
+    EXPECT_CALL(callback, onPublishNamespace(testing::_)).Times(1);
     EXPECT_CALL(callback, onConnectionError(ErrorCode::PROTOCOL_VIOLATION))
-        .Times(changeID ? 1 : 0);
+        .Times(1);
     codec.onIngress(buf.move(), false);
   }
 }

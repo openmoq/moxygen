@@ -287,9 +287,7 @@ class MoQBidiStreamCodec : public MoQControlCodec {
     } else {
       // Post-first-frame: no fresh request-initiating frame, and a non-
       // REQUEST_OK okType_ (e.g. SUBSCRIBE_OK) may only appear once.
-      const bool clusterUpdate = f == FrameType::PUBLISH_NAMESPACE &&
-          moqFrameParser_.hasExtension(SetupExtension::RelayHops);
-      if (isRequestInitiating(f) && !clusterUpdate) {
+      if (isRequestInitiating(f)) {
         return false;
       }
       if (okType_ && *okType_ != FrameType::REQUEST_OK && f == *okType_) {

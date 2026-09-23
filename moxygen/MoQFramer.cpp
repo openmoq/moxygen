@@ -577,27 +577,12 @@ folly::Expected<std::vector<uint64_t>, ErrorCode> decodeRelayHopPath(
   return hopPath;
 }
 
-folly::Expected<std::string, ErrorCode> encodeRelayHopID(
-    uint64_t hopID,
-    uint64_t version) noexcept {
-  return encodeRelayHopPath({hopID}, version);
-}
-
-folly::Expected<uint64_t, ErrorCode> decodeRelayHopID(
-    std::string_view encoded,
-    uint64_t version) noexcept {
-  auto hops = decodeRelayHopPath(encoded, version);
-  if (!hops || hops->size() != 1) {
-    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-  }
-  return hops->front();
-}
-
 namespace {
 bool validClusterAdvertisement(
     const Parameters& params,
     uint64_t version,
-    bool negotiated = true) {
+    bool negotiated = true,
+    bool update = false) {
   size_t paths = 0;
   size_t costs = 0;
   for (const auto& param : params) {
@@ -609,8 +594,12 @@ bool validClusterAdvertisement(
     return paths == 0 && costs == 0;
   }
   const auto* path = params.getFirstParam(TrackRequestParamKey::HOP_PATH);
-  return getDraftMajorVersion(version) >= 18 && paths == 1 && costs <= 1 &&
-      decodeRelayHopPath(path->asString, version).hasValue();
+  if (update && paths == 0 && costs == 0) {
+    return true;
+  }
+  return getDraftMajorVersion(version) >= 18 &&
+      (update ? paths <= 1 : paths == 1) && costs <= 1 &&
+      (!path || decodeRelayHopPath(path->asString, version).hasValue());
 }
 } // namespace
 
@@ -1101,17 +1090,10 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseSetupParams(
     }
 
     if (getDraftMajorVersion(version) >= 18 &&
-        *key == folly::to_underlying(SetupKey::RELAY_HOPS)) {
-      if (params.hasParam(*key) ||
-          !decodeRelayHopID(param->asString, version)) {
-        return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-      }
-    } else if (
-        getDraftMajorVersion(version) >= 18 &&
-        *key == folly::to_underlying(SetupKey::RELAY_COST)) {
-      if (!isClientSetup || params.hasParam(*key)) {
-        return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-      }
+        (*key == folly::to_underlying(SetupKey::HOP_ID) ||
+         *key == folly::to_underlying(SetupKey::RELAY_COST)) &&
+        params.hasParam(*key)) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     if (params.insertParam(std::move(*param)).hasError()) {
       XLOG(ERR) << "parseSetupParams: rejected setup option at index=" << i
@@ -2313,6 +2295,13 @@ folly::Expected<RequestUpdate, ErrorCode> MoQFrameParser::parseRequestUpdate(
       requestSpecificParams);
   if (!res2) {
     return folly::makeUnexpected(res2.error());
+  }
+  if (!validClusterAdvertisement(
+          requestUpdate.params,
+          *version_,
+          hasExtension(SetupExtension::RelayHops),
+          true)) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   handleRequestSpecificParams(requestUpdate, requestSpecificParams);
   if (length > 0) {
@@ -4501,7 +4490,7 @@ std::string MoQFrameWriter::encodeTokenValue(
 bool includeSetupParam(uint64_t version, SetupKey key) {
   // Cluster advertisements require owned request streams in both directions.
   if (getDraftMajorVersion(version) < 18 &&
-      (key == SetupKey::RELAY_HOPS || key == SetupKey::RELAY_COST)) {
+      (key == SetupKey::HOP_ID || key == SetupKey::RELAY_COST)) {
     return false;
   }
   // Draft 18+ delivers requests on independent bidi streams, so auth token
@@ -4513,7 +4502,7 @@ bool includeSetupParam(uint64_t version, SetupKey key) {
   return key == SetupKey::MAX_REQUEST_ID || key == SetupKey::PATH ||
       key == SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE ||
       key == SetupKey::AUTHORIZATION_TOKEN || key == SetupKey::AUTHORITY ||
-      key == SetupKey::MOQT_IMPLEMENTATION || key == SetupKey::RELAY_HOPS ||
+      key == SetupKey::MOQT_IMPLEMENTATION || key == SetupKey::HOP_ID ||
       key == SetupKey::RELAY_COST;
 }
 
@@ -4522,10 +4511,6 @@ WriteResult writeSetup(
     const Setup& setup,
     uint64_t version,
     bool isClient) noexcept {
-  if (getDraftMajorVersion(version) >= 18 && !isClient &&
-      setup.params.getFirstParam(SetupKey::RELAY_COST)) {
-    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
-  }
   // Setup is version-agnostic, so we spin up a local MoQFrameWriter to
   // dispatch to version-aware writeVarint / writeFrameHeader /
   // writeFixedString.
@@ -5618,6 +5603,13 @@ WriteResult MoQFrameWriter::writeRequestUpdate(
     const RequestUpdate& update) const noexcept {
   XCHECK(version_.has_value())
       << "Version needs to be set to write request update";
+  if (!validClusterAdvertisement(
+          update.params,
+          *version_,
+          hasExtension(SetupExtension::RelayHops),
+          true)) {
+    return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
+  }
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::SUBSCRIBE_UPDATE, error);

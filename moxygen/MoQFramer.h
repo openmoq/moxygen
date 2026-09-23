@@ -44,13 +44,6 @@ folly::Expected<std::string, ErrorCode> parseFixedString(
 // so repeated zeros in one HOP_PATH are not a loop.
 constexpr uint64_t kMoQClusterAnonHopId = 0;
 
-folly::Expected<std::string, ErrorCode> encodeRelayHopID(
-    uint64_t hopID,
-    uint64_t version) noexcept;
-folly::Expected<uint64_t, ErrorCode> decodeRelayHopID(
-    std::string_view encoded,
-    uint64_t version) noexcept;
-
 folly::Expected<std::string, ErrorCode> encodeRelayHopPath(
     const std::vector<uint64_t>& hopPath,
     uint64_t version) noexcept;

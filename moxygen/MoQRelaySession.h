@@ -11,8 +11,20 @@
 
 namespace moxygen {
 
-struct ClusterNamespaceRegistry;
-class ClusterNamespaceOwner;
+// Optional policy attached to a namespace stream. Ordinary relay sessions do
+// not create one; extension sessions supply ownership and prefix tracking.
+class NamespaceAdvertisement {
+ public:
+  virtual ~NamespaceAdvertisement() = default;
+  virtual bool claim(const TrackNamespace&) = 0;
+  virtual bool owns(const TrackNamespace&) const = 0;
+  virtual bool release(const TrackNamespace&) = 0;
+  virtual void reset() = 0;
+  virtual void setPrefix(TrackNamespace) = 0;
+  virtual void queuePrefix(std::optional<TrackNamespace>) = 0;
+  virtual void acceptPrefix() = 0;
+  virtual void discardPendingPrefix() = 0;
+};
 
 class SeparateStreamSubNsReply : public SubNSReply {
  public:
@@ -91,6 +103,12 @@ class MoQRelaySession : public MoQSession {
           nullptr) override;
 
  protected:
+  virtual std::shared_ptr<NamespaceAdvertisement> makeNamespaceAdvertisement(
+      bool /*incoming*/,
+      TrackNamespace /*prefix*/ = {}) {
+    return nullptr;
+  }
+
   void onSubscribeNamespaceImpl(
       const SubscribeNamespace& subscribeNamespace,
       std::shared_ptr<SubNSReply> subNsReply) override;
@@ -249,7 +267,20 @@ class MoQRelaySession : public MoQSession {
   // Draft 18+: reply context for each responder-side namespace or
   // SUBSCRIBE_TRACKS request's bidi stream, so a failed REQUEST_UPDATE can send
   // REQUEST_ERROR and close it.
-  folly::F14FastMap<RequestID, std::shared_ptr<ReplyContext>, RequestID::hash>
+  struct RequestUpdateReplyState {
+    RequestUpdateReplyState() = default;
+    RequestUpdateReplyState(RequestUpdateReplyState&&) noexcept = default;
+    RequestUpdateReplyState(const RequestUpdateReplyState&) = delete;
+    RequestUpdateReplyState& operator=(const RequestUpdateReplyState&) = delete;
+    std::shared_ptr<ReplyContext> context;
+    std::shared_ptr<NamespaceAdvertisement> advertisement;
+    ~RequestUpdateReplyState() {
+      if (advertisement) {
+        advertisement->reset();
+      }
+    }
+  };
+  folly::F14FastMap<RequestID, RequestUpdateReplyState, RequestID::hash>
       requestUpdateReplyContexts_;
   // Draft 18+
   folly::F14FastMap<
@@ -269,31 +300,6 @@ class MoQRelaySession : public MoQSession {
       legacySubscriberNamespaceToReqId_;
   folly::F14FastMap<TrackNamespace, RequestID, TrackNamespace::hash>
       legacySubscribeNamespaceToReqId_;
-
-  std::shared_ptr<ClusterNamespaceOwner> makeClusterNamespaceOwner(
-      bool incoming,
-      TrackNamespace prefix = {});
-  std::shared_ptr<ClusterNamespaceRegistry> incomingNamespaceRegistry_;
-  std::shared_ptr<ClusterNamespaceRegistry> outgoingNamespaceRegistry_;
-  folly::F14FastMap<
-      RequestID,
-      std::shared_ptr<ClusterNamespaceOwner>,
-      RequestID::hash>
-      outgoingNamespaceOwners_;
-
-  struct IncomingClusterAdvertisement {
-    TrackNamespace trackNamespace;
-    std::shared_ptr<ReplyContext> context;
-    std::optional<PublishNamespace> pendingUpdate;
-    std::shared_ptr<ClusterNamespaceOwner> owner;
-  };
-  folly::F14FastMap<RequestID, IncomingClusterAdvertisement, RequestID::hash>
-      incomingClusterAdvertisements_;
-  folly::F14FastMap<
-      RequestID,
-      std::shared_ptr<ClusterNamespaceOwner>,
-      RequestID::hash>
-      outgoingClusterAdvertisements_;
 
   // Extended PendingRequestState for publishNamespace support
   class MoQRelayPendingRequestState;

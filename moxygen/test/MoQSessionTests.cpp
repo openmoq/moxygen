@@ -85,26 +85,26 @@ CO_TEST_P_X(
   EXPECT_EQ(serverSession_->getRelayLinkCost(), 1);
 }
 
-CO_TEST_P_X(Draft18Test, ClusterClientOwnsZeroLinkCost) {
+CO_TEST_P_X(Draft18Test, ClusterPeersAdvertiseIndependentLinkCosts) {
   clientSession_->start();
   serverSession_->start();
   moxygen::Setup serverSetup;
   serverSetup.params.insertParam(SetupParameter(
       folly::to_underlying(SetupKey::MAX_REQUEST_ID), initialMaxRequestID_));
-  serverSetup.params.insertParam(SetupParameter(
-      folly::to_underlying(SetupKey::RELAY_HOPS),
-      *encodeRelayHopID(23, kVersionDraft18)));
+  serverSetup.params.insertParam(
+      SetupParameter(folly::to_underlying(SetupKey::HOP_ID), uint64_t{23}));
+  serverSetup.params.insertParam(
+      SetupParameter(folly::to_underlying(SetupKey::RELAY_COST), uint64_t{7}));
   serverSession_->sendSetup(std::move(serverSetup));
   auto clientSetup = getClientSetup(initialMaxRequestID_);
-  clientSetup.params.insertParam(SetupParameter(
-      folly::to_underlying(SetupKey::RELAY_HOPS),
-      *encodeRelayHopID(41, kVersionDraft18)));
+  clientSetup.params.insertParam(
+      SetupParameter(folly::to_underlying(SetupKey::HOP_ID), uint64_t{41}));
   clientSetup.params.insertParam(
       SetupParameter(folly::to_underlying(SetupKey::RELAY_COST), uint64_t{0}));
   co_await clientSession_->setup(std::move(clientSetup));
   EXPECT_EQ(clientSession_->getPeerHopID(), 23);
   EXPECT_EQ(serverSession_->getPeerHopID(), 41);
-  EXPECT_EQ(clientSession_->getRelayLinkCost(), 0);
+  EXPECT_EQ(clientSession_->getRelayLinkCost(), 7);
   EXPECT_EQ(serverSession_->getRelayLinkCost(), 0);
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
@@ -274,9 +274,8 @@ TEST_F(SetupExtensionsTest, NoneIsNeverHeld) {
 }
 
 TEST_F(SetupExtensionsTest, ShippedTableNegotiatesRelayHops) {
-  auto both = params({SetupParameter(
-      folly::to_underlying(SetupKey::RELAY_HOPS),
-      *encodeRelayHopID(42, kVersion))});
+  auto both = params(
+      {SetupParameter(folly::to_underlying(SetupKey::HOP_ID), uint64_t{42})});
   auto relayHops =
       MoQSession::computeNegotiatedExtensions(both, both, kVersion);
   EXPECT_TRUE(relayHops.has(SetupExtension::RelayHops));

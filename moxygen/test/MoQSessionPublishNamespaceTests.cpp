@@ -232,16 +232,23 @@ class ClusterUpdateHandle : public Subscriber::PublishNamespaceHandle {
  public:
   explicit ClusterUpdateHandle(RequestID id)
       : PublishNamespaceHandle(PublishNamespaceOk{.requestID = id}) {}
-  folly::Expected<folly::Unit, ErrorCode> publishNamespaceUpdate(
-      PublishNamespace ann) override {
-    latest = std::move(ann);
+  folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate update) override {
+    latest = update;
     received.post();
-    return folly::unit;
+    if (reject) {
+      co_return folly::makeUnexpected(RequestError{
+          update.requestID,
+          RequestErrorCode::NOT_SUPPORTED,
+          "update rejected"});
+    }
+    co_return RequestOk{.requestID = update.requestID};
   }
   void publishNamespaceDone() override {
     ++withdrawals;
   }
-  PublishNamespace latest;
+  bool reject{false};
+  RequestUpdate latest;
   folly::coro::Baton received;
   unsigned withdrawals{0};
 };
@@ -273,8 +280,10 @@ CO_TEST_P_X(Draft18Test, ClusterPublishNamespaceUpdatesExistingStream) {
   if (!result.hasValue()) {
     co_return;
   }
-  ann.params.insertParam(Parameter(0x40B58, uint64_t{7}));
-  auto updated = (*result)->publishNamespaceUpdate(ann);
+  RequestUpdate update;
+  update.params.insertParam(Parameter(0x40B58, uint64_t{7}));
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate()).Times(3);
+  auto updated = co_await (*result)->requestUpdate(update);
   EXPECT_TRUE(updated.hasValue());
   if (!updated) {
     clientSession_->close(SessionCloseErrorCode::NO_ERROR);
@@ -282,8 +291,23 @@ CO_TEST_P_X(Draft18Test, ClusterPublishNamespaceUpdatesExistingStream) {
   }
   co_await incoming->received;
   EXPECT_EQ(
-      incoming->latest.requestID, (*result)->publishNamespaceOk().requestID);
+      incoming->latest.existingRequestID,
+      (*result)->publishNamespaceOk().requestID);
   EXPECT_EQ(incoming->latest.params.getFirstParam(0x40B58)->asUint64, 7);
+  EXPECT_EQ(
+      incoming->latest.params.getFirstParam(TrackRequestParamKey::HOP_PATH),
+      nullptr);
+  update.params.eraseAllParamsOfType(TrackRequestParamKey::ROUTE_COST);
+  update.params.insertParam(Parameter(0x40B58, uint64_t{0}));
+  auto zero = co_await (*result)->requestUpdate(update);
+  EXPECT_TRUE(zero.hasValue());
+  EXPECT_EQ(incoming->latest.params.getFirstParam(0x40B58)->asUint64, 0);
+  incoming->reject = true;
+  auto rejected = co_await (*result)->requestUpdate(update);
+  EXPECT_TRUE(rejected.hasError());
+  EXPECT_EQ(incoming->withdrawals, 1);
+  auto stale = co_await (*result)->requestUpdate(update);
+  EXPECT_TRUE(stale.hasError());
   EXPECT_FALSE(serverSession_->isClosed());
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
@@ -349,7 +373,7 @@ CO_TEST_P_X(Draft18Test, ClusterRejectsIncomingNamespaceOnSecondStream) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
-CO_TEST_P_X(Draft18Test, ClusterQueuesUpdateUntilInitialAcceptance) {
+CO_TEST_P_X(Draft18Test, ClusterRejectsRepeatedPublishBeforeAcceptance) {
   relayHopsSupported_ = true;
   co_await setupMoQSession();
   folly::coro::Baton started;
@@ -366,7 +390,7 @@ CO_TEST_P_X(Draft18Test, ClusterQueuesUpdateUntilInitialAcceptance) {
             co_return incoming;
           });
   EXPECT_CALL(*serverSubscriberStatsCallback_, onPublishNamespaceSuccess())
-      .Times(1);
+      .Times(0);
   auto stream = clientWt_->createBidiStream();
   EXPECT_TRUE(stream.hasValue());
   if (!stream) {
@@ -390,15 +414,12 @@ CO_TEST_P_X(Draft18Test, ClusterQueuesUpdateUntilInitialAcceptance) {
   for (int i = 0; i < 50; ++i) {
     co_await folly::coro::co_reschedule_on_current_executor;
   }
-  EXPECT_EQ(incoming->withdrawals, 0);
+  EXPECT_TRUE(serverSession_->isClosed());
   accept.post();
-  co_await incoming->received;
-  EXPECT_EQ(
-      incoming->latest.params.getFirstParam(TrackRequestParamKey::ROUTE_COST)
-          ->asUint64,
-      9);
-  EXPECT_EQ(incoming->withdrawals, 0);
-  EXPECT_FALSE(serverSession_->isClosed());
+  for (int i = 0; i < 50; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  EXPECT_EQ(incoming->withdrawals, 1);
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 

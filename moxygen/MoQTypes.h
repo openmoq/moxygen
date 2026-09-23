@@ -323,7 +323,7 @@ enum class SetupKey : uint64_t {
   MAX_AUTH_TOKEN_CACHE_SIZE = 4,
   AUTHORITY = 5,
   MOQT_IMPLEMENTATION = 7,
-  RELAY_HOPS = 0x40B55,
+  HOP_ID = 0x40B54,
   RELAY_COST = 0x40B56,
 };
 

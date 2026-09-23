@@ -4541,93 +4541,58 @@ TEST_P(MoQFramerV16PlusTest, NamespaceRoundtrip) {
   EXPECT_EQ(parseResult->trackNamespaceSuffix, ns.trackNamespaceSuffix);
 }
 
-TEST_P(MoQFramerV16PlusTest, RelayHopsSetupOptionRoundtrip) {
-  ClientSetup setup;
-  ASSERT_TRUE(setup.params
-                  .insertParam(Parameter(
-                      folly::to_underlying(SetupKey::RELAY_HOPS),
-                      *encodeRelayHopID(42, GetParam())))
-                  .hasValue());
-
-  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
-  ASSERT_TRUE(writeClientSetup(writeBuf, setup, GetParam()).hasValue());
-  auto serialized = writeBuf.move();
-  folly::io::Cursor cursor(serialized.get());
-
-  auto frameType = parser_.decodeVarint(cursor);
-  ASSERT_TRUE(frameType.has_value());
-  auto parsed = parser_.parseClientSetup(cursor, frameLength(cursor));
-  ASSERT_TRUE(parsed.hasValue());
-  if (getDraftMajorVersion(GetParam()) < 18) {
-    EXPECT_TRUE(parsed->params.empty());
-    return;
+TEST_P(MoQFramerV16PlusTest, ClusterSetupOptions) {
+  EXPECT_EQ(folly::to_underlying(SetupKey::HOP_ID), 0x40B54);
+  for (bool client : {false, true}) {
+    for (uint64_t id :
+         {uint64_t{0}, uint64_t{42}, uint64_t{1} << 63, UINT64_MAX}) {
+      for (auto cost :
+           {std::optional<uint64_t>{},
+            std::optional<uint64_t>{0},
+            std::optional<uint64_t>{7}}) {
+        SCOPED_TRACE(
+            testing::Message() << "client=" << client << " id=" << id
+                               << " cost=" << cost.value_or(UINT64_MAX));
+        ClientSetup setup;
+        setup.params.insertParam(
+            Parameter(folly::to_underlying(SetupKey::HOP_ID), id));
+        if (cost) {
+          setup.params.insertParam(
+              Parameter(folly::to_underlying(SetupKey::RELAY_COST), *cost));
+        }
+        folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+        ASSERT_TRUE((client ? writeClientSetup(buf, setup, GetParam())
+                            : writeServerSetup(buf, setup, GetParam()))
+                        .hasValue());
+        auto bytes = buf.move();
+        folly::io::Cursor cursor(bytes.get());
+        ASSERT_TRUE(parser_.decodeVarint(cursor).has_value());
+        auto length = frameLength(cursor);
+        auto parsed = client ? parser_.parseClientSetup(cursor, length)
+                             : parser_.parseServerSetup(cursor, length);
+        ASSERT_TRUE(parsed.hasValue());
+        if (getDraftMajorVersion(GetParam()) < 18) {
+          EXPECT_TRUE(parsed->params.empty());
+          continue;
+        }
+        auto* hop = parsed->params.getFirstParam(SetupKey::HOP_ID);
+        ASSERT_NE(hop, nullptr);
+        EXPECT_EQ(hop->asUint64, id);
+        auto* parsedCost = parsed->params.getFirstParam(SetupKey::RELAY_COST);
+        EXPECT_EQ(parsedCost != nullptr, cost.has_value());
+        if (cost) {
+          ASSERT_NE(parsedCost, nullptr);
+          EXPECT_EQ(parsedCost->asUint64, *cost);
+        }
+      }
+    }
   }
-  ASSERT_EQ(parsed->params.size(), 1);
-  EXPECT_EQ(
-      parsed->params.at(0).key, folly::to_underlying(SetupKey::RELAY_HOPS));
-  EXPECT_EQ(*decodeRelayHopID(parsed->params.at(0).asString, GetParam()), 42);
-}
-
-TEST_P(MoQFramerV16PlusTest, ClusterSetupOptionsSuppressedOnOlderDrafts) {
-  if (getDraftMajorVersion(GetParam()) >= 18) {
-    return;
-  }
-  ClientSetup setup;
-  setup.params.insertParam(Parameter(
-      folly::to_underlying(SetupKey::RELAY_HOPS),
-      *encodeRelayHopID(42, kVersionDraft18)));
-  setup.params.insertParam(
-      Parameter(folly::to_underlying(SetupKey::RELAY_COST), uint64_t{0}));
-  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
-  ASSERT_TRUE(writeClientSetup(buf, setup, GetParam()).hasValue());
-  auto serialized = buf.move();
-  folly::io::Cursor cursor(serialized.get());
-  ASSERT_TRUE(parser_.decodeVarint(cursor).has_value());
-  auto result = parser_.parseClientSetup(cursor, frameLength(cursor));
-  ASSERT_TRUE(result.hasValue());
-  EXPECT_TRUE(result->params.empty());
-}
-
-TEST_P(MoQFramerV16PlusTest, ClusterClientRelayCostPreservesExplicitZero) {
-  if (getDraftMajorVersion(GetParam()) < 18) {
-    return;
-  }
-  ClientSetup setup;
-  setup.params.insertParam(Parameter(0x40B56, uint64_t{0}));
-  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
-  ASSERT_TRUE(writeClientSetup(buf, setup, GetParam()).hasValue());
-  auto serialized = buf.move();
-  folly::io::Cursor cursor(serialized.get());
-  ASSERT_TRUE(parser_.decodeVarint(cursor).has_value());
-  auto result = parser_.parseClientSetup(cursor, frameLength(cursor));
-  ASSERT_TRUE(result.hasValue());
-  auto* cost = result->params.getFirstParam(0x40B56);
-  ASSERT_NE(cost, nullptr);
-  EXPECT_EQ(cost->asUint64, 0);
-}
-
-TEST_P(MoQFramerV16PlusTest, ClusterRejectsIncomingServerRelayCost) {
-  if (getDraftMajorVersion(GetParam()) < 18) {
-    return;
-  }
-  ClientSetup setup;
-  setup.params.insertParam(
-      Parameter(folly::to_underlying(SetupKey::RELAY_COST), uint64_t{7}));
-  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
-  ASSERT_TRUE(writeClientSetup(buf, setup, GetParam()).hasValue());
-  auto serialized = buf.move();
-  folly::io::Cursor cursor(serialized.get());
-  ASSERT_TRUE(parser_.decodeVarint(cursor).has_value());
-  auto result = parser_.parseServerSetup(cursor, frameLength(cursor));
-  ASSERT_TRUE(result.hasError());
-  EXPECT_EQ(result.error(), ErrorCode::PROTOCOL_VIOLATION);
 }
 
 TEST(ClusterSetupTest, Draft17OmitsRelayOptions) {
   ClientSetup setup;
-  setup.params.insertParam(Parameter(
-      folly::to_underlying(SetupKey::RELAY_HOPS),
-      *encodeRelayHopID(42, kVersionDraft18)));
+  setup.params.insertParam(
+      Parameter(folly::to_underlying(SetupKey::HOP_ID), uint64_t{42}));
   setup.params.insertParam(
       Parameter(folly::to_underlying(SetupKey::RELAY_COST), uint64_t{0}));
   folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
@@ -4642,34 +4607,7 @@ TEST(ClusterSetupTest, Draft17OmitsRelayOptions) {
   EXPECT_TRUE(result->params.empty());
 }
 
-TEST_P(MoQFramerV16PlusTest, ClusterServerRelayCostRejected) {
-  if (getDraftMajorVersion(GetParam()) < 18) {
-    return;
-  }
-  ServerSetup setup;
-  setup.params.insertParam(Parameter(0x40B56, uint64_t{0}));
-  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
-  EXPECT_TRUE(writeServerSetup(buf, setup, GetParam()).hasError());
-}
 
-TEST_P(MoQFramerV16PlusTest, ClusterRejectsMalformedSetupHopID) {
-  if (getDraftMajorVersion(GetParam()) < 18) {
-    return;
-  }
-  for (const auto& value : {std::string{}, std::string("\0\1", 2)}) {
-    ClientSetup setup;
-    setup.params.insertParam(
-        Parameter(folly::to_underlying(SetupKey::RELAY_HOPS), value));
-    folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
-    ASSERT_TRUE(writeClientSetup(buf, setup, GetParam()).hasValue());
-    auto serialized = buf.move();
-    folly::io::Cursor cursor(serialized.get());
-    ASSERT_TRUE(parser_.decodeVarint(cursor).has_value());
-    auto result = parser_.parseClientSetup(cursor, frameLength(cursor));
-    ASSERT_TRUE(result.hasError());
-    EXPECT_EQ(result.error(), ErrorCode::PROTOCOL_VIOLATION);
-  }
-}
 
 TEST_P(MoQFramerV16PlusTest, ClusterRejectsDuplicateNonzeroHops) {
   EXPECT_TRUE(decodeRelayHopPath(std::string("\x01\x02\x01", 3), GetParam())
@@ -4680,52 +4618,55 @@ TEST_P(MoQFramerV16PlusTest, ClusterRejectsDuplicateNonzeroHops) {
   EXPECT_EQ(*anonymous, (std::vector<uint64_t>{0, 0}));
 }
 
-TEST_P(
-    MoQFramerV16PlusTest,
-    ClusterWriterRequiresHopPathForBothAdvertisements) {
-  SetupExtensions extensions;
-  extensions.add(SetupExtension::RelayHops);
-  writer_.setNegotiatedExtensions(extensions);
-  PublishNamespace ann;
-  ann.trackNamespace = TrackNamespace({"test"});
-  Namespace ns;
-  ns.trackNamespaceSuffix = ann.trackNamespace;
-  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
-  EXPECT_TRUE(writer_.writePublishNamespace(buf, ann).hasError());
-  EXPECT_TRUE(writer_.writeNamespace(buf, ns).hasError());
-  EXPECT_EQ(buf.chainLength(), 0);
-}
-
-TEST_P(MoQFramerV16PlusTest, ClusterRequiresNamespaceHopPath) {
-  Namespace ns;
-  ns.trackNamespaceSuffix = TrackNamespace({"test"});
-  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
-  ASSERT_TRUE(writer_.writeNamespace(buf, ns).hasValue());
-  auto serialized = buf.move();
-  folly::io::Cursor cursor(serialized.get());
-  ASSERT_TRUE(parser_.decodeVarint(cursor).has_value());
-  SetupExtensions extensions;
-  extensions.add(SetupExtension::RelayHops);
-  parser_.setNegotiatedExtensions(extensions);
-  auto result = parser_.parseNamespace(cursor, frameLength(cursor));
-  ASSERT_TRUE(result.hasError());
-  EXPECT_EQ(result.error(), ErrorCode::PROTOCOL_VIOLATION);
-}
-
-TEST_P(MoQFramerV16PlusTest, ClusterRequiresPublishNamespaceHopPath) {
-  PublishNamespace ann;
-  ann.trackNamespace = TrackNamespace({"test"});
-  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
-  ASSERT_TRUE(writer_.writePublishNamespace(buf, ann).hasValue());
-  auto serialized = buf.move();
-  folly::io::Cursor cursor(serialized.get());
-  ASSERT_TRUE(parser_.decodeVarint(cursor).has_value());
-  SetupExtensions extensions;
-  extensions.add(SetupExtension::RelayHops);
-  parser_.setNegotiatedExtensions(extensions);
-  auto result = parser_.parsePublishNamespace(cursor, frameLength(cursor));
-  ASSERT_TRUE(result.hasError());
-  EXPECT_EQ(result.error(), ErrorCode::PROTOCOL_VIOLATION);
+TEST_P(MoQFramerV16PlusTest, ClusterAdvertisementsRequireHopPath) {
+  {
+    SCOPED_TRACE("ClusterRequiresNamespaceHopPath");
+    Namespace ns;
+    ns.trackNamespaceSuffix = TrackNamespace({"test"});
+    folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+    ASSERT_TRUE(writer_.writeNamespace(buf, ns).hasValue());
+    auto serialized = buf.move();
+    folly::io::Cursor cursor(serialized.get());
+    ASSERT_TRUE(parser_.decodeVarint(cursor).has_value());
+    SetupExtensions extensions;
+    extensions.add(SetupExtension::RelayHops);
+    parser_.setNegotiatedExtensions(extensions);
+    auto result = parser_.parseNamespace(cursor, frameLength(cursor));
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(result.error(), ErrorCode::PROTOCOL_VIOLATION);
+  }
+  {
+    SCOPED_TRACE("ClusterRequiresPublishNamespaceHopPath");
+    parser_.setNegotiatedExtensions({});
+    writer_.setNegotiatedExtensions({});
+    PublishNamespace ann;
+    ann.trackNamespace = TrackNamespace({"test"});
+    folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+    ASSERT_TRUE(writer_.writePublishNamespace(buf, ann).hasValue());
+    auto serialized = buf.move();
+    folly::io::Cursor cursor(serialized.get());
+    ASSERT_TRUE(parser_.decodeVarint(cursor).has_value());
+    SetupExtensions extensions;
+    extensions.add(SetupExtension::RelayHops);
+    parser_.setNegotiatedExtensions(extensions);
+    auto result = parser_.parsePublishNamespace(cursor, frameLength(cursor));
+    ASSERT_TRUE(result.hasError());
+    EXPECT_EQ(result.error(), ErrorCode::PROTOCOL_VIOLATION);
+  }
+  {
+    SCOPED_TRACE("ClusterWriterRequiresHopPathForBothAdvertisements");
+    SetupExtensions extensions;
+    extensions.add(SetupExtension::RelayHops);
+    writer_.setNegotiatedExtensions(extensions);
+    PublishNamespace ann;
+    ann.trackNamespace = TrackNamespace({"test"});
+    Namespace ns;
+    ns.trackNamespaceSuffix = ann.trackNamespace;
+    folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+    EXPECT_TRUE(writer_.writePublishNamespace(buf, ann).hasError());
+    EXPECT_TRUE(writer_.writeNamespace(buf, ns).hasError());
+    EXPECT_EQ(buf.chainLength(), 0);
+  }
 }
 
 TEST_P(MoQFramerV16PlusTest, RelayHopPathRoundtrip) {
@@ -7734,5 +7675,65 @@ TEST(ClusterSetupTest, LegacyAdvertisementParametersFollowDraftRules) {
     EXPECT_EQ(
         writer.writePublishNamespace(output, ann).hasValue(),
         version == kVersionDraft15);
+  }
+}
+
+TEST(MoQClusterFramerTest, RequestUpdateParameters) {
+  MoQFrameWriter writer;
+  MoQFrameParser parser;
+  SetupExtensions extensions;
+  extensions.add(SetupExtension::RelayHops);
+  writer.initializeVersion(kVersionDraft18, extensions);
+  parser.initializeVersion(kVersionDraft18, extensions);
+  for (bool includePath : {false, true}) {
+    RequestUpdate update;
+    update.requestID = RequestID(2);
+    update.params.insertParam(Parameter(
+        folly::to_underlying(TrackRequestParamKey::ROUTE_COST), uint64_t{0}));
+    if (includePath) {
+      update.params.insertParam(Parameter(
+          folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+          *encodeRelayHopPath({42, 99}, kVersionDraft18)));
+    }
+    folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+    ASSERT_TRUE(writer.writeRequestUpdate(buf, update).hasValue());
+    auto bytes = buf.move();
+    folly::io::Cursor cursor(bytes.get());
+    ASSERT_TRUE(parser.decodeVarint(cursor).has_value());
+    auto length = cursor.readBE<uint16_t>();
+    auto result = parser.parseRequestUpdate(cursor, length);
+    ASSERT_TRUE(result.hasValue());
+    ASSERT_NE(
+        result->params.getFirstParam(TrackRequestParamKey::ROUTE_COST),
+        nullptr);
+    EXPECT_EQ(
+        result->params.getFirstParam(TrackRequestParamKey::ROUTE_COST)
+            ->asUint64,
+        0);
+    EXPECT_EQ(
+        result->params.hasParam(
+            folly::to_underlying(TrackRequestParamKey::HOP_PATH)),
+        includePath);
+
+    // A peer cannot smuggle these extension fields onto an ordinary session.
+    parser.setNegotiatedExtensions({});
+    folly::io::Cursor unnegotiated(bytes.get());
+    ASSERT_TRUE(parser.decodeVarint(unnegotiated).has_value());
+    length = unnegotiated.readBE<uint16_t>();
+    EXPECT_TRUE(parser.parseRequestUpdate(unnegotiated, length).hasError());
+    parser.setNegotiatedExtensions(extensions);
+    writer.setNegotiatedExtensions({});
+    EXPECT_TRUE(writer.writeRequestUpdate(buf, update).hasError());
+    EXPECT_EQ(buf.chainLength(), 0);
+    writer.setNegotiatedExtensions(extensions);
+  }
+  for (const auto& path :
+       {std::string{}, std::string("\x01\x01", 2), std::string("\xff", 1)}) {
+    RequestUpdate update;
+    update.params.insertParam(
+        Parameter(folly::to_underlying(TrackRequestParamKey::HOP_PATH), path));
+    folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+    EXPECT_TRUE(writer.writeRequestUpdate(buf, update).hasError());
+    EXPECT_EQ(buf.chainLength(), 0);
   }
 }
