@@ -509,4 +509,57 @@ TEST_F(
   EXPECT_FALSE(res2.hasValue());
 }
 
+// A channel subscriber that renews its interest with forward=true is already
+// forwarding, so the clear cannot depend on a false->true flip.
+TEST_F(OpenMOQForwarderTest, ForwardUpdateClearsChannelTombstoneWhileForwarding) {
+  auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
+  auto consumer = createMockConsumer();
+  DummyExecutor exec;
+
+  auto handle =
+      forwarder->addChannelSubscriber(&exec, /*forward=*/true, consumer);
+  ASSERT_NE(handle, nullptr);
+
+  std::shared_ptr<MockSubgroupConsumer> refused;
+  std::shared_ptr<MockSubgroupConsumer> renewed;
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce(
+          [this, &refused](uint64_t, uint64_t, uint8_t, BeginSubgroupOptions) {
+            refused = createMockSubgroupConsumer();
+            EXPECT_CALL(*refused, object(0, _, _, false))
+                .WillOnce(
+                    Return(folly::makeUnexpected(MoQPublishError(
+                        MoQPublishError::CANCELLED, "No subscribers"))));
+            return folly::makeExpected<
+                MoQPublishError,
+                std::shared_ptr<SubgroupConsumer>>(refused);
+          })
+      .WillOnce(
+          [this, &renewed](uint64_t, uint64_t, uint8_t, BeginSubgroupOptions) {
+            renewed = createMockSubgroupConsumer();
+            EXPECT_CALL(*renewed, object(1, _, _, false))
+                .WillOnce(Return(folly::unit));
+            return folly::makeExpected<
+                MoQPublishError,
+                std::shared_ptr<SubgroupConsumer>>(renewed);
+          });
+
+  auto subgroupRes = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroupRes.hasValue());
+  auto subgroup = *subgroupRes;
+
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+
+  RequestUpdate update;
+  update.requestID = RequestID(2);
+  update.forward = true;
+  ASSERT_TRUE(
+      folly::coro::blockingWait(handle->requestUpdate(update)).hasValue());
+
+  EXPECT_TRUE(subgroup->object(1, test::makeBuf(10)).hasValue());
+  EXPECT_NE(renewed, nullptr);
+
+  subgroup->reset(ResetStreamErrorCode::SESSION_CLOSED);
+}
+
 } // namespace moxygen::test
