@@ -622,14 +622,25 @@ MoQForwarder::beginSubgroup(
       if (it != sub->subgroups.end()) {
         it->second->reset(ResetStreamErrorCode::CANCELLED);
         sub->subgroups.erase(it);
-        anyReset = true;
+        // Passive subscribers (e.g. the relay's own top-N/cache observer chain)
+        // are not real downstream consumers: they never stop_sending, so they
+        // must not mask the "no active consumers" signal. Reset their stale
+        // subgroup but do not count them toward anyReset, otherwise a duplicate
+        // subgroup would never propagate CANCELLED back to the publisher once
+        // all real consumers have stop_sent.
+        if (!sub->passive) {
+          anyReset = true;
+        }
         if (sub->shouldRemove()) {
           removeSubscriber(
               sub->session, std::nullopt, "beginSubgroup duplicate");
         }
       } else if (
+          !sub->passive &&
           !sub->tombstonedSubgroups.count(subgroupIdentifier) &&
           sub->trackConsumer && checkRange(*sub) && sub->checkShouldForward()) {
+        // Passive subscribers can't renew interest either - only a real
+        // downstream subscriber counts as a reopen candidate.
         anyReopenCandidate = true;
       }
     });
