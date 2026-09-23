@@ -121,6 +121,13 @@ class BidiStreamControl {
     return readLoopExited_;
   }
 
+  // Responder with nothing left to send but replies to REQUEST_UPDATE: FIN
+  // the write half once the peer FINs, or now if it already has.
+  void finAfterPeerFin();
+
+  // Called by the read loop when the peer FINs its write half.
+  void onPeerFin();
+
  private:
   void onPeerStopSending();
   // Null the write handle and drop its cancel callback after we close it.
@@ -140,6 +147,8 @@ class BidiStreamControl {
   std::deque<RequestID> responseIDQueue_;
   bool finIsCancellation_{true};
   bool readLoopExited_{false};
+  bool finAfterPeerFin_{false};
+  bool peerFinReceived_{false};
 };
 
 // ReplyContext that writes to the bidi reply stream wrapped by a
@@ -155,6 +164,7 @@ class BidiStreamReplyContext : public ReplyContext {
     return writeBuf_;
   }
   void flush(bool fin = false) override;
+  void finAfterPeerFin() override;
   void cancel(ResetStreamErrorCode code) override;
 
  private:

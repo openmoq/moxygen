@@ -526,6 +526,51 @@ CO_TEST_P_X(Draft18Test, FetchOverBidiStreamLimit) {
       .Times(kLimit);
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+
+// A completed FETCH has to close both halves of its request stream, or the
+// peer's bidi stream limit caps how many FETCHes a session can ever send.
+CO_TEST_P_X(Draft18Test, CompletedFetchReleasesBidiStream) {
+  constexpr uint64_t kLimit = 2;
+  constexpr uint64_t kFetches = kLimit + 1;
+  clientWt_->setMaxLocalBidiStreams(kLimit);
+  co_await setupMoQSession();
+
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onFetchSuccess())
+      .Times(kFetches);
+  EXPECT_CALL(*clientSubscriberStatsCallback_, recordFetchLatency(_))
+      .Times(testing::AnyNumber());
+  for (uint64_t i = 0; i < kFetches; ++i) {
+    expectFetch([](Fetch fetch, auto fetchPub) -> TaskFetchResult {
+      fetchPub->object(
+          0,
+          0,
+          0,
+          moxygen::test::makeBuf(100),
+          noExtensions(),
+          /*finFetch=*/true);
+      co_return makeFetchOkResult(fetch, AbsoluteLocation{0, 1});
+    });
+    auto fetchCb = std::make_shared<testing::StrictMock<MockFetchConsumer>>();
+    folly::coro::Baton objBaton;
+    EXPECT_CALL(*fetchCb, object(0, 0, 0, _, _, true, _)).WillOnce([&] {
+      objBaton.post();
+      return folly::unit;
+    });
+    auto res =
+        co_await clientSession_->fetch(getFetch({0, 0}, {0, 1}), fetchCb);
+    if (res.hasError()) {
+      ADD_FAILURE() << "fetch " << i << ": " << res.error().reasonPhrase;
+      break;
+    }
+    co_await objBaton;
+    for (int j = 0; j < 4; ++j) {
+      co_await folly::coro::co_reschedule_on_current_executor;
+    }
+  }
+  EXPECT_TRUE(clientWt_->openLocalBidiStreams().empty());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, FetchOutOfOrder) {
   co_await setupMoQSession();
   std::shared_ptr<FetchConsumer> fetchPub;
