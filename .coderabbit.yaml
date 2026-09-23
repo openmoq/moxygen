@@ -12,7 +12,6 @@ reviews:
   profile: chill
 
   path_filters:
-    - "!build/**"
     - "!pics/**"
 
   path_instructions:
@@ -56,7 +55,9 @@ reviews:
     - path: "moxygen/**/*.{h,cpp}"
       instructions: |
         Wire behavior must match the MOQT drafts moxygen supports: draft-14,
-        draft-16 and draft-18 (kSupportedVersions in moxygen/MoQVersions.h).
+        draft-16 and draft-18. kSupportedVersions in moxygen/MoQVersions.h
+        still lists draft-15, but its removal is planned, so a change does not
+        need to preserve or add draft-15 behavior.
         A change to framing, setup parameters, control-message semantics or
         error codes has to state which versions it applies to and stay correct
         on the others. Version-dependent behavior belongs behind the helpers
@@ -123,7 +124,9 @@ reviews:
         openmoq/README.md and .github/CONTRIBUTING.md describe the omoq-*
         workflows, the daily upstream sync and the branch model. Workflows
         without the omoq- prefix come from upstream. PR CI runs without
-        secrets; publish, release and deploy run only on push to main.
+        secrets. omoq-ci-main.yml publishes snapshots on push to main and
+        release/**; versioned releases run through workflow_dispatch of
+        omoq-version-release.yml.
 
 knowledge_base:
   # Needed to read the IETF Datatracker drafts linked above.
