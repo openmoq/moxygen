@@ -484,6 +484,8 @@ class MoQForwarder : public TrackConsumer {
   void countReceivedObject(uint64_t groupID);
 
   uint64_t forwardingSubscribers_{0};
+  // Set when we answer the publisher CANCELLED, not when a subscriber skips.
+  bool refusedUpstream_{false};
   uint32_t passiveCount_{0};
   uint64_t totalGroupsReceived_{0};
   uint64_t totalObjectsReceived_{0};

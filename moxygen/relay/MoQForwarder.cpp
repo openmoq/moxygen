@@ -43,6 +43,7 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::forEachSubscriber(
   }
   // Check if empty after iteration - subscribers may have been removed in loop
   if (subscribers_.empty()) {
+    refusedUpstream_ = true;
     return folly::makeUnexpected(
         MoQPublishError(MoQPublishError::CANCELLED, "No subscribers"));
   }
@@ -132,6 +133,9 @@ MoQForwarder::SubgroupForwarder::forEachSubscriberSubgroup(
   // Check if empty after iteration - subscribers may have been removed in loop
   // Also check if any subscriber was actually forwarded to
   if (!forwarder_ || forwarder_->subscribers_.empty() || !anyForwarded) {
+    if (forwarder_) {
+      forwarder_->refusedUpstream_ = true;
+    }
     return folly::makeUnexpected(
         MoQPublishError(MoQPublishError::CANCELLED, "No subscribers"));
   }
@@ -652,12 +656,14 @@ MoQForwarder::beginSubgroup(
       XLOG(WARN) << "beginSubgroup: duplicate group=" << groupID
                  << " subgroup=" << subgroupID
                  << " - no active consumers, returning CANCELLED";
+      refusedUpstream_ = true;
       checkAndFireOnEmpty();
       return folly::makeUnexpected(MoQPublishError(
           MoQPublishError::CANCELLED,
           "duplicate subgroup, no active consumers"));
     }
     if (subscribers_.empty()) {
+      refusedUpstream_ = true;
       checkAndFireOnEmpty();
       return folly::makeUnexpected(MoQPublishError(
           MoQPublishError::CANCELLED, "duplicate subgroup, no subscribers"));
@@ -760,7 +766,15 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::publishDone(
 }
 
 void MoQForwarder::addForwardingSubscriber() {
-  if (forwardingSubscribers_++ == 0 && callback_) {
+  const bool refused = refusedUpstream_;
+  refusedUpstream_ = false;
+  if (forwardingSubscribers_++ == 0) {
+    if (callback_) {
+      callback_->forwardChanged(this, true);
+    }
+  } else if (refused && callback_) {
+    // An arrival past the first is the publisher's only cue that data we
+    // refused is wanted again.
     callback_->forwardChanged(this, true);
   }
 }

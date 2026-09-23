@@ -124,7 +124,11 @@ struct CountingCallback : public MoQForwarder::Callback {
   void onEmpty(MoQForwarder*) override {
     onEmptyCount++;
   }
+  void forwardChanged(MoQForwarder*) override {
+    forwardChangedCount++;
+  }
   size_t onEmptyCount{0};
+  size_t forwardChangedCount{0};
 };
 
 struct TestNGRCallback : public MoQForwarder::Callback {
@@ -985,6 +989,61 @@ TEST_F(MoQForwarderTest, ForwardUpdateClearsTombstoneWhileForwarding) {
 
   EXPECT_TRUE(subgroup->object(1, test::makeBuf(10)).hasValue());
   EXPECT_NE(renewed, nullptr);
+
+  subgroup->reset(ResetStreamErrorCode::SESSION_CLOSED);
+}
+
+// Test: an arrival past the first still has to reach the publisher, since it is
+// the only cue that data the forwarder just refused is wanted again.
+TEST_F(MoQForwarderTest, SubscriberArrivalAfterRefusalRenewsForwarding) {
+  auto forwarder = std::make_shared<MoQForwarder>(kFwdTestTrackName);
+  auto cb = std::make_shared<CountingCallback>();
+  forwarder->setCallback(cb);
+
+  auto consumer = createMockConsumer();
+  std::shared_ptr<MockSubgroupConsumer> sg;
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce(
+          [this, &sg](
+              uint64_t,
+              uint64_t,
+              uint8_t,
+              moxygen::TrackConsumer::BeginSubgroupOptions) {
+            sg = createMockSubgroupConsumer();
+            EXPECT_CALL(*sg, object(0, _, _, false))
+                .WillOnce(
+                    Return(folly::makeUnexpected(MoQPublishError(
+                        MoQPublishError::CANCELLED, "stop sending"))));
+            return folly::
+                makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                    sg);
+          });
+
+  ASSERT_NE(
+      addSubscriber(*forwarder, createMockSession(), consumer, RequestID(1)),
+      nullptr);
+  EXPECT_EQ(cb->forwardChangedCount, 1u);
+
+  auto subgroupRes = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroupRes.hasValue());
+  auto subgroup = *subgroupRes;
+
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+  // With its only subgroup tombstoned, the forwarder refuses this object upward.
+  EXPECT_FALSE(subgroup->object(1, test::makeBuf(10)).hasValue());
+
+  ASSERT_NE(
+      addSubscriber(
+          *forwarder, createMockSession(), createMockConsumer(), RequestID(2)),
+      nullptr);
+  EXPECT_EQ(cb->forwardChangedCount, 2u);
+
+  // The last arrival cleared the flag, so this one stays quiet.
+  ASSERT_NE(
+      addSubscriber(
+          *forwarder, createMockSession(), createMockConsumer(), RequestID(3)),
+      nullptr);
+  EXPECT_EQ(cb->forwardChangedCount, 2u);
 
   subgroup->reset(ResetStreamErrorCode::SESSION_CLOSED);
 }
