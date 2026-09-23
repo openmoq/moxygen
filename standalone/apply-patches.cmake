@@ -11,8 +11,67 @@
 #                     carries out of the build with it
 #
 # Patches are applied in filename order (use NNN- prefix for ordering).
+#
+# Call stash_dep_edits(<dep-name> <git-tag>) before FetchContent_Populate().
 
 find_program(PATCH_EXECUTABLE patch)
+find_package(Git QUIET)
+
+# FetchContent moves a checkout to a new pin by stashing local edits and
+# popping them afterwards. Applied patches can conflict with the new rev, so a
+# tree that is about to move has its edits stashed here, where the pop does not
+# follow. They stay recoverable with git stash list.
+function(stash_dep_edits DEP_NAME GIT_TAG)
+    string(TOUPPER "${DEP_NAME}" _upper)
+    set(_src "${FETCHCONTENT_BASE_DIR}/${DEP_NAME}-src")
+    if(FETCHCONTENT_SOURCE_DIR_${_upper} OR NOT EXISTS "${_src}/.git"
+       OR NOT GIT_EXECUTABLE)
+        return()
+    endif()
+    # A disconnected tree does not move, so its edits stay in place.
+    if(FETCHCONTENT_FULLY_DISCONNECTED OR FETCHCONTENT_UPDATES_DISCONNECTED
+       OR FETCHCONTENT_UPDATES_DISCONNECTED_${_upper})
+        return()
+    endif()
+
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
+        WORKING_DIRECTORY "${_src}"
+        OUTPUT_VARIABLE _head OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
+    )
+    # Fails when the pin has not been fetched yet, which also means a move.
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse --verify --quiet
+                "${GIT_TAG}^{commit}"
+        WORKING_DIRECTORY "${_src}"
+        OUTPUT_VARIABLE _target OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
+    )
+    if(_head STREQUAL _target)
+        return()
+    endif()
+
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" status --porcelain
+        WORKING_DIRECTORY "${_src}"
+        OUTPUT_VARIABLE _dirty ERROR_QUIET
+    )
+    if(_dirty STREQUAL "")
+        return()
+    endif()
+
+    message(STATUS "[patch] ${DEP_NAME}: stashing local edits before moving "
+                   "to ${GIT_TAG}")
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" stash push --include-untracked --quiet
+                -m "moxygen: before moving to ${GIT_TAG}"
+        WORKING_DIRECTORY "${_src}"
+        RESULT_VARIABLE _rc
+    )
+    if(NOT _rc EQUAL 0)
+        message(FATAL_ERROR "[patch] ${DEP_NAME}: git stash failed in ${_src}. "
+                            "Delete it and re-configure.")
+    endif()
+endfunction()
 
 function(apply_dep_patches DEP_NAME SOURCE_DIR)
     set(_dir "${CMAKE_CURRENT_SOURCE_DIR}/patches/${DEP_NAME}")

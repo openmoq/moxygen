@@ -16,6 +16,7 @@
 
 namespace {
 constexpr uint64_t kMaxExtensionLength = 1024;
+constexpr uint64_t kMaxExtensionBlockLength = 64 * 1024;
 
 enum class FetchHeaderSerializationBits : uint8_t {
   // Draft-15: 0xC0 reserved.
@@ -666,7 +667,8 @@ MoQFrameParser::parseAuthToken(
       } else {
         XLOG(WARN)
             << "Converting too-large CLIENT_SETUP register to USE_VALUE alias="
-            << *token->alias << " value=" << token->tokenValue;
+            << *token->alias << " tokenType=" << token->tokenType
+            << " tokenLength=" << token->tokenValue.size();
       }
     } break;
     case AliasType::USE_VALUE: {
@@ -3891,6 +3893,10 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseExtensions(
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= extLen->second;
+  if (extLen->first > kMaxExtensionBlockLength) {
+    XLOG(ERR) << "Extension block length exceeds maximum: " << extLen->first;
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
   if (extLen->first > length) {
     XLOG(DBG4) << "Extension block length provided exceeds remaining length";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
