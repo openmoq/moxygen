@@ -74,14 +74,22 @@ void BidiStreamControl::write(std::unique_ptr<folly::IOBuf> data, bool fin) {
 
 void BidiStreamControl::finAfterPeerFin() {
   finAfterPeerFin_ = true;
-  if (peerFinReceived_) {
-    writeFin();
-  }
+  maybeFinAfterPeerFin();
 }
 
 void BidiStreamControl::onPeerFin() {
   peerFinReceived_ = true;
-  if (finAfterPeerFin_) {
+  maybeFinAfterPeerFin();
+}
+
+void BidiStreamControl::releaseFin() {
+  XCHECK_GT(finHolds_, 0u);
+  finHolds_--;
+  maybeFinAfterPeerFin();
+}
+
+void BidiStreamControl::maybeFinAfterPeerFin() {
+  if (finAfterPeerFin_ && peerFinReceived_ && finHolds_ == 0) {
     writeFin();
   }
 }
@@ -115,6 +123,18 @@ void BidiStreamReplyContext::flush(bool fin) {
 void BidiStreamReplyContext::finAfterPeerFin() {
   if (!cancelled() && control_) {
     control_->finAfterPeerFin();
+  }
+}
+
+void BidiStreamReplyContext::holdFin() {
+  if (control_) {
+    control_->holdFin();
+  }
+}
+
+void BidiStreamReplyContext::releaseFin() {
+  if (control_) {
+    control_->releaseFin();
   }
 }
 

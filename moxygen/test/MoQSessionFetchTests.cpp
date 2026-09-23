@@ -563,11 +563,83 @@ CO_TEST_P_X(Draft18Test, CompletedFetchReleasesBidiStream) {
       break;
     }
     co_await objBaton;
-    for (int j = 0; j < 4; ++j) {
+    // The FIN exchange trails the last object by a few loop turns.
+    for (int j = 0; j < 100 && !clientWt_->openLocalBidiStreams().empty();
+         ++j) {
       co_await folly::coro::co_reschedule_on_current_executor;
     }
+    EXPECT_TRUE(clientWt_->openLocalBidiStreams().empty()) << "fetch " << i;
   }
-  EXPECT_TRUE(clientWt_->openLocalBidiStreams().empty());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+namespace {
+// Holds the REQUEST_UPDATE reply until the test releases it.
+class PendingUpdateFetchHandle : public Publisher::FetchHandle {
+ public:
+  explicit PendingUpdateFetchHandle(FetchOk ok)
+      : Publisher::FetchHandle(std::move(ok)) {}
+
+  void fetchCancel() override {}
+
+  folly::coro::Task<folly::Expected<RequestOk, RequestError>> requestUpdate(
+      RequestUpdate update) override {
+    updateArrived.post();
+    co_await releaseReply;
+    co_return RequestOk{.requestID = update.requestID};
+  }
+
+  folly::coro::Baton updateArrived;
+  folly::coro::Baton releaseReply;
+};
+} // namespace
+
+// A subscriber can FIN right after a REQUEST_UPDATE. The publisher's FIN has
+// to wait for the reply, or the subscriber never receives it.
+CO_TEST_P_X(Draft18Test, FetchFinWaitsForRequestUpdateReply) {
+  co_await setupMoQSession();
+  std::shared_ptr<PendingUpdateFetchHandle> pubHandle;
+  std::shared_ptr<FetchConsumer> fetchPub;
+  expectFetch([&](Fetch fetch, auto inFetchPub) -> TaskFetchResult {
+    fetchPub = std::move(inFetchPub);
+    pubHandle = std::make_shared<PendingUpdateFetchHandle>(
+        makeFetchOkResult(fetch, AbsoluteLocation{0, 10})->fetchOk());
+    co_return pubHandle;
+  });
+  expectFetchSuccess();
+  EXPECT_CALL(*clientSubscriberStatsCallback_, recordFetchLatency(_));
+  auto res =
+      co_await clientSession_->fetch(getFetch({0, 0}, {0, 10}), fetchCallback_);
+  if (res.hasError()) {
+    ADD_FAILURE() << res.error().reasonPhrase;
+    co_return;
+  }
+
+  // moxygen's client does not send FETCH REQUEST_UPDATE, so deliver one
+  // straight to the server. Draft 18's first client bidi is stream 0. Hold
+  // the server's writes on it so the client does not parse the reply.
+  auto serverStream = serverWt_->writeHandles.at(0);
+  serverStream->setImmediateDelivery(false);
+  EXPECT_CALL(*serverPublisherStatsCallback_, onRequestUpdate());
+  RequestUpdate update;
+  update.existingRequestID = res.value()->fetchOk().requestID;
+  update.requestID = RequestID(getRequestIDMultiplier());
+  update.priority = kDefaultPriority + 1;
+  static_cast<MoQControlCodec::ControlCallback*>(serverSession_.get())
+      ->onRequestUpdate(std::move(update));
+  co_await rescheduleN(5);
+  EXPECT_TRUE(pubHandle->updateArrived.ready());
+
+  // The subscriber is done updating.
+  clientWt_->writeHandles.at(0)->writeStreamData(nullptr, true, nullptr);
+  co_await rescheduleN(5);
+  EXPECT_TRUE(serverStream->open()) << "FIN sent before the REQUEST_OK";
+
+  pubHandle->releaseReply.post();
+  co_await rescheduleN(5);
+  EXPECT_FALSE(serverStream->open()) << "no FIN after the REQUEST_OK";
+
+  EXPECT_CALL(*fetchCallback_, reset(ResetStreamErrorCode::SESSION_CLOSED));
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 

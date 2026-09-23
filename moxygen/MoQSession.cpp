@@ -4576,6 +4576,10 @@ void MoQSession::handleFetchRequestUpdate(
 
   fetchPublisher->trackLatestRequestUpdate(requestUpdate);
 
+  // The peer can FIN right after this update. Our FIN has to follow the reply.
+  if (auto* replyContext = fetchPublisher->replyContext()) {
+    replyContext->holdFin();
+  }
   // Simple passthrough - just deliver to application and relay response
   co_withExecutor(
       getExecutor(),
@@ -4584,6 +4588,11 @@ void MoQSession::handleFetchRequestUpdate(
           folly::coro::co_invoke(
               [fetchPublisher = fetchPublisher,
                update = requestUpdate]() mutable -> folly::coro::Task<void> {
+                SCOPE_EXIT {
+                  if (auto* replyContext = fetchPublisher->replyContext()) {
+                    replyContext->releaseFin();
+                  }
+                };
                 co_await folly::coro::co_safe_point;
                 co_await fetchPublisher->onRequestUpdate(std::move(update));
               })))
