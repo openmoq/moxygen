@@ -28,6 +28,11 @@ POINTER_TO=""
 PRUNE_DAYS=0
 DRY_RUN=false
 
+# Assets upload concurrently, each attempt bounded: a single hung PUT to
+# uploads.github.com would otherwise stall the release indefinitely.
+UPLOAD_JOBS="${UPLOAD_JOBS:-4}"
+UPLOAD_TIMEOUT="${UPLOAD_TIMEOUT:-1200}"
+
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
 usage() {
@@ -118,6 +123,7 @@ fi
 
 # ── Step 2: Upload with retry ────────────────────────────────────────────────
 
+# timeout exits 124, which this loop retries like any other failure.
 upload_with_retry() {
   local asset="$1"
   local name
@@ -125,11 +131,13 @@ upload_with_retry() {
   local max=3 delay=10 attempt=1
   while [[ $attempt -le $max ]]; do
     # shellcheck disable=SC2086
-    if gh release upload "$TAG" "$asset" --clobber $REPO_FLAG; then
+    if timeout --kill-after=30s "$UPLOAD_TIMEOUT" \
+         gh release upload "$TAG" "$asset" --clobber $REPO_FLAG; then
+      echo "    Uploaded $name"
       return 0
     fi
     if [[ $attempt -lt $max ]]; then
-      echo "    Upload failed (attempt $attempt/$max), retrying in ${delay}s..."
+      echo "    $name: attempt $attempt/$max failed, retrying in ${delay}s..."
       sleep "$delay"
       delay=$((delay * 2))
     fi
@@ -138,6 +146,7 @@ upload_with_retry() {
   echo "    ERROR: $name upload failed after $max attempts" >&2
   return 1
 }
+export -f upload_with_retry
 
 # ── Step 3: Create/replace the release ───────────────────────────────────────
 
@@ -213,12 +222,17 @@ else
     --notes "$NOTES_BODY" \
     $REPO_FLAG
 
-  # Upload each asset individually with retry (pinned mode; the pointer has none)
+  # Upload assets concurrently with retry (pinned mode; the pointer has none).
+  # Distinct asset names, so --clobber cannot race between jobs.
   if [[ -z "$POINTER_TO" ]]; then
-    for asset in "$RELEASE_DIR"/*.tar.gz; do
-      echo "    Uploading $(basename "$asset")..."
-      upload_with_retry "$asset"
-    done
+    export TAG REPO_FLAG UPLOAD_TIMEOUT
+    echo "    Uploading $ASSET_COUNT asset(s), $UPLOAD_JOBS at a time..."
+    if ! find "$RELEASE_DIR" -name '*.tar.gz' -type f -print0 |
+           xargs -0 -P "$UPLOAD_JOBS" -n1 -I{} \
+             bash -c 'upload_with_retry "$1"' _ {}; then
+      echo "Error: one or more asset uploads failed." >&2
+      exit 1
+    fi
   fi
 
   # Ensure the release is not stuck as draft
