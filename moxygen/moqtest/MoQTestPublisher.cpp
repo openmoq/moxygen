@@ -37,7 +37,11 @@ void MoQTestFetchHandle::fetchCancel() {
 MoQTestPublisher::ObjectPacer MoQTestPublisher::makePacer(
     const MoQTestParameters& params) {
   return ObjectPacer(
-      std::chrono::milliseconds(params.objectFrequency), &timekeeper_);
+      std::chrono::milliseconds(params.objectFrequency),
+      &timekeeper_,
+      params.forwardingPreference == ForwardingPreference::DATAGRAM
+          ? &datagramStats_
+          : &subgroupStats_);
 }
 
 folly::coro::Task<void> MoQTestPublisher::ObjectPacer::awaitNextObject() {
@@ -52,6 +56,7 @@ folly::coro::Task<void> MoQTestPublisher::ObjectPacer::awaitNextObject() {
   if (nextObject_ <= now) {
     // Behind: send without sleeping until caught up, so a hiccup delays
     // objects rather than dropping them.
+    stats_->late.fetch_add(1, std::memory_order_relaxed);
     co_await folly::coro::co_reschedule_on_current_executor;
     co_return;
   }
@@ -354,6 +359,7 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerGroup(
             std::move(objectPayload),
             Extensions(extensions, {}),
             false);
+        pacer.recordSent(objectSize);
       } else {
         subConsumer->endOfGroup(objectId);
       }
@@ -411,6 +417,7 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerObject(
             std::move(objectPayload),
             Extensions(extensions, {}),
             true);
+        pacer.recordSent(objectSize);
       } else {
         subConsumer->endOfGroup(objectId);
       }
@@ -491,6 +498,7 @@ folly::coro::Task<void> MoQTestPublisher::sendTwoSubgroupsPerGroup(
             std::move(objectPayload),
             Extensions(extensions, {}),
             false);
+        pacer.recordSent(objectSize);
 
       } else {
         auto lastSubgroup = objectId % 2;
@@ -557,12 +565,13 @@ folly::coro::Task<void> MoQTestPublisher::sendDatagram(
       const bool endOfGroupMarker =
           params.sendEndOfGroupMarkers && objectId == lastObject;
       Payload objectPayload;
+      uint64_t objectSize = 0;
       if (endOfGroupMarker) {
         // Draft 15+ rejects extensions on a non-NORMAL status object.
         header.status = ObjectStatus::END_OF_GROUP;
         header.length = 0;
       } else {
-        int objectSize = getObjectSize(objectId, &params);
+        objectSize = getObjectSize(objectId, &params);
         objectPayload = folly::IOBuf::copyBuffer(std::string(objectSize, 't'));
         // Add Integer/Variable Extensions if needed
         header.extensions = Extensions(
@@ -585,6 +594,9 @@ folly::coro::Task<void> MoQTestPublisher::sendDatagram(
         done.statusCode = PublishDoneStatusCode::INTERNAL_ERROR;
         callback->publishDone(std::move(done));
         co_return;
+      }
+      if (!endOfGroupMarker) {
+        pacer.recordSent(objectSize);
       }
 
       co_await pacer.awaitNextObject();
