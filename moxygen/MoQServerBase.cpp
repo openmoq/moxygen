@@ -30,7 +30,7 @@ std::shared_ptr<MoQSession> MoQServerBase::createSession(
     folly::MaybeManagedPtr<proxygen::WebTransport> wt,
     std::shared_ptr<MoQExecutor> executor) {
   return std::make_shared<MoQSession>(
-      std::move(wt), *this, std::move(executor));
+      std::move(wt), *this, std::move(executor), authTokenCacheEnabled_);
 }
 
 folly::coro::Task<void> MoQServerBase::handleClientSession(
@@ -78,9 +78,18 @@ Setup MoQServerBase::makeServerSetup() {
   setup.params.insertParam(
       Parameter{
           folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
-          kDefaultMaxAuthTokenCacheSize});
+          authTokenCacheEnabled_ ? kDefaultMaxAuthTokenCacheSize : 0});
   // Last, so the application can override anything set above.
   applySetupParameters(setup.params, setupParams_);
+  if (!authTokenCacheEnabled_) {
+    // MoQSession forces the receive cache to zero when caching is disabled;
+    // advertising more would invite aliases we cannot resolve.
+    applySetupParameters(
+        setup.params,
+        {SetupParameter{
+            folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
+            uint64_t{0}}});
+  }
   return setup;
 }
 
