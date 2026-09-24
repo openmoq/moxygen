@@ -2330,7 +2330,7 @@ TEST_F(MoQTrackServerTest, DeductsObjectWorkFromTheObjectPeriod) {
 
   // Both bounds are one-sided in the direction a slow or contended machine
   // pushes.  A CI hiccup inflates intervals, so the upper bound reads the
-  // median, which a handful of long intervals cannot move; re-anchoring after
+  // median, which a handful of long intervals cannot move; catching up after
   // one shortens the intervals that follow, so the lower bound reads the total,
   // which no amount of slowness can shrink.
   constexpr double kMaxMedianMs = kPeriodMs + kWorkMs / 2.0;
