@@ -47,17 +47,15 @@ SubscriberState::SubscriberState(
     : testClient_(client),
       id_(id),
       moqExecutor_(std::move(executor)),
-      moqClient_(
-          samples::makeRelayClientTransport(
-              moqExecutor_,
-              url,
-              std::make_shared<
-                  test::InsecureVerifierDangerousDoNotUseInProduction>(),
-              transportType)),
-      receiver_(
-          std::make_shared<ObjectReceiver>(
-              ObjectReceiver::SUBSCRIBE,
-              callback_)) {}
+      moqClient_(samples::makeRelayClientTransport(
+          moqExecutor_,
+          url,
+          std::make_shared<
+              test::InsecureVerifierDangerousDoNotUseInProduction>(),
+          transportType)),
+      receiver_(std::make_shared<ObjectReceiver>(
+          ObjectReceiver::SUBSCRIBE,
+          callback_)) {}
 
 SubscriberState::~SubscriberState() {
   // The session may still hold subgroup receivers referencing callback_;
@@ -505,25 +503,7 @@ std::optional<AbsoluteLocation> MoQPerfTestClient::getLargestObjectSeen()
 }
 
 void MoQPerfTestClient::recordLatency(uint64_t latencyMs) {
-  latencyBuckets_[LatencyHistogram::bucketIndex(latencyMs)].fetch_add(
-      1, std::memory_order_relaxed);
-  latencyHistSum_.fetch_add(latencyMs, std::memory_order_relaxed);
-  latencyHistCount_.fetch_add(1, std::memory_order_relaxed);
-
-  intervalLatencySum_.fetch_add(latencyMs, std::memory_order_relaxed);
-  intervalLatencyCount_.fetch_add(1, std::memory_order_relaxed);
-
-  uint64_t cur = intervalLatencyMin_.load(std::memory_order_relaxed);
-  while (latencyMs < cur &&
-         !intervalLatencyMin_.compare_exchange_weak(
-             cur, latencyMs, std::memory_order_relaxed)) {
-  }
-
-  cur = intervalLatencyMax_.load(std::memory_order_relaxed);
-  while (latencyMs > cur &&
-         !intervalLatencyMax_.compare_exchange_weak(
-             cur, latencyMs, std::memory_order_relaxed)) {
-  }
+  latency_.record(latencyMs);
 }
 
 MoQPerfTestClient::TestResults MoQPerfTestClient::getResults() const {
@@ -547,14 +527,7 @@ MoQPerfTestClient::TestResults MoQPerfTestClient::getResults() const {
     results.latencyObjects += sub->latencyObjects_;
   }
 
-  results.intervalLatency.sumMs =
-      intervalLatencySum_.exchange(0, std::memory_order_relaxed);
-  results.intervalLatency.count =
-      intervalLatencyCount_.exchange(0, std::memory_order_relaxed);
-  results.intervalLatency.minMs = intervalLatencyMin_.exchange(
-      std::numeric_limits<uint64_t>::max(), std::memory_order_relaxed);
-  results.intervalLatency.maxMs =
-      intervalLatencyMax_.exchange(0, std::memory_order_relaxed);
+  results.intervalLatency = latency_.takeInterval();
 
   auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                      std::chrono::steady_clock::now() - startTime_)
@@ -565,13 +538,7 @@ MoQPerfTestClient::TestResults MoQPerfTestClient::getResults() const {
 }
 
 LatencyHistogram MoQPerfTestClient::snapshotLatencyHist() const {
-  LatencyHistogram hist;
-  for (size_t i = 0; i < latencyBuckets_.size(); ++i) {
-    hist.addRawBucket(i, latencyBuckets_[i].load(std::memory_order_relaxed));
-  }
-  hist.addSum(latencyHistSum_.load(std::memory_order_relaxed));
-  hist.addCount(latencyHistCount_.load(std::memory_order_relaxed));
-  return hist;
+  return latency_.snapshot();
 }
 
 } // namespace moxygen
