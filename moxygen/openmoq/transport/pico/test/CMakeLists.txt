@@ -9,6 +9,7 @@ endif()
 moxygen_add_test(TARGET PicoWebTransportBaseTests
   PREFIX "PicoWebTransportBase"
   SOURCES
+    PicoQuicWebTransportTest.cpp
     PicoWebTransportBaseTest.cpp
   DEPENDS
     openmoq_pico_base
