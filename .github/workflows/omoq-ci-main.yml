@@ -10,9 +10,9 @@ name: ci main
 #
 # Job graph:
 #
-#   build (linux, macos, asan debug) ─────────────────────────────────────────┐
-#   publish (7 platforms) ───────────────────────────────────────────────────┼── release ── notify
-#                                                                            └── prune-caches
+#   build (linux, macos, asan debug) ──┐
+#   publish (7 platforms) ─────────────┼── release ──┬── alias ── notify
+#                                      └── prune-caches
 
 on:
   push:
@@ -21,7 +21,7 @@ on:
 # A group holds one running and one pending run; a newer push cancels the
 # pending one, so a burst of merges skips snapshots. Runs on main therefore
 # get their own group and run in parallel: everything they write is per-commit
-# except the rolling alias, which only moves forward (see the release job).
+# except the rolling alias, which only moves forward (see the alias job).
 # release/** branches keep serializing.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
@@ -322,6 +322,7 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      pin_tag: ${{ steps.tag.outputs.pin_tag }}
     steps:
       - uses: actions/checkout@v4
 
@@ -362,23 +363,56 @@ jobs:
             --branch "${{ github.ref_name }}" \
             --prune-days 30
 
-      # Parallel runs finish in any order; the alias only moves to a descendant
-      # of the commit it points at now.
+  # ════════════════════════════════════════════════════════════════════════════
+  # Alias: move the rolling pointer, one run at a time.
+  #
+  # Main runs are otherwise fully parallel, so reading the alias target and
+  # writing its replacement must not interleave: two runs reading the same
+  # target would both judge themselves ahead, and whichever wrote second would
+  # win regardless of age. This job's concurrency group is that lock, and the
+  # comparison happens inside it, so the value read is the value replaced.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  alias:
+    needs: [release]
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: ${{ github.workflow }}-alias-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Check alias ordering
         id: order
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          CUR=$(gh release view "$TAG" --json targetCommitish --jq .targetCommitish 2>/dev/null || true)
-          STATUS=identical
-          if [ -n "$CUR" ]; then
-            STATUS=$(gh api "repos/${{ github.repository }}/compare/${CUR}...${GITHUB_SHA}" --jq .status)
+          TAG="${{ needs.release.outputs.tag }}"
+
+          # Only a 404 means "no alias yet". Treating a 5xx, a rate limit or an
+          # auth failure as absent would advance the alias unconditionally.
+          if BODY=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" 2>&1); then
+            CUR=$(printf '%s' "$BODY" | jq -r '.target_commitish // ""')
+          elif printf '%s' "$BODY" | grep -q 'HTTP 404'; then
+            CUR=""
+          else
+            echo "::error::cannot read $TAG: $BODY"
+            exit 1
           fi
+
+          if [ -z "$CUR" ]; then
+            echo "advance=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STATUS=$(gh api "repos/${{ github.repository }}/compare/${CUR}...${GITHUB_SHA}" --jq .status)
           case "$STATUS" in
             ahead|identical)
               echo "advance=true" >> "$GITHUB_OUTPUT" ;;
             *)
+              # A force-push can leave the alias target off the branch, which
+              # holds the alias here for good; delete the rolling release once
+              # to recover (.github/CONTRIBUTING.md).
               echo "::notice::$TAG points at ${CUR:0:12}, which is $STATUS of this commit; leaving it"
               echo "advance=false" >> "$GITHUB_OUTPUT" ;;
           esac
@@ -389,9 +423,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash openmoq/scripts/publish-artifacts.sh \
-            --pointer-to "${{ steps.tag.outputs.pin_tag }}" \
+            --pointer-to "${{ needs.release.outputs.pin_tag }}" \
             --sha "$GITHUB_SHA" \
-            --tag "${{ steps.tag.outputs.tag }}" \
+            --tag "${{ needs.release.outputs.tag }}" \
             --branch "${{ github.ref_name }}"
 
   # ════════════════════════════════════════════════════════════════════════════
@@ -456,7 +490,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
 
   notify:
-    needs: [build, publish, release]
+    needs: [build, publish, release, alias]
     if: always()
     runs-on: ubuntu-22.04
     steps:
@@ -484,9 +518,16 @@ jobs:
             esac
           }
 
+          # A failed alias job leaves the pinned snapshot published but the
+          # rolling pointer stale, which is worth seeing in the alert.
+          REL_RESULT="${{ needs.release.result }}"
+          if [ "$REL_RESULT" = "success" ] && [ "${{ needs.alias.result }}" != "success" ]; then
+            REL_RESULT="${{ needs.alias.result }}"
+          fi
+
           VER=$(fmt_status "${{ needs.build.result }}")
           PUB=$(fmt_status "${{ needs.publish.result }}")
-          REL=$(fmt_status "${{ needs.release.result }}")
+          REL=$(fmt_status "$REL_RESULT")
 
           STATUS="verify:${VER} publish:${PUB} release:${REL}"
 
@@ -514,6 +555,9 @@ jobs:
           VER="${{ needs.build.result }}"
           PUB="${{ needs.publish.result }}"
           REL="${{ needs.release.result }}"
+          if [ "$REL" = "success" ] && [ "${{ needs.alias.result }}" != "success" ]; then
+            REL="${{ needs.alias.result }}"
+          fi
 
           STATUS="verify:${VER} publish:${PUB} release:${REL}"
 
