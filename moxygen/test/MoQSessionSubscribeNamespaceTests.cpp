@@ -72,6 +72,21 @@ CO_TEST_P_X(MoQSessionTest, UnsubscribeNamespaceAfterSessionClosed) {
 
 using V16PlusSubscribeNamespaceTest = MoQSessionTest;
 
+class RelayHopNamespacePublishHandle
+    : public Publisher::NamespacePublishHandle {
+ public:
+  void namespaceMsg(const Namespace& ns) override {
+    message = ns;
+    namespaceBaton.post();
+  }
+
+  void namespaceMsg(const TrackNamespace&) override {}
+  void namespaceDoneMsg(const TrackNamespace&) override {}
+
+  std::optional<Namespace> message;
+  folly::coro::Baton namespaceBaton;
+};
+
 // Verifies that after NAMESPACE + NAMESPACE_DONE, a second NAMESPACE
 // can still be sent on the same stream.
 folly::coro::Task<void> verifyNamespaceDoneDoesNotCloseStream(
@@ -151,6 +166,80 @@ CO_TEST_P_X(V16PlusSubscribeNamespaceTest, NamespaceDoneDoesNotCloseStream) {
       .WillOnce(testing::Invoke([&unsubBaton]() { unsubBaton.post(); }));
   publishNamespaceResult.value()->unsubscribeNamespace();
   co_await unsubBaton;
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    V16PlusSubscribeNamespaceTest,
+    NamespacePreservesRelayHopParameters) {
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  EXPECT_TRUE(
+      clientSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
+  EXPECT_TRUE(
+      serverSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
+
+  std::shared_ptr<MockSubscribeNamespaceHandle> serverSubscribeHandle;
+  std::shared_ptr<Publisher::NamespacePublishHandle> serverPublishHandle;
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillOnce(testing::Invoke(
+          [&serverSubscribeHandle, &serverPublishHandle](
+              auto subNs, auto handler)
+              -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+            serverPublishHandle = std::move(handler);
+            serverSubscribeHandle =
+                std::make_shared<MockSubscribeNamespaceHandle>(
+                    SubscribeNamespaceOk{
+                        .requestID = subNs.requestID,
+                        .requestSpecificParams = {},
+                    });
+            co_return serverSubscribeHandle;
+          }));
+
+  auto clientNamespacePublishHandle =
+      std::make_shared<RelayHopNamespacePublishHandle>();
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onSubscribeNamespaceSuccess());
+  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeNamespaceSuccess());
+  auto result = co_await clientSession_->subscribeNamespace(
+      getSubscribeNamespace(), clientNamespacePublishHandle);
+  EXPECT_TRUE(result.hasValue());
+  if (!result.hasValue()) {
+    co_return;
+  }
+
+  Namespace outgoing;
+  outgoing.trackNamespaceSuffix = TrackNamespace{{"relay", "hops"}};
+  auto encodedPath = encodeRelayHopPath({11, 22, 33}, GetParam().serverVersion);
+  EXPECT_TRUE(encodedPath.hasValue());
+  if (!encodedPath.hasValue()) {
+    co_return;
+  }
+  outgoing.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::HOP_PATH),
+      std::move(encodedPath.value())));
+
+  serverPublishHandle->namespaceMsg(outgoing);
+  co_await clientNamespacePublishHandle->namespaceBaton;
+  EXPECT_TRUE(clientNamespacePublishHandle->message.has_value());
+  if (!clientNamespacePublishHandle->message) {
+    co_return;
+  }
+  const auto& incoming = *clientNamespacePublishHandle->message;
+  EXPECT_EQ(incoming.trackNamespaceSuffix, outgoing.trackNamespaceSuffix);
+  EXPECT_EQ(incoming.params.size(), 1);
+  if (!incoming.params.empty()) {
+    auto hopPath = decodeRelayHopPath(
+        incoming.params.at(0).asString, GetParam().serverVersion);
+    EXPECT_TRUE(hopPath.hasValue());
+    if (hopPath.hasValue()) {
+      EXPECT_EQ(hopPath.value(), (std::vector<uint64_t>{11, 22, 33}));
+    }
+  }
+
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onUnsubscribeNamespace());
+  EXPECT_CALL(*serverPublisherStatsCallback_, onUnsubscribeNamespace());
+  EXPECT_CALL(*serverSubscribeHandle, unsubscribeNamespace());
+  result.value()->unsubscribeNamespace();
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 

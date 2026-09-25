@@ -101,6 +101,11 @@ option(BUILD_MOQTEST
   ON
 )
 
+option(BUILD_MEDIA_SERVER
+  "If enabled, build the media server and mp4 receiver executables."
+  ON
+)
+
 list(APPEND
   _MOXYGEN_COMMON_COMPILE_OPTIONS
   -Wall

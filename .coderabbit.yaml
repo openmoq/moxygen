@@ -1,0 +1,146 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit review context for openmoq/moxygen.
+#
+# Points CodeRabbit at moxygen's own documentation and the normative MOQT
+# specs, so reviews cite them instead of guessing. Keep the pointers in sync
+# when docs move or the supported draft list changes.
+
+language: en-US
+
+reviews:
+  profile: chill
+
+  path_filters:
+    - "!pics/**"
+
+  path_instructions:
+    - path: "**"
+      instructions: |
+        This is openmoq/moxygen, a community-maintained fork of
+        facebookexperimental/moxygen. moxygen implements the Media over QUIC
+        Transport (MOQT) session layer, relay, cache and forwarder, over mvfst
+        (via proxygen) and picoquic.
+
+        Documentation map. These files are authoritative; prefer them over
+        inference from the diff, and flag a change that contradicts one without
+        updating it.
+        - ARCHITECTURE.md — the Publisher/Subscriber and TrackConsumer APIs,
+          MoQSession, MoQRelay, MoQForwarder, MoQCache, executors, the
+          threading model, and version negotiation.
+        - .github/CONTRIBUTING.md — PR scope, review, CI and branch
+          conventions for this fork.
+        - openmoq/README.md — the upstream/main branch model and the omoq-*
+          workflows.
+        - moxygen/openmoq/transport/pico/README.md — the picoquic transport:
+          server thread models, send model and WebTransport adapters.
+        - QUICKSTART.md, README.md — building and running.
+
+        Per .github/CONTRIBUTING.md, a PR should carry a single cohesive
+        thesis, a title that states the functional impact, and tests or other
+        pass/fail evaluation criteria. A change to core moxygen should go
+        upstream when possible; when a PR changes upstream-owned code in this
+        fork, the description should say why it lands here first.
+
+        Upstream sync PRs (branches sync/<sha>, titled "sync: upstream
+        moxygen <sha>") merge the upstream branch into main. Picoquic sync PRs
+        (branches sync-picoquic/<sha>) only move the picoquic pin. Summarize what upstream changed rather than
+        reviewing upstream code for style. Call out changes to
+        moxygen/relay/MoQRelay.*, MoQCache.* and MoQForwarder.*, and to the
+        Publisher, Subscriber and TrackConsumer interfaces: moqx
+        (https://github.com/openmoq/moqx) forks MoQRelay and MoQCache as
+        MoqxRelay and MoqxCache and builds on MoQForwarder, so those changes
+        may need a matching port there.
+
+    - path: "moxygen/**/*.{h,cpp}"
+      instructions: |
+        Wire behavior must match the MOQT drafts moxygen supports: draft-14,
+        draft-16 and draft-18. kSupportedVersions in moxygen/MoQVersions.h
+        still lists draft-15, but its removal is planned, so a change does not
+        need to preserve or add draft-15 behavior.
+        A change to framing, setup parameters, control-message semantics or
+        error codes has to state which versions it applies to and stay correct
+        on the others. Version-dependent behavior belongs behind the helpers
+        in MoQVersions.h rather than ad hoc version comparisons.
+
+        Normative texts on the IETF Datatracker:
+        - draft-14: https://www.ietf.org/archive/id/draft-ietf-moq-transport-14.txt
+        - draft-16: https://www.ietf.org/archive/id/draft-ietf-moq-transport-16.txt
+        - draft-18: https://www.ietf.org/archive/id/draft-ietf-moq-transport-18.txt
+        - all revisions: https://datatracker.ietf.org/doc/draft-ietf-moq-transport/
+
+        The RELAY_HOPS extension (MoQTypes.h) is specified by
+        draft-lcurley-moq-relay-hops:
+        https://datatracker.ietf.org/doc/draft-lcurley-moq-relay-hops/
+
+    - path: "**/*.{h,cpp}"
+      instructions: |
+        Multi-threaded performance matters. moxygen avoids mutexes and
+        gratuitous atomics, and that includes shared_ptr and weak_ptr, whose
+        refcounts are atomic. Flag a new lock, atomic, shared_ptr or weak_ptr
+        unless the change needs it and the PR justifies it.
+
+        Reuse code. moxygen already depends on folly, so before accepting a
+        new utility function, check whether folly has a tested, optimized
+        equivalent and suggest it. Flag logic that duplicates existing moxygen
+        code, and suggest a refactor that shares it.
+
+        Flag overcommenting and dense or poorly worded comments. A comment
+        should match the local style, document a non-obvious invariant, and
+        describe the code as written. Flag comments that restate the code
+        below them or narrate how the code came to be, such as rejected
+        alternatives or what an earlier version did.
+
+    - path: "moxygen/relay/**"
+      instructions: |
+        Read the Relay and Forwarding and Threading Model sections of
+        ARCHITECTURE.md before judging this code. moqx forks MoQRelay and
+        MoQCache and builds on MoQForwarder, so a behavior change here should
+        say whether moqx needs the same change.
+
+    - path: "moxygen/openmoq/transport/pico/**"
+      instructions: |
+        The picoquic transport is openmoq-owned code and does not exist
+        upstream. Read moxygen/openmoq/transport/pico/README.md before judging
+        this code: it covers the threaded and EventBase server models, the
+        JIT send model for streams and datagrams, wake timeouts, the h3zero
+        WebTransport flow and the connection lifecycle. Each picoquic context
+        is single-threaded: picoquic I/O, callbacks and MoQSession coroutines
+        share one thread (the packet loop thread or the EventBase thread).
+        Flag picoquic or session state touched from another thread without
+        going through that thread's executor. The README also carries
+        the class hierarchy and file list, so a new or renamed class needs a
+        matching README update.
+
+    - path: "moxygen/{MoQSession,MoQRelaySession,MoQFramer,MoQCodec}.*"
+      instructions: |
+        These files carry the wire format and session state machine. Check
+        the change against the draft text for each supported version, and
+        check that tests in moxygen/test cover every version the change
+        affects.
+
+    - path: ".github/workflows/**"
+      instructions: |
+        openmoq/README.md and .github/CONTRIBUTING.md describe the omoq-*
+        workflows, the daily upstream sync and the branch model. Workflows
+        without the omoq- prefix come from upstream. PR CI runs without
+        secrets. omoq-ci-main.yml publishes snapshots on push to main and
+        release/**; versioned releases run through workflow_dispatch of
+        omoq-version-release.yml.
+
+knowledge_base:
+  # Needed to read the IETF Datatracker drafts linked above.
+  web_search:
+    enabled: true
+
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - files: ".github/CONTRIBUTING.md"
+        applyTo: "**"
+      - files: "ARCHITECTURE.md"
+        applyTo: "moxygen/**"
+      - files: "moxygen/openmoq/transport/pico/README.md"
+        applyTo: "moxygen/openmoq/**"
+      - files: "openmoq/README.md"
+        applyTo: ".github/**,openmoq/**"

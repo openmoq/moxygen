@@ -124,7 +124,11 @@ struct CountingCallback : public MoQForwarder::Callback {
   void onEmpty(MoQForwarder*) override {
     onEmptyCount++;
   }
+  void forwardChanged(MoQForwarder*) override {
+    forwardChangedCount++;
+  }
   size_t onEmptyCount{0};
+  size_t forwardChangedCount{0};
 };
 
 struct TestNGRCallback : public MoQForwarder::Callback {
@@ -930,6 +934,213 @@ TEST_F(MoQForwarderTest, TombstonedSubgroupIgnoresSubsequentObjects) {
   EXPECT_EQ(res2.error().code, MoQPublishError::CANCELLED);
 
   subgroup->reset(ResetStreamErrorCode::SESSION_CLOSED);
+}
+
+// Test: a subscriber that renews its interest with forward=true is already
+// forwarding, so clearing its tombstones cannot wait for a false->true flip.
+TEST_F(MoQForwarderTest, ForwardUpdateClearsTombstoneWhileForwarding) {
+  auto subscriber = createMockSession();
+
+  auto forwarder = std::make_shared<MoQForwarder>(kFwdTestTrackName);
+  auto consumer = createMockConsumer();
+  std::shared_ptr<MockSubgroupConsumer> refused;
+  std::shared_ptr<MockSubgroupConsumer> renewed;
+
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce(
+          [this, &refused](
+              uint64_t,
+              uint64_t,
+              uint8_t,
+              moxygen::TrackConsumer::BeginSubgroupOptions) {
+            refused = createMockSubgroupConsumer();
+            EXPECT_CALL(*refused, object(0, _, _, false))
+                .WillOnce(
+                    Return(folly::makeUnexpected(MoQPublishError(
+                        MoQPublishError::CANCELLED, "stop sending"))));
+            return folly::
+                makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                    refused);
+          })
+      .WillOnce(
+          [this, &renewed](
+              uint64_t,
+              uint64_t,
+              uint8_t,
+              moxygen::TrackConsumer::BeginSubgroupOptions) {
+            renewed = createMockSubgroupConsumer();
+            EXPECT_CALL(*renewed, object(1, _, _, false))
+                .WillOnce(Return(folly::unit));
+            return folly::
+                makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                    renewed);
+          });
+
+  auto subHandle =
+      addSubscriber(*forwarder, subscriber, consumer, RequestID(1));
+  ASSERT_NE(subHandle, nullptr);
+
+  auto subgroupRes = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroupRes.hasValue());
+  auto subgroup = *subgroupRes;
+
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+  EXPECT_TRUE(applyForwardUpdate(subHandle, RequestID(2), /*forward=*/true));
+
+  EXPECT_TRUE(subgroup->object(1, test::makeBuf(10)).hasValue());
+  EXPECT_NE(renewed, nullptr);
+
+  subgroup->reset(ResetStreamErrorCode::SESSION_CLOSED);
+}
+
+// Test: an arrival past the first renews forwarding after a refusal, since the
+// forwarding count does not cross zero.
+TEST_F(MoQForwarderTest, SubscriberArrivalAfterRefusalRenewsForwarding) {
+  auto forwarder = std::make_shared<MoQForwarder>(kFwdTestTrackName);
+  auto cb = std::make_shared<CountingCallback>();
+  forwarder->setCallback(cb);
+
+  auto consumer = createMockConsumer();
+  std::shared_ptr<MockSubgroupConsumer> sg;
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce(
+          [this, &sg](
+              uint64_t,
+              uint64_t,
+              uint8_t,
+              moxygen::TrackConsumer::BeginSubgroupOptions) {
+            sg = createMockSubgroupConsumer();
+            EXPECT_CALL(*sg, object(0, _, _, false))
+                .WillOnce(
+                    Return(folly::makeUnexpected(MoQPublishError(
+                        MoQPublishError::CANCELLED, "stop sending"))));
+            return folly::
+                makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                    sg);
+          });
+
+  ASSERT_NE(
+      addSubscriber(*forwarder, createMockSession(), consumer, RequestID(1)),
+      nullptr);
+  EXPECT_EQ(cb->forwardChangedCount, 1u);
+
+  auto subgroupRes = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroupRes.hasValue());
+  auto subgroup = *subgroupRes;
+
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+  // The only subgroup is tombstoned, so the forwarder refuses this object.
+  EXPECT_FALSE(subgroup->object(1, test::makeBuf(10)).hasValue());
+
+  ASSERT_NE(
+      addSubscriber(
+          *forwarder, createMockSession(), createMockConsumer(), RequestID(2)),
+      nullptr);
+  EXPECT_EQ(cb->forwardChangedCount, 2u);
+
+  // The last arrival cleared the refusal. This one does not fire.
+  ASSERT_NE(
+      addSubscriber(
+          *forwarder, createMockSession(), createMockConsumer(), RequestID(3)),
+      nullptr);
+  EXPECT_EQ(cb->forwardChangedCount, 2u);
+
+  subgroup->reset(ResetStreamErrorCode::SESSION_CLOSED);
+}
+
+// Test: ending a subgroup that every subscriber tombstoned does not refuse the
+// publisher. A later forward=true update or arrival does not fire
+// forwardChanged.
+TEST_F(MoQForwarderTest, TombstonedEndDoesNotRenewForwarding) {
+  auto forwarder = std::make_shared<MoQForwarder>(kFwdTestTrackName);
+  auto cb = std::make_shared<CountingCallback>();
+  forwarder->setCallback(cb);
+
+  auto consumer = createMockConsumer();
+  std::shared_ptr<MockSubgroupConsumer> sg;
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce(
+          [this, &sg](
+              uint64_t,
+              uint64_t,
+              uint8_t,
+              moxygen::TrackConsumer::BeginSubgroupOptions) {
+            sg = createMockSubgroupConsumer();
+            EXPECT_CALL(*sg, object(0, _, _, false))
+                .WillOnce(
+                    Return(folly::makeUnexpected(MoQPublishError(
+                        MoQPublishError::CANCELLED, "stop sending"))));
+            return folly::
+                makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                    sg);
+          });
+
+  auto subHandle =
+      addSubscriber(*forwarder, createMockSession(), consumer, RequestID(1));
+  ASSERT_NE(subHandle, nullptr);
+  EXPECT_EQ(cb->forwardChangedCount, 1u);
+
+  auto subgroupRes = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroupRes.hasValue());
+  auto subgroup = *subgroupRes;
+
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+  EXPECT_TRUE(subgroup->endOfSubgroup().hasValue());
+
+  EXPECT_TRUE(applyForwardUpdate(subHandle, RequestID(2), /*forward=*/true));
+  EXPECT_EQ(cb->forwardChangedCount, 1u);
+
+  ASSERT_NE(
+      addSubscriber(
+          *forwarder, createMockSession(), createMockConsumer(), RequestID(3)),
+      nullptr);
+  EXPECT_EQ(cb->forwardChangedCount, 1u);
+}
+
+// Test: a forward=true update from a subscriber that is still forwarding
+// renews forwarding once the forwarder has refused the publisher.
+TEST_F(MoQForwarderTest, ForwardUpdateAfterRefusalRenewsForwarding) {
+  auto forwarder = std::make_shared<MoQForwarder>(kFwdTestTrackName);
+  auto cb = std::make_shared<CountingCallback>();
+  forwarder->setCallback(cb);
+
+  auto consumer = createMockConsumer();
+  std::shared_ptr<MockSubgroupConsumer> sg;
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce(
+          [this, &sg](
+              uint64_t,
+              uint64_t,
+              uint8_t,
+              moxygen::TrackConsumer::BeginSubgroupOptions) {
+            sg = createMockSubgroupConsumer();
+            EXPECT_CALL(*sg, object(0, _, _, false))
+                .WillOnce(
+                    Return(folly::makeUnexpected(MoQPublishError(
+                        MoQPublishError::CANCELLED, "stop sending"))));
+            return folly::
+                makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                    sg);
+          });
+
+  auto subHandle =
+      addSubscriber(*forwarder, createMockSession(), consumer, RequestID(1));
+  ASSERT_NE(subHandle, nullptr);
+  EXPECT_EQ(cb->forwardChangedCount, 1u);
+
+  auto subgroupRes = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroupRes.hasValue());
+  auto subgroup = *subgroupRes;
+
+  // An update before any refusal does not fire forwardChanged.
+  EXPECT_TRUE(applyForwardUpdate(subHandle, RequestID(2), /*forward=*/true));
+  EXPECT_EQ(cb->forwardChangedCount, 1u);
+
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+  EXPECT_FALSE(subgroup->object(1, test::makeBuf(10)).hasValue());
+
+  EXPECT_TRUE(applyForwardUpdate(subHandle, RequestID(3), /*forward=*/true));
+  EXPECT_EQ(cb->forwardChangedCount, 2u);
 }
 
 // Test: A subscriber whose only subgroup was tombstoned is removed by
