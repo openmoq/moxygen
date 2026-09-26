@@ -3,7 +3,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # Test utilities
-add_library(moqtest_utils Utils.cpp)
+add_library(moqtest_utils Utils.cpp PromMetrics.cpp)
 target_include_directories(
   moqtest_utils PUBLIC
   $<BUILD_INTERFACE:${MOXYGEN_FBCODE_ROOT}>
