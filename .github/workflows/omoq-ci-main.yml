@@ -376,6 +376,8 @@ jobs:
   alias:
     needs: [release]
     runs-on: ubuntu-22.04
+    outputs:
+      state: ${{ steps.order.outputs.state }}
     concurrency:
       group: ${{ github.workflow }}-alias-${{ github.ref }}
       cancel-in-progress: false
@@ -405,19 +407,23 @@ jobs:
 
           if [ -z "$CUR" ]; then
             echo "advance=true" >> "$GITHUB_OUTPUT"
+            echo "state=moved" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           STATUS=$(gh api "repos/${{ github.repository }}/compare/${CUR}...${GITHUB_SHA}" --jq .status)
           case "$STATUS" in
             ahead|identical)
-              echo "advance=true" >> "$GITHUB_OUTPUT" ;;
+              echo "advance=true" >> "$GITHUB_OUTPUT"
+              echo "state=moved" >> "$GITHUB_OUTPUT" ;;
             *)
-              # A force-push can leave the alias target off the branch, which
-              # holds the alias here for good; delete the rolling release once
-              # to recover (.github/CONTRIBUTING.md).
+              # Expected while runs overlap: a newer commit already owns it.
+              # diverged is unreachable on main (force-push and deletion are
+              # both blocked there); on a release branch, delete the rolling
+              # release once to recover. See .github/CONTRIBUTING.md.
               echo "::notice::$TAG points at ${CUR:0:12}, which is $STATUS of this commit; leaving it"
-              echo "advance=false" >> "$GITHUB_OUTPUT" ;;
+              echo "advance=false" >> "$GITHUB_OUTPUT"
+              echo "state=held" >> "$GITHUB_OUTPUT" ;;
           esac
 
       - name: Publish rolling alias (asset-less pointer)
@@ -532,10 +538,12 @@ jobs:
           PUB=$(fmt_status "${{ needs.publish.result }}")
           REL=$(fmt_status "$REL_RESULT")
 
-          STATUS="verify:${VER} publish:${PUB} release:${REL}"
+          # moved: this commit owns the rolling alias; held: a newer commit does.
+          # Without it every run in a burst reports the same thing.
+          STATUS="verify:${VER} publish:${PUB} release:${REL} alias:${{ needs.alias.outputs.state || '—' }}"
 
+          REL_URL="${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.release.outputs.tag }}"
           if [ "$REL_RESULT" = "success" ]; then
-            REL_URL="${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.release.outputs.tag }}"
             TEXT=":white_check_mark: *${{ github.repository }}* \`${{ github.ref_name }}\` \`${SHORT}\` — ${STATUS}  <${RUN_URL}|#${{ github.run_number }}> artifacts: <${REL_URL}|view>"
           else
             TEXT=":x: *${{ github.repository }}* \`${{ github.ref_name }}\` \`${SHORT}\` — ${STATUS}  <${RUN_URL}|#${{ github.run_number }}>"
@@ -562,7 +570,7 @@ jobs:
             REL="${{ needs.alias.result }}"
           fi
 
-          STATUS="verify:${VER} publish:${PUB} release:${REL}"
+          STATUS="verify:${VER} publish:${PUB} release:${REL} alias:${{ needs.alias.outputs.state || '—' }}"
 
           if [ "${{ needs.release.result }}" = "success" ]; then
             REL_URL="${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.release.outputs.tag }}"

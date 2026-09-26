@@ -104,9 +104,9 @@ commit against the one the alias points at now, and a run whose commit is
 behind or diverged leaves it alone with a notice. Its own per-rev
 `snapshot-<sha12>` release is published either way, so nothing is lost. That
 job takes one run at a time, and fails rather than guessing if it cannot read
-the alias. If `main` is force-pushed the alias can end up on a commit that is
-no longer in the branch, and every later run will then hold; delete the
-`snapshot-latest` pre-release once and the next push recreates it.
+the alias. `main` blocks force-pushes and deletions, so its alias cannot end up off the
+branch. A `release/*` branch can: the alias then holds on every later run, and
+deleting that rolling pre-release once lets the next push recreate it.
 
 Versioned releases are cut manually from `main` via
 [omoq-version-release.yml](.github/workflows/omoq-version-release.yml):
