@@ -181,14 +181,13 @@ void MoQForwarder::setCallback(std::shared_ptr<Callback> callback) {
 }
 
 std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
-    std::shared_ptr<MoQSession> session,
+    SessionId sessionId,
     const SubscribeRequest& subReq,
     std::shared_ptr<TrackConsumer> consumer) {
   if (draining_) {
     XLOG(ERR) << "addSubscriber called on draining track";
     return nullptr;
   }
-  const void* key = static_cast<const void*>(session.get());
   auto trackAlias = trackAlias_.value_or(subReq.requestID.value);
   XCHECK(consumer);
   consumer->setTrackAlias(trackAlias);
@@ -201,17 +200,17 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
           MoQSession::resolveGroupOrder(groupOrder_, subReq.groupOrder),
           largest_,
           extensions_},
-      std::move(session),
+      sessionId,
       subReq.requestID,
       toSubscribeRange(subReq, largest_),
       std::move(consumer),
       subReq.forward);
   subscriber->mapKey = key;
   // If the session already has a subscriber (e.g. from a prior
-  // addSubscriber(session, forward) call), emplace is a no-op. Return the
+  // addSubscriber(sessionId, forward) call), emplace is a no-op. Return the
   // existing in-map entry and only increment the forwarding count when a new
   // entry was actually inserted.
-  auto [it, inserted] = subscribers_.emplace(key, subscriber);
+  auto [it, inserted] = subscribers_.emplace(sessionId, subscriber);
   if (inserted && subReq.forward) {
     addForwardingSubscriber();
   }
@@ -219,13 +218,12 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
 }
 
 std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
-    std::shared_ptr<MoQSession> session,
+    SessionId sessionId,
     bool forward) {
   if (draining_) {
     XLOG(ERR) << "addSubscriber called on draining track";
     return nullptr;
   }
-  const void* key = static_cast<const void*>(session.get());
   auto subscriber = std::make_shared<MoQForwarder::Subscriber>(
       *this,
       SubscribeOk{
@@ -235,13 +233,12 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
           groupOrder_,
           largest_,
           extensions_},
-      std::move(session),
+      sessionId,
       RequestID(0),
       SubscribeRange{{0, 0}, kLocationMax},
       nullptr,
       forward);
-  subscriber->mapKey = key;
-  auto [it, inserted] = subscribers_.emplace(key, subscriber);
+  auto [it, inserted] = subscribers_.emplace(sessionId, subscriber);
   if (inserted && forward) {
     addForwardingSubscriber();
   }
@@ -374,9 +371,9 @@ void MoQForwarder::removeChannelSubscriberByExec(
 }
 
 folly::Expected<SubscribeRange, FetchError> MoQForwarder::resolveJoiningFetch(
-    const std::shared_ptr<MoQSession>& session,
+    SessionId sessionId,
     const JoiningFetch& joining) const {
-  auto subIt = subscribers_.find(static_cast<const void*>(session.get()));
+  auto subIt = subscribers_.find(sessionId);
   if (subIt == subscribers_.end()) {
     XLOG(ERR) << "Session not found";
     return folly::makeUnexpected(
@@ -431,23 +428,50 @@ folly::Expected<SubscribeRange, FetchError> MoQForwarder::resolveJoiningFetch(
 }
 
 void MoQForwarder::drainSubscriber(
-    const std::shared_ptr<MoQSession>& session,
+    SessionId sessionId,
     PublishDone pubDone,
     const std::string& callsite) {
-  XLOG(DBG1) << __func__ << " from " << callsite
-             << " session=" << session.get();
-  drainSubscriberByKey(
-      static_cast<const void*>(session.get()), std::move(pubDone), callsite);
+  XLOG(DBG1) << __func__ << " from " << callsite << " session=" << sessionId;
+  auto subIt = subscribers_.find(sessionId);
+  if (subIt == subscribers_.end()) {
+    XLOG(WARNING) << "Session not found in drainSubscriber from " << callsite
+                  << " sess=" << sessionId;
+    return;
+  }
+
+  auto& subscriber = *subIt->second;
+
+  // Forward the publishDone message WITHOUT resetting subgroups
+  pubDone.requestID = subscriber.requestID;
+  if (subscriber.trackConsumer) {
+    subscriber.trackConsumer->publishDone(std::move(pubDone));
+  }
+
+  // If no open subgroups, delegate to removeSubscriberIt for cleanup
+  if (subscriber.subgroups.empty()) {
+    // Pass std::nullopt for pubDone since we already forwarded it above
+    removeSubscriberIt(subIt, std::nullopt, callsite);
+    return;
+  }
+
+  // Otherwise, mark receivedPublishDone and wait for subgroups to close
+  subscriber.receivedPublishDone_ = true;
+  XLOG(DBG1) << "Subscriber " << &subscriber << " is draining with "
+             << subscriber.subgroups.size() << " open subgroups";
 }
 
 void MoQForwarder::removeSubscriber(
-    const std::shared_ptr<MoQSession>& session,
+    SessionId sessionId,
     std::optional<PublishDone> pubDone,
     const std::string& callsite) {
-  XLOG(DBG1) << __func__ << " from " << callsite
-             << " session=" << session.get();
-  removeSubscriberByKey(
-      static_cast<const void*>(session.get()), std::move(pubDone), callsite);
+  XLOG(DBG1) << __func__ << " from " << callsite << " session=" << sessionId;
+  auto subIt = subscribers_.find(sessionId);
+  if (subIt == subscribers_.end()) {
+    XLOG(WARNING) << "Session not found in removeSubscriber from " << callsite
+                  << " sess=" << sessionId;
+    return;
+  }
+  removeSubscriberIt(subIt, std::move(pubDone), callsite);
 }
 
 void MoQForwarder::checkAndFireOnEmpty() {
@@ -467,7 +491,7 @@ void MoQForwarder::checkAndFireOnEmpty() {
 }
 
 void MoQForwarder::removeSubscriberIt(
-    folly::F14FastMap<const void*, std::shared_ptr<Subscriber>>::iterator subIt,
+    SubscriberMap::iterator subIt,
     std::optional<PublishDone> pubDone,
     const std::string& callsite) {
   auto& subscriber = *subIt->second;
@@ -535,8 +559,8 @@ bool MoQForwarder::checkPastEnd(const Subscriber& sub) {
   XCHECK(largest_);
   if (*largest_ > sub.range.end) {
     XLOG(DBG4) << "removeSubscriber from checkPastEnd";
-    removeSubscriberByKey(
-        sub.mapKey,
+    removeSubscriber(
+        sub.sessionId,
         PublishDone{
             sub.requestID,
             PublishDoneStatusCode::SUBSCRIPTION_ENDED,
@@ -554,8 +578,8 @@ void MoQForwarder::removeSubscriberOnError(
     const std::string& callsite) {
   XLOG(ERR) << "Removing subscriber after error in " << callsite
             << " err=" << err.what();
-  removeSubscriberByKey(
-      sub.mapKey,
+  removeSubscriber(
+      sub.sessionId,
       PublishDone{
           sub.requestID,
           PublishDoneStatusCode::INTERNAL_ERROR,
@@ -583,7 +607,7 @@ void MoQForwarder::handleSubgroupError(
     // Nothing will close this subgroup now, so a draining subscriber waiting
     // only on it has to be retired here.
     if (sub.shouldRemove()) {
-      removeSubscriberByKey(sub.mapKey, std::nullopt, callsite);
+      removeSubscriber(sub.sessionId, std::nullopt, callsite);
     }
   } else {
     // Hard error - remove the entire subscription
@@ -632,8 +656,8 @@ MoQForwarder::beginSubgroup(
           anyReset = true;
         }
         if (sub->shouldRemove()) {
-          removeSubscriberByKey(
-              sub->mapKey, std::nullopt, "beginSubgroup duplicate");
+          removeSubscriber(
+              sub->sessionId, std::nullopt, "beginSubgroup duplicate");
         }
       } else if (
           !sub->passive &&
@@ -747,8 +771,8 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::publishDone(
     callback_->onPublishDone(this);
   }
   forEachSubscriber([&](const std::shared_ptr<Subscriber>& sub) {
-    drainSubscriberByKey(
-        sub->mapKey,
+    drainSubscriber(
+        sub->sessionId,
         PublishDone{
             sub->requestID,
             pubDone.statusCode,
@@ -820,13 +844,13 @@ Payload MoQForwarder::maybeClone(const Payload& payload) {
 MoQForwarder::Subscriber::Subscriber(
     MoQForwarder& f,
     SubscribeOk ok,
-    std::shared_ptr<MoQSession> s,
+    SessionId sessId,
     RequestID sid,
     SubscribeRange r,
     std::shared_ptr<TrackConsumer> tc,
     bool shouldForwardIn)
     : SubscriptionHandle(std::move(ok)),
-      session(std::move(s)),
+      sessionId(sessId),
       requestID(sid),
       range(r),
       trackConsumer(std::move(tc)),
@@ -960,7 +984,7 @@ MoQForwarder::Subscriber::requestUpdate(RequestUpdate requestUpdate) {
 void MoQForwarder::Subscriber::unsubscribe() {
   XLOG(DBG4) << "unsubscribe sess=" << this;
   if (forwarder) {
-    forwarder->removeSubscriber(session, std::nullopt, "unsubscribe");
+    forwarder->removeSubscriber(sessionId, std::nullopt, "unsubscribe");
   }
 }
 
@@ -1052,7 +1076,7 @@ void MoQForwarder::SubgroupForwarder::closeSubgroupForSubscriber(
   sub->tombstonedSubgroups.erase(identifier_);
   // If this subscriber is draining and this was the last subgroup, remove it
   if (sub->shouldRemove()) {
-    forwarder_->removeSubscriberByKey(sub->mapKey, std::nullopt, callsite);
+    forwarder_->removeSubscriber(sub->sessionId, std::nullopt, callsite);
   }
 }
 

@@ -86,7 +86,7 @@ void MoQTestPublisher::cancelAll() {
 
 std::shared_ptr<MoQForwarder> MoQTestPublisher::makeForwarder(
     const FullTrackName& ftn,
-    MoQSession& session) {
+    uint64_t version) {
   auto forwarder = std::make_shared<MoQForwarder>(ftn);
 
   // Advertise the priority even-numbered groups are published at, so the
@@ -94,8 +94,7 @@ std::shared_ptr<MoQForwarder> MoQTestPublisher::makeForwarder(
   // explicitly for the odd ones.  The framer downgrades the extension to a
   // PUBLISHER_PRIORITY param for draft 15; earlier drafts have no way to carry
   // it, so the priority always stays on the wire instead.
-  auto version = session.getNegotiatedVersion();
-  if (version && getDraftMajorVersion(*version) >= 15) {
+  if (getDraftMajorVersion(version) >= 15) {
     Extensions trackProperties;
     trackProperties.insertMutableExtension(
         Extension{kPublisherPriorityExtensionType, kMoQTestPublisherPriority});
@@ -137,13 +136,14 @@ folly::coro::Task<MoQSession::SubscribeResult> MoQTestPublisher::subscribe(
     co_return folly::makeUnexpected(error);
   }
 
-  auto session = MoQSession::getRequestSession();
+  const auto reqCtx = MoQSession::getRequestContext();
   auto trackIt = tracks_.find(sub.fullTrackName);
   const bool isNewTrack = (trackIt == tracks_.end());
-  auto forwarder = isNewTrack ? makeForwarder(sub.fullTrackName, *session)
+  auto forwarder = isNewTrack ? makeForwarder(sub.fullTrackName, reqCtx.version)
                               : trackIt->second.forwarder;
 
-  auto subscriber = forwarder->addSubscriber(session, sub, std::move(callback));
+  auto subscriber =
+      forwarder->addSubscriber(reqCtx.sessionId, sub, std::move(callback));
   if (!subscriber) {
     co_return folly::makeUnexpected(
         SubscribeError{
@@ -253,7 +253,8 @@ folly::coro::Task<folly::coro::Task<void>> MoQTestPublisher::startPublishTrack(
   forwarder->setCallback(unpauseCb);
   pendingUnpauses_.push_back(unpauseCb);
 
-  auto subscriber = forwarder->addSubscriber(session, /*forward=*/false);
+  auto subscriber =
+      forwarder->addSubscriber(session->sessionId(), /*forward=*/false);
   if (!subscriber) {
     co_yield folly::coro::co_error(
         std::runtime_error("PUBLISH failed: addSubscriber returned null"));
@@ -598,7 +599,8 @@ folly::coro::Task<void> MoQTestPublisher::sendDatagram(
 folly::Expected<StandaloneFetch, FetchError>
 MoQTestPublisher::resolveJoiningFetch(
     const Fetch& fetch,
-    const JoiningFetch& joining) {
+    const JoiningFetch& joining,
+    SessionId sessionId) {
   auto trackIt = tracks_.find(fetch.fullTrackName);
   if (trackIt == tracks_.end()) {
     return folly::makeUnexpected(
@@ -617,8 +619,7 @@ MoQTestPublisher::resolveJoiningFetch(
             FetchErrorCode::INVALID_RANGE,
             "No objects published for track"});
   }
-  auto range =
-      forwarder.resolveJoiningFetch(MoQSession::getRequestSession(), joining);
+  auto range = forwarder.resolveJoiningFetch(sessionId, joining);
   if (range.hasError()) {
     auto error = range.error();
     error.requestID = fetch.requestID;
@@ -654,7 +655,8 @@ folly::coro::Task<MoQSession::FetchResult> MoQTestPublisher::fetch(
   auto [standalone, joining] = fetchType(fetch);
   const bool isJoining = joining != nullptr;
   if (isJoining) {
-    auto range = resolveJoiningFetch(fetch, *joining);
+    auto range = resolveJoiningFetch(
+        fetch, *joining, MoQSession::getRequestContext().sessionId);
     if (range.hasError()) {
       co_return folly::makeUnexpected(range.error());
     }

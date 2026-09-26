@@ -6,39 +6,19 @@
 
 #include "moxygen/mlog/SamplingMLoggerFactory.h"
 
+#include <folly/Random.h>
+
 namespace moxygen {
 
 SamplingMLoggerFactory::SamplingMLoggerFactory(
     std::shared_ptr<MLoggerFactory> inner,
     float sampleRate)
-    : inner_(std::move(inner)), sampleRate_(sampleRate) {
-  // Validate and normalize sampleRate to valid range [0.0, 1.0]
-  if (sampleRate_ <= 0.0f) {
-    sampleRate_ = 0.0f;
-    bucketSize_ = 0; // Sentinel: no sampling
-  } else if (sampleRate_ >= 1.0f) {
-    sampleRate_ = 1.0f;
-    bucketSize_ = 1; // All sessions logged
-  } else {
-    // bucketSize = how many sessions per one logged session, e.g. 0.01 -> 100
-    bucketSize_ = static_cast<uint32_t>(1.0f / sampleRate_);
-    if (bucketSize_ == 0) {
-      bucketSize_ = 1; // guard against rounding to zero for very high rates
-    }
-  }
-}
+    : inner_(std::move(inner)), sampleRate_(sampleRate) {}
 
 std::shared_ptr<MLogger> SamplingMLoggerFactory::createMLogger() {
-  if (bucketSize_ == 0) {
-    // No sampling: sampleRate was <= 0
-    return nullptr;
-  }
-  if (bucketSize_ == 1) {
-    // Log all: sampleRate was >= 1
-    return inner_->createMLogger();
-  }
-  // folly::Random::oneIn() is thread-safe and bucketSize_ is always > 1 here.
-  if (folly::Random::oneIn(bucketSize_)) {
+  // randDouble01() yields [0, 1), so a rate of 0 never logs and a rate of 1
+  // always logs. A NaN rate fails the comparison and never logs.
+  if (folly::Random::randDouble01() < sampleRate_) {
     return inner_->createMLogger();
   }
   return nullptr;

@@ -16,6 +16,7 @@
 #include <folly/CancellationToken.h>
 #include <folly/MaybeManagedPtr.h>
 #include <folly/container/F14Map.h>
+#include <folly/container/IntrusiveList.h>
 #include <folly/coro/Promise.h>
 #include <folly/coro/Task.h>
 #include <folly/logging/xlog.h>
@@ -157,6 +158,17 @@ class MoQSession : public Subscriber,
   };
 
   static std::shared_ptr<MoQSession> getRequestSession();
+
+  // Facts about the peer serving the current request. A value, so a handler
+  // that only needs to know who is calling cannot call them back.
+  struct RequestContext {
+    SessionId sessionId;
+    uint64_t version{0};
+    MoQExecutor* executor{nullptr};
+  };
+
+  // Only valid while handling a request.
+  static RequestContext getRequestContext();
 
   SessionId sessionId() const {
     return id_;
@@ -1426,14 +1438,27 @@ class MoQSession : public Subscriber,
  private:
   class GoawayTimeoutCallback;
 
+  // A data stream read loop that is waiting for an unknown track alias.  The
+  // waiting coroutine frame owns it, so any unwind deregisters it.
+  struct AliasWaiter {
+    AliasWaiter(MoQSession& session, TrackAlias alias)
+        : session_(session), alias_(alias) {}
+    ~AliasWaiter();
+
+    void deliver();
+
+    TimedBaton baton;
+    folly::IntrusiveListHook hook;
+
+   private:
+    MoQSession& session_;
+    TrackAlias alias_;
+  };
+  using AliasWaiterList = folly::IntrusiveList<AliasWaiter, &AliasWaiter::hook>;
+
   // Private implementation methods
   void initializeNegotiatedVersion(uint64_t negotiatedVersion);
-  // Records one half of the setup exchange. Once both halves are in, computes
-  // the negotiated extensions and pushes them to the framers, which is why
-  // this runs before any frame that an extension could alter is sent or
-  // parsed.
-  void onSetupParams(SetupParameters params, bool local);
-  void removeBufferedSubgroupBaton(TrackAlias alias, TimedBaton* baton);
+  void pruneBufferedSubgroups(TrackAlias alias);
   void scheduleGoawayTimeout(uint64_t timeoutMs);
   void cancelGoawayTimeout();
   void onGoawayTimeoutExpired();
@@ -1449,7 +1474,8 @@ class MoQSession : public Subscriber,
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingSubscribeTracks_;
   folly::F14FastMap<TrackAlias, std::list<Payload>, TrackAlias::hash>
       bufferedDatagrams_;
-  folly::F14FastMap<TrackAlias, std::list<TimedBaton*>, TrackAlias::hash>
+  // F14Node: moving an intrusive list head would relink every waiter.
+  folly::F14NodeMap<TrackAlias, AliasWaiterList, TrackAlias::hash>
       bufferedSubgroups_;
   std::list<std::shared_ptr<moxygen::TimedBaton>> subgroupsWaitingForVersion_;
 
