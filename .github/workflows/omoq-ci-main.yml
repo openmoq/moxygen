@@ -149,11 +149,43 @@ jobs:
         run: cmake --install _build
 
   # ════════════════════════════════════════════════════════════════════════════
+  # Create-release: the pinned snapshot as an empty draft, before any asset
+  # exists, so each publish job can upload its own tarballs straight into it.
+  # A draft is invisible to consumers and to by-tag lookups, so the snapshot
+  # appears complete or not at all; the release job flips it once every
+  # publish job is green.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  create-release:
+    runs-on: ubuntu-22.04
+    outputs:
+      pin_tag: ${{ steps.tag.outputs.pin_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute pinned tag
+        id: tag
+        run: |
+          # 12 hex chars matches the moqx prebuilt cache key (_rev_short).
+          echo "pin_tag=snapshot-$(echo "$GITHUB_SHA" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft pinned snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash openmoq/scripts/publish-artifacts.sh \
+            --create-draft \
+            --sha "$GITHUB_SHA" \
+            --tag "${{ steps.tag.outputs.pin_tag }}" \
+            --branch "${{ github.ref_name }}"
+
+  # ════════════════════════════════════════════════════════════════════════════
   # Publish: BUNDLE_DEPS artifact builds. Runs alongside verify; release needs
   # both, so nothing is published for a commit that fails verify.
   # ════════════════════════════════════════════════════════════════════════════
 
   publish:
+    needs: [create-release]
     strategy:
       fail-fast: false
       matrix:
@@ -294,22 +326,19 @@ jobs:
             --output "${{ matrix.artifact }}" \
             --debug-output "${{ matrix.debug_artifact }}"
 
-      # Handoff to the release job within this run; the release then holds the
-      # same tarballs on free storage. The week is re-run headroom: a failed
-      # release job can be retried without rebuilding, over a weekend included.
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
-          retention-days: 7
-
-      - name: Upload debug artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.debug_artifact }}
-          path: ${{ matrix.debug_artifact }}
-          retention-days: 7
+      # Straight into the draft snapshot. Each job carries only its own two
+      # tarballs, so one slow or hung upload cannot hold up the other six.
+      - name: Upload assets to the draft snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p _assets
+          mv "${{ matrix.artifact }}" "${{ matrix.debug_artifact }}" _assets/
+          bash openmoq/scripts/publish-artifacts.sh \
+            --upload-only \
+            --artifacts-dir _assets \
+            --sha "$GITHUB_SHA" \
+            --tag "${{ needs.create-release.outputs.pin_tag }}"
 
   # ════════════════════════════════════════════════════════════════════════════
   # Release: create/update branch-derived snapshot pre-release (all green)
@@ -318,18 +347,13 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
 
   release:
-    needs: [build, publish]
+    needs: [build, publish, create-release]
     runs-on: ubuntu-22.04
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       pin_tag: ${{ steps.tag.outputs.pin_tag }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts/
 
       - name: Compute release tags
         id: tag
@@ -342,22 +366,21 @@ jobs:
             LABEL="${BRANCH#release/}"
             TAG="snapshot-${LABEL}-latest"
           fi
-          # 12 hex chars matches the moqx prebuilt cache key (_rev_short).
-          PIN_TAG="snapshot-$(echo "$GITHUB_SHA" | cut -c1-12)"
+          PIN_TAG="${{ needs.create-release.outputs.pin_tag }}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "pin_tag=$PIN_TAG" >> "$GITHUB_OUTPUT"
           echo "Release tags: $PIN_TAG + $TAG (branch: $BRANCH)"
 
-      # The pinned per-rev snapshot carries the assets (uploaded once) and is
-      # the contract pin-following consumers depend on, so it publishes before
-      # the alias: if the alias update fails, the rev is still fetchable by pin.
-      # Pinned snapshots older than 30 days are pruned with their tags.
-      - name: Publish pinned snapshot
+      # Every publish job is green, so the draft holds all 14 assets: flipping
+      # it public is the point at which the rev becomes fetchable by pin. It
+      # happens before the alias moves, so if the alias update fails the rev is
+      # still reachable. Pinned snapshots older than 30 days go with their tags.
+      - name: Finalize pinned snapshot
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash openmoq/scripts/publish-artifacts.sh \
-            --artifacts-dir artifacts/ \
+            --finalize \
             --sha "$GITHUB_SHA" \
             --tag "${{ steps.tag.outputs.pin_tag }}" \
             --branch "${{ github.ref_name }}" \
@@ -493,7 +516,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
 
   notify:
-    needs: [build, publish, release, alias]
+    needs: [build, publish, release, alias, create-release]
     if: always()
     runs-on: ubuntu-22.04
     steps:
@@ -521,6 +544,13 @@ jobs:
             esac
           }
 
+          # create-release gates publish, so its failure would otherwise
+          # surface as publish:— and hide the cause.
+          PUB_RESULT="${{ needs.publish.result }}"
+          if [ "${{ needs.create-release.result }}" != "success" ]; then
+            PUB_RESULT="${{ needs.create-release.result }}"
+          fi
+
           # A failed alias job leaves the pinned snapshot published but the
           # rolling pointer stale, which is worth seeing in the alert.
           REL_RESULT="${{ needs.release.result }}"
@@ -529,7 +559,7 @@ jobs:
           fi
 
           VER=$(fmt_status "${{ needs.build.result }}")
-          PUB=$(fmt_status "${{ needs.publish.result }}")
+          PUB=$(fmt_status "$PUB_RESULT")
           REL=$(fmt_status "$REL_RESULT")
 
           STATUS="verify:${VER} publish:${PUB} release:${REL}"
@@ -557,6 +587,9 @@ jobs:
 
           VER="${{ needs.build.result }}"
           PUB="${{ needs.publish.result }}"
+          if [ "${{ needs.create-release.result }}" != "success" ]; then
+            PUB="${{ needs.create-release.result }}"
+          fi
           REL="${{ needs.release.result }}"
           if [ "$REL" = "success" ] && [ "${{ needs.alias.result }}" != "success" ]; then
             REL="${{ needs.alias.result }}"
