@@ -7,6 +7,7 @@
 #pragma once
 
 #include <folly/container/F14Map.h>
+#include <functional>
 #include <moxygen/MoQSession.h>
 
 namespace moxygen {
@@ -24,6 +25,11 @@ class NamespaceAdvertisement {
   virtual void queuePrefix(std::optional<TrackNamespace>) = 0;
   virtual void acceptPrefix() = 0;
   virtual void discardPendingPrefix() = 0;
+  // Runs `callback` once a losing claim() on `suffix` is no longer blocked.
+  // Default no-op for implementations that don't support retrying.
+  virtual void retryClaim(
+      const TrackNamespace& /*suffix*/,
+      std::function<void()> /*callback*/) {}
 };
 
 class SeparateStreamSubNsReply : public SubNSReply {

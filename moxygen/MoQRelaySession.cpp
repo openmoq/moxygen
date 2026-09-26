@@ -1711,7 +1711,9 @@ void MoQRelaySession::onSubscribeNamespaceImpl(
       .start();
 }
 
-class MoQNamespacePublishHandle : public Publisher::NamespacePublishHandle {
+class MoQNamespacePublishHandle
+    : public Publisher::NamespacePublishHandle,
+      public std::enable_shared_from_this<MoQNamespacePublishHandle> {
  public:
   MoQNamespacePublishHandle(
       std::shared_ptr<SubNSReply> subNsReply,
@@ -1727,7 +1729,17 @@ class MoQNamespacePublishHandle : public Publisher::NamespacePublishHandle {
     bool owned =
         namespaceOwner_ && namespaceOwner_->owns(ns.trackNamespaceSuffix);
     if (namespaceOwner_ && !namespaceOwner_->claim(ns.trackNamespaceSuffix)) {
-      XLOG(ERR) << "Namespace belongs to another advertisement stream";
+      // Owned by another stream; retry once it releases the namespace.
+      XLOG(DBG1) << "Namespace claimed by another advertisement stream; "
+                    "will retry once released ns="
+                 << ns.trackNamespaceSuffix;
+      namespaceOwner_->retryClaim(
+          ns.trackNamespaceSuffix,
+          [weakSelf = weak_from_this(), ns]() {
+            if (auto self = weakSelf.lock()) {
+              self->namespaceMsg(ns);
+            }
+          });
       return;
     }
     auto writeResult = subNsReply_->namespaceMsg(ns);

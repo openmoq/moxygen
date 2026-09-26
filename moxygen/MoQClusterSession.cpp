@@ -8,6 +8,7 @@
 
 #include <array>
 #include <deque>
+#include <functional>
 #include <utility>
 
 namespace moxygen {
@@ -23,6 +24,12 @@ struct ClusterNamespaceRegistry {
       std::array<const ClusterNamespaceOwner*, 2>,
       TrackNamespace::hash>
       owners;
+  // Retry callbacks from claim() losers, keyed by namespace and direction.
+  folly::F14FastMap<
+      TrackNamespace,
+      std::array<std::deque<std::function<void()>>, 2>,
+      TrackNamespace::hash>
+      waiters;
 };
 
 class ClusterNamespaceOwner : public NamespaceAdvertisement {
@@ -44,12 +51,14 @@ class ClusterNamespaceOwner : public NamespaceAdvertisement {
     if (!active_ || !registry_->active) {
       return false;
     }
-    auto& owners = registry_->owners[fullNamespace(suffix)];
+    auto full = fullNamespace(suffix);
+    auto& owners = registry_->owners[full];
     auto& owner = owners[incoming_];
     if (owner && owner != this) {
       return false;
     }
     owner = this;
+    claimed_.insert(std::move(full));
     return true;
   }
   bool owns(const TrackNamespace& suffix) const override {
@@ -61,28 +70,29 @@ class ClusterNamespaceOwner : public NamespaceAdvertisement {
     if (!owns(suffix)) {
       return false;
     }
-    auto it = registry_->owners.find(fullNamespace(suffix));
-    it->second[incoming_] = nullptr;
-    if (!it->second[0] && !it->second[1]) {
-      registry_->owners.erase(it);
-    }
+    auto full = fullNamespace(suffix);
+    releaseFull(full);
+    claimed_.erase(full);
     return true;
   }
   void reset() override {
     active_ = false;
-    for (auto it = registry_->owners.begin(); it != registry_->owners.end();) {
-      if (it->second[incoming_] == this) {
-        it->second[incoming_] = nullptr;
-      }
-      if (!it->second[0] && !it->second[1]) {
-        it = registry_->owners.erase(it);
+    for (const auto& full : claimed_) {
+      releaseFull(full);
+    }
+    claimed_.clear();
+  }
+  void setPrefix(TrackNamespace prefix) override {
+    prefix_ = std::move(prefix);
+    // Release claims that no longer fall under the narrowed prefix.
+    for (auto it = claimed_.begin(); it != claimed_.end();) {
+      if (!it->startsWith(prefix_)) {
+        releaseFull(*it);
+        it = claimed_.erase(it);
       } else {
         ++it;
       }
     }
-  }
-  void setPrefix(TrackNamespace prefix) override {
-    prefix_ = std::move(prefix);
   }
   void queuePrefix(std::optional<TrackNamespace> prefix) override {
     pendingPrefixes_.push_back(std::move(prefix));
@@ -101,6 +111,11 @@ class ClusterNamespaceOwner : public NamespaceAdvertisement {
       pendingPrefixes_.pop_back();
     }
   }
+  void retryClaim(const TrackNamespace& suffix, std::function<void()> callback)
+      override {
+    registry_->waiters[fullNamespace(suffix)][incoming_].push_back(
+        std::move(callback));
+  }
 
  private:
   TrackNamespace fullNamespace(const TrackNamespace& suffix) const {
@@ -110,11 +125,42 @@ class ClusterNamespaceOwner : public NamespaceAdvertisement {
     }
     return full;
   }
+  void releaseFull(const TrackNamespace& full) {
+    auto it = registry_->owners.find(full);
+    if (it != registry_->owners.end()) {
+      if (it->second[incoming_] == this) {
+        it->second[incoming_] = nullptr;
+      }
+      if (!it->second[0] && !it->second[1]) {
+        registry_->owners.erase(it);
+      }
+    }
+    notifyWaiters(full);
+  }
+  void notifyWaiters(const TrackNamespace& full) {
+    auto wit = registry_->waiters.find(full);
+    if (wit == registry_->waiters.end()) {
+      return;
+    }
+    std::function<void()> callback;
+    auto& perDirection = wit->second;
+    if (!perDirection[incoming_].empty()) {
+      callback = std::move(perDirection[incoming_].front());
+      perDirection[incoming_].pop_front();
+    }
+    if (perDirection[0].empty() && perDirection[1].empty()) {
+      registry_->waiters.erase(wit);
+    }
+    if (callback) {
+      callback();
+    }
+  }
   std::shared_ptr<ClusterNamespaceRegistry> registry_;
   TrackNamespace prefix_;
   bool active_{true};
   bool incoming_;
   std::deque<std::optional<TrackNamespace>> pendingPrefixes_;
+  folly::F14FastSet<TrackNamespace, TrackNamespace::hash> claimed_;
 };
 
 std::shared_ptr<NamespaceAdvertisement>
@@ -135,6 +181,7 @@ void MoQClusterSession::cleanupClusterState() {
   if (namespaceRegistry_) {
     namespaceRegistry_->active = false;
     namespaceRegistry_->owners.clear();
+    namespaceRegistry_->waiters.clear();
   }
 }
 
