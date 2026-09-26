@@ -32,9 +32,11 @@ endif()
 # PicoConnectionContext.h includes PicoH3WebTransport.h which needs h3zero.
 # Propagate picohttp include path to all consumers via BUILD_INTERFACE
 # (avoids CMake policy error for build-dir paths in INTERFACE_INCLUDE_DIRECTORIES).
-if(TARGET picohttp-core)
-  target_include_directories(openmoq_pico_base PUBLIC
-    $<BUILD_INTERFACE:${picoquic_SOURCE_DIR}/picohttp>)
+if(TARGET picoquic::picohttp-core)
+  if(EXISTS "${picoquic_SOURCE_DIR}/picohttp")
+    target_include_directories(openmoq_pico_base PUBLIC
+      $<BUILD_INTERFACE:${picoquic_SOURCE_DIR}/picohttp>)
+  endif()
   target_link_libraries(openmoq_pico_base PUBLIC picoquic::picohttp-core)
 endif()
 

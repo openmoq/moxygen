@@ -7,9 +7,30 @@
 #pragma once
 
 #include <folly/container/F14Map.h>
+#include <functional>
 #include <moxygen/MoQSession.h>
 
 namespace moxygen {
+
+// Optional policy attached to a namespace stream. Ordinary relay sessions do
+// not create one; extension sessions supply ownership and prefix tracking.
+class NamespaceAdvertisement {
+ public:
+  virtual ~NamespaceAdvertisement() = default;
+  virtual bool claim(const TrackNamespace&) = 0;
+  virtual bool owns(const TrackNamespace&) const = 0;
+  virtual bool release(const TrackNamespace&) = 0;
+  virtual void reset() = 0;
+  virtual void setPrefix(TrackNamespace) = 0;
+  virtual void queuePrefix(std::optional<TrackNamespace>) = 0;
+  virtual void acceptPrefix() = 0;
+  virtual void discardPendingPrefix() = 0;
+  // Runs `callback` once a losing claim() on `suffix` is no longer blocked.
+  // Default no-op for implementations that don't support retrying.
+  virtual void retryClaim(
+      const TrackNamespace& /*suffix*/,
+      std::function<void()> /*callback*/) {}
+};
 
 class SeparateStreamSubNsReply : public SubNSReply {
  public:
@@ -88,6 +109,12 @@ class MoQRelaySession : public MoQSession {
           nullptr) override;
 
  protected:
+  virtual std::shared_ptr<NamespaceAdvertisement> makeNamespaceAdvertisement(
+      bool /*incoming*/,
+      TrackNamespace /*prefix*/ = {}) {
+    return nullptr;
+  }
+
   void onSubscribeNamespaceImpl(
       const SubscribeNamespace& subscribeNamespace,
       std::shared_ptr<SubNSReply> subNsReply) override;
@@ -246,7 +273,20 @@ class MoQRelaySession : public MoQSession {
   // Draft 18+: reply context for each responder-side namespace or
   // SUBSCRIBE_TRACKS request's bidi stream, so a failed REQUEST_UPDATE can send
   // REQUEST_ERROR and close it.
-  folly::F14FastMap<RequestID, std::shared_ptr<ReplyContext>, RequestID::hash>
+  struct RequestUpdateReplyState {
+    RequestUpdateReplyState() = default;
+    RequestUpdateReplyState(RequestUpdateReplyState&&) noexcept = default;
+    RequestUpdateReplyState(const RequestUpdateReplyState&) = delete;
+    RequestUpdateReplyState& operator=(const RequestUpdateReplyState&) = delete;
+    std::shared_ptr<ReplyContext> context;
+    std::shared_ptr<NamespaceAdvertisement> advertisement;
+    ~RequestUpdateReplyState() {
+      if (advertisement) {
+        advertisement->reset();
+      }
+    }
+  };
+  folly::F14FastMap<RequestID, RequestUpdateReplyState, RequestID::hash>
       requestUpdateReplyContexts_;
   // Draft 18+
   folly::F14FastMap<

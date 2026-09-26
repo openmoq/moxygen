@@ -117,6 +117,13 @@ moxygen_add_library(moxygen_moq_relay_session
     Folly::folly_container_f14_hash
 )
 
+moxygen_add_library(moxygen_moq_cluster_session
+  SRCS
+    MoQClusterSession.cpp
+  EXPORTED_DEPS
+    moxygen_moq_relay_session
+)
+
 moxygen_add_library(moxygen_moq_publish_error
   EXPORTED_DEPS
     fmt::fmt
