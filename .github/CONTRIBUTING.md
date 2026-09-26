@@ -97,6 +97,17 @@ local patch.
 ## Releases
 
 `main` produces rolling `snapshot-latest` artifacts on every push.
+
+Runs on `main` are parallel and can finish out of order, so `snapshot-latest`
+only ever moves **forward**: before moving it, the alias job compares its
+commit against the one the alias points at now, and a run whose commit is
+behind or diverged leaves it alone with a notice. Its own per-rev
+`snapshot-<sha12>` release is published either way, so nothing is lost. That
+job takes one run at a time, and fails rather than guessing if it cannot read
+the alias. If `main` is force-pushed the alias can end up on a commit that is
+no longer in the branch, and every later run will then hold; delete the
+`snapshot-latest` pre-release once and the next push recreates it.
+
 Versioned releases are cut manually from `main` via
 [omoq-version-release.yml](.github/workflows/omoq-version-release.yml):
 Actions → *version release* → *Run workflow* → enter version. The
