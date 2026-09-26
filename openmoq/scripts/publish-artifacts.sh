@@ -39,6 +39,7 @@ DRY_RUN=false
 CREATE_DRAFT=false
 UPLOAD_ONLY=false
 FINALIZE=false
+EXPECT_ASSETS=0
 
 # Assets upload concurrently, each attempt bounded: a single hung PUT to
 # uploads.github.com would otherwise stall the release indefinitely.
@@ -58,6 +59,8 @@ Options:
   --create-draft        Create the release as an empty draft
   --upload-only         Upload --artifacts-dir into an existing draft
   --finalize            Flip an existing draft public
+  --expect-assets N     With --finalize, refuse to publish unless the draft
+                        holds exactly N assets (default 0 = no check)
   --sha SHA             Full commit SHA for the release
   --tag TAG             Pre-release tag name (default: snapshot-latest)
   --branch BRANCH       Source branch name for release notes (default: main)
@@ -82,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     --create-draft)  CREATE_DRAFT=true; shift ;;
     --upload-only)   UPLOAD_ONLY=true; shift ;;
     --finalize)      FINALIZE=true; shift ;;
+    --expect-assets) EXPECT_ASSETS="$2"; shift 2 ;;
     --dry-run)       DRY_RUN=true; shift ;;
     -h|--help)       usage 0 ;;
     *)               echo "Unknown option: $1" >&2; usage 1 ;;
@@ -196,6 +200,9 @@ upload_assets() {
 
 prune_snapshots() {
   [[ "$PRUNE_DAYS" -gt 0 ]] || return 0
+  # --prune-days is documented as acting after publishing; in draft-creation
+  # mode the replacement is not published yet.
+  [[ "$CREATE_DRAFT" == true ]] && return 0
   echo "==> Pruning pinned snapshots older than ${PRUNE_DAYS} days"
   local cutoff tag created created_s
   cutoff=$(date -u -d "-${PRUNE_DAYS} days" +%s)
@@ -223,6 +230,14 @@ prune_snapshots() {
 
 if [[ "$UPLOAD_ONLY" == true ]]; then
   echo "==> Uploading to $TAG"
+  # --clobber on a published release would replace assets consumers can already
+  # fetch; a draft is the only safe target.
+  # shellcheck disable=SC2086
+  IS_DRAFT=$(gh release view "$TAG" --json isDraft --jq .isDraft $REPO_FLAG)
+  if [[ "$IS_DRAFT" != "true" ]]; then
+    echo "Error: $TAG is not a draft; refusing to replace assets on a published release." >&2
+    exit 1
+  fi
   if [[ "$DRY_RUN" == true ]]; then
     echo "    [dry-run] Would upload $ASSET_COUNT asset(s) to $TAG"
   else
@@ -234,6 +249,17 @@ fi
 
 if [[ "$FINALIZE" == true ]]; then
   echo "==> Finalizing $TAG"
+  # The draft is about to become the rev's contract; publishing it short of its
+  # tarballs would break "complete or not at all".
+  if [[ "$EXPECT_ASSETS" -gt 0 ]]; then
+    # shellcheck disable=SC2086
+    COUNT=$(gh release view "$TAG" --json assets --jq '.assets | length' $REPO_FLAG)
+    if [[ "$COUNT" -ne "$EXPECT_ASSETS" ]]; then
+      echo "Error: $TAG holds $COUNT asset(s), expected $EXPECT_ASSETS." >&2
+      exit 1
+    fi
+    echo "    $COUNT/$EXPECT_ASSETS assets present"
+  fi
   if [[ "$DRY_RUN" == true ]]; then
     echo "    [dry-run] Would flip $TAG out of draft"
   else
@@ -307,11 +333,18 @@ else
   # the delete above misses them and a second create would not collide — then
   # uploads-by-tag would be ambiguous. Paginate: on a busy repo an old draft
   # falls past the first page within hours.
-  gh api --paginate "repos/${REPO_SLUG}/releases" \
-    --jq ".[] | select(.tag_name == \"$TAG\" and .draft) | .id" |
-  while read -r id; do
+  # --arg, not interpolation: TAG reaches here from --tag and github.ref_name,
+  # and a crafted value inside the filter would select unrelated drafts.
+  STALE=$(gh api --paginate "repos/${REPO_SLUG}/releases" |
+    jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag and .draft) | .id')
+  # A plain loop, not a pipeline: exit must leave the script, not a subshell.
+  for id in $STALE; do
     echo "    Removing stale draft release $id for $TAG"
-    gh api -X DELETE "repos/${REPO_SLUG}/releases/$id" || true
+    if ! gh api -X DELETE "repos/${REPO_SLUG}/releases/$id"; then
+      echo "Error: could not delete stale draft $id for $TAG." >&2
+      echo "       A second draft on this tag makes uploads-by-tag ambiguous." >&2
+      exit 1
+    fi
   done
 
   if [[ "$ROLLING" == true ]]; then
@@ -346,8 +379,8 @@ else
     echo "    Draft created: $TAG"
   else
     # gh release create without files can leave the release in draft state.
-    RELEASE_ID=$(gh api repos/{owner}/{repo}/releases \
-      --jq ".[] | select(.tag_name == \"$TAG\") | .id")
+    RELEASE_ID=$(gh api repos/{owner}/{repo}/releases |
+      jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id')
     if [[ -n "$RELEASE_ID" ]]; then
       gh api "repos/{owner}/{repo}/releases/$RELEASE_ID" \
         -X PATCH -f draft=false >/dev/null

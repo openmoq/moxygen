@@ -379,8 +379,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 7 publish platforms x (tarball + debug sidecar).
           bash openmoq/scripts/publish-artifacts.sh \
             --finalize \
+            --expect-assets 14 \
             --sha "$GITHUB_SHA" \
             --tag "${{ steps.tag.outputs.pin_tag }}" \
             --branch "${{ github.ref_name }}" \
