@@ -4,14 +4,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <atomic>
 #include <iomanip>
 #include <memory>
 #include <sstream>
-#include <thread>
 #include <vector>
 
-#include <folly/coro/BlockingWait.h>
 #include <folly/coro/Sleep.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
 #include <folly/init/Init.h>
@@ -64,152 +61,99 @@ DEFINE_string(
     "histogram) to this path once per second, for a node_exporter textfile "
     "collector to scrape");
 
-// Shared stats structure for cross-thread aggregation
-struct SharedStats {
-  std::atomic<uint64_t> totalObjects{0};
-  std::atomic<uint64_t> totalBytes{0};
-  std::atomic<uint32_t> totalSubscribers{0};
-  std::atomic<uint32_t> totalResets{0};
-  std::atomic<bool> trackEnded{false};
-};
-
 namespace {
 
-struct PerfPromSnapshot {
-  uint32_t subscribers{0};
-  double throughputMbps{0.0};
-  uint64_t totalObjects{0};
-  uint64_t totalBytes{0};
-  uint32_t totalResets{0};
-  uint32_t totalFailures{0};
-  double avgLatencyMs{0.0};
+using Clients = std::vector<std::unique_ptr<moxygen::MoQPerfTestClient>>;
+
+constexpr double kBitsPerMbit = 1024.0 * 1024.0;
+
+struct Totals {
+  uint64_t peakSubscribers{0};
+  uint64_t currentSubscribers{0};
+  uint64_t objects{0};
+  uint64_t bytes{0};
+  uint64_t resets{0};
+  uint64_t failures{0};
+  size_t completed{0};
   moxygen::LatencyHistogram latency;
+  moxygen::AtomicLatency::Interval interval;
+
+  double avgLatencyMs() const {
+    return latency.count() > 0 ? static_cast<double>(latency.sum()) /
+            static_cast<double>(latency.count())
+                               : 0.0;
+  }
 };
+
+// Safe from any thread.  Drains each client's interval latency.
+Totals sumResults(const Clients& clients) {
+  Totals t;
+  for (const auto& client : clients) {
+    auto r = client->getResults();
+    t.peakSubscribers += r.subscribersReached;
+    t.currentSubscribers += r.currentSubscribers;
+    t.objects += r.totalObjects;
+    t.bytes += r.totalBytes;
+    t.resets += r.totalResets;
+    t.failures += r.totalFailures;
+    t.completed += r.trackEnded ? 1 : 0;
+    t.latency.merge(r.latency);
+    t.interval.merge(r.intervalLatency);
+  }
+  return t;
+}
 
 // Rewrite the whole .prom file each tick.
 void writePromFile(
     const std::string& path,
     const std::string& labels,
-    const PerfPromSnapshot& s) {
+    const Totals& t,
+    double throughputMbps) {
   moxygen::PromWriter w(labels);
-  w.gauge("moqperf_subscribers", "Active subscribers", s.subscribers);
+  w.gauge("moqperf_subscribers", "Active subscribers", t.currentSubscribers);
   w.gauge(
-      "moqperf_throughput_mbps",
-      "Interval throughput in Mbps",
-      s.throughputMbps);
-  w.counter("moqperf_objects_total", "Objects received", s.totalObjects);
-  w.counter("moqperf_bytes_total", "Bytes received", s.totalBytes);
-  w.counter("moqperf_resets_total", "Subgroup resets", s.totalResets);
-  w.counter("moqperf_failures_total", "Subscribe failures", s.totalFailures);
+      "moqperf_throughput_mbps", "Interval throughput in Mbps", throughputMbps);
+  w.counter("moqperf_objects_total", "Objects received", t.objects);
+  w.counter("moqperf_bytes_total", "Bytes received", t.bytes);
+  w.counter("moqperf_resets_total", "Subgroup resets", t.resets);
+  w.counter("moqperf_failures_total", "Subscribe failures", t.failures);
   w.gauge(
       "moqperf_latency_avg_ms",
       "Run-average end-to-end object latency in ms",
-      s.avgLatencyMs);
+      t.avgLatencyMs());
   w.histogram(
       "moqperf_object_latency_seconds",
       "End-to-end object latency in seconds",
-      {{"", s.latency}});
+      {{"", t.latency}});
   w.writeFile(path);
 }
 
-// Sum every client's cumulative latency histogram. Safe from any thread:
-// snapshotLatencyHist() reads atomic counters, no EventBase hop.
-moxygen::LatencyHistogram mergeLatency(
-    const std::vector<std::unique_ptr<moxygen::MoQPerfTestClient>>& clients) {
-  moxygen::LatencyHistogram hist;
-  for (const auto& client : clients) {
-    hist.merge(client->snapshotLatencyHist());
-  }
-  return hist;
-}
-
-} // namespace
-
-// Stats aggregation coroutine
 folly::coro::Task<void> aggregateStats(
-    const std::vector<std::unique_ptr<moxygen::MoQPerfTestClient>>& clients,
-    std::shared_ptr<SharedStats> sharedStats,
+    const Clients& clients,
     folly::CancellationToken cancelToken,
     std::string metricsOut,
     std::string promLabels) {
   auto startTime = std::chrono::steady_clock::now();
-  uint64_t lastTotalObjects = 0;
-  uint64_t lastTotalBytes = 0;
-  uint32_t lastTotalResets = 0;
-  uint32_t lastTotalFailures = 0;
+  Totals last;
 
   while (!cancelToken.isCancellationRequested()) {
     co_await folly::coro::sleepReturnEarlyOnCancel(std::chrono::seconds(1));
 
-    // Aggregate stats from all clients
-    uint64_t totalObjects = 0;
-    uint64_t totalBytes = 0;
-    uint32_t peakSubscribers = 0;
-    uint32_t currentSubscribers = 0;
-    uint32_t totalResets = 0;
-    uint32_t totalFailures = 0;
-    uint32_t totalCompleted = 0;
-
-    uint64_t totalLatencyMs = 0;
-    uint64_t latencyObjects = 0;
-    moxygen::MoQPerfTestClient::TestResults::IntervalLatency ivl;
-    for (const auto& client : clients) {
-      auto results = client->getResults();
-      totalObjects += results.totalObjects;
-      totalBytes += results.totalBytes;
-      totalLatencyMs += results.totalLatencyMs;
-      latencyObjects += results.latencyObjects;
-      ivl.sumMs += results.intervalLatency.sumMs;
-      ivl.count += results.intervalLatency.count;
-      ivl.minMs = std::min(ivl.minMs, results.intervalLatency.minMs);
-      ivl.maxMs = std::max(ivl.maxMs, results.intervalLatency.maxMs);
-      peakSubscribers += results.subscribersReached;
-      currentSubscribers += results.currentSubscribers;
-      totalResets += results.totalResets;
-      totalFailures += results.totalFailures;
-      if (results.trackEnded) {
-        totalCompleted++;
-      }
-    }
-
-    // Update shared stats (use peak for final summary)
-    sharedStats->totalObjects = totalObjects;
-    sharedStats->totalBytes = totalBytes;
-    sharedStats->totalSubscribers = peakSubscribers;
-    sharedStats->totalResets = totalResets;
-
-    // Calculate interval stats
-    uint64_t intervalObjects =
-        totalObjects >= lastTotalObjects ? totalObjects - lastTotalObjects : 0;
-    uint64_t intervalBytes =
-        totalBytes >= lastTotalBytes ? totalBytes - lastTotalBytes : 0;
-    uint32_t intervalResets = totalResets - lastTotalResets;
-    uint32_t intervalFailures = totalFailures - lastTotalFailures;
-
-    lastTotalObjects = totalObjects;
-    lastTotalBytes = totalBytes;
-    lastTotalResets = totalResets;
-    lastTotalFailures = totalFailures;
-
+    auto t = sumResults(clients);
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                        std::chrono::steady_clock::now() - startTime)
                        .count();
+    double mbps = (t.bytes - last.bytes) * 8.0 / kBitsPerMbit;
+    const auto& ivl = t.interval;
 
-    double mbps = (intervalBytes * 8.0) / (1024.0 * 1024.0);
-    double totalMB = totalBytes / (1024.0 * 1024.0);
-
-    double runAvgLatencyMs = latencyObjects > 0
-        ? static_cast<double>(totalLatencyMs) /
-            static_cast<double>(latencyObjects)
-        : 0.0;
     XLOG(INFO) << "[AGGREGATE] [" << elapsed
-               << "s] Subs: " << currentSubscribers
-               << " | Obj/s: " << intervalObjects << " | Mbps: " << std::fixed
-               << std::setprecision(2) << mbps << " | Total: " << totalObjects
-               << " objs, " << std::fixed << std::setprecision(2) << totalMB
-               << " MB"
+               << "s] Subs: " << t.currentSubscribers
+               << " | Obj/s: " << t.objects - last.objects
+               << " | Mbps: " << std::fixed << std::setprecision(2) << mbps
+               << " | Total: " << t.objects << " objs, " << std::fixed
+               << std::setprecision(2) << t.bytes / (1024.0 * 1024.0) << " MB"
                << " | Latency(run avg): " << std::fixed << std::setprecision(1)
-               << runAvgLatencyMs << " ms"
+               << t.avgLatencyMs() << " ms"
                << " | Latency(interval min/avg/max): "
                << (ivl.count > 0 ? ivl.minMs : 0) << "/" << std::fixed
                << std::setprecision(1)
@@ -217,33 +161,25 @@ folly::coro::Task<void> aggregateStats(
                            static_cast<double>(ivl.count)
                                  : 0.0)
                << "/" << (ivl.count > 0 ? ivl.maxMs : 0) << " ms"
-               << " | Resets: " << intervalResets << "/s, " << totalResets
+               << " | Resets: " << t.resets - last.resets << "/s, " << t.resets
                << " total"
-               << " | Failures: " << intervalFailures << "/s, " << totalFailures
-               << " total"
-               << " | Done: " << totalCompleted << "/" << clients.size();
+               << " | Failures: " << t.failures - last.failures << "/s, "
+               << t.failures << " total"
+               << " | Done: " << t.completed << "/" << clients.size();
 
     if (!metricsOut.empty()) {
-      PerfPromSnapshot snap;
-      snap.subscribers = currentSubscribers;
-      snap.throughputMbps = mbps;
-      snap.totalObjects = totalObjects;
-      snap.totalBytes = totalBytes;
-      snap.totalResets = totalResets;
-      snap.totalFailures = totalFailures;
-      snap.avgLatencyMs = runAvgLatencyMs;
-      snap.latency = mergeLatency(clients);
-      writePromFile(metricsOut, promLabels, snap);
+      writePromFile(metricsOut, promLabels, t, mbps);
     }
+    last = t;
 
-    // Check if all threads have completed
-    if (totalCompleted >= clients.size()) {
+    if (t.completed >= clients.size()) {
       XLOG(INFO) << "[AGGREGATE] All tracks ended - stopping stats aggregation";
-      sharedStats->trackEnded = true;
       break;
     }
   }
 }
+
+} // namespace
 
 int main(int argc, char** argv) {
   gflags::ParseCommandLineFlags(&argc, &argv, false);
@@ -271,8 +207,8 @@ int main(int argc, char** argv) {
   XLOG(INFO) << "Other object size: " << FLAGS_other_object_size << " bytes";
   XLOG(INFO) << "Delivery timeout: " << FLAGS_delivery_timeout << " ms";
 
-  if (FLAGS_num_threads == 0) {
-    XLOG(ERR) << "Number of threads must be at least 1";
+  if (FLAGS_num_threads == 0 || FLAGS_objects_per_group == 0) {
+    XLOG(ERR) << "--num_threads and --objects_per_group must be at least 1";
     return 1;
   }
 
@@ -299,20 +235,17 @@ int main(int argc, char** argv) {
 
   try {
     auto url = proxygen::URL(FLAGS_relay_url);
-    auto sharedStats = std::make_shared<SharedStats>();
     folly::CancellationSource cancelSource;
 
     XLOG(INFO) << "Starting " << FLAGS_num_threads << " client thread(s)...";
 
-    // Create IO thread pool executor for client threads
     auto executor = std::make_unique<folly::IOThreadPoolExecutor>(
         FLAGS_num_threads,
         std::make_shared<folly::NamedThreadFactory>("MoQPerfTest"),
         folly::EventBaseManager::get(),
         folly::IOThreadPoolExecutor::Options().setWaitForAll(true));
 
-    // Create clients and launch on executor
-    std::vector<std::unique_ptr<moxygen::MoQPerfTestClient>> clients;
+    Clients clients;
     uint32_t i = 0;
     for (auto& evb : executor->getAllEventBases()) {
       auto client = std::make_unique<moxygen::MoQPerfTestClient>(
@@ -333,86 +266,51 @@ int main(int argc, char** argv) {
       clients.push_back(std::move(client));
     }
 
-    // Start stats aggregation on separate thread
-    folly::ScopedEventBaseThread statsThread;
-    folly::coro::co_withExecutor(
-        statsThread.getEventBase(),
-        aggregateStats(
-            clients,
-            sharedStats,
-            cancelSource.getToken(),
-            FLAGS_metrics_out,
-            promLabels))
-        .start();
+    {
+      folly::ScopedEventBaseThread statsThread;
+      folly::coro::co_withExecutor(
+          statsThread.getEventBase(),
+          aggregateStats(
+              clients, cancelSource.getToken(), FLAGS_metrics_out, promLabels))
+          .start();
 
-    // Wait for all client tasks to complete
-    executor->stop();
+      // Wait for all client tasks to complete
+      executor->stop();
+      cancelSource.requestCancellation();
+    }
 
-    // Stop stats aggregation
-    cancelSource.requestCancellation();
-    // ScopedEventBaseThread destructor will wait for aggregateStats to finish
+    auto t = sumResults(clients);
+    auto duration = clients[0]->getResults().durationSeconds;
+    double throughputMbps = duration > 0
+        ? t.bytes * 8.0 / kBitsPerMbit / static_cast<double>(duration)
+        : 0.0;
 
-    // Print final results
     XLOG(INFO) << "========================================";
     XLOG(INFO) << "Final Test Summary (All Threads):";
     XLOG(INFO) << "  Threads: " << FLAGS_num_threads;
-    XLOG(INFO) << "  Total Subscribers: "
-               << sharedStats->totalSubscribers.load();
-    XLOG(INFO) << "  Total Objects: " << sharedStats->totalObjects.load();
-    XLOG(INFO) << "  Total Bytes: " << sharedStats->totalBytes.load();
-    XLOG(INFO) << "  Total Resets: " << sharedStats->totalResets.load();
-
-    // Calculate aggregate throughput and latency across all clients
-    uint64_t totalBytes = 0;
-    uint64_t totalLatencyMs = 0;
-    uint64_t latencyObjects = 0;
-
-    for (const auto& client : clients) {
-      auto results = client->getResults();
-      totalBytes += results.totalBytes;
-      totalLatencyMs += results.totalLatencyMs;
-      latencyObjects += results.latencyObjects;
-    }
-
-    auto duration = clients[0]->getResults().durationSeconds;
+    XLOG(INFO) << "  Total Subscribers: " << t.peakSubscribers;
+    XLOG(INFO) << "  Total Objects: " << t.objects;
+    XLOG(INFO) << "  Total Bytes: " << t.bytes;
+    XLOG(INFO) << "  Total Resets: " << t.resets;
     XLOG(INFO) << "  Duration: " << duration << " seconds";
-
-    double throughputMbps = 0.0;
-    if (totalBytes > 0 && duration > 0) {
-      double mbytes = static_cast<double>(totalBytes) / (1024.0 * 1024.0);
-      throughputMbps = (mbytes * 8.0) / static_cast<double>(duration);
-      XLOG(INFO) << "  Throughput: " << throughputMbps << " Mbps";
+    XLOG(INFO) << "  Throughput: " << fmt::format("{:.2f}", throughputMbps)
+               << " Mbps";
+    if (t.latency.count() > 0) {
+      XLOG(INFO) << "  Avg Object Latency: "
+                 << fmt::format("{:.1f}", t.avgLatencyMs()) << " ms ("
+                 << t.latency.count() << " objects measured)";
     }
+    XLOG(INFO) << "  Result: "
+               << (t.completed == clients.size()
+                       ? "SUCCESS - Track ended naturally"
+                       : "Test stopped");
 
-    double avgLatencyMs = 0.0;
-    if (latencyObjects > 0) {
-      avgLatencyMs = static_cast<double>(totalLatencyMs) /
-          static_cast<double>(latencyObjects);
-      XLOG(INFO) << "  Avg Object Latency: " << avgLatencyMs << " ms ("
-                 << latencyObjects << " objects measured)";
-    }
-
-    // Client threads are already joined (executor->stop()), so the histograms
-    // are quiescent here; write one last snapshot to capture the final tail.
+    // Client threads are already joined, so this snapshot captures the final
+    // tail.
     if (!FLAGS_metrics_out.empty()) {
-      PerfPromSnapshot snap;
-      snap.throughputMbps = throughputMbps;
-      snap.totalObjects = sharedStats->totalObjects.load();
-      snap.totalBytes = totalBytes;
-      snap.totalResets = sharedStats->totalResets.load();
-      snap.avgLatencyMs = avgLatencyMs;
-      snap.latency = mergeLatency(clients);
-      writePromFile(FLAGS_metrics_out, promLabels, snap);
+      writePromFile(FLAGS_metrics_out, promLabels, t, throughputMbps);
     }
-
-    if (sharedStats->trackEnded.load()) {
-      XLOG(INFO) << "  Result: SUCCESS - Track ended naturally";
-      return 0;
-    } else {
-      XLOG(INFO) << "  Result: Test stopped";
-      return 0;
-    }
-
+    return 0;
   } catch (const std::exception& ex) {
     XLOG(ERR) << "Exception: " << ex.what();
     return 1;

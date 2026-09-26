@@ -26,7 +26,8 @@ DEFINE_int32(perf_connect_timeout, 1000, "connect timeout in ms for perf test");
 DEFINE_int32(
     perf_transaction_timeout,
     1000,
-    "transaction timeout in ms for perf test");
+    "transaction timeout in seconds for perf test.  For WebTransport this is "
+    "the idle timeout on the CONNECT stream");
 
 // Constants for moq-test scheme parameters
 constexpr uint64_t kStartGroup = 0;
@@ -194,23 +195,18 @@ ObjectReceiverCallback::FlowControlState SubscriberState::Callback::onObject(
   if (!state_) {
     return FlowControlState::UNBLOCKED;
   }
-  state_->objectsReceived_++;
-  if (payload) {
-    state_->bytesReceived_ += payload->computeChainDataLength();
-  }
-
+  std::optional<uint64_t> latencyMs;
   if (auto sendTs =
           objHeader.extensions.getIntExtension(kTimestampExtensionType)) {
     uint64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
     if (nowMs >= *sendTs) {
-      uint64_t latencyMs = nowMs - *sendTs;
-      state_->totalLatencyMs_ += latencyMs;
-      state_->latencyObjects_++;
-      state_->testClient_.recordLatency(latencyMs);
+      latencyMs = nowMs - *sendTs;
     }
   }
+  state_->testClient_.recordObject(
+      payload ? payload->computeChainDataLength() : 0, latencyMs);
 
   // Update largest object seen for track restart detection
   AbsoluteLocation location(objHeader.group, objHeader.id);
@@ -306,18 +302,25 @@ MoQPerfTestClient::MoQPerfTestClient(
   params_.testIntegerExtension = -1;  // no extensions
   params_.testVariableExtension = -1; // no extensions
   params_.deliveryTimeout = 0;        // don't set the server's delivery timeout
-  params_.lastGroupInTrack =
-      durationSeconds; // Triggers track end from publisher
   params_.startGroup = kStartGroup;
   params_.startObject = 0;
   params_.groupIncrement = 1;
   params_.objectIncrement = 1;
-  params_.lastObjectInTrack = objectsPerGroup;
+  params_.lastObjectInTrack = objectsPerGroup - 1;
+  // The publisher ends the track after the last group, so size the track to
+  // end within the test.  A group longer than the whole test still gets one
+  // group.
+  uint64_t groupMs = uint64_t(objectsPerGroup) * objectIntervalMs;
+  uint64_t groups = groupMs > 0
+      ? uint64_t(durationSeconds) * 1000 / groupMs
+      : durationSeconds;
+  params_.lastGroupInTrack = groups > 0 ? groups - 1 : 0;
 }
 
 folly::coro::Task<void> MoQPerfTestClient::run() {
-  startTime_ = std::chrono::steady_clock::now();
-  auto hardDeadline = startTime_ + std::chrono::seconds(durationSeconds_) +
+  auto startTime = std::chrono::steady_clock::now();
+  startTime_ = startTime;
+  auto hardDeadline = startTime + std::chrono::seconds(durationSeconds_) +
       std::chrono::seconds(5);
 
   auto currentIncrement = maxSubscribersPerSecond_;
@@ -327,6 +330,7 @@ folly::coro::Task<void> MoQPerfTestClient::run() {
         !trackRestarted_ && std::chrono::steady_clock::now() < hardDeadline;
   };
 
+  bool atMax = false;
   // Adaptive loop: continuously adjust subscriber count based on resets
   while (shouldContinue()) {
     // Clear interval counters before adding subscribers
@@ -338,10 +342,12 @@ folly::coro::Task<void> MoQPerfTestClient::run() {
         std::min(currentIncrement, maxSubscribersPerSecond_);
     // Cap the number of subscribers to add by remaining capacity
     if (subscribers_.size() >= maxSubscribers_) {
-      XLOG(INFO) << "Max subscribers reached (" << maxSubscribers_
-                 << ") - not adding more this interval";
+      XLOG_IF(INFO, !atMax) << "Max subscribers reached (" << maxSubscribers_
+                            << ") - not adding more";
+      atMax = true;
       subscribersToAdd = 0;
     } else {
+      atMax = false;
       auto remainingCapacity = maxSubscribers_ - subscribers_.size();
       subscribersToAdd =
           std::min(subscribersToAdd, static_cast<uint32_t>(remainingCapacity));
@@ -359,8 +365,9 @@ folly::coro::Task<void> MoQPerfTestClient::run() {
             std::chrono::milliseconds(sleepIntervalMs));
       }
     }
-    XLOG(INFO) << "Added " << subscribersAddedInBatch
-               << " subscribers (increment: " << currentIncrement << ")";
+    XLOG_IF(INFO, subscribersAddedInBatch > 0)
+        << "Added " << subscribersAddedInBatch
+        << " subscribers (increment: " << currentIncrement << ")";
 
     // === Wait 2 seconds to observe if resets or failures occur
     co_await folly::coro::sleepReturnEarlyOnCancel(std::chrono::seconds(2));
@@ -397,13 +404,8 @@ folly::coro::Task<void> MoQPerfTestClient::run() {
     XLOG(INFO) << "Test cancelled";
   }
 
-  // Flush active subscriber stats before clearing so getResults() stays
-  // accurate
-  for (auto& [id, sub] : subscribers_) {
-    cumulativeObjects_ += sub->objectsReceived_;
-    cumulativeBytes_ += sub->bytesReceived_;
-  }
   subscribers_.clear();
+  currentSubscribers_ = 0;
 }
 
 folly::coro::Task<void> MoQPerfTestClient::addSubscriber() {
@@ -433,13 +435,9 @@ folly::coro::Task<void> MoQPerfTestClient::addSubscriber() {
     // Add to subscribers map
     XLOG(DBG1) << "Added subscriber " << id;
     subscribers_[id] = std::move(subscriber);
-
-    // Update peak subscribers
-    auto currentSize = subscribers_.size();
-    auto currentPeak = peakSubscribers_.load();
-    while (currentSize > currentPeak &&
-           !peakSubscribers_.compare_exchange_weak(currentPeak, currentSize)) {
-      // Loop until we successfully update the peak
+    currentSubscribers_ = subscribers_.size();
+    if (subscribers_.size() > peakSubscribers_) {
+      peakSubscribers_ = subscribers_.size();
     }
 
     XLOG(DBG1) << "Added subscriber " << id
@@ -460,14 +458,9 @@ void MoQPerfTestClient::removeSubscriber(size_t id) {
   XLOG(DBG1) << "Removing subscriber " << id
              << " (current total: " << subscribers_.size() << ")";
 
-  // Add subscriber's stats to cumulative totals before removing
-  cumulativeObjects_ += it->second->objectsReceived_;
-  cumulativeBytes_ += it->second->bytesReceived_;
-  cumulativeLatencyMs_ += it->second->totalLatencyMs_;
-  cumulativeLatencyObjects_ += it->second->latencyObjects_;
-
   // Destructor will handle unsubscribe
   subscribers_.erase(it);
+  currentSubscribers_ = subscribers_.size();
 }
 
 void MoQPerfTestClient::completed() {
@@ -502,43 +495,32 @@ std::optional<AbsoluteLocation> MoQPerfTestClient::getLargestObjectSeen()
   return largestObjectSeen_;
 }
 
-void MoQPerfTestClient::recordLatency(uint64_t latencyMs) {
-  latency_.record(latencyMs);
+void MoQPerfTestClient::recordObject(
+    uint64_t bytes,
+    std::optional<uint64_t> latencyMs) {
+  objects_.fetch_add(1, std::memory_order_relaxed);
+  bytes_.fetch_add(bytes, std::memory_order_relaxed);
+  if (latencyMs) {
+    latency_.record(*latencyMs);
+  }
 }
 
 MoQPerfTestClient::TestResults MoQPerfTestClient::getResults() const {
   TestResults results;
   results.subscribersReached = peakSubscribers_.load();
-  results.currentSubscribers = subscribers_.size();
+  results.currentSubscribers = currentSubscribers_.load();
   results.totalResets = totalResets_.load();
   results.totalFailures = totalFailures_.load();
   results.trackEnded = (numCompleted_ > 0);
-
-  // Combine cumulative stats with current active subscribers
-  results.totalObjects = cumulativeObjects_.load();
-  results.totalBytes = cumulativeBytes_.load();
-  results.totalLatencyMs = cumulativeLatencyMs_.load();
-  results.latencyObjects = cumulativeLatencyObjects_.load();
-
-  for (const auto& [id, sub] : subscribers_) {
-    results.totalObjects += sub->objectsReceived_;
-    results.totalBytes += sub->bytesReceived_;
-    results.totalLatencyMs += sub->totalLatencyMs_;
-    results.latencyObjects += sub->latencyObjects_;
-  }
-
+  results.totalObjects = objects_.load(std::memory_order_relaxed);
+  results.totalBytes = bytes_.load(std::memory_order_relaxed);
+  results.latency = latency_.snapshot();
   results.intervalLatency = latency_.takeInterval();
-
-  auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                     std::chrono::steady_clock::now() - startTime_)
-                     .count();
-  results.durationSeconds = elapsed;
-
+  results.durationSeconds =
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::steady_clock::now() - startTime_.load())
+          .count();
   return results;
-}
-
-LatencyHistogram MoQPerfTestClient::snapshotLatencyHist() const {
-  return latency_.snapshot();
 }
 
 } // namespace moxygen
