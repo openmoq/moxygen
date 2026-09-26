@@ -3497,6 +3497,8 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
     // updating the request". No-op if write half already closed.
     if (!bidiCallback && fin) {
       control->writeFin();
+    } else if (fin) {
+      control->onPeerFin();
     }
   }
   // Anything above can still call control->cancel(), so take the code last.
@@ -4590,6 +4592,10 @@ void MoQSession::handleFetchRequestUpdate(
 
   fetchPublisher->trackLatestRequestUpdate(requestUpdate);
 
+  // The peer can FIN right after this update. Our FIN has to follow the reply.
+  if (auto* replyContext = fetchPublisher->replyContext()) {
+    replyContext->holdFin();
+  }
   // Simple passthrough - just deliver to application and relay response
   co_withExecutor(
       getExecutor(),
@@ -4598,6 +4604,11 @@ void MoQSession::handleFetchRequestUpdate(
           folly::coro::co_invoke(
               [fetchPublisher = fetchPublisher,
                update = requestUpdate]() mutable -> folly::coro::Task<void> {
+                SCOPE_EXIT {
+                  if (auto* replyContext = fetchPublisher->replyContext()) {
+                    replyContext->releaseFin();
+                  }
+                };
                 co_await folly::coro::co_safe_point;
                 co_await fetchPublisher->onRequestUpdate(std::move(update));
               })))
@@ -6784,8 +6795,9 @@ void MoQSession::fetchOk(const FetchOk& fetchOk, ReplyContext& replyContext) {
     logger_->logFetchOk(fetchOk);
   }
   // Bidi stream stays open after FETCH_OK so the subscriber can send
-  // REQUEST_UPDATE or signal cancellation via FIN/RST/STOP_SENDING.
+  // REQUEST_UPDATE or cancel with RST/STOP_SENDING, until it FINs.
   replyContext.flush();
+  replyContext.finAfterPeerFin();
 }
 
 void MoQSession::fetchError(const FetchError& fetchErr, ReplyContext& ctx) {

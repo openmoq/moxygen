@@ -72,6 +72,28 @@ void BidiStreamControl::write(std::unique_ptr<folly::IOBuf> data, bool fin) {
   }
 }
 
+void BidiStreamControl::finAfterPeerFin() {
+  finAfterPeerFin_ = true;
+  maybeFinAfterPeerFin();
+}
+
+void BidiStreamControl::onPeerFin() {
+  peerFinReceived_ = true;
+  maybeFinAfterPeerFin();
+}
+
+void BidiStreamControl::releaseFin() {
+  XCHECK_GT(finHolds_, 0u);
+  finHolds_--;
+  maybeFinAfterPeerFin();
+}
+
+void BidiStreamControl::maybeFinAfterPeerFin() {
+  if (finAfterPeerFin_ && peerFinReceived_ && finHolds_ == 0) {
+    writeFin();
+  }
+}
+
 void BidiStreamControl::cancel(ResetStreamErrorCode code) {
   onPeerTerminationFn_ = nullptr;
   readCancelCode_ = toWireResetStreamErrorCode(code, negotiatedVersion_);
@@ -95,6 +117,24 @@ void BidiStreamReplyContext::flush(bool fin) {
     control_->write(writeBuf_.move(), fin);
   } else {
     writeBuf_.move();
+  }
+}
+
+void BidiStreamReplyContext::finAfterPeerFin() {
+  if (!cancelled() && control_) {
+    control_->finAfterPeerFin();
+  }
+}
+
+void BidiStreamReplyContext::holdFin() {
+  if (control_) {
+    control_->holdFin();
+  }
+}
+
+void BidiStreamReplyContext::releaseFin() {
+  if (control_) {
+    control_->releaseFin();
   }
 }
 
