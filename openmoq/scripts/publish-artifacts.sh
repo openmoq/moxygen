@@ -11,7 +11,9 @@
 #                         uploaded once, to the pinned release only
 #
 # --prune-days N deletes pinned snapshot-<sha12> pre-releases (and their tags)
-# older than N days after a successful publish.
+# published more than N days ago. Age comes from published_at: a release's
+# created_at is the date of its commit, so republishing an old rev would
+# otherwise make its fresh snapshot immediately eligible for deletion.
 #
 # Requires: gh CLI authenticated with a token that has contents:write.
 
@@ -254,7 +256,7 @@ if [[ "$PRUNE_DAYS" -gt 0 ]]; then
   echo "==> Pruning pinned snapshots older than ${PRUNE_DAYS} days"
   CUTOFF=$(date -u -d "-${PRUNE_DAYS} days" +%s)
   gh api "repos/${REPO_SLUG}/releases" --paginate \
-    --jq '.[] | select(.prerelease) | [.tag_name, .created_at] | @tsv' |
+    --jq '.[] | select(.prerelease) | [.tag_name, (.published_at // .created_at)] | @tsv' |
   while IFS=$'\t' read -r tag created; do
     # Pinned snapshots only — never rolling aliases or v* releases.
     [[ "$tag" =~ ^snapshot-[0-9a-f]{12}$ ]] || continue
