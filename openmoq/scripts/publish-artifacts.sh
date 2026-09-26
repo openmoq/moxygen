@@ -381,10 +381,12 @@ else
     echo "    Draft created: $TAG"
   else
     # gh release create without files can leave the release in draft state.
-    RELEASE_ID=$(gh api repos/{owner}/{repo}/releases |
+    # REPO_SLUG, not {owner}/{repo}: gh resolves the placeholders from the
+    # current repo, which is not where --repo sent the release.
+    RELEASE_ID=$(gh api "repos/${REPO_SLUG}/releases" |
       jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id')
     if [[ -n "$RELEASE_ID" ]]; then
-      gh api "repos/{owner}/{repo}/releases/$RELEASE_ID" \
+      gh api "repos/${REPO_SLUG}/releases/$RELEASE_ID" \
         -X PATCH -f draft=false >/dev/null
       echo "    Release published (draft=false)"
     fi
