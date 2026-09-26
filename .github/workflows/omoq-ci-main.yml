@@ -377,7 +377,7 @@ jobs:
     needs: [release]
     runs-on: ubuntu-22.04
     outputs:
-      state: ${{ steps.order.outputs.state }}
+      state: ${{ steps.publish.outputs.state || steps.order.outputs.state }}
     concurrency:
       group: ${{ github.workflow }}-alias-${{ github.ref }}
       cancel-in-progress: false
@@ -407,15 +407,13 @@ jobs:
 
           if [ -z "$CUR" ]; then
             echo "advance=true" >> "$GITHUB_OUTPUT"
-            echo "state=moved" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           STATUS=$(gh api "repos/${{ github.repository }}/compare/${CUR}...${GITHUB_SHA}" --jq .status)
           case "$STATUS" in
             ahead|identical)
-              echo "advance=true" >> "$GITHUB_OUTPUT"
-              echo "state=moved" >> "$GITHUB_OUTPUT" ;;
+              echo "advance=true" >> "$GITHUB_OUTPUT" ;;
             *)
               # Expected while runs overlap: a newer commit already owns it.
               # diverged is unreachable on main (force-push and deletion are
@@ -427,6 +425,7 @@ jobs:
           esac
 
       - name: Publish rolling alias (asset-less pointer)
+        id: publish
         if: steps.order.outputs.advance == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -436,6 +435,9 @@ jobs:
             --sha "$GITHUB_SHA" \
             --tag "${{ needs.release.outputs.tag }}" \
             --branch "${{ github.ref_name }}"
+          # Only now has the alias actually moved; a failure above leaves the
+          # state empty so the alerts do not claim it did.
+          echo "state=moved" >> "$GITHUB_OUTPUT"
 
   # ════════════════════════════════════════════════════════════════════════════
   # Prune build caches: keep the newest generation of each cache family.
@@ -572,7 +574,7 @@ jobs:
 
           STATUS="verify:${VER} publish:${PUB} release:${REL} alias:${{ needs.alias.outputs.state || '—' }}"
 
-          if [ "${{ needs.release.result }}" = "success" ]; then
+          if [ "$REL" = "success" ]; then
             REL_URL="${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.release.outputs.tag }}"
             SUBJECT="[moxygen] published ${{ github.ref_name }} ${SHORT}"
             BODY="Repository: ${{ github.repository }}\nBranch: ${{ github.ref_name }}\nCommit: ${GITHUB_SHA}\nStatus: ${STATUS}\nArtifacts: ${REL_URL}\nRun: ${RUN_URL}"
