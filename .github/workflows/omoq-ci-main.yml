@@ -379,6 +379,9 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-alias-${{ github.ref }}
       cancel-in-progress: false
+      # queue: single (the default) cancels an already-pending job when another
+      # joins, which would drop a newer commit's alias move entirely.
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -531,7 +534,7 @@ jobs:
 
           STATUS="verify:${VER} publish:${PUB} release:${REL}"
 
-          if [ "${{ needs.release.result }}" = "success" ]; then
+          if [ "$REL_RESULT" = "success" ]; then
             REL_URL="${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.release.outputs.tag }}"
             TEXT=":white_check_mark: *${{ github.repository }}* \`${{ github.ref_name }}\` \`${SHORT}\` — ${STATUS}  <${RUN_URL}|#${{ github.run_number }}> artifacts: <${REL_URL}|view>"
           else
