@@ -204,11 +204,14 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // Once the session ends, drop the signal handler so evb.loop() can return.
-  // Without --track, this serves until a signal or the idle timeout ends the
-  // session.
-  folly::CancellationCallback onSessionEnd(
-      session->getCancelToken(), [&] { signalHandler.unregister(); });
+  // Once the session ends, cancel waiting publishes and let evb.loop() return.
+  // runInLoop keeps a publish from resuming inside MoQSession::close().
+  folly::CancellationCallback onSessionEnd(session->getCancelToken(), [&] {
+    evb.runInLoop([&] {
+      publisher->cancelAll();
+      signalHandler.unregister();
+    });
+  });
   std::shared_ptr<moxygen::Subscriber::PublishNamespaceHandle> nsHandle;
   auto done = folly::coro::co_withExecutor(
                   &evb,
