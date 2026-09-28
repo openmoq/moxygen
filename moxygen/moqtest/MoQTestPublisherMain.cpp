@@ -112,16 +112,17 @@ int main(int argc, char** argv) {
               moxygen::test::InsecureVerifierDangerousDoNotUseInProduction>(),
           *transportType));
 
-  // A signal means stop now, mid-track. drain() would wait for the publishes
-  // to finish, which is the opposite of what we want, so close outright.
-  // SignalHandler terminates the loop and restores the default disposition, so
-  // a second Ctrl-C still force-quits.
-  moxygen::SignalHandler signalHandler(&evb, [&](int) {
-    publisher->cancelAll();
-    if (auto session = relayClient->getSession()) {
-      session->close(moxygen::SessionCloseErrorCode::NO_ERROR);
-    }
-  });
+  // A signal stops the publishes mid-track and closes the session outright. The
+  // loop keeps running so the cancelled publishes unwind before main returns.
+  moxygen::SignalHandler signalHandler(
+      &evb,
+      [&](int) {
+        publisher->cancelAll();
+        if (auto session = relayClient->getSession()) {
+          session->close(moxygen::SessionCloseErrorCode::NO_ERROR);
+        }
+      },
+      /*terminateLoop=*/false);
 
   XLOG(INFO) << "Connecting to " << FLAGS_url;
   // Pass the EventBase so blockingWait drives it; the loop below has not
@@ -158,7 +159,7 @@ int main(int argc, char** argv) {
   folly::coro::co_withExecutor(
       &evb,
       folly::coro::co_invoke(
-          [&publishes, &relayClient, &evb, &anyFailed]()
+          [&publishes, &relayClient, &signalHandler, &anyFailed]()
               -> folly::coro::Task<void> {
             auto results =
                 co_await folly::coro::collectAllTryRange(std::move(publishes));
@@ -175,12 +176,12 @@ int main(int argc, char** argv) {
               }
             }
             XLOG(INFO) << "All tracks done";
-            // Nothing is outstanding now, so drain for a clean close and let
-            // the loop finish flushing it.
+            // Drain for a clean close. With the signal handler gone,
+            // evb.loop() returns once that close has flushed.
             if (auto session = relayClient->getSession()) {
               session->drain();
             }
-            evb.terminateLoopSoon();
+            signalHandler.unregister();
           }))
       .start();
 
