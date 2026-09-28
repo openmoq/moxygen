@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <folly/Function.h>
 #include <folly/coro/Baton.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
 #include "moxygen/MoQClientBase.h"
@@ -116,6 +117,12 @@ class MoQTestClient : public Subscriber,
 
   void setLogger(const std::shared_ptr<MLogger>& logger);
 
+  // Validates this many whole groups, starting after the first group received,
+  // and then unsubscribes. 0 validates the whole track.
+  void setGroupsToValidate(uint64_t groups) {
+    groupsToValidate_ = groups;
+  }
+
   // Subscriber: accept the relay's PUBLISH by handing back the receiver that
   // validates the track.
   PublishResult publish(
@@ -177,14 +184,21 @@ class MoQTestClient : public Subscriber,
         std::optional<TrackAlias> trackAlias,
         const ObjectHeader& objHeader,
         Payload payload) override {
-      return client_.onObject(
-          state_, std::move(trackAlias), objHeader, std::move(payload));
+      client_.deliver([this,
+                       trackAlias = std::move(trackAlias),
+                       objHeader,
+                       payload = std::move(payload)]() mutable {
+        client_.onObject(state_, trackAlias, objHeader, std::move(payload));
+      });
+      return FlowControlState::UNBLOCKED;
     }
 
     void onObjectStatus(
         std::optional<TrackAlias> trackAlias,
         const ObjectHeader& objHeader) override {
-      client_.onObjectStatus(state_, std::move(trackAlias), objHeader);
+      client_.deliver([this, trackAlias = std::move(trackAlias), objHeader] {
+        client_.onObjectStatus(state_, trackAlias, objHeader);
+      });
     }
 
     void onEndOfStream() override {
@@ -192,15 +206,17 @@ class MoQTestClient : public Subscriber,
     }
 
     void onError(ResetStreamErrorCode code) override {
-      client_.onError(state_, code);
+      client_.deliver([this, code] { client_.onError(state_, code); });
     }
 
     void onPublishDone(PublishDone done) override {
-      client_.onPublishDone(std::move(done));
+      client_.deliver([this, done = std::move(done)]() mutable {
+        client_.onPublishDone(std::move(done));
+      });
     }
 
     void onAllDataReceived() override {
-      client_.onAllDataReceived(state_);
+      client_.deliver([this] { client_.onAllDataReceived(state_); });
     }
 
    private:
@@ -229,8 +245,10 @@ class MoQTestClient : public Subscriber,
         uint64_t subgroupID,
         Priority priority,
         BeginSubgroupOptions options) override {
-      client_.validateSubgroupHeader(
-          state_, groupID, subgroupID, priority, options);
+      client_.deliver([this, groupID, subgroupID, priority, options] {
+        client_.validateSubgroupHeader(
+            state_, groupID, subgroupID, priority, options);
+      });
       return ObjectReceiver::beginSubgroup(
           groupID, subgroupID, priority, options);
     }
@@ -311,7 +329,7 @@ class MoQTestClient : public Subscriber,
   };
 
   void armObjectDeadlines();
-  void armRequestDeadline();
+  void armRequestDeadline(std::chrono::milliseconds lead = {});
   std::chrono::milliseconds objectInterval() const;
   void cancelDeadlines();
   void objectDeadlineExpired(uint64_t group, uint64_t id);
@@ -350,6 +368,24 @@ class MoQTestClient : public Subscriber,
 
   // The slice of the track the current request covers
   MoQTestFetchWindow window_;
+
+  // The groups window opens at the first object received, or for a join at the
+  // backfill's first group. Objects outside it are ignored.
+  uint64_t groupsToValidate_{0};
+  bool groupsWindowOpen_{false};
+  // A join's window depends on the join's reply. Events that arrive before the
+  // reply are held and replayed in order.
+  bool joinWindowPending_{false};
+  std::vector<folly::Function<void()>> pendingEvents_;
+  void deliver(folly::Function<void()> event);
+  void releaseHeldEvents();
+  MoQTestFetchWindow initialWindow(const MoQTestParameters& params) const;
+  void openGroupsWindow(uint64_t firstGroup, std::chrono::milliseconds lead);
+  bool outsideGroupsWindow(uint64_t group) const;
+  // Opens the window on the first object, then reports whether it ignores one.
+  bool ignoredByGroupsWindow(ReceiveState& state, uint64_t group);
+  void finishGroupsWindowIfComplete(ReceiveState& state);
+  void buildScoreboard(std::chrono::milliseconds lead);
 
   // Scoreboard of expected (group, objectId) pairs, each owning the deadline it
   // must arrive by, so scoring an object off also cancels its timer.
