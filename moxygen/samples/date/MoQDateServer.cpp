@@ -686,6 +686,9 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // Outlives the worker, whose EB runs the session this owns.
+  std::unique_ptr<MoQRelayClient> relayClient;
+
   // DatePublisher state is single-threaded; share one worker EB across stacks.
   // waitForAll: proxygen detaches this EB's WebTransport CONNECT stream only on
   // the delivery ack for the EOM that closing the relay session queues.
@@ -706,7 +709,6 @@ int main(int argc, char* argv[]) {
   }
 
   // Create relay client if relay URL is specified
-  std::unique_ptr<MoQRelayClient> relayClient;
   if (!FLAGS_relay_url.empty()) {
     relayClient = createRelayClient(workerEvb, publisher, loggerFactory);
     if (!relayClient) {
