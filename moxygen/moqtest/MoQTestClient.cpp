@@ -55,6 +55,8 @@ void MoQTestClient::setLogger(const std::shared_ptr<MLogger>& logger) {
 
 void MoQTestClient::shutdown() {
   tearingDown_ = true;
+  // Pending deadlines would keep evb.loop() running.
+  cancelDeadlines();
   // Cancel the active request first: drain() only closes once there are no
   // active subscriptions, otherwise it waits for the whole track.
   if (subHandle_) {
