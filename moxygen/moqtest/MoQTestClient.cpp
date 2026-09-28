@@ -216,6 +216,11 @@ Subscriber::PublishResult MoQTestClient::publish(
   if (handle) {
     subHandle_ = std::move(handle);
   }
+  if (awaitingPublish_) {
+    awaitingPublish_ = false;
+    armObjectDeadlines();
+    armRequestDeadline();
+  }
 
   PublishOk ok;
   ok.requestID = pub.requestID;
@@ -337,6 +342,40 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::publishTrack(
   co_await doneBaton_;
   // Drained here rather than up front: draining the subscriber session before
   // the PUBLISH arrives would reject it.
+  shutdown();
+  co_return trackNamespace.value();
+}
+
+folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::receivePublish(
+    MoQTestParameters params) {
+  auto trackNamespace = convertMoqTestParamToTrackNamespace(params);
+  if (trackNamespace.hasError()) {
+    XLOG(ERR)
+        << "MoQTest verification result: "
+        << "FAILURE! Reason: Error Converting Parameters to TrackNamespace: "
+        << trackNamespace.error().what();
+    moqClient_->moqSession_->drain();
+    co_yield folly::coro::co_error(trackNamespace.error());
+  }
+
+  requestID_ = kDefaultRequestId;
+  initializeExpecteds(params, resolveFetchWindow(params));
+  startReceiving(subState_, ReceivingType::SUBSCRIBE);
+  // The publisher can start at any time, so the deadlines start at its PUBLISH.
+  cancelDeadlines();
+  awaitingPublish_ = true;
+
+  auto subRes = co_await folly::coro::co_awaitTry(
+      subscribeTracks(trackNamespace.value()));
+  if (subRes.hasException()) {
+    XLOG(ERR) << "MoQTest verification result: FAILURE! Reason: "
+              << subRes.exception().what();
+    shutdown();
+    co_return trackNamespace.value();
+  }
+
+  co_await doneBaton_;
+  // Draining before the PUBLISH arrives would reject it.
   shutdown();
   co_return trackNamespace.value();
 }
@@ -692,6 +731,12 @@ void MoQTestClient::armObjectDeadlines() {
   for (auto& [unused, cb] : expectedObjects_) {
     moqExecutor_->scheduleTimeout(cb.get(), cb->timeout());
   }
+}
+
+void MoQTestClient::armRequestDeadline() {
+  moqExecutor_->scheduleTimeout(
+      &requestDeadline_,
+      int64_t(expectedObjects_.size()) * objectInterval() + kDeadlineSlack);
 }
 
 std::chrono::milliseconds MoQTestClient::objectInterval() const {
@@ -1242,9 +1287,7 @@ void MoQTestClient::initializeExpecteds(
   datagramDrops_ = 0;
 
   publishDoneReceived_ = false;
-  moqExecutor_->scheduleTimeout(
-      &requestDeadline_,
-      int64_t(expectedObjects_.size()) * objectInterval() + kDeadlineSlack);
+  armRequestDeadline();
 }
 
 void MoQTestClient::seedCursor(

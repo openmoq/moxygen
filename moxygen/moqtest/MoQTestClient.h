@@ -109,6 +109,11 @@ class MoQTestClient : public Subscriber,
       const std::string& versions = "",
       PublishOrder order = PublishOrder::SubscribeFirst);
 
+  // Sends SUBSCRIBE_TRACKS and validates the track that the relay forwards in
+  // a PUBLISH. The publisher can start at any time.
+  folly::coro::Task<moxygen::TrackNamespace> receivePublish(
+      MoQTestParameters params);
+
   void setLogger(const std::shared_ptr<MLogger>& logger);
 
   // Subscriber: accept the relay's PUBLISH by handing back the receiver that
@@ -306,6 +311,7 @@ class MoQTestClient : public Subscriber,
   };
 
   void armObjectDeadlines();
+  void armRequestDeadline();
   std::chrono::milliseconds objectInterval() const;
   void cancelDeadlines();
   void objectDeadlineExpired(uint64_t group, uint64_t id);
@@ -313,6 +319,8 @@ class MoQTestClient : public Subscriber,
   void finishRequest();
 
   RequestDeadline requestDeadline_{*this};
+  // Set by receivePublish(), which arms the deadlines when the PUBLISH arrives.
+  bool awaitingPublish_{false};
   bool publishDoneReceived_{false};
   // A datagram that arrives after its deadline is as good as dropped.
   uint64_t datagramDrops_{0};
