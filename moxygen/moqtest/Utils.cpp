@@ -98,45 +98,52 @@ convertMoqTestParamToTrackNamespace(const MoQTestParameters& params) {
       std::to_string((params.testVariableExtension)),
       std::to_string(params.publisherDeliveryTimeout),
   });
+  trackNamespace.trackNamespace.insert(
+      trackNamespace.trackNamespace.begin(),
+      params.nsPrefix.begin(),
+      params.nsPrefix.end());
   return trackNamespace;
 }
 
 folly::Expected<moxygen::MoQTestParameters, std::runtime_error>
 convertTrackNamespaceToMoqTestParam(TrackNamespace* track) {
-  // Check if TrackNamespace is of length 16
-  if ((track->trackNamespace).size() != kNumParams) {
+  // Any tuples ahead of the last 16 are nsPrefix.
+  const auto& tuples = track->trackNamespace;
+  if (tuples.size() < kNumParams) {
     return folly::makeUnexpected(
-        std::runtime_error("TrackNamespace is not of length 16"));
+        std::runtime_error("TrackNamespace is shorter than 16"));
   }
+  const auto prefixLen = tuples.size() - kNumParams;
+  const auto field = [&tuples, prefixLen](size_t i) -> const std::string& {
+    return tuples[prefixLen + i];
+  };
   // Check if TrackNamespace is correct protocol (Tuple Field 0)
-  if ((track->trackNamespace)[0] != kField0) {
+  if (field(0) != kField0) {
     return folly::makeUnexpected(
-        std::runtime_error("Tuple element 0 is not moq-test-00"));
+        std::runtime_error("Tuple Field 0 is not moq-test-00"));
   }
 
   // Create Empty MoQTestParameters
   MoQTestParameters params = MoQTestParameters();
+  params.nsPrefix.assign(tuples.begin(), tuples.begin() + prefixLen);
 
   // Assign values to appropriate positions in params
   try {
-    params.forwardingPreference =
-        ForwardingPreference(std::stoi((track->trackNamespace)[1]));
-    params.startGroup = std::stoull((track->trackNamespace)[2]);
-    params.startObject = std::stoull((track->trackNamespace)[3]);
-    params.lastGroupInTrack = std::stoull((track->trackNamespace)[4]);
-    params.lastObjectInTrack = std::stoull((track->trackNamespace)[5]);
-    params.objectsPerGroup = std::stoull((track->trackNamespace)[6]);
-    params.sizeOfObjectZero = std::stoull((track->trackNamespace)[7]);
-    params.sizeOfObjectGreaterThanZero =
-        std::stoull((track->trackNamespace)[8]);
-    params.objectFrequency = std::stoull((track->trackNamespace)[9]);
-    params.groupIncrement = std::stoull((track->trackNamespace)[10]);
-    params.objectIncrement = std::stoull((track->trackNamespace)[11]);
-    params.sendEndOfGroupMarkers =
-        static_cast<bool>(std::stoi((track->trackNamespace)[12]));
-    params.testIntegerExtension = (std::stoi((track->trackNamespace)[13]));
-    params.testVariableExtension = (std::stoi((track->trackNamespace)[14]));
-    params.publisherDeliveryTimeout = std::stoull((track->trackNamespace)[15]);
+    params.forwardingPreference = ForwardingPreference(std::stoi(field(1)));
+    params.startGroup = std::stoull(field(2));
+    params.startObject = std::stoull(field(3));
+    params.lastGroupInTrack = std::stoull(field(4));
+    params.lastObjectInTrack = std::stoull(field(5));
+    params.objectsPerGroup = std::stoull(field(6));
+    params.sizeOfObjectZero = std::stoull(field(7));
+    params.sizeOfObjectGreaterThanZero = std::stoull(field(8));
+    params.objectFrequency = std::stoull(field(9));
+    params.groupIncrement = std::stoull(field(10));
+    params.objectIncrement = std::stoull(field(11));
+    params.sendEndOfGroupMarkers = static_cast<bool>(std::stoi(field(12)));
+    params.testIntegerExtension = std::stoi(field(13));
+    params.testVariableExtension = std::stoi(field(14));
+    params.publisherDeliveryTimeout = std::stoull(field(15));
   } catch (const std::exception& e) {
     return folly::makeUnexpected(
         std::runtime_error(
@@ -152,6 +159,12 @@ convertTrackNamespaceToMoqTestParam(TrackNamespace* track) {
   }
 
   return params;
+}
+
+std::vector<std::string> parseNsPrefix(const std::string& prefix) {
+  std::vector<std::string> tuples;
+  folly::split('/', prefix, tuples, /*ignoreEmpty=*/true);
+  return tuples;
 }
 
 std::vector<Extension> getExtensions(
