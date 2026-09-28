@@ -114,10 +114,12 @@ DEFINE_string(
 DEFINE_string(
     request,
     "subscribe",
-    "Request Type: must be one of \"subscribe\", \"fetch\" or \"publish\". "
+    "Request Type: must be one of \"subscribe\", \"fetch\", \"publish\" or "
+    "\"subscribe_tracks\". "
     "\"publish\" asks the relay for the track via SUBSCRIBE_TRACKS and "
     "PUBLISHes it on a second session to the same endpoint. It requires a "
-    "relay, and only works when the whole namespace is specified.");
+    "relay, and only works when the whole namespace is specified. "
+    "\"subscribe_tracks\" receives the track from another publisher.");
 DEFINE_string(
     join_start,
     "",
@@ -321,6 +323,13 @@ int main(int argc, char** argv) {
       folly::coro::co_withExecutor(
           &evb,
           client->publishTrack(defaultMoqParams, FLAGS_versions, publishOrder))
+          .start()
+          .via(&evb)
+          .thenTry(onComplete);
+    } else if (FLAGS_request == "subscribe_tracks") {
+      XLOG(INFO) << "Awaiting PUBLISH from " << url.getHostAndPort();
+      folly::coro::co_withExecutor(
+          &evb, client->receivePublish(defaultMoqParams))
           .start()
           .via(&evb)
           .thenTry(onComplete);
