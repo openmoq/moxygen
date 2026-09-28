@@ -109,6 +109,11 @@ class MoQTestClient : public Subscriber,
       const std::string& versions = "",
       PublishOrder order = PublishOrder::SubscribeFirst);
 
+  // Sends SUBSCRIBE_TRACKS and validates the track that the relay forwards in
+  // a PUBLISH. The publisher can start at any time.
+  folly::coro::Task<moxygen::TrackNamespace> receivePublish(
+      MoQTestParameters params);
+
   void setLogger(const std::shared_ptr<MLogger>& logger);
 
   // Subscriber: accept the relay's PUBLISH by handing back the receiver that
@@ -317,6 +322,8 @@ class MoQTestClient : public Subscriber,
   RequestDeadline requestDeadline_{*this};
   // Last group the joining FETCH half covers; unset when there is no join.
   std::optional<uint64_t> fetchHalfLastGroup_;
+  // Set by receivePublish(), which arms the deadlines when the PUBLISH arrives.
+  bool awaitingPublish_{false};
   bool publishDoneReceived_{false};
   // A datagram that arrives after its deadline is as good as dropped.
   uint64_t datagramDrops_{0};
