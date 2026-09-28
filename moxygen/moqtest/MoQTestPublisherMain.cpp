@@ -22,6 +22,11 @@ DEFINE_string(
     "moq-test track namespace to PUBLISH, e.g. "
     "'moq-test-00/0/0/0/2/5/5/1024/100/50/1/1/0/-1/-1/0'. Repeat to publish "
     "more than one track. The namespace encodes the track parameters.");
+DEFINE_string(
+    ns_prefix,
+    "",
+    "Without --track, send PUBLISH_NAMESPACE for <ns_prefix>/moq-test-00 "
+    "('/'-separated) and serve SUBSCRIBEs under it");
 DEFINE_int32(connect_timeout, 1000, "Connect timeout (ms)");
 DEFINE_int32(transaction_timeout, 120000, "Transaction timeout (ms)");
 DEFINE_string(
@@ -54,6 +59,61 @@ std::vector<std::string> collectTracks(int argc, char** argv) {
   return tracks;
 }
 
+using TrackList =
+    std::vector<std::pair<moxygen::FullTrackName, moxygen::MoQTestParameters>>;
+
+// The publisher serves SUBSCRIBEs as the session's publish handler, so this
+// only sends PUBLISH_NAMESPACE.
+folly::coro::Task<bool> publishTestNamespace(
+    std::shared_ptr<moxygen::MoQSession> session,
+    std::string nsPrefix,
+    std::shared_ptr<moxygen::Subscriber::PublishNamespaceHandle>& handle) {
+  auto nsTuples = moxygen::parseNsPrefix(nsPrefix);
+  nsTuples.emplace_back("moq-test-00");
+  moxygen::PublishNamespace pubNs;
+  pubNs.trackNamespace = moxygen::TrackNamespace(std::move(nsTuples));
+  XLOG(INFO) << "PUBLISH_NAMESPACE " << pubNs.trackNamespace;
+  auto res = co_await session->publishNamespace(std::move(pubNs));
+  if (res.hasError()) {
+    XLOG(ERR) << "PUBLISH_NAMESPACE failed: " << res.error().reasonPhrase;
+    session->close(moxygen::SessionCloseErrorCode::NO_ERROR);
+    co_return false;
+  }
+  handle = std::move(res.value());
+  co_return true;
+}
+
+// Each publishTrack waits for the peer to turn forwarding on, so the tracks
+// publish concurrently.
+folly::coro::Task<bool> publishTracks(
+    std::shared_ptr<moxygen::MoQTestPublisher> publisher,
+    std::shared_ptr<moxygen::MoQSession> session,
+    TrackList tracks) {
+  std::vector<folly::coro::Task<void>> publishes;
+  publishes.reserve(tracks.size());
+  for (size_t i = 0; i < tracks.size(); i++) {
+    XLOG(INFO) << "PUBLISH " << tracks[i].first.trackNamespace;
+    publishes.emplace_back(publisher->publishTrack(
+        session, tracks[i].first, tracks[i].second, moxygen::RequestID(i)));
+  }
+  bool ok = true;
+  auto results = co_await folly::coro::collectAllTryRange(std::move(publishes));
+  for (const auto& result : results) {
+    // A cancelled publish means shutdown and does not count as a failure.
+    if (result.hasException<folly::OperationCancelled>()) {
+      continue;
+    }
+    if (result.hasException()) {
+      ok = false;
+      XLOG(ERR) << "PUBLISH failed: "
+                << result.exception().what().toStdString();
+    }
+  }
+  XLOG(INFO) << "All tracks done";
+  session->drain();
+  co_return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -61,14 +121,13 @@ int main(int argc, char** argv) {
   gflags::ParseCommandLineFlags(&argc, &argv, false);
   folly::Init init(&argc, &argv);
 
-  if (trackArgs.empty()) {
-    XLOG(ERR) << "At least one --track is required";
+  if (!trackArgs.empty() && !FLAGS_ns_prefix.empty()) {
+    XLOG(ERR) << "--ns_prefix applies only without --track";
     return 1;
   }
 
   // Decode up front so a bad namespace fails before we connect.
-  std::vector<std::pair<moxygen::FullTrackName, moxygen::MoQTestParameters>>
-      tracks;
+  TrackList tracks;
   for (const auto& trackArg : trackArgs) {
     moxygen::TrackNamespace ns(trackArg, "/");
     auto params = moxygen::convertTrackNamespaceToMoqTestParam(&ns);
@@ -145,46 +204,18 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // Each track parks in publishTrack until the peer turns forwarding on, so
-  // publish them concurrently rather than serially.
-  std::vector<folly::coro::Task<void>> publishes;
-  publishes.reserve(tracks.size());
-  for (size_t i = 0; i < tracks.size(); i++) {
-    XLOG(INFO) << "PUBLISH " << tracks[i].first.trackNamespace;
-    publishes.emplace_back(publisher->publishTrack(
-        session, tracks[i].first, tracks[i].second, moxygen::RequestID(i)));
-  }
-
-  bool anyFailed = false;
-  folly::coro::co_withExecutor(
-      &evb,
-      folly::coro::co_invoke(
-          [&publishes, &relayClient, &signalHandler, &anyFailed]()
-              -> folly::coro::Task<void> {
-            auto results =
-                co_await folly::coro::collectAllTryRange(std::move(publishes));
-            for (const auto& result : results) {
-              // A cancelled publish is a signal-initiated shutdown, not a
-              // failure.
-              if (result.hasException<folly::OperationCancelled>()) {
-                continue;
-              }
-              if (result.hasException()) {
-                anyFailed = true;
-                XLOG(ERR) << "PUBLISH failed: "
-                          << result.exception().what().toStdString();
-              }
-            }
-            XLOG(INFO) << "All tracks done";
-            // Drain for a clean close. With the signal handler gone,
-            // evb.loop() returns once that close has flushed.
-            if (auto session = relayClient->getSession()) {
-              session->drain();
-            }
-            signalHandler.unregister();
-          }))
-      .start();
-
+  // Once the session ends, drop the signal handler so evb.loop() can return.
+  // Without --track, this serves until a signal or the idle timeout ends the
+  // session.
+  folly::CancellationCallback onSessionEnd(
+      session->getCancelToken(), [&] { signalHandler.unregister(); });
+  std::shared_ptr<moxygen::Subscriber::PublishNamespaceHandle> nsHandle;
+  auto done = folly::coro::co_withExecutor(
+                  &evb,
+                  trackArgs.empty()
+                      ? publishTestNamespace(session, FLAGS_ns_prefix, nsHandle)
+                      : publishTracks(publisher, session, std::move(tracks)))
+                  .start();
   evb.loop();
-  return anyFailed ? 1 : 0;
+  return std::move(done).get() ? 0 : 1;
 }
