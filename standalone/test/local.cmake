@@ -9,3 +9,14 @@ if(TARGET pico_evb_relay_server AND TARGET pico_evb_text_client)
   set_tests_properties(xlog_category_pico PROPERTIES
     LABELS "logging;smoke" TIMEOUT 180)
 endif()
+
+# moqtest_client options that exist only in this tree.
+if(TARGET moqtest_client)
+  add_test(
+    NAME moqtest_client_flags
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/moqtest_client_flags.sh
+            $<TARGET_FILE:moqtest_client>
+  )
+  set_tests_properties(moqtest_client_flags PROPERTIES
+    LABELS "moqtest;smoke" TIMEOUT 60)
+endif()
