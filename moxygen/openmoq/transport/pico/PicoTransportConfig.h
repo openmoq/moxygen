@@ -51,6 +51,9 @@ struct PicoSocketConfig {
   // SO_SNDBUF/SO_RCVBUF for the shared socket, matching MoQServer's default.
   // The kernel clamps this to wmem_max/rmem_max, which is often far lower.
   int socketBufferBytes{1024 * 1024};
+
+  // When false, datagrams are read and dropped until startAcceptingPackets().
+  bool acceptPacketsOnStart{true};
 };
 
 /**
