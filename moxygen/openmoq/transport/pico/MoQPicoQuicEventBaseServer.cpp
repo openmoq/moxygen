@@ -97,7 +97,8 @@ void MoQPicoQuicEventBaseServer::stop() {
   destroyQuicContext();
   impl_->handler.reset();
 
-  executor_.reset();
+  // Callbacks that the sessions closed above posted still call executor_ after
+  // stop() returns.
   evb_ = {}; // release KeepAlive so EVB destructor doesn't spin
 
   XLOG(INFO) << "MoQPicoQuicEventBaseServer stopped";
