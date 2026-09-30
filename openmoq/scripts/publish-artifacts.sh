@@ -136,18 +136,15 @@ if [[ -n "$ARTIFACTS_DIR" && ! -d "$ARTIFACTS_DIR" ]]; then
   exit 1
 fi
 
-REPO_FLAG=""
-if [[ -n "$REPO" ]]; then
-  REPO_FLAG="--repo $REPO"
-fi
-
 SHORT_SHA="${SHA:0:7}"
 
-# Several api calls and the pointer link need a literal owner/name, even when
-# --repo is unset. Prefer GITHUB_REPOSITORY: `gh repo view` infers the repo by
-# shelling out to git, which fails inside the publish containers where the
-# checkout's git context is not visible. Fall back to it only off-CI.
+# Resolve the repository once, then make every gh call repo-explicit. Left to
+# itself gh infers the repo by shelling out to git, which fails inside the
+# publish containers where the checkout's git context is not visible. Prefer
+# GITHUB_REPOSITORY, which Actions always sets; `gh repo view` is the off-CI
+# fallback and is the only path that still needs a working git.
 REPO_SLUG="${REPO:-${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}}"
+REPO_FLAG="--repo $REPO_SLUG"
 
 # ── Step 1: Collect artifact files (pinned mode only) ────────────────────────
 
