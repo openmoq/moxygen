@@ -48,6 +48,18 @@ EXPECT_ASSETS=0
 UPLOAD_JOBS="${UPLOAD_JOBS:-4}"
 UPLOAD_TIMEOUT="${UPLOAD_TIMEOUT:-1200}"
 
+# GNU timeout is absent on macOS runners. Fall back to `env`, a no-op prefix, so
+# the command line stays one shape; the caller bounds that platform with a
+# step-level timeout-minutes instead. A scalar, not an array: upload_with_retry
+# runs under `bash -c` from xargs and arrays do not survive export.
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_PREFIX="timeout --kill-after=30s $UPLOAD_TIMEOUT"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_PREFIX="gtimeout --kill-after=30s $UPLOAD_TIMEOUT"
+else
+  TIMEOUT_PREFIX="env"
+fi
+
 # ── Argument parsing ─────────────────────────────────────────────────────────
 
 usage() {
@@ -162,7 +174,7 @@ fi
 
 # ── Step 2: Upload with retry ────────────────────────────────────────────────
 
-# timeout exits 124, which this loop retries like any other failure.
+# A timeout exits 124, which this loop retries like any other failure.
 upload_with_retry() {
   local asset="$1"
   local name
@@ -170,8 +182,7 @@ upload_with_retry() {
   local max=3 delay=10 attempt=1
   while [[ $attempt -le $max ]]; do
     # shellcheck disable=SC2086
-    if timeout --kill-after=30s "$UPLOAD_TIMEOUT" \
-         gh release upload "$TAG" "$asset" --clobber $REPO_FLAG; then
+    if $TIMEOUT_PREFIX gh release upload "$TAG" "$asset" --clobber $REPO_FLAG; then
       echo "    Uploaded $name"
       return 0
     fi
@@ -190,7 +201,7 @@ export -f upload_with_retry
 # Upload everything staged in RELEASE_DIR concurrently.
 # Distinct asset names, so --clobber cannot race between jobs.
 upload_assets() {
-  export TAG REPO_FLAG UPLOAD_TIMEOUT
+  export TAG REPO_FLAG UPLOAD_TIMEOUT TIMEOUT_PREFIX
   echo "    Uploading $ASSET_COUNT asset(s), $UPLOAD_JOBS at a time..."
   if ! find "$RELEASE_DIR" -name '*.tar.gz' -type f -print0 |
          xargs -0 -P "$UPLOAD_JOBS" -n1 -I{} \

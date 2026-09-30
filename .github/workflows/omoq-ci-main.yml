@@ -253,7 +253,7 @@ jobs:
           apt_get() { timeout -k 30 600 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
           apt_get update
           apt_get install -y --no-install-recommends \
-            git ca-certificates curl pkg-config sudo bash ccache
+            git ca-certificates curl pkg-config sudo bash ccache gh
 
       - name: Install system dependencies
         if: ${{ !contains(toJSON(matrix.runner), 'self-hosted') || matrix.container != '' }}
@@ -329,6 +329,9 @@ jobs:
       # Straight into the draft snapshot. Each job carries only its own two
       # tarballs, so one slow or hung upload cannot hold up the other six.
       - name: Upload assets to the draft snapshot
+        # The per-attempt bound needs GNU timeout, which macOS lacks; this caps
+        # the step on every platform regardless.
+        timeout-minutes: 30
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
