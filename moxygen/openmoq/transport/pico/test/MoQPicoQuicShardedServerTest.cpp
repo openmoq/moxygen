@@ -26,6 +26,7 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
+#include <atomic>
 #include <cstdio>
 #include <exception>
 #include <thread>
@@ -95,7 +96,10 @@ class TestShardedServer : public MoQPicoQuicShardedServer {
 
   void onNewSession(std::shared_ptr<MoQSession> session) override {
     session->setPublishHandler(std::make_shared<Publisher>());
+    sessionExecutor = session->getExecutor();
   }
+
+  std::atomic<folly::Executor*> sessionExecutor{nullptr};
 };
 
 class NoopReceiverCallback : public ObjectReceiverCallback {
@@ -234,6 +238,52 @@ TEST(MoQPicoQuicShardedServerTest, NoShardReadsUntilEveryShardIsBound) {
 
   clientEvb->runInEventBaseThreadAndWait([&] { clients.clear(); });
   server->stop();
+}
+
+// Session owners keep raw pointers to a session's executor and post through
+// them while tearing down after stop(), until they destroy the server.
+TEST(MoQPicoQuicShardedServerTest, SessionExecutorOutlivesStop) {
+  auto certs = makeSelfSignedCert();
+  auto port = pickFreeUdpPort();
+  folly::ScopedEventBaseThread clientThread("client");
+  auto* clientEvb = clientThread.getEventBase();
+
+  auto server =
+      std::make_shared<TestShardedServer>(certs->cert, certs->key, kEndpoint);
+  // No EventBases, so the shard runs on a worker thread that the server owns.
+  server->start(folly::SocketAddress("::", port));
+
+  const quic::TransportSettings transportSettings;
+  const auto alpns = getMoqtProtocols("16", /*useStandard=*/true);
+  std::unique_ptr<MoQClient> client;
+  folly::SemiFuture<folly::Unit> setup = folly::makeSemiFuture();
+  clientEvb->runInEventBaseThreadAndWait([&] {
+    client = std::make_unique<MoQClient>(
+        std::make_shared<MoQFollyExecutorImpl>(clientEvb),
+        proxygen::URL(fmt::format("moqt://localhost:{}{}", port, kEndpoint)),
+        std::make_shared<InsecureVerifierDangerousDoNotUseInProduction>());
+    setup = folly::coro::co_withExecutor(
+                clientEvb,
+                client->setupMoQSession(
+                    std::chrono::seconds(10),
+                    std::chrono::seconds(3),
+                    nullptr,
+                    nullptr,
+                    transportSettings,
+                    alpns))
+                .start();
+  });
+  std::move(setup).get(std::chrono::seconds(10));
+  auto* sessionExecutor = server->sessionExecutor.load();
+  ASSERT_NE(sessionExecutor, nullptr);
+
+  clientEvb->runInEventBaseThreadAndWait([&] { client.reset(); });
+  server->stop();
+
+  auto ran = std::make_shared<folly::Baton<>>();
+  sessionExecutor->add([ran] { ran->post(); });
+  EXPECT_TRUE(ran->try_wait_for(std::chrono::seconds(5)));
+  server.reset();
 }
 
 } // namespace moxygen::test
