@@ -15,3 +15,18 @@ moxygen_add_test(TARGET PicoWebTransportBaseTests
     openmoq_pico_base
     testmain
 )
+
+moxygen_add_test(TARGET MoQPicoQuicShardedServerTests
+  PREFIX "MoQPicoQuicShardedServer"
+  SOURCES
+    MoQPicoQuicShardedServerTest.cpp
+  DEPENDS
+    openmoq_pico_evb_sharded_server_transport
+    moxygen_moqclient
+    moxygen_util_insecure_verifier_dangerous_do_not_use_in_production
+    OpenSSL::Crypto
+    Folly::folly_coro_blocking_wait
+    Folly::folly_coro_timeout
+    Folly::folly_testing_test_util
+    testmain
+)

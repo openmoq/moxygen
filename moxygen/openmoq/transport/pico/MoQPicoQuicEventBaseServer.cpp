@@ -66,6 +66,12 @@ void MoQPicoQuicEventBaseServer::start(const folly::SocketAddress& addr) {
   impl_->handler->start(addr, reusePort_);
 }
 
+void MoQPicoQuicEventBaseServer::startAcceptingPackets() {
+  if (impl_->handler) {
+    impl_->handler->startAcceptingPackets();
+  }
+}
+
 folly::SocketAddress MoQPicoQuicEventBaseServer::getAddress() const {
   // createQuicContext() can fail and leave the handler unset.
   return impl_->handler ? impl_->handler->boundAddress()

@@ -59,6 +59,10 @@ class MoQPicoQuicEventBaseServer : public MoQPicoServerBase {
    */
   void start(const folly::SocketAddress& addr) override;
 
+  // Ends the drop that PicoSocketConfig::acceptPacketsOnStart = false sets up.
+  // Call from the EventBase thread.
+  void startAcceptingPackets();
+
   /**
    * Stop the server: cancel the wake timer, pause socket reads, free picoquic.
    * Must be called from the EventBase thread.

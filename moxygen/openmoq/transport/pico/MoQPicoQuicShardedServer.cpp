@@ -112,6 +112,9 @@ void MoQPicoQuicShardedServer::start(
                   "shard holding its state)";
     cfg.disableMigration = true;
   }
+  // A flow that a shard accepts before the last shard joins the reuseport
+  // group can rehash to a shard without its state.
+  cfg.socket.acceptPacketsOnStart = !sharded;
 
   // On port 0 the first shard's bind picks an ephemeral port; the rest bind
   // to that port to join the same reuseport group.
@@ -164,6 +167,13 @@ void MoQPicoQuicShardedServer::start(
     }
     if (bindAddr.getPort() == 0) {
       bindAddr = shardAddr;
+    }
+  }
+
+  if (sharded) {
+    for (auto& shard : shards_) {
+      shard.evb->runImmediatelyOrRunInEventBaseThreadAndWait(
+          [&] { shard.server->startAcceptingPackets(); });
     }
   }
 
