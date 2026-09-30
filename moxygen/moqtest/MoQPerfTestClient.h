@@ -126,12 +126,8 @@ class MoQPerfTestClient {
     uint64_t totalBytes{0};
     uint64_t totalLatencyMs{0}; // cumulative sum (for final avg)
     uint64_t latencyObjects{0}; // cumulative count (for final avg)
-    struct IntervalLatency {
-      uint64_t sumMs{0};
-      uint64_t count{0};
-      uint64_t minMs{std::numeric_limits<uint64_t>::max()};
-      uint64_t maxMs{0};
-    } intervalLatency;
+    using IntervalLatency = AtomicLatency::Interval;
+    IntervalLatency intervalLatency;
     uint32_t totalResets{0};
     uint32_t totalFailures{0};
     uint32_t durationSeconds{0};
@@ -189,18 +185,8 @@ class MoQPerfTestClient {
   std::atomic<uint64_t> cumulativeBytes_{0};
   std::atomic<uint64_t> cumulativeLatencyMs_{0};
   std::atomic<uint64_t> cumulativeLatencyObjects_{0};
-  // Interval latency — reset on each getResults() call
-  mutable std::atomic<uint64_t> intervalLatencySum_{0};
-  mutable std::atomic<uint64_t> intervalLatencyCount_{0};
-  mutable std::atomic<uint64_t> intervalLatencyMin_{
-      std::numeric_limits<uint64_t>::max()};
-  mutable std::atomic<uint64_t> intervalLatencyMax_{0};
-  // Cumulative latency histogram (whole run). Atomic so snapshotLatencyHist()
-  // can read it from the aggregation thread without hopping onto evb_.
-  std::array<std::atomic<uint64_t>, LatencyHistogram::kNumBuckets>
-      latencyBuckets_{};
-  std::atomic<uint64_t> latencyHistSum_{0};
-  std::atomic<uint64_t> latencyHistCount_{0};
+  // Interval latency is reset on each getResults() call.
+  mutable AtomicLatency latency_;
 };
 
 } // namespace moxygen
