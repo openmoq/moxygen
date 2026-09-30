@@ -48,6 +48,10 @@ class MoQPicoQuicShardedServer::ShardServer
     parent_->terminateClientSession(std::move(session));
   }
 
+  std::shared_ptr<MoQExecutor> sessionExecutor() const {
+    return executor_;
+  }
+
  protected:
   std::shared_ptr<MoQSession> createSession(
       folly::MaybeManagedPtr<proxygen::WebTransport> wt,
@@ -168,6 +172,7 @@ void MoQPicoQuicShardedServer::start(
     if (bindAddr.getPort() == 0) {
       bindAddr = shardAddr;
     }
+    sessionExecutors_.push_back(shard->sessionExecutor());
   }
 
   if (sharded) {

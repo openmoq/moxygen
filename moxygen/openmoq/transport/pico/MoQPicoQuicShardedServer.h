@@ -12,6 +12,7 @@
 #include <folly/io/async/ScopedEventBaseThread.h>
 #include <folly/synchronization/Baton.h>
 #include <moxygen/MoQServerBase.h>
+#include <moxygen/events/MoQExecutor.h>
 #include <moxygen/openmoq/transport/pico/PicoQuicStatsCallback.h>
 #include <moxygen/openmoq/transport/pico/PicoTransportConfig.h>
 #include <memory>
@@ -118,6 +119,9 @@ class MoQPicoQuicShardedServer : public MoQServerBase {
 
   std::vector<std::unique_ptr<folly::ScopedEventBaseThread>> ownedWorkers_;
   std::vector<Shard> shards_;
+  // Session owners may post through raw pointers to these after stop(), until
+  // they destroy this server. stop() destroys the shards but not these.
+  std::vector<std::shared_ptr<MoQExecutor>> sessionExecutors_;
   folly::SocketAddress boundAddr_;
   bool started_{false};
   bool stopped_{false};
