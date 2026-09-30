@@ -143,8 +143,11 @@ fi
 
 SHORT_SHA="${SHA:0:7}"
 
-# The pointer link and the prune API need the slug even when --repo is unset.
-REPO_SLUG="${REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
+# Several api calls and the pointer link need a literal owner/name, even when
+# --repo is unset. Prefer GITHUB_REPOSITORY: `gh repo view` infers the repo by
+# shelling out to git, which fails inside the publish containers where the
+# checkout's git context is not visible. Fall back to it only off-CI.
+REPO_SLUG="${REPO:-${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}}"
 
 # ── Step 1: Collect artifact files (pinned mode only) ────────────────────────
 
