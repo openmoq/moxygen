@@ -124,7 +124,11 @@ struct CountingCallback : public MoQForwarder::Callback {
   void onEmpty(MoQForwarder*) override {
     onEmptyCount++;
   }
+  void forwardChanged(MoQForwarder*) override {
+    forwardChangedCount++;
+  }
   size_t onEmptyCount{0};
+  size_t forwardChangedCount{0};
 };
 
 struct TestNGRCallback : public MoQForwarder::Callback {
