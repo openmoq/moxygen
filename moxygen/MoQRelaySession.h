@@ -255,6 +255,10 @@ class MoQRelaySession : public MoQSession {
       std::shared_ptr<Publisher::SubscribeTracksHandle>,
       RequestID::hash>
       subscribeTracksHandles_;
+  // Drafts 16-17 send PUBLISH_NAMESPACE on the control stream. A
+  // PUBLISH_NAMESPACE_DONE that arrives while its handler runs cancels it here.
+  folly::F14FastMap<RequestID, folly::CancellationSource, RequestID::hash>
+      publishNamespaceHandlerCancels_;
 
   // Legacy TrackNamespace → RequestID translation maps.
   // Remove these once we drop support for the respective legacy versions.

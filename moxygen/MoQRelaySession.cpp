@@ -1228,10 +1228,33 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
       publishNamespace.trackNamespace,
       publishNamespace.requestID,
       replyContext);
+  auto cancelToken = replyContext->cancelToken();
+  const bool onControlStream =
+      getDraftMajorVersion(*getNegotiatedVersion()) < 18;
+  if (onControlStream) {
+    auto& source =
+        publishNamespaceHandlerCancels_[publishNamespace.requestID];
+    cancelToken =
+        folly::cancellation_token_merge(cancelToken, source.getToken());
+  }
   auto publishNamespaceResult = co_await co_awaitTry(co_withCancellation(
-      cancellationSource_.getToken(),
+      cancelToken,
       subscribeHandler_->publishNamespace(
           publishNamespace, std::move(pubNsCb))));
+  if (onControlStream) {
+    publishNamespaceHandlerCancels_.erase(publishNamespace.requestID);
+  }
+  if (cancelToken.isCancellationRequested()) {
+    // The publisher withdrew before this handle was installed.
+    if (publishNamespaceResult.hasValue() &&
+        publishNamespaceResult->hasValue()) {
+      publishNamespaceResult->value()->publishNamespaceDone();
+    }
+    if (!cancellationSource_.isCancellationRequested()) {
+      retireRequestID(/*signalWriteLoop=*/true);
+    }
+    co_return;
+  }
   if (publishNamespaceResult.hasException()) {
     XLOG(ERR) << "Exception in Subscriber callback ex="
               << publishNamespaceResult.exception().what().toStdString();
@@ -1358,6 +1381,11 @@ void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone pubNsDone) {
 
   auto it = publishNamespaceHandles_.find(reqId);
   if (it == publishNamespaceHandles_.end()) {
+    auto cancelIt = publishNamespaceHandlerCancels_.find(reqId);
+    if (cancelIt != publishNamespaceHandlerCancels_.end()) {
+      cancelIt->second.requestCancellation();
+      return;
+    }
     XLOG(ERR) << "PublishNamespaceDone for unknown requestID=" << reqId;
     return;
   }
@@ -1652,9 +1680,21 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
     publishHandle = std::make_shared<MoQNamespacePublishHandle>(
         subNsReply, *negotiatedVersion_, getNegotiatedExtensions());
   }
+  auto cancelToken = subNsReply->replyContext()
+      ? subNsReply->replyContext()->cancelToken()
+      : cancellationSource_.getToken();
   auto subNsResult = co_await co_awaitTry(co_withCancellation(
-      cancellationSource_.getToken(),
-      publishHandler_->subscribeNamespace(subNs, publishHandle)));
+      cancelToken, publishHandler_->subscribeNamespace(subNs, publishHandle)));
+  if (cancelToken.isCancellationRequested()) {
+    // The subscriber left before this handle was installed.
+    if (subNsResult.hasValue() && subNsResult->hasValue()) {
+      subNsResult->value()->unsubscribeNamespace();
+    }
+    if (!cancellationSource_.isCancellationRequested()) {
+      retireRequestID(/*signalWriteLoop=*/true);
+    }
+    co_return;
+  }
   if (subNsResult.hasException()) {
     XLOG(ERR) << "Exception in Publisher callback ex="
               << subNsResult.exception().what().toStdString();
@@ -1952,10 +1992,21 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeTracks(
   setRequestSession();
   std::shared_ptr<Publisher::PublishBlockedHandle> publishBlockedHandle =
       subTracksReply;
+  auto cancelToken = subTracksReply->replyContext()
+      ? subTracksReply->replyContext()->cancelToken()
+      : cancellationSource_.getToken();
   auto subTracksResult = co_await co_awaitTry(co_withCancellation(
-      cancellationSource_.getToken(),
+      cancelToken,
       publishHandler_->subscribeTracks(
           subTracks, std::move(publishBlockedHandle))));
+  if (cancelToken.isCancellationRequested()) {
+    // The subscriber left before this handle was installed.
+    // onSubscribeTracksStreamClosed already retired the request.
+    if (subTracksResult.hasValue() && subTracksResult->hasValue()) {
+      subTracksResult->value()->unsubscribeTracks();
+    }
+    co_return;
+  }
   if (subTracksResult.hasException()) {
     XLOG(ERR) << "Exception in subscribeTracks publisher callback ex="
               << subTracksResult.exception().what().toStdString();
