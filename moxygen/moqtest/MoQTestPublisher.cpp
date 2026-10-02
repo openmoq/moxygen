@@ -50,9 +50,8 @@ folly::coro::Task<void> MoQTestPublisher::ObjectPacer::awaitNextObject() {
   nextObject_ += period_;
   auto now = std::chrono::steady_clock::now();
   if (nextObject_ <= now) {
-    // Re-anchor to the last deadline that passed, not the next one: a hiccup
-    // must not shift the objects after it off the grid.
-    nextObject_ += period_ * ((now - nextObject_) / period_);
+    // Behind: send without sleeping until caught up, so a hiccup delays
+    // objects rather than dropping them.
     co_await folly::coro::co_reschedule_on_current_executor;
     co_return;
   }
@@ -72,9 +71,9 @@ void MoQTestPublisher::cancelAll() {
   }
   // Move before cancelling: cancel() can resume a waiting publish inline, and
   // that coroutine erases its own entry on the way out.
-  auto pending = std::move(pendingUnpauses_);
-  pendingUnpauses_.clear();
-  for (auto& p : pending) {
+  auto published = std::move(publishedTracks_);
+  publishedTracks_.clear();
+  for (auto& p : published) {
     p->cancel();
   }
   auto fetches = std::move(activeFetches_);
@@ -86,7 +85,7 @@ void MoQTestPublisher::cancelAll() {
 
 std::shared_ptr<MoQForwarder> MoQTestPublisher::makeForwarder(
     const FullTrackName& ftn,
-    MoQSession& session) {
+    uint64_t version) {
   auto forwarder = std::make_shared<MoQForwarder>(ftn);
 
   // Advertise the priority even-numbered groups are published at, so the
@@ -94,8 +93,7 @@ std::shared_ptr<MoQForwarder> MoQTestPublisher::makeForwarder(
   // explicitly for the odd ones.  The framer downgrades the extension to a
   // PUBLISHER_PRIORITY param for draft 15; earlier drafts have no way to carry
   // it, so the priority always stays on the wire instead.
-  auto version = session.getNegotiatedVersion();
-  if (version && getDraftMajorVersion(*version) >= 15) {
+  if (getDraftMajorVersion(version) >= 15) {
     Extensions trackProperties;
     trackProperties.insertMutableExtension(
         Extension{kPublisherPriorityExtensionType, kMoQTestPublisherPriority});
@@ -137,13 +135,14 @@ folly::coro::Task<MoQSession::SubscribeResult> MoQTestPublisher::subscribe(
     co_return folly::makeUnexpected(error);
   }
 
-  auto session = MoQSession::getRequestSession();
+  const auto reqCtx = MoQSession::getRequestContext();
   auto trackIt = tracks_.find(sub.fullTrackName);
   const bool isNewTrack = (trackIt == tracks_.end());
-  auto forwarder = isNewTrack ? makeForwarder(sub.fullTrackName, *session)
+  auto forwarder = isNewTrack ? makeForwarder(sub.fullTrackName, reqCtx.version)
                               : trackIt->second.forwarder;
 
-  auto subscriber = forwarder->addSubscriber(session, sub, std::move(callback));
+  auto subscriber =
+      forwarder->addSubscriber(reqCtx.sessionId, sub, std::move(callback));
   if (!subscriber) {
     co_return folly::makeUnexpected(
         SubscribeError{
@@ -249,11 +248,12 @@ folly::coro::Task<folly::coro::Task<void>> MoQTestPublisher::startPublishTrack(
   // Only the first unpause is honored. If the peer pauses again mid-track we
   // keep generating and the forwarder drops the objects, which for a test
   // publisher is simpler than parking and re-arming.
-  auto unpauseCb = std::make_shared<PendingUnpause>();
-  forwarder->setCallback(unpauseCb);
-  pendingUnpauses_.push_back(unpauseCb);
+  auto published = std::make_shared<PublishedTrack>();
+  forwarder->setCallback(published);
+  publishedTracks_.push_back(published);
 
-  auto subscriber = forwarder->addSubscriber(session, /*forward=*/false);
+  auto subscriber =
+      forwarder->addSubscriber(session->sessionId(), /*forward=*/false);
   if (!subscriber) {
     co_yield folly::coro::co_error(
         std::runtime_error("PUBLISH failed: addSubscriber returned null"));
@@ -286,20 +286,24 @@ folly::coro::Task<folly::coro::Task<void>> MoQTestPublisher::startPublishTrack(
   subscriber->onPublishOk(pubResult.value().value());
 
   co_return streamPublishedTrack(
-      std::move(unpauseCb), std::move(forwarder), params, requestID);
+      std::move(published), std::move(forwarder), params, requestID);
 }
 
 folly::coro::Task<void> MoQTestPublisher::streamPublishedTrack(
-    std::shared_ptr<PendingUnpause> unpauseCb,
+    std::shared_ptr<PublishedTrack> published,
     std::shared_ptr<MoQForwarder> forwarder,
     MoQTestParameters params,
     RequestID requestID) {
   // Drop the registration however this track ends, so a long-lived publisher
   // doesn't accumulate one fulfilled entry per publish.
   auto unregister = folly::makeGuard(
-      [this, unpauseCb] { std::erase(pendingUnpauses_, unpauseCb); });
-  co_await unpauseCb->unpaused.getFuture();
-  co_await sendTrackData(params, requestID, std::move(forwarder));
+      [this, published] { std::erase(publishedTracks_, published); });
+  co_await published->unpaused.getFuture();
+  auto token = folly::cancellation_token_merge(
+      co_await folly::coro::co_current_cancellation_token,
+      published->cancelSource.getToken());
+  co_await folly::coro::co_withCancellation(
+      std::move(token), sendTrackData(params, requestID, std::move(forwarder)));
 }
 
 folly::coro::Task<void> MoQTestPublisher::publishTrack(
@@ -598,7 +602,8 @@ folly::coro::Task<void> MoQTestPublisher::sendDatagram(
 folly::Expected<StandaloneFetch, FetchError>
 MoQTestPublisher::resolveJoiningFetch(
     const Fetch& fetch,
-    const JoiningFetch& joining) {
+    const JoiningFetch& joining,
+    SessionId sessionId) {
   auto trackIt = tracks_.find(fetch.fullTrackName);
   if (trackIt == tracks_.end()) {
     return folly::makeUnexpected(
@@ -617,8 +622,7 @@ MoQTestPublisher::resolveJoiningFetch(
             FetchErrorCode::INVALID_RANGE,
             "No objects published for track"});
   }
-  auto range =
-      forwarder.resolveJoiningFetch(MoQSession::getRequestSession(), joining);
+  auto range = forwarder.resolveJoiningFetch(sessionId, joining);
   if (range.hasError()) {
     auto error = range.error();
     error.requestID = fetch.requestID;
@@ -654,7 +658,8 @@ folly::coro::Task<MoQSession::FetchResult> MoQTestPublisher::fetch(
   auto [standalone, joining] = fetchType(fetch);
   const bool isJoining = joining != nullptr;
   if (isJoining) {
-    auto range = resolveJoiningFetch(fetch, *joining);
+    auto range = resolveJoiningFetch(
+        fetch, *joining, MoQSession::getRequestContext().sessionId);
     if (range.hasError()) {
       co_return folly::makeUnexpected(range.error());
     }
@@ -727,8 +732,8 @@ folly::coro::Task<void> MoQTestPublisher::fetchObjects(
     std::shared_ptr<FetchConsumer> callback,
     MoQTestFetchWindow window) {
   auto token = co_await folly::coro::co_current_cancellation_token;
-  // Object frequency describes how a live track is produced; a FETCH serves what
-  // already exists, so it does not pace at all.
+  // Object frequency describes how a live track is produced; a FETCH serves
+  // what already exists, so it does not pace at all.
   uint32_t objectsSent = 0;
   // A datagram track fetches back through here because its objects have no
   // subgroup.  From draft 16 the flag tells the framer to omit the subgroup

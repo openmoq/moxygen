@@ -16,6 +16,7 @@
 #include <folly/io/async/EventBaseLocal.h>
 #include <folly/io/async/EventBaseManager.h>
 
+#include <chrono>
 #include <utility>
 
 #include "moxygen/MoQSession.h"
@@ -35,6 +36,8 @@ class MoQServer : public MoQServerBase {
     std::function<bool()> useQuicWtSession;
     size_t udpSendBufferBytes{0};
     size_t udpRecvBufferBytes{0};
+    // Idle timeout per HTTP/3 transaction, WebTransport CONNECT included. > 0.
+    std::chrono::milliseconds txnTimeout{std::chrono::seconds(60)};
   };
 
   // What a server uses when Options carries no transport settings.
@@ -107,6 +110,8 @@ class MoQServer : public MoQServerBase {
   }
 
   void stop() override;
+
+  void setAuthTokenCacheEnabled(bool enabled) override;
 
   // Takeover runtime wrapper methods - forward to underlying QuicServer
   // Takeover part 1: Methods called on the old instance.

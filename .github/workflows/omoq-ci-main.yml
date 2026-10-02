@@ -10,16 +10,21 @@ name: ci main
 #
 # Job graph:
 #
-#   build (linux, macos, asan debug) ─────────────────────────────────────────┐
-#   publish (7 platforms) ───────────────────────────────────────────────────┼── release ── notify
-#                                                                            └── prune-caches
+#   build (linux, macos, asan debug) ──┐
+#   publish (7 platforms) ─────────────┼── release ──┬── alias ── notify
+#                                      └── prune-caches
 
 on:
   push:
     branches: [main, 'release/**']
 
+# A group holds one running and one pending run; a newer push cancels the
+# pending one, so a burst of merges skips snapshots. Runs on main therefore
+# get their own group and run in parallel: everything they write is per-commit
+# except the rolling alias, which only moves forward (see the alias job).
+# release/** branches keep serializing.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -144,11 +149,43 @@ jobs:
         run: cmake --install _build
 
   # ════════════════════════════════════════════════════════════════════════════
-  # Publish: BUNDLE_DEPS artifact builds (needs verify to pass)
+  # Create-release: the pinned snapshot as an empty draft, before any asset
+  # exists, so each publish job can upload its own tarballs straight into it.
+  # A draft is invisible to consumers and to by-tag lookups, so the snapshot
+  # appears complete or not at all; the release job flips it once every
+  # publish job is green.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  create-release:
+    runs-on: ubuntu-22.04
+    outputs:
+      pin_tag: ${{ steps.tag.outputs.pin_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute pinned tag
+        id: tag
+        run: |
+          # 12 hex chars matches the moqx prebuilt cache key (_rev_short).
+          echo "pin_tag=snapshot-$(echo "$GITHUB_SHA" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft pinned snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash openmoq/scripts/publish-artifacts.sh \
+            --create-draft \
+            --sha "$GITHUB_SHA" \
+            --tag "${{ steps.tag.outputs.pin_tag }}" \
+            --branch "${{ github.ref_name }}"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Publish: BUNDLE_DEPS artifact builds. Runs alongside verify; release needs
+  # both, so nothing is published for a commit that fails verify.
   # ════════════════════════════════════════════════════════════════════════════
 
   publish:
-    needs: [build]
+    needs: [create-release]
     strategy:
       fail-fast: false
       matrix:
@@ -216,7 +253,7 @@ jobs:
           apt_get() { timeout -k 30 600 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 "$@"; }
           apt_get update
           apt_get install -y --no-install-recommends \
-            git ca-certificates curl pkg-config sudo bash ccache
+            git ca-certificates curl pkg-config sudo bash ccache gh
 
       - name: Install system dependencies
         if: ${{ !contains(toJSON(matrix.runner), 'self-hosted') || matrix.container != '' }}
@@ -289,22 +326,22 @@ jobs:
             --output "${{ matrix.artifact }}" \
             --debug-output "${{ matrix.debug_artifact }}"
 
-      # Handoff to the release job within this run; the release then holds the
-      # same tarballs on free storage. The week is re-run headroom: a failed
-      # release job can be retried without rebuilding, over a weekend included.
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
-          retention-days: 7
-
-      - name: Upload debug artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.debug_artifact }}
-          path: ${{ matrix.debug_artifact }}
-          retention-days: 7
+      # Straight into the draft snapshot. Each job carries only its own two
+      # tarballs, so one slow or hung upload cannot hold up the other six.
+      - name: Upload assets to the draft snapshot
+        # The per-attempt bound needs GNU timeout, which macOS lacks; this caps
+        # the step on every platform regardless.
+        timeout-minutes: 30
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p _assets
+          mv "${{ matrix.artifact }}" "${{ matrix.debug_artifact }}" _assets/
+          bash openmoq/scripts/publish-artifacts.sh \
+            --upload-only \
+            --artifacts-dir _assets \
+            --sha "$GITHUB_SHA" \
+            --tag "${{ needs.create-release.outputs.pin_tag }}"
 
   # ════════════════════════════════════════════════════════════════════════════
   # Release: create/update branch-derived snapshot pre-release (all green)
@@ -313,22 +350,21 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
 
   release:
-    needs: [build, publish]
+    needs: [build, publish, create-release]
     runs-on: ubuntu-22.04
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      pin_tag: ${{ steps.tag.outputs.pin_tag }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts/
-
       - name: Compute release tags
         id: tag
+        env:
+          # Through the environment: a release/** name is author-controlled and
+          # would otherwise be interpolated into this script's source.
+          BRANCH: ${{ github.ref_name }}
         run: |
-          BRANCH="${{ github.ref_name }}"
           if [ "$BRANCH" = "main" ]; then
             TAG="snapshot-latest"
           else
@@ -336,36 +372,118 @@ jobs:
             LABEL="${BRANCH#release/}"
             TAG="snapshot-${LABEL}-latest"
           fi
-          # 12 hex chars matches the moqx prebuilt cache key (_rev_short).
-          PIN_TAG="snapshot-$(echo "$GITHUB_SHA" | cut -c1-12)"
+          PIN_TAG="${{ needs.create-release.outputs.pin_tag }}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "pin_tag=$PIN_TAG" >> "$GITHUB_OUTPUT"
           echo "Release tags: $PIN_TAG + $TAG (branch: $BRANCH)"
 
-      # The pinned per-rev snapshot carries the assets (uploaded once) and is
-      # the contract pin-following consumers depend on, so it publishes before
-      # the alias: if the alias update fails, the rev is still fetchable by pin.
-      # Pinned snapshots older than 30 days are pruned with their tags.
-      - name: Publish pinned snapshot
+      # Every publish job is green, so the draft holds all 14 assets: flipping
+      # it public is the point at which the rev becomes fetchable by pin. It
+      # happens before the alias moves, so if the alias update fails the rev is
+      # still reachable. Pinned snapshots older than 30 days go with their tags.
+      - name: Finalize pinned snapshot
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 7 publish platforms x (tarball + debug sidecar).
           bash openmoq/scripts/publish-artifacts.sh \
-            --artifacts-dir artifacts/ \
+            --finalize \
+            --expect-assets 14 \
             --sha "$GITHUB_SHA" \
             --tag "${{ steps.tag.outputs.pin_tag }}" \
             --branch "${{ github.ref_name }}" \
             --prune-days 30
 
+  # ════════════════════════════════════════════════════════════════════════════
+  # Alias: move the rolling pointer, one run at a time.
+  #
+  # Main runs are otherwise fully parallel, so reading the alias target and
+  # writing its replacement must not interleave: two runs reading the same
+  # target would both judge themselves ahead, and whichever wrote second would
+  # win regardless of age. This job's concurrency group is that lock, and the
+  # comparison happens inside it, so the value read is the value replaced.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  alias:
+    needs: [release]
+    runs-on: ubuntu-22.04
+    outputs:
+      state: ${{ steps.publish.outputs.state || steps.order.outputs.state }}
+    concurrency:
+      group: ${{ github.workflow }}-alias-${{ github.ref }}
+      cancel-in-progress: false
+      # queue: single (the default) cancels an already-pending job when another
+      # joins, which would drop a newer commit's alias move entirely.
+      queue: max
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check alias ordering
+        id: order
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through the environment: a release/** name is author-controlled and
+          # would otherwise be interpolated into this script's source.
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          TAG="${{ needs.release.outputs.tag }}"
+
+          # Only a 404 means "no alias yet". Treating a 5xx, a rate limit or an
+          # auth failure as absent would advance the alias unconditionally.
+          if BODY=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" 2>&1); then
+            CUR=$(printf '%s' "$BODY" | jq -r '.target_commitish // ""')
+          elif printf '%s' "$BODY" | grep -q 'HTTP 404'; then
+            CUR=""
+          else
+            echo "::error::cannot read $TAG: $BODY"
+            exit 1
+          fi
+
+          if [ -z "$CUR" ]; then
+            # Absent is not always "never published": publishing the alias
+            # deletes it before recreating it, and if that create fails the
+            # release is simply gone. An older queued run must not read that as
+            # a clean slate and take the alias. Only the branch tip may claim a
+            # missing alias.
+            TIP=$(gh api "repos/${{ github.repository }}/git/ref/heads/${BRANCH}" --jq .object.sha)
+            if [ "$GITHUB_SHA" = "$TIP" ]; then
+              echo "advance=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::notice::$TAG is missing and this commit is not the ${BRANCH} tip; leaving it"
+              echo "advance=false" >> "$GITHUB_OUTPUT"
+              echo "state=held" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          STATUS=$(gh api "repos/${{ github.repository }}/compare/${CUR}...${GITHUB_SHA}" --jq .status)
+          case "$STATUS" in
+            ahead|identical)
+              echo "advance=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              # Expected while runs overlap: a newer commit already owns it.
+              # diverged is unreachable on main (force-push and deletion are
+              # both blocked there); on a release branch, delete the rolling
+              # release once to recover. See .github/CONTRIBUTING.md.
+              echo "::notice::$TAG points at ${CUR:0:12}, which is $STATUS of this commit; leaving it"
+              echo "advance=false" >> "$GITHUB_OUTPUT"
+              echo "state=held" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       - name: Publish rolling alias (asset-less pointer)
+        id: publish
+        if: steps.order.outputs.advance == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash openmoq/scripts/publish-artifacts.sh \
-            --pointer-to "${{ steps.tag.outputs.pin_tag }}" \
+            --pointer-to "${{ needs.release.outputs.pin_tag }}" \
             --sha "$GITHUB_SHA" \
-            --tag "${{ steps.tag.outputs.tag }}" \
+            --tag "${{ needs.release.outputs.tag }}" \
             --branch "${{ github.ref_name }}"
+          # Only now has the alias actually moved; a failure above leaves the
+          # state empty so the alerts do not claim it did.
+          echo "state=moved" >> "$GITHUB_OUTPUT"
 
   # ════════════════════════════════════════════════════════════════════════════
   # Prune build caches: keep the newest generation of each cache family.
@@ -429,7 +547,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
 
   notify:
-    needs: [build, publish, release]
+    needs: [build, publish, release, alias, create-release]
     if: always()
     runs-on: ubuntu-22.04
     steps:
@@ -457,14 +575,30 @@ jobs:
             esac
           }
 
+          # create-release gates publish, so its failure would otherwise
+          # surface as publish:— and hide the cause.
+          PUB_RESULT="${{ needs.publish.result }}"
+          if [ "${{ needs.create-release.result }}" != "success" ]; then
+            PUB_RESULT="${{ needs.create-release.result }}"
+          fi
+
+          # A failed alias job leaves the pinned snapshot published but the
+          # rolling pointer stale, which is worth seeing in the alert.
+          REL_RESULT="${{ needs.release.result }}"
+          if [ "$REL_RESULT" = "success" ] && [ "${{ needs.alias.result }}" != "success" ]; then
+            REL_RESULT="${{ needs.alias.result }}"
+          fi
+
           VER=$(fmt_status "${{ needs.build.result }}")
-          PUB=$(fmt_status "${{ needs.publish.result }}")
-          REL=$(fmt_status "${{ needs.release.result }}")
+          PUB=$(fmt_status "$PUB_RESULT")
+          REL=$(fmt_status "$REL_RESULT")
 
-          STATUS="verify:${VER} publish:${PUB} release:${REL}"
+          # moved: this commit owns the rolling alias; held: a newer commit does.
+          # Without it every run in a burst reports the same thing.
+          STATUS="verify:${VER} publish:${PUB} release:${REL} alias:${{ needs.alias.outputs.state || '—' }}"
 
-          if [ "${{ needs.release.result }}" = "success" ]; then
-            REL_URL="${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.release.outputs.tag }}"
+          REL_URL="${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.release.outputs.tag }}"
+          if [ "$REL_RESULT" = "success" ]; then
             TEXT=":white_check_mark: *${{ github.repository }}* \`${{ github.ref_name }}\` \`${SHORT}\` — ${STATUS}  <${RUN_URL}|#${{ github.run_number }}> artifacts: <${REL_URL}|view>"
           else
             TEXT=":x: *${{ github.repository }}* \`${{ github.ref_name }}\` \`${SHORT}\` — ${STATUS}  <${RUN_URL}|#${{ github.run_number }}>"
@@ -486,11 +620,17 @@ jobs:
 
           VER="${{ needs.build.result }}"
           PUB="${{ needs.publish.result }}"
+          if [ "${{ needs.create-release.result }}" != "success" ]; then
+            PUB="${{ needs.create-release.result }}"
+          fi
           REL="${{ needs.release.result }}"
+          if [ "$REL" = "success" ] && [ "${{ needs.alias.result }}" != "success" ]; then
+            REL="${{ needs.alias.result }}"
+          fi
 
-          STATUS="verify:${VER} publish:${PUB} release:${REL}"
+          STATUS="verify:${VER} publish:${PUB} release:${REL} alias:${{ needs.alias.outputs.state || '—' }}"
 
-          if [ "${{ needs.release.result }}" = "success" ]; then
+          if [ "$REL" = "success" ]; then
             REL_URL="${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.release.outputs.tag }}"
             SUBJECT="[moxygen] published ${{ github.ref_name }} ${SHORT}"
             BODY="Repository: ${{ github.repository }}\nBranch: ${{ github.ref_name }}\nCommit: ${GITHUB_SHA}\nStatus: ${STATUS}\nArtifacts: ${REL_URL}\nRun: ${RUN_URL}"

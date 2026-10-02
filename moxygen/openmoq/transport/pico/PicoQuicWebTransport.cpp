@@ -224,11 +224,13 @@ uint8_t* PicoQuicWebTransport::getDatagramBuffer(
                     : picoquic_datagram_not_active);
     return nullptr;
   }
-  // Normal send path. keepPolling is not passed here — picoquic re-polls as
-  // long as picoquic_mark_datagram_ready is set (done in
-  // markDatagramActiveImpl). The base class issues a length==0 /
-  // keepPolling=false call once the queue drains to cancel the ready signal.
-  return picoquic_provide_datagram_buffer(context, length);
+  // This call overwrites the ready flag that markDatagramActiveImpl set.
+  // The flag stays set while more datagrams are queued.
+  return picoquic_provide_datagram_buffer_ex(
+      context,
+      length,
+      keepPolling ? picoquic_datagram_active_any_path
+                  : picoquic_datagram_not_active);
 }
 
 void PicoQuicWebTransport::clearPicoquicCallback() {

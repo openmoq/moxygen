@@ -298,7 +298,9 @@ void PicoQuicSocketHandler::onNotifyDataAvailable(
 
     uint64_t currentTime = picoquic_current_time();
     for (int i = 0; i < n; i++) {
-      parseCmsgsAndDeliver(msgs[i], bufs[i], currentTime);
+      if (acceptingPackets_) {
+        parseCmsgsAndDeliver(msgs[i], bufs[i], currentTime);
+      }
       msgs[i].msg_hdr.msg_namelen = sizeof(fromAddrs[i]);
       msgs[i].msg_hdr.msg_controllen = kCmsgBufSize;
       msgs[i].msg_hdr.msg_flags = 0;

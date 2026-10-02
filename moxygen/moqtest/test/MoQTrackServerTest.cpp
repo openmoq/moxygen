@@ -1471,8 +1471,8 @@ CO_TEST_F(MoQTrackServerTest, CancelAllStopsAnInFlightFetch) {
           testing::_,
           testing::_))
       .WillByDefault(
-          [&objects,
-           midTrack]() -> folly::Expected<folly::Unit, moxygen::MoQPublishError> {
+          [&objects, midTrack]()
+              -> folly::Expected<folly::Unit, moxygen::MoQPublishError> {
             if (++objects == kObjectsBeforeCancel) {
               midTrack->post();
               return folly::makeUnexpected(
@@ -1493,7 +1493,8 @@ CO_TEST_F(MoQTrackServerTest, CancelAllStopsAnInFlightFetch) {
   publisher_->cancelAll();
 
   // Waking the generator after the cancel proves it stopped on the token rather
-  // than on the block: it resumes, rechecks, and unwinds without another object.
+  // than on the block: it resumes, rechecks, and unwinds without another
+  // object.
   drained.setValue(0);
   co_await folly::coro::sleep(std::chrono::milliseconds(100));
   EXPECT_EQ(objects, kObjectsBeforeCancel);
@@ -1822,7 +1823,8 @@ TEST_F(MoQTrackServerTest, RequestUpdateTogglesForward) {
   sub.locType = moxygen::LocationType::LargestObject;
   sub.forward = true;
 
-  auto subscriber = forwarder->addSubscriber(session, sub, mockConsumer);
+  auto subscriber =
+      forwarder->addSubscriber(session->sessionId(), sub, mockConsumer);
   ASSERT_NE(subscriber, nullptr);
   EXPECT_TRUE(subscriber->shouldForward);
 
@@ -2330,7 +2332,7 @@ TEST_F(MoQTrackServerTest, DeductsObjectWorkFromTheObjectPeriod) {
 
   // Both bounds are one-sided in the direction a slow or contended machine
   // pushes.  A CI hiccup inflates intervals, so the upper bound reads the
-  // median, which a handful of long intervals cannot move; re-anchoring after
+  // median, which a handful of long intervals cannot move; catching up after
   // one shortens the intervals that follow, so the lower bound reads the total,
   // which no amount of slowness can shrink.
   constexpr double kMaxMedianMs = kPeriodMs + kWorkMs / 2.0;
@@ -2345,4 +2347,58 @@ TEST_F(MoQTrackServerTest, DeductsObjectWorkFromTheObjectPeriod) {
       << kObjects << " objects took " << elapsedMs << "ms, short of the "
       << (kObjects - 1) * kPeriodMs << "ms a " << kPeriodMs
       << "ms period calls for";
+}
+
+// A generator that stalls past several deadlines sends the objects it owes
+// back to back, then returns to the original grid.
+TEST_F(MoQTrackServerTest, CatchesUpAfterAStall) {
+  using namespace std::chrono;
+  MoQTrackServerTest::CreateDefaultMoQTestParameters();
+  constexpr uint64_t kPeriodMs = 40;
+  constexpr uint64_t kStallMs = kPeriodMs * 7 / 2;
+  constexpr uint64_t kObjects = 6;
+  params_.lastGroupInTrack = 0;
+  params_.objectsPerGroup = kObjects;
+  params_.lastObjectInTrack = kObjects - 1;
+  params_.objectFrequency = kPeriodMs;
+
+  auto ok = folly::makeExpected<moxygen::MoQPublishError>(folly::unit);
+  std::vector<steady_clock::time_point> times;
+  auto subgroup =
+      std::make_shared<testing::NiceMock<moxygen::MockSubgroupConsumer>>();
+  ON_CALL(*subgroup, object(testing::_, testing::_, testing::_, testing::_))
+      .WillByDefault([&times, ok, kStallMs](auto, auto, const auto&, auto) {
+        times.push_back(steady_clock::now());
+        if (times.size() == 1) {
+          auto until = times.back() + milliseconds(kStallMs);
+          while (steady_clock::now() < until) {
+          }
+        }
+        return ok;
+      });
+  ON_CALL(*subgroup, endOfSubgroup()).WillByDefault(testing::Return(ok));
+
+  auto consumer =
+      std::make_shared<testing::NiceMock<moxygen::MockTrackConsumer>>();
+  ON_CALL(
+      *consumer, beginSubgroup(testing::_, testing::_, testing::_, testing::_))
+      .WillByDefault(
+          testing::Return(
+              folly::makeExpected<moxygen::MoQPublishError>(
+                  std::shared_ptr<moxygen::SubgroupConsumer>(subgroup))));
+
+  folly::coro::blockingWait(
+      publisher_->sendOneSubgroupPerGroup(params_, consumer));
+
+  ASSERT_EQ(times.size(), kObjects);
+  auto sinceStart = [&](size_t i) {
+    return duration<double, std::milli>(times[i] - times.front()).count();
+  };
+  // Objects 1-3 were due at 40, 80 and 120ms, all before the stall ended.
+  EXPECT_LT(sinceStart(3) - sinceStart(1), kPeriodMs)
+      << "objects owed after a stall were spaced out instead of sent back to "
+         "back";
+  // Object 4 was due at 160ms, after the stall ended at 140ms, so the
+  // generator waits for it.
+  EXPECT_GT(sinceStart(4), kStallMs + kPeriodMs / 4);
 }

@@ -6,18 +6,18 @@
 
 #pragma once
 
-#include <folly/Random.h>
-#include <memory>
 #include <moxygen/mlog/MLoggerFactory.h>
+#include <memory>
 
 namespace moxygen {
 
 // Wraps a MLoggerFactory and applies probabilistic sampling.
 // For each createMLogger() call, returns a logger with probability sampleRate,
-// or nullptr otherwise (meaning the session is not logged).
+// or nullptr otherwise (meaning the session is not logged). A rate <= 0 never
+// logs and a rate >= 1 always logs; NaN is treated as "never".
 //
-// THREAD SAFETY: Uses folly::Random::oneIn() which relies on ThreadLocalPRNG
-// and is safe for concurrent calls. 
+// THREAD SAFETY: Uses folly::Random, which relies on ThreadLocalPRNG and is
+// safe for concurrent calls.
 class SamplingMLoggerFactory : public MLoggerFactory {
  public:
   SamplingMLoggerFactory(
@@ -29,7 +29,6 @@ class SamplingMLoggerFactory : public MLoggerFactory {
  private:
   std::shared_ptr<MLoggerFactory> inner_;
   float sampleRate_;
-  uint32_t bucketSize_; // ceil(1 / sampleRate_)
 };
 
 } // namespace moxygen

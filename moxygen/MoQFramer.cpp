@@ -156,7 +156,7 @@ validateDeliveryTimeoutExtension(
 
 std::vector<moxygen::Parameter> sortParamsByKey(
     std::vector<moxygen::Parameter> params) {
-  std::sort(
+  std::stable_sort(
       params.begin(),
       params.end(),
       [](const moxygen::Parameter& a, const moxygen::Parameter& b) {
@@ -609,7 +609,7 @@ MoQFrameParser::parseAuthToken(
     folly::io::Cursor& cursor,
     size_t length,
     bool isClientSetup) const noexcept {
-  auto& tokenCache = *tokenCache_;
+  auto& tokenCache = getTokenCache();
   std::optional<AuthToken> token;
   token.emplace(); // plan for success
   auto aliasType = decodeVarint(cursor, length);
@@ -702,8 +702,7 @@ MoQFrameParser::parseAuthToken(
       } else {
         XLOG(WARN)
             << "Converting too-large CLIENT_SETUP register to USE_VALUE alias="
-            << *token->alias << " tokenType=" << token->tokenType
-            << " tokenLength=" << token->tokenValue.size();
+            << *token->alias;
       }
     } break;
     case AliasType::USE_VALUE: {
@@ -2042,8 +2041,7 @@ std::optional<SubscriptionFilter> MoQFrameParser::extractSubscriptionFilter(
 std::optional<TrackFilter> MoQFrameParser::extractTrackFilter(
     const std::vector<Parameter>& requestSpecificParams) const noexcept {
   for (const auto& param : requestSpecificParams) {
-    if (param.key ==
-        folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
+    if (param.key == folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
       return param.asTrackFilter;
     }
   }
@@ -4524,13 +4522,17 @@ std::string MoQFrameWriter::encodeTokenValue(
 }
 
 bool includeSetupParam(uint64_t version, SetupKey key) {
-  // Cluster advertisements require owned request streams in both directions.
+  // Cluster setup parameters are defined for draft 18+.
   if (getDraftMajorVersion(version) < 18 &&
       (key == SetupKey::HOP_ID || key == SetupKey::RELAY_COST)) {
     return false;
   }
-  // Draft 18+ delivers requests on independent bidi streams, so auth token
-  // aliasing (which relies on request ordering) is disabled. Strip the param.
+  // Draft 18 removed this param in favor of QUIC stream limits.
+  if (key == SetupKey::MAX_REQUEST_ID && useBidiRequestStreams(version)) {
+    return false;
+  }
+  // Draft 18+ disables auth token aliasing, which relies on request ordering.
+
   if (key == SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE &&
       useBidiRequestStreams(version)) {
     return false;

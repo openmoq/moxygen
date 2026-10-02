@@ -51,263 +51,237 @@ TEST_P(MoQVersionNegotiationTest, Setup) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
-using RelayHopsNegotiationTest = MoQSessionTest;
+// start() hands the control loops to the executor, and the owner may close
+// and release the session before the executor runs them. ASan reports a loop
+// that reads the session after that. No weak_ptr here: one would keep the
+// make_shared allocation alive and hide the read.
+TEST_P(MoQVersionNegotiationTest, ReleasedBeforeControlLoopsRun) {
+  clientSession_->start();
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+  clientSession_.reset();
+  for (int i = 0; i < 10; ++i) {
+    eventBase_.loopOnce(EVLOOP_NONBLOCK);
+  }
+}
+
+TEST_P(MoQVersionNegotiationTest, ReleasedWithoutCloseBeforeControlLoopsRun) {
+  clientSession_->start();
+  // serverWt_ would otherwise report the session end to the freed client.
+  serverWt_->setPeerHandler(nullptr);
+  clientSession_.reset();
+  for (int i = 0; i < 10; ++i) {
+    eventBase_.loopOnce(EVLOOP_NONBLOCK);
+  }
+}
+using CurrentVersionOnly = MoQSessionTest;
+
+class SetupTokenCacheTest : public MoQSessionTest {
+ public:
+  folly::Try<moxygen::Setup> onClientSetup(
+      moxygen::Setup setup,
+      const std::shared_ptr<MoQSession>&) override {
+    receivedSetup_ = true;
+    std::vector<std::tuple<uint64_t, std::string, std::optional<uint64_t>>>
+        setupTokens;
+    for (const auto& param : setup.params) {
+      if (param.key == folly::to_underlying(SetupKey::AUTHORIZATION_TOKEN)) {
+        setupTokens.emplace_back(
+            param.asAuthToken.tokenType,
+            param.asAuthToken.tokenValue,
+            param.asAuthToken.alias);
+      }
+    }
+    EXPECT_EQ(setupTokens, expectedSetupTokens_);
+
+    moxygen::Setup serverSetup;
+    serverSetup.params.insertParam(
+        SetupParameter{
+            folly::to_underlying(SetupKey::MAX_REQUEST_ID),
+            initialMaxRequestID_});
+    serverSetup.params.insertParam(
+        SetupParameter{
+            folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
+            finalCacheSize_});
+    return folly::Try<moxygen::Setup>(std::move(serverSetup));
+  }
+
+  folly::coro::Task<Publisher::TrackStatusResult> validateTrackStatus(
+      TrackStatus request) {
+    EXPECT_EQ(request.params.size(), 1);
+    if (request.params.size() != 1) {
+      co_return makeTrackStatusOkResult(request, AbsoluteLocation{0, 0});
+    }
+    const auto& token = request.params.at(0).asAuthToken;
+    const auto& expectedValue =
+        requestIndex_ == 0 ? retainedToken_ : evictedToken_;
+    const auto expectedAlias = requestIndex_ == 0 ? 0 : reregisteredAlias_;
+    EXPECT_EQ(token.tokenType, 7);
+    EXPECT_EQ(token.tokenValue, expectedValue);
+    EXPECT_EQ(token.alias, expectedAlias);
+    ++requestIndex_;
+    co_return makeTrackStatusOkResult(request, AbsoluteLocation{0, 0});
+  }
+
+ protected:
+  std::vector<std::tuple<uint64_t, std::string, std::optional<uint64_t>>>
+      expectedSetupTokens_;
+  uint64_t finalCacheSize_{0};
+  std::string retainedToken_;
+  std::string evictedToken_;
+  uint64_t reregisteredAlias_{0};
+  size_t requestIndex_{0};
+  bool receivedSetup_{false};
+};
 
 INSTANTIATE_TEST_SUITE_P(
-    RelayHopsNegotiationTest,
-    RelayHopsNegotiationTest,
+    LegacySetupTokenCacheTest,
+    SetupTokenCacheTest,
     testing::Values(
-        VersionParams{{kVersionDraft16}, kVersionDraft16},
-        VersionParams{{kVersionDraft18}, kVersionDraft18}));
+        VersionParams{{kVersionDraft14}, kVersionDraft14},
+        VersionParams{{kVersionDraft15}, kVersionDraft15},
+        VersionParams{{kVersionDraft16}, kVersionDraft16}));
 
-CO_TEST_P_X(RelayHopsNegotiationTest, NegotiatesWhenBothPeersAdvertise) {
-  relayHopsSupported_ = true;
-  co_await setupMoQSession();
-  const bool supported = getDraftMajorVersion(GetParam().serverVersion) >= 18;
-  EXPECT_EQ(
-      clientSession_->negotiatedSetupExtension(SetupExtension::RelayHops),
-      supported);
-  EXPECT_EQ(
-      serverSession_->negotiatedSetupExtension(SetupExtension::RelayHops),
-      supported);
-}
+CO_TEST_P_X(SetupTokenCacheTest, PreservesSetupAliasesAcrossFinalClamp) {
+  std::vector<std::string> setupTokens;
+  for (uint64_t i = 0; i < 32; ++i) {
+    auto token = std::string("setup-token-");
+    token.push_back('a' + (i / 26));
+    token.push_back('a' + (i % 26));
+    setupTokens.push_back(std::move(token));
+  }
+  retainedToken_ = setupTokens.front();
+  evictedToken_ = setupTokens.back();
+  reregisteredAlias_ = setupTokens.size();
+  expectedSetupTokens_.reserve(setupTokens.size());
+  for (uint64_t i = 0; i < setupTokens.size(); ++i) {
+    expectedSetupTokens_.emplace_back(7, setupTokens.at(i), i);
+  }
+  finalCacheSize_ = MoQTokenCache::cachedSize(retainedToken_) + 1;
 
-CO_TEST_P_X(
-    RelayHopsNegotiationTest,
-    ClusterNegotiatesPeerIdentityAndDefaultCost) {
-  relayHopsSupported_ = true;
-  co_await setupMoQSession();
-  const uint64_t expected =
-      getDraftMajorVersion(GetParam().serverVersion) >= 18 ? 42 : 0;
-  EXPECT_EQ(clientSession_->getPeerHopID(), expected);
-  EXPECT_EQ(serverSession_->getPeerHopID(), expected);
-  EXPECT_EQ(clientSession_->getRelayLinkCost(), 1);
-  EXPECT_EQ(serverSession_->getRelayLinkCost(), 1);
-}
-
-CO_TEST_P_X(Draft18Test, ClusterPeersAdvertiseIndependentLinkCosts) {
+  clientSession_->setPublishHandler(clientPublisher);
+  clientSession_->setSubscribeHandler(clientSubscriber);
   clientSession_->start();
+  serverSession_->setPublishHandler(serverPublisher);
+  serverSession_->setSubscribeHandler(serverSubscriber);
   serverSession_->start();
-  moxygen::Setup serverSetup;
-  serverSetup.params.insertParam(SetupParameter(
-      folly::to_underlying(SetupKey::MAX_REQUEST_ID), initialMaxRequestID_));
-  serverSetup.params.insertParam(
-      SetupParameter(folly::to_underlying(SetupKey::HOP_ID), uint64_t{23}));
-  serverSetup.params.insertParam(
-      SetupParameter(folly::to_underlying(SetupKey::RELAY_COST), uint64_t{7}));
-  serverSession_->sendSetup(std::move(serverSetup));
+  clientSession_->setServerMaxTokenCacheSizeGuess(1024);
+
   auto clientSetup = getClientSetup(initialMaxRequestID_);
-  clientSetup.params.insertParam(
-      SetupParameter(folly::to_underlying(SetupKey::HOP_ID), uint64_t{41}));
-  clientSetup.params.insertParam(
-      SetupParameter(folly::to_underlying(SetupKey::RELAY_COST), uint64_t{0}));
-  co_await clientSession_->setup(std::move(clientSetup));
-  EXPECT_EQ(clientSession_->getPeerHopID(), 23);
-  EXPECT_EQ(serverSession_->getPeerHopID(), 41);
-  EXPECT_EQ(clientSession_->getRelayLinkCost(), 7);
-  EXPECT_EQ(serverSession_->getRelayLinkCost(), 0);
+  for (const auto& token : setupTokens) {
+    clientSetup.params.insertParam(Parameter(
+        folly::to_underlying(SetupKey::AUTHORIZATION_TOKEN),
+        AuthToken{7, token, AuthToken::Register}));
+  }
+  auto serverSetup = co_await clientSession_->setup(std::move(clientSetup));
+
+  auto finalCacheParam = std::find_if(
+      serverSetup.params.begin(),
+      serverSetup.params.end(),
+      [](const auto& param) {
+        return param.key ==
+            folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE);
+      });
+  EXPECT_NE(finalCacheParam, serverSetup.params.end());
+  if (finalCacheParam == serverSetup.params.end()) {
+    clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+    co_return;
+  }
+  EXPECT_EQ(finalCacheParam->asUint64, finalCacheSize_);
+
+  EXPECT_CALL(*serverPublisherStatsCallback_, onTrackStatus()).Times(2);
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onTrackStatus()).Times(2);
+  EXPECT_CALL(*serverPublisher, trackStatus(_))
+      .Times(2)
+      .WillRepeatedly(
+          testing::Invoke(this, &SetupTokenCacheTest::validateTrackStatus));
+
+  auto request = getTrackStatus();
+  request.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
+      AuthToken{7, retainedToken_, AuthToken::Register}));
+  auto retainedResult = co_await clientSession_->trackStatus(request);
+  EXPECT_FALSE(retainedResult.hasError());
+
+  request = getTrackStatus();
+  request.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
+      AuthToken{7, evictedToken_, AuthToken::Register}));
+  auto evictedResult = co_await clientSession_->trackStatus(request);
+  EXPECT_FALSE(evictedResult.hasError());
+  EXPECT_EQ(requestIndex_, 2);
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
-CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWithoutAdvertisement) {
-  co_await setupMoQSession();
-  EXPECT_FALSE(
-      clientSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
-  EXPECT_FALSE(
-      serverSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
-}
-
-CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWhenOnlyServerAdvertises) {
-  serverRelayHopsSupported_ = true;
-  co_await setupMoQSession();
-  EXPECT_FALSE(
-      clientSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
-  EXPECT_FALSE(
-      serverSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
-}
-
-CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWhenOnlyClientAdvertises) {
-  clientRelayHopsSupported_ = true;
-  co_await setupMoQSession();
-  EXPECT_FALSE(
-      clientSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
-  EXPECT_FALSE(
-      serverSession_->negotiatedSetupExtension(SetupExtension::RelayHops));
-}
-
-// Tests for MoQSession::computeNegotiatedExtensions().
-class SetupExtensionsTest : public ::testing::Test {
- protected:
-  static constexpr auto kExtA = static_cast<SetupExtension>(1u << 0);
-  static constexpr auto kExtB = static_cast<SetupExtension>(1u << 1);
-  // Synthetic keys for these tests; deliberately not any real SetupKey.
-  static constexpr uint64_t kKeyA = 0xF00D1;
-  static constexpr uint64_t kKeyB = 0xF00D2;
-  static constexpr uint64_t kVersion = kVersionDraft18;
-
-  const std::vector<SetupExtensionDescriptor> mutualFlags_{
-      {kExtA, bothAdvertise(kKeyA)},
-      {kExtB, bothAdvertise(kKeyB)}};
-
-  static SetupParameters params(std::vector<SetupParameter> setupParams) {
-    SetupParameters result(FrameType::CLIENT_SETUP);
-    for (auto& param : setupParams) {
-      result.insertParam(std::move(param));
-    }
-    return result;
-  }
-
-  static SetupParameter flag(uint64_t key) {
-    return SetupParameter(key, std::string{});
+class DisabledTokenCacheTest : public SetupTokenCacheTest {
+ public:
+  DisabledTokenCacheTest() {
+    serverAuthTokenCacheEnabled_ = false;
   }
 };
 
-TEST_F(SetupExtensionsTest, MutualFlagNegotiatesWhenBothAdvertise) {
-  auto extensions = MoQSession::computeNegotiatedExtensions(
-      params({flag(kKeyA)}), params({flag(kKeyA)}), kVersion, mutualFlags_);
-  EXPECT_TRUE(extensions.has(kExtA));
-  EXPECT_FALSE(extensions.has(kExtB));
-}
+INSTANTIATE_TEST_SUITE_P(
+    LegacyDisabledTokenCacheTest,
+    DisabledTokenCacheTest,
+    testing::Values(
+        VersionParams{{kVersionDraft14}, kVersionDraft14},
+        VersionParams{{kVersionDraft15}, kVersionDraft15},
+        VersionParams{{kVersionDraft16}, kVersionDraft16}));
 
-TEST_F(SetupExtensionsTest, MutualFlagNeedsBothSides) {
-  EXPECT_TRUE(MoQSession::computeNegotiatedExtensions(
-                  params({flag(kKeyA)}), params({}), kVersion, mutualFlags_)
-                  .empty());
-  EXPECT_TRUE(MoQSession::computeNegotiatedExtensions(
-                  params({}), params({flag(kKeyA)}), kVersion, mutualFlags_)
-                  .empty());
-  EXPECT_TRUE(MoQSession::computeNegotiatedExtensions(
-                  params({}), params({}), kVersion, mutualFlags_)
-                  .empty());
-}
+CO_TEST_P_X(DisabledTokenCacheTest, SendsFullTokenValues) {
+  clientSession_->setPublishHandler(clientPublisher);
+  clientSession_->start();
+  serverSession_->setPublishHandler(serverPublisher);
+  serverSession_->start();
+  moxygen::Setup clientSetup;
+  clientSetup.params.insertParam(Parameter(
+      folly::to_underlying(SetupKey::MAX_REQUEST_ID), initialMaxRequestID_));
+  clientSetup.params.insertParam(Parameter(
+      folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 1024));
+  auto serverSetup = co_await clientSession_->setup(std::move(clientSetup));
+  auto cacheSizeParam = std::find_if(
+      serverSetup.params.begin(),
+      serverSetup.params.end(),
+      [](const auto& param) {
+        return param.key ==
+            folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE);
+      });
+  EXPECT_NE(cacheSizeParam, serverSetup.params.end());
+  if (cacheSizeParam == serverSetup.params.end()) {
+    clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+    co_return;
+  }
+  EXPECT_EQ(cacheSizeParam->asUint64, 0);
 
-TEST_F(SetupExtensionsTest, ExtensionsAreIndependent) {
-  auto extensions = MoQSession::computeNegotiatedExtensions(
-      params({flag(kKeyA), flag(kKeyB)}),
-      params({flag(kKeyB)}),
-      kVersion,
-      mutualFlags_);
-  EXPECT_FALSE(extensions.has(kExtA));
-  EXPECT_TRUE(extensions.has(kExtB));
-  EXPECT_FALSE(extensions.empty());
-}
+  auto validateToken = [](TrackStatus request)
+      -> folly::coro::Task<Publisher::TrackStatusResult> {
+    EXPECT_EQ(request.params.size(), 1);
+    if (request.params.size() == 1) {
+      const auto& token = request.params.at(0).asAuthToken;
+      EXPECT_EQ(token.tokenType, 7);
+      EXPECT_EQ(token.tokenValue, "token");
+      EXPECT_FALSE(token.alias.has_value());
+    }
+    co_return makeTrackStatusOkResult(request, AbsoluteLocation{0, 0});
+  };
+  EXPECT_CALL(*clientPublisher, trackStatus(_))
+      .Times(2)
+      .WillRepeatedly(validateToken);
+  EXPECT_CALL(*serverPublisher, trackStatus(_))
+      .Times(2)
+      .WillRepeatedly(validateToken);
 
-TEST_F(SetupExtensionsTest, UnrelatedSetupParamsDoNotNegotiate) {
-  auto maxRequestID = params(
-      {SetupParameter(folly::to_underlying(SetupKey::MAX_REQUEST_ID), 8)});
-  EXPECT_TRUE(MoQSession::computeNegotiatedExtensions(
-                  maxRequestID, maxRequestID, kVersion, mutualFlags_)
-                  .empty());
-}
-
-// A rule can inspect values, be asymmetric, and depend on the draft -- the
-// point of taking a negotiator rather than a key.
-TEST_F(SetupExtensionsTest, RuleCanNegotiateOnValue) {
-  const std::vector<SetupExtensionDescriptor> byValue{
-      {kExtA,
-       [](const SetupParameters& local,
-          const SetupParameters& peer,
-          uint64_t) {
-         const auto* localParam = local.getFirstParam(kKeyA);
-         const auto* peerParam = peer.getFirstParam(kKeyA);
-         return localParam && peerParam &&
-             std::min(localParam->asUint64, peerParam->asUint64) > 0;
-       }}};
-
-  EXPECT_TRUE(MoQSession::computeNegotiatedExtensions(
-                  params({SetupParameter(kKeyA, 4)}),
-                  params({SetupParameter(kKeyA, 2)}),
-                  kVersion,
-                  byValue)
-                  .has(kExtA));
-  EXPECT_FALSE(MoQSession::computeNegotiatedExtensions(
-                   params({SetupParameter(kKeyA, 4)}),
-                   params({SetupParameter(kKeyA, 0)}),
-                   kVersion,
-                   byValue)
-                   .has(kExtA));
-}
-
-// Modelled on the auth token cache: my advertisement governs what I receive,
-// the peer's governs what I send, so the two directions can differ.
-TEST_F(SetupExtensionsTest, RuleCanBeAsymmetric) {
-  const std::vector<SetupExtensionDescriptor> perDirection{
-      {kExtA,
-       [](const SetupParameters& local, const SetupParameters&, uint64_t) {
-         return local.hasParam(kKeyA);
-       }},
-      {kExtB,
-       [](const SetupParameters&, const SetupParameters& peer, uint64_t) {
-         return peer.hasParam(kKeyA);
-       }}};
-
-  auto extensions = MoQSession::computeNegotiatedExtensions(
-      params({flag(kKeyA)}), params({}), kVersion, perDirection);
-  EXPECT_TRUE(extensions.has(kExtA));
-  EXPECT_FALSE(extensions.has(kExtB));
-}
-
-TEST_F(SetupExtensionsTest, RuleCanDependOnVersion) {
-  const std::vector<SetupExtensionDescriptor> v18Only{
-      {kExtA,
-       [](const SetupParameters& local,
-          const SetupParameters& peer,
-          uint64_t version) {
-         return getDraftMajorVersion(version) >= 18 && local.hasParam(kKeyA) &&
-             peer.hasParam(kKeyA);
-       }}};
-
-  auto both = params({flag(kKeyA)});
-  EXPECT_TRUE(MoQSession::computeNegotiatedExtensions(
-                  both, both, kVersionDraft18, v18Only)
-                  .has(kExtA));
-  EXPECT_FALSE(MoQSession::computeNegotiatedExtensions(
-                   both, both, kVersionDraft17, v18Only)
-                   .has(kExtA));
-}
-
-TEST_F(SetupExtensionsTest, NoneIsNeverHeld) {
-  auto extensions = MoQSession::computeNegotiatedExtensions(
-      params({flag(kKeyA)}), params({flag(kKeyA)}), kVersion, mutualFlags_);
-  EXPECT_FALSE(extensions.has(SetupExtension::None));
-  EXPECT_FALSE(SetupExtensions().has(SetupExtension::None));
-}
-
-TEST_F(SetupExtensionsTest, ShippedTableNegotiatesRelayHops) {
-  auto both = params(
-      {SetupParameter(folly::to_underlying(SetupKey::HOP_ID), uint64_t{42})});
-  auto relayHops =
-      MoQSession::computeNegotiatedExtensions(both, both, kVersion);
-  EXPECT_TRUE(relayHops.has(SetupExtension::RelayHops));
-
-  auto oneSided =
-      MoQSession::computeNegotiatedExtensions(both, params({}), kVersion);
-  EXPECT_FALSE(oneSided.has(SetupExtension::RelayHops));
-
-  auto draft17 =
-      MoQSession::computeNegotiatedExtensions(both, both, kVersionDraft17);
-  EXPECT_FALSE(draft17.has(SetupExtension::RelayHops));
-
-  auto draft15 =
-      MoQSession::computeNegotiatedExtensions(both, both, kVersionDraft15);
-  EXPECT_FALSE(draft15.has(SetupExtension::RelayHops));
-}
-
-// Both halves of the setup exchange are retained on both endpoints, which is
-// what extension negotiation runs on.
-TEST_P(MoQVersionNegotiationTest, SetupParamsRetainedOnBothEndpoints) {
-  folly::coro::blockingWait(setupMoQSession(), getExecutor());
-  for (auto* session : {clientSession_.get(), serverSession_.get()}) {
-    ASSERT_TRUE(session->getLocalSetupParams().has_value());
-    ASSERT_TRUE(session->getPeerSetupParams().has_value());
-    EXPECT_TRUE(session->getLocalSetupParams()->hasParam(
-        folly::to_underlying(SetupKey::MAX_REQUEST_ID)));
-    EXPECT_TRUE(session->getPeerSetupParams()->hasParam(
-        folly::to_underlying(SetupKey::MAX_REQUEST_ID)));
+  for (size_t i = 0; i < 2; ++i) {
+    auto request = getTrackStatus();
+    request.params.insertParam(Parameter(
+        folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
+        AuthToken{7, "token", AuthToken::Register}));
+    auto serverResult = co_await serverSession_->trackStatus(request);
+    EXPECT_FALSE(serverResult.hasError());
+    auto clientResult = co_await clientSession_->trackStatus(request);
+    EXPECT_FALSE(clientResult.hasError());
   }
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
-using CurrentVersionOnly = MoQSessionTest;
 
 CO_TEST_P_X(CurrentVersionOnly, SetupTimeout) {
   MoQSettings moqSettings;
@@ -333,6 +307,10 @@ INSTANTIATE_TEST_SUITE_P(
     testing::Values(
         VersionParams{{kVersionDraftCurrent}, kVersionDraftCurrent}));
 namespace {
+class ScopedTestHandler : public Publisher,
+                          public Subscriber,
+                          public SessionScoped {};
+
 std::shared_ptr<MoQRelaySession> makeBareSession(
     const std::shared_ptr<MoQFollyExecutorImpl>& exec,
     proxygen::WebTransport* wt) {
@@ -363,6 +341,74 @@ TEST(MoQSessionTest, SessionIdsAreDistinct) {
   auto third = makeBareSession(exec, clientWt.get());
   EXPECT_NE(third->sessionId(), firstId);
   EXPECT_NE(third->sessionId(), second->sessionId());
+}
+
+// Registering a SessionScoped handler binds it to that session, so the handler
+// can reach its peer without going through the request context.
+TEST(MoQSessionTest, SessionScopedHandlerIsBoundOnRegistration) {
+  folly::EventBase eventBase;
+  auto exec = std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+  auto [clientWt, serverWt] =
+      proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
+  auto session = makeBareSession(exec, clientWt.get());
+
+  auto handler = std::make_shared<ScopedTestHandler>();
+  session->setSubscribeHandler(handler);
+
+  EXPECT_EQ(handler->boundSessionId(), session->sessionId());
+  EXPECT_EQ(handler->getSession(), session);
+
+  // Registering the same handler for the other role on the same session is
+  // how a handler that implements both is wired up, and must be accepted.
+  session->setPublishHandler(handler);
+  EXPECT_EQ(handler->getSession(), session);
+
+  // The publish setter binds on its own: it casts from Publisher*, which is a
+  // different subobject than the subscribe setter casts from.
+  auto publishOnly = std::make_shared<ScopedTestHandler>();
+  session->setPublishHandler(publishOnly);
+  EXPECT_EQ(publishOnly->boundSessionId(), session->sessionId());
+  EXPECT_EQ(publishOnly->getSession(), session);
+}
+
+// A SessionScoped handler serves exactly one peer. Registering it on a second
+// session would silently make it answer for the wrong one.
+TEST(MoQSessionTest, SessionScopedHandlerRejectsASecondSession) {
+  folly::EventBase eventBase;
+  auto exec = std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+  auto [clientWt, serverWt] =
+      proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
+  auto first = makeBareSession(exec, clientWt.get());
+  auto second = makeBareSession(exec, clientWt.get());
+
+  auto handler = std::make_shared<ScopedTestHandler>();
+  first->setSubscribeHandler(handler);
+
+  EXPECT_DEATH(second->setSubscribeHandler(handler), "more than one session");
+}
+
+// The peer is held weakly, so a handler that outlives its session gets null
+// back instead of a dangling one. Both samples that use this API turn that
+// into an error reply, so it has to be reachable.
+TEST(MoQSessionTest, SessionScopedHandlerLosesItsPeerWhenTheSessionGoes) {
+  folly::EventBase eventBase;
+  auto exec = std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+  auto [clientWt, serverWt] =
+      proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
+  auto session = makeBareSession(exec, clientWt.get());
+  auto sessionId = session->sessionId();
+
+  auto handler = std::make_shared<ScopedTestHandler>();
+  session->setSubscribeHandler(handler);
+  ASSERT_NE(handler->getSession(), nullptr);
+
+  // The handler is registered on the session, so drop the handler's own owner
+  // first to break the cycle, then the session.
+  session->setSubscribeHandler(nullptr);
+  session.reset();
+
+  EXPECT_EQ(handler->getSession(), nullptr);
+  EXPECT_EQ(handler->boundSessionId(), sessionId);
 }
 
 TEST(MoQSessionTest, SetVersionFromAlpnLegacy) {
@@ -491,6 +537,39 @@ class RecordingSessionCloseCallback
   std::optional<SessionCloseErrorCode> errorCode;
   folly::coro::Baton closed;
 };
+
+CO_TEST_P_X(DisabledTokenCacheTest, SetupRegistrationsRemainUncached) {
+  RecordingSessionCloseCallback closeCallback;
+  serverSession_->setSessionCloseCallback(&closeCallback);
+  serverSession_->start();
+
+  const std::string token = "uncached-setup-token";
+  expectedSetupTokens_ = {{7, token, 42}, {7, token, 42}};
+  MoQFrameWriter writer;
+  writer.initializeVersion(getServerSelectedVersion());
+  auto setup = getClientSetup(initialMaxRequestID_);
+  for (size_t i = 0; i < 2; ++i) {
+    setup.params.insertParam(Parameter(
+        folly::to_underlying(SetupKey::AUTHORIZATION_TOKEN),
+        writer.encodeRegisterToken(42, 7, token)));
+  }
+
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  EXPECT_TRUE(
+      writeClientSetup(writeBuf, setup, getServerSelectedVersion()).hasValue());
+  auto request = getTrackStatus();
+  request.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
+      writer.encodeUseAlias(42)));
+  EXPECT_TRUE(writer.writeTrackStatus(writeBuf, request).hasValue());
+
+  auto bidi = clientWt_->createBidiStream();
+  EXPECT_TRUE(bidi.hasValue());
+  bidi->writeHandle->writeStreamData(writeBuf.move(), false, nullptr);
+  co_await closeCallback.closed;
+  EXPECT_TRUE(receivedSetup_);
+  EXPECT_EQ(closeCallback.errorCode, SessionCloseErrorCode::PROTOCOL_VIOLATION);
+}
 
 // === AUTHORITY / PATH tests ===
 
@@ -1634,6 +1713,18 @@ CO_TEST_P_X(MoQSessionTest, DatagramBeforeSetup) {
   EXPECT_TRUE(clientWt_->isSessionClosed());
   co_return;
 }
+CO_TEST_P_X(Draft18Test, PeerRequestIDAtEndOfSpaceClosesSession) {
+  co_await setupMoQSession();
+
+  auto subscribeRequest = getSubscribe(kTestTrackName);
+  subscribeRequest.requestID =
+      RequestID(std::numeric_limits<uint64_t>::max() - 1);
+  static_cast<MoQControlCodec::ControlCallback&>(*serverSession_)
+      .onSubscribe(subscribeRequest);
+
+  EXPECT_TRUE(serverWt_->isSessionClosed());
+}
+
 CO_TEST_P_X(Draft18Test, PaddingDatagramIsDiscarded) {
   co_await setupMoQSession();
   MoQFrameWriter writer;
@@ -1678,6 +1769,27 @@ CO_TEST_P_X(MoQSessionTest, EmptyUnidirectionalStream) {
 
   co_await folly::coro::sleep(std::chrono::milliseconds(50));
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// cleanup() erases the pubTracks_ entry before retiring the publisher, so the
+// PUBLISH_DONE it used to send could only miss its own lookup and never reached
+// the wire. The stat has to stay silent with it.
+CO_TEST_P_X(MoQSessionTest, SessionCloseRetiresPublisherWithoutPublishDone) {
+  co_await setupMoQSession();
+  expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
+    EXPECT_FALSE(pub->beginSubgroup(0, 0, 0).hasError());
+    co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+  });
+  auto res = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_FALSE(res.hasError());
+
+  EXPECT_CALL(*serverPublisherStatsCallback_, onPublishDone(_)).Times(0);
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
+      .WillOnce(testing::Return(folly::unit));
+
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+  co_await rescheduleN(2);
 }
 
 // === Uni Control Stream tests (draft-18-meta-00) ===
@@ -1822,6 +1934,111 @@ CO_TEST_P_X(MoQUniControlTest, UniControlDataStreamBeforeSetup) {
 
   res.value()->unsubscribe();
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// The peer resolves the alias and ends the subscription in one batch of control
+// messages, so the waiting read loop wakes to find the state gone again.
+CO_TEST_P_X(MoQUniControlTest, UnknownAliasResolvedThenRemovedAbandonsStream) {
+  co_await setupMoQSession();
+  MoQSettings moqSettings;
+  moqSettings.unknownAliasTimeout = std::chrono::seconds(5);
+  clientSession_->setMoqSettings(moqSettings);
+
+  auto dataWh = CHECK_NOTNULL(serverWt_->createUniStream().value_or(nullptr));
+  folly::IOBufQueue dataBuf{folly::IOBufQueue::cacheChainLength()};
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft18);
+  const TrackAlias trackAlias{0};
+  ObjectHeader objHeader(0, 0, 0, 0, ObjectStatus::NORMAL);
+  objHeader.length = 5;
+  writer.writeSubgroupHeader(
+      dataBuf, trackAlias, objHeader, SubgroupOptions{.hasExtensions = true});
+  writer.writeStreamObject(
+      dataBuf,
+      getSubgroupStreamType(
+          kVersionDraft18, SubgroupIDFormat::Present, true, false),
+      objHeader,
+      makeBuf(5));
+  dataWh->writeStreamData(dataBuf.move(), false, nullptr);
+
+  co_await rescheduleN(2);
+
+  // Hold the server's responses so that SUBSCRIBE_OK and PUBLISH_DONE arrive
+  // together and the client handles both before the waiting read loop runs.
+  auto serverControl = serverWt_->writeHandles.at(3);
+  EXPECT_NE(serverControl, nullptr);
+  serverControl->setImmediateDelivery(false);
+  folly::coro::Baton serverHandledSubscribe;
+  expectSubscribe([&](auto sub, auto pub) -> TaskSubscribeResult {
+    EXPECT_TRUE(
+        pub->publishDone(getTrackEndedPublishDone(sub.requestID)).hasValue());
+    serverHandledSubscribe.post();
+    co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+  });
+
+  folly::coro::Baton publishDoneReceived;
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
+      .WillOnce(
+          testing::Invoke(
+              [&](PublishDone)
+                  -> folly::Expected<folly::Unit, MoQPublishError> {
+                publishDoneReceived.post();
+                return folly::unit;
+              }));
+
+  auto subscribeFuture =
+      folly::coro::co_withExecutor(
+          MoQExecutor_.get(),
+          folly::coro::co_invoke([&]() -> folly::coro::Task<void> {
+            auto result = co_await clientSession_->subscribe(
+                getSubscribe(kTestTrackName), subscribeCallback_);
+            EXPECT_TRUE(result.hasValue());
+          }))
+          .start();
+  co_await serverHandledSubscribe;
+  co_await rescheduleN(2);
+  serverControl->deliverInflightData();
+
+  co_await std::move(subscribeFuture);
+  co_await publishDoneReceived;
+  co_await rescheduleN(4);
+
+  // The read loop found the state gone on replay and stopped reading, which
+  // reaches the publisher as STOP_SENDING.
+  EXPECT_TRUE(
+      serverWt_->writeHandles.at(dataWh->getID())->getWriteErr().has_value());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// Closing with a read loop still waiting destroys its frame.  Nothing to assert
+// beyond surviving it; the sanitizer builds are the real check.
+CO_TEST_P_X(MoQUniControlTest, UnknownAliasSessionTeardownDropsWaiter) {
+  co_await setupMoQSession();
+  MoQSettings moqSettings;
+  moqSettings.unknownAliasTimeout = std::chrono::seconds(5);
+  clientSession_->setMoqSettings(moqSettings);
+
+  auto dataWh = CHECK_NOTNULL(serverWt_->createUniStream().value_or(nullptr));
+  folly::IOBufQueue dataBuf{folly::IOBufQueue::cacheChainLength()};
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft18);
+  const TrackAlias trackAlias{0};
+  ObjectHeader objHeader(0, 0, 0, 0, ObjectStatus::NORMAL);
+  objHeader.length = 5;
+  writer.writeSubgroupHeader(
+      dataBuf, trackAlias, objHeader, SubgroupOptions{.hasExtensions = true});
+  writer.writeStreamObject(
+      dataBuf,
+      getSubgroupStreamType(
+          kVersionDraft18, SubgroupIDFormat::Present, true, false),
+      objHeader,
+      makeBuf(5));
+  dataWh->writeStreamData(dataBuf.move(), false, nullptr);
+
+  co_await rescheduleN(2);
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+  co_await rescheduleN(4);
 }
 
 // Drops everything the peer sends, so a test can drive one session in

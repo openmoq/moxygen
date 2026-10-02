@@ -58,7 +58,7 @@ target_compile_options(
 target_link_libraries(
     moqsessiontestcommon PUBLIC
     moqtestutils
-    moxygen_moq_cluster_session
+    moxygen_moq_relay_session
     moxygen_events_moq_folly_executor_impl
     moxygen_moqclient
     moxygen_relay_moq_relay_client
@@ -99,6 +99,15 @@ moxygen_add_test(TARGET MoQSessionTests
     MoQSessionSubscribeTests.cpp
     MoQSessionTests.cpp
     MoQSessionTrackStatusTests.cpp
+  DEPENDS
+    moqsessiontestcommon
+    testmain
+)
+
+moxygen_add_test(TARGET OpenMOQSessionTests
+  PREFIX "OpenMOQSession"
+  SOURCES
+    OpenMOQSessionTests.cpp
   DEPENDS
     moqsessiontestcommon
     testmain

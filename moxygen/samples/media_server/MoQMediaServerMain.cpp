@@ -4,27 +4,29 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <moxygen/MoQVersions.h>
 #include <moxygen/samples/media_server/FilePrControlServer.h>
 #include <moxygen/samples/media_server/MoQBroadcastDispatcher.h>
 #include <moxygen/samples/media_server/MoQBroadcastFactory.h>
-#include <moxygen/samples/media_server/MoQMediaServer.h>
+#include <moxygen/samples/media_server/MoQMediaListeners.h>
 #include <moxygen/util/SignalHandler.h>
 
-#include <proxygen/httpserver/samples/hq/FizzContext.h>
-
 #include <folly/SocketAddress.h>
+#include <folly/String.h>
 #include <folly/init/Init.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/ScopedEventBaseThread.h>
 #include <folly/logging/xlog.h>
 
 #include <chrono>
+#include <cstdlib>
+#include <exception>
 #include <memory>
 #include <string>
 #include <vector>
 
-DEFINE_int32(port, 9779, "Server port");
+DEFINE_int32(port, 9779, "Server port (UDP for QUIC, TCP for QMUX)");
+DEFINE_bool(quic, true, "Listen on QUIC/WebTransport (UDP)");
+DEFINE_bool(qmux, true, "Listen on QMUX-on-TCP (TLS via Fizz is mandatory)");
 DEFINE_string(cert, "", "Cert path");
 DEFINE_string(key, "", "Key path");
 DEFINE_bool(
@@ -42,6 +44,12 @@ DEFINE_int32(
     10,
     "Seconds between file_abr catalog updates");
 DEFINE_bool(loop, false, "Loop the fMP4 source forever");
+DEFINE_string(
+    file_namespace_aliases,
+    "",
+    "Comma-separated first namespace fields served like 'file', e.g. "
+    "'moq-media' for clients that subscribe to [\"moq-media\"]; empty "
+    "disables");
 DEFINE_int32(
     file_pr_control_port,
     60101,
@@ -50,23 +58,25 @@ DEFINE_int32(
 namespace {
 using namespace moxygen;
 using namespace moxygen::media_server;
-
-std::vector<std::string> serverAlpns() {
-  std::vector<std::string> alpns = {"h3"};
-  auto moqt = getMoqtProtocols("", true);
-  alpns.insert(alpns.end(), moqt.begin(), moqt.end());
-  return alpns;
-}
 } // namespace
 
 int main(int argc, char* argv[]) {
   folly::Init init(&argc, &argv, true);
 
   XCHECK(!FLAGS_input.empty()) << "--input is required";
+  XCHECK(FLAGS_quic || FLAGS_qmux)
+      << "At least one of --quic or --qmux must be enabled";
   XCHECK_GT(FLAGS_fragment_interval_ms, 0);
   XCHECK_GT(FLAGS_catalog_update_interval, 0);
   XCHECK_GE(FLAGS_file_pr_control_port, 0);
   XCHECK_LE(FLAGS_file_pr_control_port, 65535);
+
+  std::vector<std::string> fileNamespaceAliases;
+  folly::split(
+      ',',
+      FLAGS_file_namespace_aliases,
+      fileNamespaceAliases,
+      /*ignoreEmpty=*/true);
 
   folly::ScopedEventBaseThread worker("MoQMediaWorker");
   auto* workerEvb = worker.getEventBase();
@@ -82,27 +92,32 @@ int main(int argc, char* argv[]) {
           std::chrono::milliseconds(FLAGS_fragment_interval_ms),
           std::chrono::seconds(FLAGS_catalog_update_interval),
           FLAGS_loop,
+          fileNamespaceAliases,
           workerEvb),
-      workerEvb);
+      *workerEvb);
 
-  const auto alpns = serverAlpns();
-  auto fizzContext = FLAGS_insecure
-      ? quic::samples::createFizzServerContextWithInsecureDefault(
-            alpns,
-            fizz::server::ClientAuthMode::None,
-            "" /* cert */,
-            "" /* key */)
-      : quic::samples::createFizzServerContext(
-            alpns, fizz::server::ClientAuthMode::None, FLAGS_cert, FLAGS_key);
-  auto server =
-      std::make_shared<MoQMediaServer>(fizzContext, "/moq-media", dispatcher);
-
-  folly::SocketAddress addr("::", FLAGS_port);
-  server->start(addr, {workerEvb});
-  server->waitUntilInitialized();
-  XLOG(INFO) << "[main] MoQMediaServer listening port=" << FLAGS_port
-             << " (namespaces resolved by prefix; file backend input="
-             << FLAGS_input << ")";
+  MediaListeners listeners;
+  try {
+    listeners = startMediaListeners(
+        dispatcher,
+        folly::SocketAddress("::", FLAGS_port),
+        MediaListenerOptions{
+            .quic = FLAGS_quic,
+            .qmux = FLAGS_qmux,
+            .cert = FLAGS_cert,
+            .key = FLAGS_key,
+            .insecure = FLAGS_insecure});
+  } catch (const std::exception& ex) {
+    XLOG(ERR) << "[main] failed to start listeners: " << ex.what();
+    return EXIT_FAILURE;
+  }
+  XLOG(INFO)
+      << "[main] MoQMediaServer listening quic="
+      << (listeners.quic ? listeners.quic->getAddress().describe() : "off")
+      << " qmux="
+      << (listeners.qmux ? listeners.qmux->getAddress().describe() : "off")
+      << " (namespaces resolved by prefix; file backend input=" << FLAGS_input
+      << " aliases=" << FLAGS_file_namespace_aliases << ")";
 
   std::unique_ptr<FilePrControlServer> filePrControl;
   if (FLAGS_file_pr_control_port > 0) {
@@ -119,7 +134,7 @@ int main(int argc, char* argv[]) {
   evb.loopForever();
 
   filePrControl.reset();
-  server->stop();
+  listeners.stop();
   XLOG(INFO) << "[main] stopped";
   return 0;
 }

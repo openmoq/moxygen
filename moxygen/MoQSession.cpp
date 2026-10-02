@@ -1475,6 +1475,13 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     }
   }
 
+  void sessionClosed(ResetStreamErrorCode code) override {
+    // Clear session_ last: each subgroup reports onSubscriptionStreamClosed.
+    resetAllSubgroups(code);
+    subscriptionHandle_.reset();
+    setSession(nullptr);
+  }
+
   void resetForGoaway(ResetStreamErrorCode code) override {
     if (!subscriptionHandle_) {
       resetAllSubgroups(code);
@@ -1632,6 +1639,15 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
     reset(error);
   }
 
+  void sessionClosed(ResetStreamErrorCode code) override {
+    // Clear streamPublisher_ first so onStreamComplete skips fetchComplete.
+    // Clear session_ last: the reset reports onSubgroupReset.
+    if (auto streamPublisher = std::exchange(streamPublisher_, nullptr)) {
+      streamPublisher->reset(code);
+    }
+    setSession(nullptr);
+  }
+
   void resetForGoaway(ResetStreamErrorCode code) override {
     // Reset the request (bidi) stream first; reset() below resets the data
     // stream and drives fetchComplete -> pubTracks_.erase + retireRequestID.
@@ -1649,6 +1665,10 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
 
   void onStreamComplete(const ObjectHeader&) override {
     cancelGoawayResetTimer();
+    if (!streamPublisher_) {
+      // sessionClosed() cleared streamPublisher_ and retired this publisher.
+      return;
+    }
     streamPublisher_.reset();
     PublisherImpl::fetchComplete();
   }
@@ -2544,12 +2564,15 @@ MoQSession::MoQSession(
       nextRequestID_(0),
 
       nextExpectedPeerRequestID_(1),
-      nextPeerRequestIDForGoaway_(1) {}
+      nextPeerRequestIDForGoaway_(1) {
+  controlCodec_->setTokenCache(&receiveTokenCache_);
+}
 
 MoQSession::MoQSession(
     folly::MaybeManagedPtr<proxygen::WebTransport> wt,
     ServerSetupCallback& serverSetupCallback,
-    std::shared_ptr<MoQExecutor> exec)
+    std::shared_ptr<MoQExecutor> exec,
+    bool authTokenCacheEnabled)
     : dir_(MoQControlCodec::Direction::SERVER),
       wt_(std::move(wt)),
       exec_(std::move(exec)),
@@ -2557,10 +2580,21 @@ MoQSession::MoQSession(
       nextRequestID_(1),
       nextExpectedPeerRequestID_(0),
       nextPeerRequestIDForGoaway_(0),
-      serverSetupCallback_(&serverSetupCallback) {}
+      serverSetupCallback_(&serverSetupCallback),
+      authTokenCacheEnabled_(authTokenCacheEnabled),
+      tokenCache_(authTokenCacheEnabled ? kMaxSendTokenCacheSize : 0) {
+  // Legacy CLIENT_SETUP is parsed before the application chooses its final
+  // advertised budget, so optimistic registrations need a bounded ceiling.
+  receiveTokenCache_.setMaxSize(
+      authTokenCacheEnabled_ ? kMaxReceiveTokenCacheSize : 0);
+  controlCodec_->setTokenCache(&receiveTokenCache_);
+}
 
 MoQSession::~MoQSession() {
   cleanup();
+  // An owner may release the session without close(). Loops that exec_ has
+  // not started yet check this token before they touch the session.
+  cancellationSource_.requestCancellation();
   if (logger_) {
     logger_->outputLogs();
   }
@@ -2580,20 +2614,13 @@ void MoQSession::cleanup() {
   }
   while (!pubTracks_.empty()) {
     auto it = pubTracks_.begin();
-    auto requestID = it->first;
     auto pubTrack = std::move(it->second);
     pubTracks_.erase(it);
     if (const auto& control = pubTrack->bidiControl()) {
       control->disarmOnPeerTermination();
     }
     endSubscriptionStat(*pubTrack);
-    pubTrack->terminatePublish(
-        PublishDone(
-            {requestID,
-             PublishDoneStatusCode::SESSION_CLOSED,
-             0,
-             "Session Closed"}),
-        ResetStreamErrorCode::SESSION_CLOSED);
+    pubTrack->sessionClosed(ResetStreamErrorCode::SESSION_CLOSED);
   }
   for (auto it = subTracks_.begin(); it != subTracks_.end();) {
     auto sub = it->second;
@@ -3057,8 +3084,9 @@ folly::Expected<folly::Unit, quic::TransportErrorCode> MoQSession::sendSetup(
   // Set up the shared receive-side token cache and point the control codec
   // at it. The cache is necessarily empty at this point.
   receiveTokenCache_.setMaxSize(
-      getMaxAuthTokenCacheSizeIfPresent(
-          setup.params, setupSerializationVersion),
+      authTokenCacheEnabled_ ? getMaxAuthTokenCacheSizeIfPresent(
+                                   setup.params, setupSerializationVersion)
+                             : 0,
       /*evict=*/!isClient);
   controlCodec_->setTokenCache(&receiveTokenCache_);
   // Optimistically registers params without knowing peer's capabilities
@@ -3086,6 +3114,11 @@ void MoQSession::initLocalMaxRequestID(uint64_t fromParam) {
 
 void MoQSession::initPeerMaxRequestID(const Parameters& peerParams) {
   if (negotiatedVersion_ && useBidiRequestStreams(*negotiatedVersion_)) {
+    if (getMaxRequestIDIfPresent(peerParams) != 0) {
+      XLOG(WARN) << "Ignoring MAX_REQUEST_ID setup param, removed in draft "
+                 << getDraftMajorVersion(*negotiatedVersion_)
+                 << " sess=" << this;
+    }
     peerMaxRequestID_ = std::numeric_limits<uint64_t>::max();
   } else {
     peerMaxRequestID_ = getMaxRequestIDIfPresent(peerParams);
@@ -3161,7 +3194,9 @@ void MoQSession::onServerSetup(Setup serverSetup) {
   auto peerAuthCacheSize = getMaxAuthTokenCacheSizeIfPresent(
       serverSetup.params, *getNegotiatedVersion());
   tokenCache_.setMaxSize(
-      std::min(kMaxSendTokenCacheSize, peerAuthCacheSize),
+      authTokenCacheEnabled_
+          ? std::min(kMaxSendTokenCacheSize, peerAuthCacheSize)
+          : 0,
       /*evict=*/true);
   setupPromise_.setValue(std::move(serverSetup));
 }
@@ -3187,7 +3222,9 @@ void MoQSession::onClientSetup(Setup clientSetup) {
   auto peerAuthCacheSize = getMaxAuthTokenCacheSizeIfPresent(
       clientSetup.params, negotiatedVersion_.value_or(kVersionDraft14));
   tokenCache_.setMaxSize(
-      std::min(kMaxSendTokenCacheSize, peerAuthCacheSize),
+      authTokenCacheEnabled_
+          ? std::min(kMaxSendTokenCacheSize, peerAuthCacheSize)
+          : 0,
       /*evict=*/true);
 
   auto clientAuthority = getFirstStringParam(
@@ -3385,11 +3422,12 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
     std::shared_ptr<BidiStreamControl> control,
     std::unique_ptr<MoQControlCodec::ControlCallback> senderCallback) {
   XLOG(DBG1) << __func__ << " sess=" << this;
+  // The session may be gone by the time exec_ starts this loop.
+  co_await folly::coro::co_safe_point;
   const auto negotiatedVersion = negotiatedVersion_;
   auto g = folly::makeGuard([func = __func__, this] {
     XLOG(DBG1) << "exit " << func << " sess=" << this;
   });
-  co_await folly::coro::co_safe_point;
   auto* controlCodec = codec ? codec.get() : controlCodec_.get();
   auto streamId = readHandle.id();
   controlCodec->setStreamId(streamId);
@@ -3578,8 +3616,8 @@ std::shared_ptr<MoQSession::SubscribeTrackReceiveState>
 MoQSession::getSubscribeTrackReceiveState(TrackAlias trackAlias) {
   auto trackIt = subTracks_.find(trackAlias);
   if (trackIt == subTracks_.end()) {
-    // received an object for unknown track alias
-    XLOG(ERR) << "unknown track alias=" << trackAlias << " sess=" << this;
+    XLOG(DBG1) << "No subscription state for track alias=" << trackAlias
+               << " sess=" << this;
     return nullptr;
   }
   return trackIt->second;
@@ -4090,9 +4128,6 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
   MoQObjectStreamCodec codec(nullptr);
   codec.initializeVersion(*negotiatedVersion_, negotiatedExtensions_);
 
-  // Baton for waiting on unknown alias
-  TimedBaton aliasBaton;
-
   // Lambda for onSubgroup
   TrackAlias deferredAlias{std::numeric_limits<uint64_t>::max()};
   uint64_t deferredGroup = 0;
@@ -4102,7 +4137,6 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
   auto token = co_await folly::coro::co_current_cancellation_token;
   auto onSubgroupFunc = [this,
                          &token,
-                         &aliasBaton,
                          &deferredAlias,
                          &deferredGroup,
                          &deferredSubgroup,
@@ -4117,9 +4151,7 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
       -> std::shared_ptr<SubscribeTrackReceiveState> {
     auto state = getSubscribeTrackReceiveState(alias);
     if (!state) {
-      XLOG(DBG4) << "State not ready, adding baton to bufferedSubgroups_["
-                 << alias << "]";
-      bufferedSubgroups_[alias].push_back(&aliasBaton);
+      XLOG(DBG4) << "State not ready for alias=" << alias;
       deferredAlias = alias;
       deferredGroup = group;
       deferredSubgroup = subgroup;
@@ -4217,15 +4249,19 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
       // Handle BLOCKED state (subgroup alias not yet known)
       if (result == MoQCodec::ParseResult::BLOCKED) {
         XLOG(DBG4) << "Parser returned BLOCKED, waiting for signal id=" << id;
+        // Heap allocated so that a stream that does not block only costs the
+        // frame a pointer.  The destructor unlinks it however this loop exits.
+        auto waiter = std::make_unique<AliasWaiter>(*this, deferredAlias);
+        bufferedSubgroups_[deferredAlias].push_back(*waiter);
         // Merged token for baton waits (session + readHandle)
         auto batonWaitToken = folly::cancellation_token_merge(
             cancellationSource_.getToken(), readHandle.cancelToken());
         auto waitRes = co_await co_awaitTry(co_withCancellation(
-            batonWaitToken, aliasBaton.wait(moqSettings_.unknownAliasTimeout)));
+            batonWaitToken,
+            waiter->baton.wait(moqSettings_.unknownAliasTimeout)));
         if (waitRes.hasException()) {
           XLOG(ERR) << "Timed out waiting for subscription state id=" << id
                     << " sess=" << this;
-          removeBufferedSubgroupBaton(deferredAlias, &aliasBaton);
           break;
         }
         result = dcb.onSubgroup(
@@ -4261,6 +4297,8 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
       break;
     }
   }
+  // A consumer left open after a cancel still gets its one terminal callback.
+  dcb.reset(ResetStreamErrorCode::CANCELLED);
   // ~ReadHandleRef sends STOP_SENDING if the handle is still live.
 }
 
@@ -4807,9 +4845,8 @@ void MoQSession::onSubscribeOk(SubscribeOk subOk) {
     close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
     return;
   }
-  auto trackReceiveState = std::move(*trackPtr);
-  pendingRequests_.erase(it);
-  pendingSubscribeTracks_.erase(trackReceiveState->fullTrackName());
+  // Keep the pending request registered so close() can complete it on error.
+  auto trackReceiveState = *trackPtr;
 
   auto res = reqIdToTrackAlias_.try_emplace(subOk.requestID, subOk.trackAlias);
   if (!res.second) {
@@ -4824,7 +4861,10 @@ void MoQSession::onSubscribeOk(SubscribeOk subOk) {
     XLOG(ERR) << "TrackAlias already in use" << subOk.trackAlias
               << " sess=" << this;
     close(SessionCloseErrorCode::DUPLICATE_TRACK_ALIAS);
+    return;
   }
+  pendingRequests_.erase(it);
+  pendingSubscribeTracks_.erase(trackReceiveState->fullTrackName());
   auto trackAlias = subOk.trackAlias;
   setPublisherPriorityFromParams(
       subOk.params, subOk.extensions, trackReceiveState);
@@ -4847,27 +4887,37 @@ void MoQSession::deliverBufferedData(TrackAlias trackAlias) {
 
   auto subgroupsIt = bufferedSubgroups_.find(trackAlias);
   if (subgroupsIt != bufferedSubgroups_.end()) {
-    auto subgroups = std::move(subgroupsIt->second);
+    // Detach the whole list before signaling anything.
+    auto ready = std::move(subgroupsIt->second);
     bufferedSubgroups_.erase(subgroupsIt);
-    XLOG(DBG4) << "Signaling " << subgroups.size()
-               << " batons for alias=" << trackAlias;
-    for (auto* baton : subgroups) {
-      baton->signal();
+    XLOG(DBG4) << "Signaling " << ready.size()
+               << " waiters for alias=" << trackAlias;
+    while (!ready.empty()) {
+      ready.front().deliver();
     }
   }
 }
 
-// Helper to remove a particular alias/baton from bufferedSubgroups_
-void MoQSession::removeBufferedSubgroupBaton(
-    TrackAlias alias,
-    TimedBaton* baton) {
+MoQSession::AliasWaiter::~AliasWaiter() {
+  if (hook.is_linked()) {
+    // Unlink first; prune erases the entry only once the list is empty.
+    hook.unlink();
+    session_.pruneBufferedSubgroups(alias_);
+  }
+}
+
+// Leave the list before signaling; the signal can resume a waiter inline.
+void MoQSession::AliasWaiter::deliver() {
+  hook.unlink();
+  baton.signal();
+}
+
+// Erase the alias only once its last waiter unlinks; other streams may still be
+// waiting on the same alias.
+void MoQSession::pruneBufferedSubgroups(TrackAlias alias) {
   auto it = bufferedSubgroups_.find(alias);
-  if (it != bufferedSubgroups_.end()) {
-    auto& batonList = it->second;
-    batonList.remove(baton);
-    if (batonList.empty()) {
-      bufferedSubgroups_.erase(it);
-    }
+  if (it != bufferedSubgroups_.end() && it->second.empty()) {
+    bufferedSubgroups_.erase(it);
   }
 }
 
@@ -6148,7 +6198,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
   };
   if (draining_ || closed_) {
     SubscribeError subscribeError = {
-        std::numeric_limits<uint64_t>::max(),
+        failedLocalRequestID(),
         SubscribeErrorCode::INTERNAL_ERROR,
         "draining/closed session"};
     MOQ_SUBSCRIBER_STATS(
@@ -6367,14 +6417,14 @@ void MoQSession::endSubscriptionStat(PublisherImpl& pubTrack) {
 
 void MoQSession::sendPublishDone(const PublishDone& pubDone) {
   XLOG(DBG1) << __func__ << " sess=" << this;
-  MOQ_PUBLISHER_STATS(
-      publisherStatsCallback_, onPublishDone, pubDone.statusCode);
   auto it = pubTracks_.find(pubDone.requestID);
   if (it == pubTracks_.end()) {
     XLOG(ERR) << "publishDone for invalid id=" << pubDone.requestID
               << " sess=" << this;
     return;
   }
+  MOQ_PUBLISHER_STATS(
+      publisherStatsCallback_, onPublishDone, pubDone.statusCode);
   auto pubTrack = it->second;
   pubTrack->cancelGoawayResetTimer();
   endSubscriptionStat(*pubTrack);
@@ -6666,7 +6716,7 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
       folly::makeGuard([func = __func__] { XLOG(DBG1) << "exit " << func; });
   if (draining_ || closed_) {
     FetchError fetchError = {
-        std::numeric_limits<uint64_t>::max(),
+        failedLocalRequestID(),
         FetchErrorCode::INTERNAL_ERROR,
         "draining/closed session"};
     MOQ_SUBSCRIBER_STATS(
@@ -6834,8 +6884,8 @@ folly::coro::Task<MoQSession::JoinResult> MoQSession::join(
     std::shared_ptr<FetchConsumer> fetchCallback,
     FetchType fetchType) {
   Fetch fetchReq(
-      0,              // will be picked by fetch()
-      nextRequestID_, // this will be the ID for subscribe()
+      0,            // will be picked by fetch()
+      std::nullopt, // resolved by FullTrackName match in resolveJoiningFetch
       joiningStart,
       fetchType,
       fetchPri,
@@ -7051,7 +7101,7 @@ std::optional<MoQSession::BidiStreamConfig> MoQSession::getBidiStreamConfig(
             nullptr};
       case FrameType::PUBLISH_NAMESPACE:
         // Publisher (sender) closes the stream (FIN or RST) to withdraw
-        // the announce — both signal end-of-PUBLISH_NAMESPACE.
+        // the publish namespace — both signal end-of-PUBLISH_NAMESPACE.
         return BidiStreamConfig{
             {FrameType::PUBLISH_NAMESPACE, FrameType::REQUEST_UPDATE},
             [this](RequestID id, std::optional<ResetStreamErrorCode>) {
@@ -7340,6 +7390,15 @@ bool MoQSession::closeSessionIfRequestIDInvalid(
       nextExpectedPeerRequestID_ += getRequestIDMultiplier();
     } // in draft 16+, request IDs can come out of order
     if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
+      // Draft 18 dropped MAX_REQUEST_ID, so nothing else keeps the cutoff
+      // from wrapping.
+      if (requestID.value >
+          std::numeric_limits<uint64_t>::max() - getRequestIDMultiplier()) {
+        XLOG(ERR) << "requestID exhausts the ID space: " << requestID
+                  << " sess=" << this;
+        close(SessionCloseErrorCode::INVALID_REQUEST_ID);
+        return true;
+      }
       nextPeerRequestIDForGoaway_ = std::max(
           nextPeerRequestIDForGoaway_,
           requestID.value + getRequestIDMultiplier());
@@ -7374,6 +7433,9 @@ void MoQSession::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
   negotiatedVersion_ = negotiatedVersion;
   moqFrameWriter_.initializeVersion(*negotiatedVersion_);
   controlCodec_->initializeVersion(*negotiatedVersion_);
+  if (useBidiRequestStreams(*negotiatedVersion_)) {
+    receiveTokenCache_.setMaxSize(0, /*evict=*/true);
+  }
   for (const auto& versionBaton : subgroupsWaitingForVersion_) {
     versionBaton->signal();
   }
@@ -7482,11 +7544,10 @@ uint64_t MoQSession::getMaxAuthTokenCacheSizeIfPresent(
   if (useBidiRequestStreams(version)) {
     return 0;
   }
-  constexpr uint64_t kMaxAuthTokenCacheSize = 4096;
   for (const auto& param : params) {
     if (param.key ==
         folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE)) {
-      return std::min(param.asUint64, kMaxAuthTokenCacheSize);
+      return std::min(param.asUint64, kMaxReceiveTokenCacheSize);
     }
   }
   return 0;
@@ -7530,7 +7591,8 @@ void MoQSession::aliasifyAuthTokens(
     // bidi streams, breaking the request-order assumption). Bypass the
     // tokenCache_ branch unconditionally — the send-side cache may still
     // hold a pre-SETUP default size before negotiation completes.
-    const bool aliasingDisabled = useBidiRequestStreams(*version);
+    const bool aliasingDisabled =
+        !authTokenCacheEnabled_ || useBidiRequestStreams(*version);
     if (!aliasingDisabled && token.alias &&
         token.tokenValue.size() < tokenCache_.maxTokenSize()) {
       auto lookupRes =
@@ -7843,6 +7905,17 @@ std::shared_ptr<MoQSession> MoQSession::getRequestSession() {
   return sessionData->session;
 }
 
+MoQSession::RequestContext MoQSession::getRequestContext() {
+  auto session = getRequestSession();
+  // The negotiated version is unset during teardown before SETUP completed.
+  // getDraftMajorVersion(0) is 0, so a version check denies rather than
+  // crashing.
+  return RequestContext{
+      session->sessionId(),
+      session->getNegotiatedVersion().value_or(0),
+      session->getExecutor()};
+}
+
 SessionId MoQSession::makeSessionId() {
   // Never returns 0, which is what kUnsetSessionId relies on.
   return SessionId(folly::processLocalUniqueId());
@@ -7877,12 +7950,35 @@ void MoQSession::setMoqSettings(MoQSettings settings) {
   moqSettings_ = settings;
 }
 
+void SessionScoped::bind(const std::shared_ptr<MoQSession>& session) {
+  XCHECK(session);
+  if (bound_) {
+    XCHECK(sessionId_ == session->sessionId())
+        << "SessionScoped handler registered on more than one session";
+    return;
+  }
+  session_ = session;
+  sessionId_ = session->sessionId();
+  bound_ = true;
+}
+
+std::shared_ptr<MoQSession> SessionScoped::getSession() const {
+  XCHECK(bound_) << "SessionScoped handler used before it was registered";
+  return session_.lock();
+}
+
 void MoQSession::setPublishHandler(std::shared_ptr<Publisher> publishHandler) {
+  if (auto* scoped = dynamic_cast<SessionScoped*>(publishHandler.get())) {
+    scoped->bind(shared_from_this());
+  }
   publishHandler_ = std::move(publishHandler);
 }
 
 void MoQSession::setSubscribeHandler(
     std::shared_ptr<Subscriber> subscribeHandler) {
+  if (auto* scoped = dynamic_cast<SessionScoped*>(subscribeHandler.get())) {
+    scoped->bind(shared_from_this());
+  }
   subscribeHandler_ = std::move(subscribeHandler);
 }
 

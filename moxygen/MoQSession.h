@@ -16,6 +16,7 @@
 #include <folly/CancellationToken.h>
 #include <folly/MaybeManagedPtr.h>
 #include <folly/container/F14Map.h>
+#include <folly/container/IntrusiveList.h>
 #include <folly/coro/Promise.h>
 #include <folly/coro/Task.h>
 #include <folly/logging/xlog.h>
@@ -136,6 +137,37 @@ class SubscribeTracksReply : public MessageReply,
   bool errorSent_{false};
 };
 
+class MoQSession;
+
+// Mixin for a Publisher or Subscriber that serves exactly one peer, which it
+// reaches through getSession(). Construct one per session and register it;
+// MoQSession binds it on the way in. The peer is held weakly, because the
+// session owns the handler.
+class SessionScoped {
+ public:
+  // Null once the session is gone. Invalid to call before the handler has been
+  // registered on a session.
+  std::shared_ptr<MoQSession> getSession() const;
+
+  SessionId boundSessionId() const {
+    return sessionId_;
+  }
+
+ protected:
+  SessionScoped() = default;
+  ~SessionScoped() = default;
+
+ private:
+  friend class MoQSession;
+  // Registering the same handler on a second session is a programming error:
+  // the handler would silently start answering for the wrong peer.
+  void bind(const std::shared_ptr<MoQSession>& session);
+
+  std::weak_ptr<MoQSession> session_;
+  SessionId sessionId_;
+  bool bound_{false};
+};
+
 class MoQSession : public Subscriber,
                    public Publisher,
                    public MoQControlCodec::ControlCallback,
@@ -158,9 +190,24 @@ class MoQSession : public Subscriber,
 
   static std::shared_ptr<MoQSession> getRequestSession();
 
+  // Facts about the peer serving the current request. A value, so a handler
+  // that only needs to know who is calling cannot call them back.
+  struct RequestContext {
+    SessionId sessionId;
+    uint64_t version{0};
+    MoQExecutor* executor{nullptr};
+  };
+
+  // Only valid while handling a request.
+  static RequestContext getRequestContext();
+
   SessionId sessionId() const {
     return id_;
   }
+
+  // Unique within the process, so a forwarder subscriber that is not a session
+  // can use one as its key.
+  static SessionId makeSessionId();
 
   void setServerMaxTokenCacheSizeGuess(size_t size);
 
@@ -221,7 +268,8 @@ class MoQSession : public Subscriber,
   explicit MoQSession(
       folly::MaybeManagedPtr<proxygen::WebTransport> wt,
       ServerSetupCallback& serverSetupCallback,
-      std::shared_ptr<MoQExecutor> exec);
+      std::shared_ptr<MoQExecutor> exec,
+      bool authTokenCacheEnabled = true);
 
   void setVersion(uint64_t version);
   void setMoqSettings(MoQSettings settings);
@@ -470,6 +518,10 @@ class MoQSession : public Subscriber,
     virtual void terminatePublish(
         PublishDone pubDone,
         ResetStreamErrorCode error = ResetStreamErrorCode::INTERNAL_ERROR) = 0;
+
+    // Tear down during session close. The entry is already out of pubTracks_,
+    // so reset the data streams and do not answer the peer.
+    virtual void sessionClosed(ResetStreamErrorCode code) = 0;
 
     // End the request after a draft-18 request-stream GOAWAY timeout.
     // Subscriptions use PUBLISH_DONE; FETCH resets its request and data
@@ -844,8 +896,6 @@ class MoQSession : public Subscriber,
 
  private:
   static const folly::RequestToken& sessionRequestToken();
-
-  static SessionId makeSessionId();
 
   const SessionId id_{makeSessionId()};
 
@@ -1424,10 +1474,29 @@ class MoQSession : public Subscriber,
   // (control stream, draft16+ SUBSCRIBE_NAMESPACE bidi streams, etc.) point to
   // this cache so that aliases registered on one stream are visible on all
   // others and the total budget is enforced once rather than per-codec.
+  static constexpr uint64_t kMaxReceiveTokenCacheSize{4096};
   MoQTokenCache receiveTokenCache_;
 
  private:
   class GoawayTimeoutCallback;
+
+  // A data stream read loop that is waiting for an unknown track alias.  The
+  // waiting coroutine frame owns it, so any unwind deregisters it.
+  struct AliasWaiter {
+    AliasWaiter(MoQSession& session, TrackAlias alias)
+        : session_(session), alias_(alias) {}
+    ~AliasWaiter();
+
+    void deliver();
+
+    TimedBaton baton;
+    folly::IntrusiveListHook hook;
+
+   private:
+    MoQSession& session_;
+    TrackAlias alias_;
+  };
+  using AliasWaiterList = folly::IntrusiveList<AliasWaiter, &AliasWaiter::hook>;
 
   // Private implementation methods
   void initializeNegotiatedVersion(uint64_t negotiatedVersion);
@@ -1436,7 +1505,7 @@ class MoQSession : public Subscriber,
   // this runs before any frame that an extension could alter is sent or
   // parsed.
   void onSetupParams(SetupParameters params, bool local);
-  void removeBufferedSubgroupBaton(TrackAlias alias, TimedBaton* baton);
+  void pruneBufferedSubgroups(TrackAlias alias);
   void scheduleGoawayTimeout(uint64_t timeoutMs);
   void cancelGoawayTimeout();
   void onGoawayTimeoutExpired();
@@ -1452,7 +1521,8 @@ class MoQSession : public Subscriber,
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingSubscribeTracks_;
   folly::F14FastMap<TrackAlias, std::list<Payload>, TrackAlias::hash>
       bufferedDatagrams_;
-  folly::F14FastMap<TrackAlias, std::list<TimedBaton*>, TrackAlias::hash>
+  // F14Node: moving an intrusive list head would relink every waiter.
+  folly::F14NodeMap<TrackAlias, AliasWaiterList, TrackAlias::hash>
       bufferedSubgroups_;
   std::list<std::shared_ptr<moxygen::TimedBaton>> subgroupsWaitingForVersion_;
 
@@ -1481,6 +1551,8 @@ class MoQSession : public Subscriber,
   ServerSetupCallback* serverSetupCallback_{nullptr};
   MoQSessionCloseCallback* closeCallback_{nullptr};
   MoQSettings moqSettings_;
+
+  bool authTokenCacheEnabled_{true};
 
   // Send-side auth token cache (for aliasifyAuthTokens).
   MoQTokenCache tokenCache_{1024};

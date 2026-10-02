@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <folly/CancellationToken.h>
 #include <folly/container/F14Map.h>
 #include <folly/coro/SharedPromise.h>
 #include <folly/futures/HeapTimekeeper.h>
@@ -120,11 +121,12 @@ class MoQTestPublisher : public Publisher,
       MoQTestFetchWindow window);
 
  private:
-  // Tracks one publishTrack that is paused waiting for the peer to ask for
-  // data. Registered so cancelAll() can release it during shutdown, where it
-  // completes with OperationCancelled and unwinds the publish.
-  struct PendingUnpause : public MoQForwarder::Callback {
+  // One publishTrack, from the PUBLISH until its generator finishes. The
+  // publish waits on `unpaused` until the peer turns forwarding on. cancelAll()
+  // cancels both the wait and the generator.
+  struct PublishedTrack : public MoQForwarder::Callback {
     folly::coro::SharedPromise<void> unpaused;
+    folly::CancellationSource cancelSource;
 
     void onEmpty(MoQForwarder*) override {}
 
@@ -137,6 +139,7 @@ class MoQTestPublisher : public Publisher,
     }
 
     void cancel() {
+      cancelSource.requestCancellation();
       if (!unpaused.isFulfilled()) {
         unpaused.setException(
             folly::make_exception_wrapper<folly::OperationCancelled>());
@@ -168,7 +171,7 @@ class MoQTestPublisher : public Publisher,
 
   // Second phase of startPublishTrack.
   folly::coro::Task<void> streamPublishedTrack(
-      std::shared_ptr<PendingUnpause> unpauseCb,
+      std::shared_ptr<PublishedTrack> published,
       std::shared_ptr<MoQForwarder> forwarder,
       MoQTestParameters params,
       RequestID requestID);
@@ -178,7 +181,8 @@ class MoQTestPublisher : public Publisher,
   // covers the track from the start.
   folly::Expected<StandaloneFetch, FetchError> resolveJoiningFetch(
       const Fetch& fetch,
-      const JoiningFetch& joining);
+      const JoiningFetch& joining,
+      SessionId sessionId);
 
   // Runs onFetch and drops the fetch's cancellation source from
   // activeFetches_ however it ends.
@@ -214,7 +218,7 @@ class MoQTestPublisher : public Publisher,
   // request ID as the alias, which is what keeps aliases unique per session.
   std::shared_ptr<MoQForwarder> makeForwarder(
       const FullTrackName& ftn,
-      MoQSession& session);
+      uint64_t version);
 
   // Generates the track and retires it from tracks_ however it ends.
   folly::coro::Task<void> runTrack(
@@ -236,7 +240,7 @@ class MoQTestPublisher : public Publisher,
   // alive, so retireTrack can release this reference from inside a forwarder
   // callback without destroying the forwarder underneath itself.
   folly::F14FastMap<FullTrackName, TrackState, FullTrackName::hash> tracks_;
-  std::vector<std::shared_ptr<PendingUnpause>> pendingUnpauses_;
+  std::vector<std::shared_ptr<PublishedTrack>> publishedTracks_;
   // Cancellation sources for fetches that are still generating objects, so
   // cancelAll() reaches them the way it reaches subscriptions.
   std::vector<std::shared_ptr<folly::CancellationSource>> activeFetches_;

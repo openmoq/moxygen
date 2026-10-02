@@ -477,9 +477,8 @@ void MoQPicoServerBase::onNewConnectionImpl(void* vcnx) {
     auto logger = createLogger();
     auto picoCid = picoquic_get_local_cnxid(cnx);
     if (picoCid.id_len > 0) {
-      logger->setDcid(
-          quic::ConnectionId::createAndMaybeCrash(
-              std::vector<uint8_t>(picoCid.id, picoCid.id + picoCid.id_len)));
+      logger->setDcid(quic::ConnectionId::createAndMaybeCrash(
+          std::vector<uint8_t>(picoCid.id, picoCid.id + picoCid.id_len)));
     }
     moqSession->setLogger(logger);
   }
@@ -574,33 +573,6 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
     return -1;
   }
 
-  // Create PicoH3WebTransport adapter
-  auto webTransport = std::make_shared<PicoH3WebTransport>(
-      cnx, h3Ctx, streamCtx, localSockAddr, peerSockAddr);
-  onWebTransportCreated(*webTransport);
-
-  // Create MoQSession
-  auto moqSession = createSession(webTransport, executor_);
-  if (mLoggerFactory_) {
-    auto logger = createLogger();
-    auto picoCid = picoquic_get_local_cnxid(cnx);
-    if (picoCid.id_len > 0) {
-      logger->setDcid(
-          quic::ConnectionId::createAndMaybeCrash(
-              std::vector<uint8_t>(picoCid.id, picoCid.id + picoCid.id_len)));
-    }
-    moqSession->setLogger(logger);
-  }
-  webTransport->setHandler(moqSession.get());
-
-  // Set path from the HTTP/3 CONNECT request. Authority is not set because
-  // h3zero_header_parts_t does not expose the :authority pseudo-header.
-  const auto& hdr = streamCtx->ps.stream_state.header;
-  if (hdr.path && hdr.path_length > 0) {
-    moqSession->setPath(
-        std::string(reinterpret_cast<const char*>(hdr.path), hdr.path_length));
-  }
-
   // Negotiate MOQT version via WebTransport protocol negotiation.
   // The client sends wt-available-protocols, we select from our supported
   // versions. Note: picowt_select_wt_protocol expects ALPN format (e.g.
@@ -615,14 +587,50 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
              << (clientProtos ? clientProtos : "NULL") << "], server offers ["
              << alpnList << "]";
 
+  const char* selectedProto = nullptr;
   int wtProtoRet = picowt_select_wt_protocol(streamCtx, alpnList.c_str());
   if (wtProtoRet == 0 && streamCtx->ps.stream_state.wt_protocol) {
-    const char* selectedProto = streamCtx->ps.stream_state.wt_protocol;
+    selectedProto = streamCtx->ps.stream_state.wt_protocol;
     XLOG(DBG1) << "WebTransport selected protocol: " << selectedProto;
-    moqSession->validateAndSetVersionFromAlpn(selectedProto);
+  } else if (
+      std::find(alpnProtocols.begin(), alpnProtocols.end(), kAlpnMoqtLegacy) ==
+      alpnProtocols.end()) {
+    // In-band ClientSetup negotiates only draft 14.
+    XLOG(DBG1) << "WT subprotocol not negotiated and draft 14 not offered";
+    return -1;
   } else {
     // No WT subprotocol negotiated; fall back to in-band ClientSetup.
     XLOG(DBG1) << "WT subprotocol not negotiated; using in-band ClientSetup";
+  }
+
+  // Create PicoH3WebTransport adapter
+  auto webTransport = std::make_shared<PicoH3WebTransport>(
+      cnx, h3Ctx, streamCtx, localSockAddr, peerSockAddr);
+  onWebTransportCreated(*webTransport);
+
+  // Create MoQSession
+  auto moqSession = createSession(webTransport, executor_);
+  if (mLoggerFactory_) {
+    auto logger = createLogger();
+    auto picoCid = picoquic_get_local_cnxid(cnx);
+    if (picoCid.id_len > 0) {
+      logger->setDcid(quic::ConnectionId::createAndMaybeCrash(
+          std::vector<uint8_t>(picoCid.id, picoCid.id + picoCid.id_len)));
+    }
+    moqSession->setLogger(logger);
+  }
+  webTransport->setHandler(moqSession.get());
+
+  // Set path from the HTTP/3 CONNECT request. Authority is not set because
+  // h3zero_header_parts_t does not expose the :authority pseudo-header.
+  const auto& hdr = streamCtx->ps.stream_state.header;
+  if (hdr.path && hdr.path_length > 0) {
+    moqSession->setPath(
+        std::string(reinterpret_cast<const char*>(hdr.path), hdr.path_length));
+  }
+
+  if (selectedProto) {
+    moqSession->validateAndSetVersionFromAlpn(selectedProto);
   }
 
   // Store session context on the control stream. Data streams inherit it via

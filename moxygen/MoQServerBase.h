@@ -68,9 +68,18 @@ class MoQServerBase : public MoQSession::ServerSetupCallback,
    */
   void setMLoggerFactory(std::shared_ptr<MLoggerFactory> factory);
 
+  /**
+   * Enable or disable auth token alias caching in both directions.
+   * Configure before accepting sessions.
+   */
+  virtual void setAuthTokenCacheEnabled(bool enabled) {
+    authTokenCacheEnabled_ = enabled;
+  }
+
   // Adds a parameter to every SETUP, replacing (not duplicating) any parameter
   // makeServerSetup() would otherwise send with the same key. Call before
-  // accepting sessions.
+  // accepting sessions. MAX_AUTH_TOKEN_CACHE_SIZE cannot be raised this way
+  // while setAuthTokenCacheEnabled(false) is in effect.
   void addSetupParameter(SetupParameter parameter) {
     setupParams_.emplace_back(std::move(parameter));
   }
@@ -113,6 +122,7 @@ class MoQServerBase : public MoQSession::ServerSetupCallback,
   std::unordered_set<std::string> endpoints_;
   std::shared_ptr<MLoggerFactory> mLoggerFactory_;
   std::vector<SetupParameter> setupParams_;
+  bool authTokenCacheEnabled_{true};
 };
 
 } // namespace moxygen

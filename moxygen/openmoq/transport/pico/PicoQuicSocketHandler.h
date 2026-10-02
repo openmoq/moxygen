@@ -94,6 +94,10 @@ class PicoQuicSocketHandler
     statsCallback_ = cb;
   }
 
+  void startAcceptingPackets() {
+    acceptingPackets_ = true;
+  }
+
  private:
   void pauseRead();
 
@@ -246,6 +250,7 @@ class PicoQuicSocketHandler
   picoquic_quic_t* quic_; // non-owning
   folly::EventBase* evb_; // non-owning
   PicoSocketConfig config_;
+  bool acceptingPackets_{config_.acceptPacketsOnStart};
   PicoQuicStatsCallback* statsCallback_{nullptr}; // non-owning, optional
   int fd_{-1};
   int socketFamily_{AF_UNSPEC}; // AF_INET or AF_INET6, set in start()

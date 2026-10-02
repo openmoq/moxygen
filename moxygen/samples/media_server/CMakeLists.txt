@@ -10,6 +10,7 @@ moxygen_add_library(moxygen_samples_media_server
     MoQBroadcast.cpp
     MoQBroadcastDispatcher.cpp
     MoQBroadcastFactory.cpp
+    MoQMediaListeners.cpp
     PublishLoop.cpp
     sources/CmafFrameChunker.cpp
     sources/FileMediaSourceResolver.cpp
@@ -18,6 +19,10 @@ moxygen_add_library(moxygen_samples_media_server
   DEPS
     moxygen_moq_consumers
     moxygen_moq_publish_error
+    moxygen_moq_versions
+    moxygen_qmux_utils
+    proxygen::proxygen_hq_server
+    fmt::fmt
     Folly::folly_base64
     Folly::folly_dynamic
     Folly::folly_coro_sleep
@@ -26,6 +31,7 @@ moxygen_add_library(moxygen_samples_media_server
   EXPORTED_DEPS
     moxygen_msf_media_catalog
     moxygen_moq
+    moxygen_moq_qmux_server
     moxygen_moq_server
     moxygen_moq_types
     moxygen_relay_moq_forwarder
@@ -37,8 +43,10 @@ moxygen_add_library(moxygen_samples_media_server
     Folly::folly_coro_task
     Folly::folly_executor
     Folly::folly_function
+    Folly::folly_io_async_async_base
     Folly::folly_io_iobuf
     Folly::folly_logging_logging
+    Folly::folly_network_address
 )
 
 # MoQMediaServer binary
@@ -63,15 +71,14 @@ target_link_libraries(
   moq_media_server PUBLIC
   moxygen_samples_media_server
   moxygen_moq_server
-  moxygen_moq_versions
   moxygen_util_signal_handler
-  proxygen::proxygen_hq_server
   Folly::folly_coro_task
   Folly::folly_init_init
   Folly::folly_io_async_async_base
   Folly::folly_io_async_scoped_event_base_thread
   Folly::folly_logging_logging
   Folly::folly_network_address
+  Folly::folly_string
 )
 
 install(

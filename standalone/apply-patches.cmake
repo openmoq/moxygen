@@ -97,8 +97,10 @@ function(apply_dep_patches DEP_NAME SOURCE_DIR)
 
         # A reverse dry-run also succeeds once the change lands upstream and the
         # pin moves past it, which is when the patch should be deleted.
+        # -f: without it, BSD patch (macOS) flips direction on a patch that
+        # looks reversed, so this passes on an unpatched tree.
         execute_process(
-            COMMAND ${PATCH_EXECUTABLE} -p1 -F0 -R --dry-run -i "${_patch}"
+            COMMAND ${PATCH_EXECUTABLE} -p1 -F0 -f -R --dry-run -i "${_patch}"
             WORKING_DIRECTORY "${SOURCE_DIR}"
             RESULT_VARIABLE _rev_rc
             OUTPUT_QUIET ERROR_QUIET
@@ -111,7 +113,7 @@ function(apply_dep_patches DEP_NAME SOURCE_DIR)
         # -F0: patch's default fuzz applies a hunk whose context has drifted,
         # landing a stale patch on code it was never written against.
         execute_process(
-            COMMAND ${PATCH_EXECUTABLE} -p1 -F0 --dry-run -i "${_patch}"
+            COMMAND ${PATCH_EXECUTABLE} -p1 -F0 -f --dry-run -i "${_patch}"
             WORKING_DIRECTORY "${SOURCE_DIR}"
             RESULT_VARIABLE _fwd_rc
             OUTPUT_VARIABLE _fwd_out
@@ -126,7 +128,7 @@ function(apply_dep_patches DEP_NAME SOURCE_DIR)
         endif()
 
         execute_process(
-            COMMAND ${PATCH_EXECUTABLE} -p1 -F0 -i "${_patch}"
+            COMMAND ${PATCH_EXECUTABLE} -p1 -F0 -f -i "${_patch}"
             WORKING_DIRECTORY "${SOURCE_DIR}"
             RESULT_VARIABLE _apply_rc
             OUTPUT_VARIABLE _apply_out

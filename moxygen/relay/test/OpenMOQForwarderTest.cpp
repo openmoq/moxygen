@@ -19,10 +19,6 @@ using namespace moxygen;
 namespace moxygen::test {
 
 namespace {
-struct DummyExecutor : public folly::Executor {
-  void add(folly::Func) override {}
-};
-
 struct ForwardChangedTracker : public MoQForwarder::Callback {
   void onEmpty(MoQForwarder*) override {
     emptyCalls++;
@@ -90,7 +86,7 @@ class OpenMOQForwarderTest : public ::testing::Test {
     sub.requestID = requestID;
     sub.locType = locType;
     return forwarder.addSubscriber(
-        std::move(session), sub, std::move(consumer));
+        session->sessionId(), sub, std::move(consumer));
   }
 };
 
@@ -106,6 +102,29 @@ TEST_F(OpenMOQForwarderTest, SubscriberIsPinnedReflectsPinnedField) {
   EXPECT_TRUE(subscriber->isPinned());
 }
 
+TEST_F(OpenMOQForwarderTest, MintedSessionIdsAreDistinct) {
+  auto session = createMockSession();
+  auto minted1 = MoQSession::makeSessionId();
+  auto minted2 = MoQSession::makeSessionId();
+  EXPECT_NE(minted1, kUnsetSessionId);
+  EXPECT_NE(minted1, minted2);
+  EXPECT_NE(minted1, session->sessionId());
+  EXPECT_NE(minted2, session->sessionId());
+}
+
+TEST_F(OpenMOQForwarderTest, GetSubscriberFindsBySessionId) {
+  auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
+  auto session = createMockSession();
+  auto channelId = MoQSession::makeSessionId();
+  auto sessionHandle = addSubscriber(*forwarder, session, createMockConsumer());
+  auto channelHandle = forwarder->addSubscriber(
+      channelId, /*forward=*/true, createMockConsumer());
+
+  EXPECT_EQ(forwarder->getSubscriber(session->sessionId()), sessionHandle);
+  EXPECT_EQ(forwarder->getSubscriber(channelId), channelHandle);
+  EXPECT_EQ(forwarder->getSubscriber(MoQSession::makeSessionId()), nullptr);
+}
+
 TEST_F(OpenMOQForwarderTest, PassiveSubscriberDoesNotTriggerForwardChanged) {
   auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
   auto cb = std::make_shared<ForwardChangedTracker>();
@@ -115,12 +134,12 @@ TEST_F(OpenMOQForwarderTest, PassiveSubscriberDoesNotTriggerForwardChanged) {
   auto consumer = createMockConsumer();
 
   auto handle = forwarder->addSubscriber(
-      session, /*forward=*/true, consumer, /*passive=*/true);
+      session->sessionId(), /*forward=*/true, consumer, /*passive=*/true);
   ASSERT_NE(handle, nullptr);
   EXPECT_EQ(cb->forwardChangedCalls, 0);
   EXPECT_EQ(forwarder->numForwardingSubscribers(), 0u);
 
-  forwarder->removeSubscriber(session, std::nullopt, "test");
+  forwarder->removeSubscriber(session->sessionId(), std::nullopt, "test");
   EXPECT_EQ(cb->forwardChangedCalls, 0);
 }
 
@@ -134,11 +153,15 @@ TEST_F(OpenMOQForwarderTest, OnEmptyFiresWhenOnlyPassiveRemain) {
   auto realConsumer = createMockConsumer();
   auto passiveConsumer = createMockConsumer();
 
-  forwarder->addSubscriber(realSession, /*forward=*/true, realConsumer);
   forwarder->addSubscriber(
-      passiveSession, /*forward=*/true, passiveConsumer, /*passive=*/true);
+      realSession->sessionId(), /*forward=*/true, realConsumer);
+  forwarder->addSubscriber(
+      passiveSession->sessionId(),
+      /*forward=*/true,
+      passiveConsumer,
+      /*passive=*/true);
 
-  forwarder->removeSubscriber(realSession, std::nullopt, "test");
+  forwarder->removeSubscriber(realSession->sessionId(), std::nullopt, "test");
   EXPECT_EQ(cb->emptyCalls, 1);
   EXPECT_EQ(forwarder->subscriberCount(), 1u);
 }
@@ -155,22 +178,27 @@ TEST_F(
   auto passiveSession = createMockSession();
   auto consumer = createMockConsumer();
 
-  forwarder->addSubscriber(realSession1, /*forward=*/true, consumer);
+  forwarder->addSubscriber(
+      realSession1->sessionId(), /*forward=*/true, consumer);
   EXPECT_EQ(cb->forwardChangedCalls, 1);
 
   forwarder->addSubscriber(
-      passiveSession, /*forward=*/true, consumer, /*passive=*/true);
+      passiveSession->sessionId(),
+      /*forward=*/true,
+      consumer,
+      /*passive=*/true);
   EXPECT_EQ(cb->forwardChangedCalls, 1);
 
-  forwarder->addSubscriber(realSession2, /*forward=*/true, consumer);
+  forwarder->addSubscriber(
+      realSession2->sessionId(), /*forward=*/true, consumer);
   EXPECT_EQ(cb->forwardChangedCalls, 1);
   EXPECT_EQ(forwarder->numForwardingSubscribers(), 2u);
 
-  forwarder->removeSubscriber(realSession1, std::nullopt, "test");
+  forwarder->removeSubscriber(realSession1->sessionId(), std::nullopt, "test");
   EXPECT_EQ(cb->forwardChangedCalls, 1);
   EXPECT_EQ(forwarder->numForwardingSubscribers(), 1u);
 
-  forwarder->removeSubscriber(realSession2, std::nullopt, "test");
+  forwarder->removeSubscriber(realSession2->sessionId(), std::nullopt, "test");
   EXPECT_EQ(cb->forwardChangedCalls, 1);
   EXPECT_EQ(cb->emptyCalls, 1);
 }
@@ -178,12 +206,11 @@ TEST_F(
 TEST_F(OpenMOQForwarderTest, ChannelSubscriberReceivesSubgroupObjects) {
   auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
   auto consumer = createMockConsumer();
-  DummyExecutor exec;
+  auto channelId = MoQSession::makeSessionId();
 
-  auto handle =
-      forwarder->addChannelSubscriber(&exec, /*forward=*/true, consumer);
+  auto handle = forwarder->addSubscriber(channelId, /*forward=*/true, consumer);
   ASSERT_NE(handle, nullptr);
-  EXPECT_EQ(handle->session, nullptr);
+  EXPECT_EQ(handle->sessionId, channelId);
   EXPECT_EQ(forwarder->numForwardingSubscribers(), 1u);
 
   std::shared_ptr<MockSubgroupConsumer> sg;
@@ -204,13 +231,12 @@ TEST_F(OpenMOQForwarderTest, ChannelSubscriberReceivesSubgroupObjects) {
   EXPECT_TRUE(pubSg->endOfSubgroup().hasValue());
 }
 
-TEST_F(OpenMOQForwarderTest, RemoveChannelSubscriberByHandle) {
+TEST_F(OpenMOQForwarderTest, RemoveChannelSubscriberWithPublishDone) {
   auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
   auto consumer = createMockConsumer();
-  DummyExecutor exec;
+  auto channelId = MoQSession::makeSessionId();
 
-  auto handle =
-      forwarder->addChannelSubscriber(&exec, /*forward=*/true, consumer);
+  auto handle = forwarder->addSubscriber(channelId, /*forward=*/true, consumer);
   ASSERT_NE(handle, nullptr);
   EXPECT_EQ(forwarder->subscriberCount(), 1u);
   EXPECT_EQ(forwarder->numForwardingSubscribers(), 1u);
@@ -218,26 +244,26 @@ TEST_F(OpenMOQForwarderTest, RemoveChannelSubscriberByHandle) {
   EXPECT_CALL(*consumer, publishDone(_))
       .WillOnce(Return(folly::makeExpected<MoQPublishError>(folly::unit)));
 
-  forwarder->removeChannelSubscriber(
-      handle,
+  forwarder->removeSubscriber(
+      handle->sessionId,
       PublishDone{
-          RequestID(0), PublishDoneStatusCode::SUBSCRIPTION_ENDED, 0, ""});
+          RequestID(0), PublishDoneStatusCode::SUBSCRIPTION_ENDED, 0, ""},
+      "test");
 
   EXPECT_TRUE(forwarder->empty());
   EXPECT_EQ(forwarder->numForwardingSubscribers(), 0u);
 }
 
-TEST_F(OpenMOQForwarderTest, RemoveChannelSubscriberByExec) {
+TEST_F(OpenMOQForwarderTest, RemoveChannelSubscriberById) {
   auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
   auto consumer = createMockConsumer();
-  DummyExecutor exec;
+  auto channelId = MoQSession::makeSessionId();
 
-  auto handle =
-      forwarder->addChannelSubscriber(&exec, /*forward=*/true, consumer);
+  auto handle = forwarder->addSubscriber(channelId, /*forward=*/true, consumer);
   ASSERT_NE(handle, nullptr);
   EXPECT_EQ(forwarder->subscriberCount(), 1u);
 
-  forwarder->removeChannelSubscriberByExec(&exec, std::nullopt);
+  forwarder->removeSubscriber(channelId, std::nullopt, "test");
   EXPECT_TRUE(forwarder->empty());
 }
 
@@ -246,10 +272,10 @@ TEST_F(OpenMOQForwarderTest, PublishDoneFansOutToMixedSubscribers) {
   auto sessionConsumer = createMockConsumer();
   auto channelConsumer = createMockConsumer();
   auto session = createMockSession();
-  DummyExecutor exec;
 
   addSubscriber(*forwarder, session, sessionConsumer, RequestID(1));
-  forwarder->addChannelSubscriber(&exec, /*forward=*/true, channelConsumer);
+  forwarder->addSubscriber(
+      MoQSession::makeSessionId(), /*forward=*/true, channelConsumer);
   EXPECT_EQ(forwarder->subscriberCount(), 2u);
 
   EXPECT_CALL(*sessionConsumer, publishDone(_))
@@ -264,20 +290,20 @@ TEST_F(OpenMOQForwarderTest, PublishDoneFansOutToMixedSubscribers) {
   EXPECT_TRUE(forwarder->empty());
 }
 
-TEST_F(OpenMOQForwarderTest, DuplicateChannelSubscriberSameExecIsNoOp) {
+TEST_F(OpenMOQForwarderTest, DuplicateChannelSubscriberSameIdIsNoOp) {
   auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
-  DummyExecutor exec;
+  auto channelId = MoQSession::makeSessionId();
   auto consumer1 = createMockConsumer();
   auto consumer2 = createMockConsumer();
 
   auto handle1 =
-      forwarder->addChannelSubscriber(&exec, /*forward=*/true, consumer1);
+      forwarder->addSubscriber(channelId, /*forward=*/true, consumer1);
   ASSERT_NE(handle1, nullptr);
   EXPECT_EQ(forwarder->subscriberCount(), 1u);
   EXPECT_EQ(forwarder->numForwardingSubscribers(), 1u);
 
   auto handle2 =
-      forwarder->addChannelSubscriber(&exec, /*forward=*/true, consumer2);
+      forwarder->addSubscriber(channelId, /*forward=*/true, consumer2);
   ASSERT_NE(handle2, nullptr);
   EXPECT_EQ(handle1.get(), handle2.get());
   EXPECT_EQ(forwarder->subscriberCount(), 1u);
@@ -326,7 +352,10 @@ TEST_F(OpenMOQForwarderTest, PassiveResetDoesNotMaskDuplicateSubgroupCancel) {
       addSubscriber(*forwarder, realSession, realConsumer, RequestID(1));
   ASSERT_NE(realHandle, nullptr);
   auto passiveHandle = forwarder->addSubscriber(
-      passiveSession, /*forward=*/true, passiveConsumer, /*passive=*/true);
+      passiveSession->sessionId(),
+      /*forward=*/true,
+      passiveConsumer,
+      /*passive=*/true);
   ASSERT_NE(passiveHandle, nullptr);
 
   auto pubSg = forwarder->beginSubgroup(0, 0, 0).value();
@@ -372,7 +401,10 @@ TEST_F(OpenMOQForwarderTest, PassiveDoesNotCountAsReopenCandidate) {
   EXPECT_TRUE(pubSg->object(0, test::makeBuf(4)).hasValue());
 
   auto passiveHandle = forwarder->addSubscriber(
-      passiveSession, /*forward=*/true, passiveConsumer, /*passive=*/true);
+      passiveSession->sessionId(),
+      /*forward=*/true,
+      passiveConsumer,
+      /*passive=*/true);
   ASSERT_NE(passiveHandle, nullptr);
 
   auto dupRes = forwarder->beginSubgroup(0, 0, 0);
@@ -383,7 +415,6 @@ TEST_F(OpenMOQForwarderTest, PassiveDoesNotCountAsReopenCandidate) {
 TEST_F(OpenMOQForwarderTest, ChannelSubscriberDrainsWhenSubgroupsOpen) {
   auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
   auto consumer = createMockConsumer();
-  DummyExecutor exec;
 
   std::shared_ptr<MockSubgroupConsumer> sg;
   EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
@@ -394,7 +425,8 @@ TEST_F(OpenMOQForwarderTest, ChannelSubscriberDrainsWhenSubgroupsOpen) {
                 sg);
       });
 
-  forwarder->addChannelSubscriber(&exec, /*forward=*/true, consumer);
+  forwarder->addSubscriber(
+      MoQSession::makeSessionId(), /*forward=*/true, consumer);
   auto pubSg = forwarder->beginSubgroup(0, 0, 0).value();
   ASSERT_TRUE(pubSg->beginObject(0, 10, 0).hasValue());
 
@@ -414,14 +446,13 @@ TEST_F(OpenMOQForwarderTest, ChannelSubscriberDrainsWhenSubgroupsOpen) {
   EXPECT_TRUE(forwarder->empty());
 }
 
-// A draining channel subscriber has a null session, so it has to be retired by
-// its map key once its last open subgroup gets STOP_SENDING.
+// A draining channel subscriber has no session, so it has to be retired by its
+// minted id once its last open subgroup gets STOP_SENDING.
 TEST_F(OpenMOQForwarderTest, DrainingChannelSubscriberRetiredOnSoftError) {
   auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
   auto cb = std::make_shared<ForwardChangedTracker>();
   forwarder->setCallback(cb);
   auto consumer = createMockConsumer();
-  DummyExecutor exec;
 
   std::shared_ptr<MockSubgroupConsumer> sg;
   EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
@@ -435,7 +466,8 @@ TEST_F(OpenMOQForwarderTest, DrainingChannelSubscriberRetiredOnSoftError) {
                 sg);
       });
 
-  forwarder->addChannelSubscriber(&exec, /*forward=*/true, consumer);
+  forwarder->addSubscriber(
+      MoQSession::makeSessionId(), /*forward=*/true, consumer);
   auto pubSg = forwarder->beginSubgroup(0, 0, 0).value();
 
   forwarder->publishDone(PublishDone{
@@ -455,7 +487,6 @@ TEST_F(OpenMOQForwarderTest, DrainingChannelSubscriberRetiredOnDuplicate) {
   auto cb = std::make_shared<ForwardChangedTracker>();
   forwarder->setCallback(cb);
   auto consumer = createMockConsumer();
-  DummyExecutor exec;
 
   std::shared_ptr<MockSubgroupConsumer> sg;
   EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
@@ -467,7 +498,8 @@ TEST_F(OpenMOQForwarderTest, DrainingChannelSubscriberRetiredOnDuplicate) {
                 sg);
       });
 
-  forwarder->addChannelSubscriber(&exec, /*forward=*/true, consumer);
+  forwarder->addSubscriber(
+      MoQSession::makeSessionId(), /*forward=*/true, consumer);
   ASSERT_TRUE(forwarder->beginSubgroup(0, 0, 0).hasValue());
 
   forwarder->publishDone(PublishDone{
@@ -486,11 +518,10 @@ TEST_F(
     ChannelSubscriberRequestUpdateInvalidRangeNoCrash) {
   auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
   auto consumer = createMockConsumer();
-  DummyExecutor exec;
 
   forwarder->setLargest({5, 0});
-  auto handle =
-      forwarder->addChannelSubscriber(&exec, /*forward=*/true, consumer);
+  auto handle = forwarder->addSubscriber(
+      MoQSession::makeSessionId(), /*forward=*/true, consumer);
   ASSERT_NE(handle, nullptr);
 
   RequestUpdate validUpdate;
@@ -499,14 +530,66 @@ TEST_F(
   auto res1 = folly::coro::blockingWait(handle->requestUpdate(validUpdate));
   EXPECT_TRUE(res1.hasValue());
 
-  // start moves ahead of bounded end → invalid range; session is null so
-  // the close call must not crash.
+  // start moves ahead of bounded end → invalid range; a channel subscriber has
+  // no session, so the close call must not crash.
   RequestUpdate invalidUpdate;
   invalidUpdate.requestID = RequestID(2);
   invalidUpdate.start = AbsoluteLocation{20, 0};
   invalidUpdate.endGroup = 3;
   auto res2 = folly::coro::blockingWait(handle->requestUpdate(invalidUpdate));
   EXPECT_FALSE(res2.hasValue());
+}
+
+// A channel subscriber that renews its interest with forward=true is already
+// forwarding, so the clear cannot depend on a false->true flip.
+TEST_F(OpenMOQForwarderTest, ForwardUpdateClearsChannelTombstoneWhileForwarding) {
+  auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
+  auto consumer = createMockConsumer();
+
+  auto handle = forwarder->addSubscriber(
+      MoQSession::makeSessionId(), /*forward=*/true, consumer);
+  ASSERT_NE(handle, nullptr);
+
+  std::shared_ptr<MockSubgroupConsumer> refused;
+  std::shared_ptr<MockSubgroupConsumer> renewed;
+  EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+      .WillOnce(
+          [this, &refused](uint64_t, uint64_t, uint8_t, BeginSubgroupOptions) {
+            refused = createMockSubgroupConsumer();
+            EXPECT_CALL(*refused, object(0, _, _, false))
+                .WillOnce(
+                    Return(folly::makeUnexpected(MoQPublishError(
+                        MoQPublishError::CANCELLED, "No subscribers"))));
+            return folly::makeExpected<
+                MoQPublishError,
+                std::shared_ptr<SubgroupConsumer>>(refused);
+          })
+      .WillOnce(
+          [this, &renewed](uint64_t, uint64_t, uint8_t, BeginSubgroupOptions) {
+            renewed = createMockSubgroupConsumer();
+            EXPECT_CALL(*renewed, object(1, _, _, false))
+                .WillOnce(Return(folly::unit));
+            return folly::makeExpected<
+                MoQPublishError,
+                std::shared_ptr<SubgroupConsumer>>(renewed);
+          });
+
+  auto subgroupRes = forwarder->beginSubgroup(0, 0, 0);
+  ASSERT_TRUE(subgroupRes.hasValue());
+  auto subgroup = *subgroupRes;
+
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+
+  RequestUpdate update;
+  update.requestID = RequestID(2);
+  update.forward = true;
+  ASSERT_TRUE(
+      folly::coro::blockingWait(handle->requestUpdate(update)).hasValue());
+
+  EXPECT_TRUE(subgroup->object(1, test::makeBuf(10)).hasValue());
+  EXPECT_NE(renewed, nullptr);
+
+  subgroup->reset(ResetStreamErrorCode::SESSION_CLOSED);
 }
 
 } // namespace moxygen::test

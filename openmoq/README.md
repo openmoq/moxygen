@@ -46,6 +46,20 @@ openmoq/scripts/publish-artifacts.sh \
   --dry-run
 ```
 
+`ci main` instead splits this across jobs, so each build uploads its own
+tarballs rather than funnelling them all through one job:
+
+```bash
+# create-release: empty draft, invisible until finalized
+--create-draft --sha "$SHA" --tag snapshot-<sha12>
+
+# each publish job: its own two tarballs
+--upload-only --artifacts-dir _assets --sha "$SHA" --tag snapshot-<sha12>
+
+# release: make it public, then prune aged snapshots
+--finalize --sha "$SHA" --tag snapshot-<sha12> --prune-days 30
+```
+
 ### `openmoq/scripts/collect-artifacts-standalone.sh`
 
 Strips binaries, splits debug symbols, and creates release tarballs from a

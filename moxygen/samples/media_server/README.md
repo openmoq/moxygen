@@ -21,7 +21,11 @@ cmake --build build --target moq_media_server
 Flags:
 
 - `--input` (required): catalog JSON for the file-backed modes.
-- `--port` (default `9779`): QUIC/WebTransport listen port.
+- `--port` (default `9779`): listen port, UDP for QUIC/WebTransport and TCP
+  for QMUX.
+- `--quic` (default on): listen for QUIC/WebTransport.
+- `--qmux` (default on): listen for QMUX-on-TCP, the TCP fallback for MoQ. At
+  least one of `--quic` and `--qmux` must be on.
 - `--fragment_interval_ms` (default `1000`): media-time window width used to
   pace source fragments on the shared playback clock. Each source fragment is
   emitted as one MoQ group containing single-sample CMAF objects.
@@ -29,6 +33,9 @@ Flags:
   snapshots in `file_abr` mode.
 - `--loop` (default off): loop the source forever (live); omit for a finite
   one-shot that ends after one pass.
+- `--file_namespace_aliases` (default empty): comma-separated namespace first
+  fields served like `file`, e.g. `moq-media` for clients that subscribe to the
+  single-field namespace `["moq-media"]`.
 - `--file_pr_control_port` (default `60101`): HTTP port for the experimental
   `file_pr` fault-control UI; `0` disables it.
 
@@ -45,6 +52,9 @@ and writes each track to disk:
 ```
 
 It writes `/tmp/moq_out.<track>.mp4` per track (e.g. `video0`, `audio0`).
+Add `--transport qmux` to receive over QMUX-on-TCP instead of raw QUIC. For
+WebTransport, use `--transport h3wt` with an `https://` URL that includes the
+server's endpoint path, e.g. `--connect_url https://localhost:60100/moq-media`.
 Use `file_pr/moq-media` as the namespace to enable the fault-control UI.
 Use `file_abr/moq-media` to start with the first authored video track plus all
 non-video tracks, then advertise one additional video track per catalog group.
@@ -59,7 +69,7 @@ to that `file_pr` track and never affect the reliable `file` namespace.
 
 ## Layout
 
-- `MoQMediaServer` — MoQ transport (WebTransport + raw QUIC); hands each session to the dispatcher.
+- `MoQMediaServer` / `MoQMediaQmuxServer` — MoQ transport (WebTransport + raw QUIC / QMUX-on-TCP); hands each session to the shared dispatcher.
 - `MoQBroadcastDispatcher` — namespace registry; routes SUBSCRIBE/FETCH to a broadcast.
 - `MoQBroadcastFactory` — builds a broadcast per namespace; owns backend/resolver selection.
 - `MoQBroadcast` — per-namespace serving unit; per-track stacks (source + forwarder + publish loop).

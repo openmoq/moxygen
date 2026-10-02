@@ -117,13 +117,6 @@ moxygen_add_library(moxygen_moq_relay_session
     Folly::folly_container_f14_hash
 )
 
-moxygen_add_library(moxygen_moq_cluster_session
-  SRCS
-    MoQClusterSession.cpp
-  EXPORTED_DEPS
-    moxygen_moq_relay_session
-)
-
 moxygen_add_library(moxygen_moq_publish_error
   EXPORTED_DEPS
     fmt::fmt
@@ -277,6 +270,7 @@ moxygen_add_library(moxygen_moq_qmux_server
     Folly::folly_coro_error
     Folly::folly_coro_timeout
     Folly::folly_coro_with_cancellation
+    Folly::folly_exception_wrapper
     Folly::folly_futures_core
     Folly::folly_io_async_async_socket
     Folly::folly_io_async_event_base_manager
@@ -329,6 +323,11 @@ moxygen_add_library(moxygen_moq_obj_receiver
   EXPORTED_DEPS
     moxygen_moq_consumers
     Folly::folly_logging_logging
+)
+
+moxygen_add_library(moxygen_moq_streaming_obj_receiver
+  EXPORTED_DEPS
+    moxygen_moq_consumers
 )
 
 moxygen_add_library(moxygen_moq_queue_callback
