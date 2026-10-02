@@ -927,7 +927,11 @@ CO_TEST_P_X(MoQSessionTest, SubscriberCancelsBeforeSubscribeOK) {
               co_await folly::coro::co_reschedule_on_current_executor;
               co_return mockSubscriptionHandle;
             });
-      });
+      },
+      MoQControlCodec::Direction::SERVER,
+      /*error=*/std::nullopt,
+      // The publisher never replies if the unsubscribe beats its handler.
+      /*expectResultStat=*/false);
 
   auto subscribeRequest = getSubscribe(kTestTrackName);
   auto sg = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
@@ -941,26 +945,33 @@ CO_TEST_P_X(MoQSessionTest, SubscriberCancelsBeforeSubscribeOK) {
               clientSession_->subscribe(subscribeRequest, subscribeCallback_)))
           .start()
           .via(&eventBase_);
-  co_await folly::coro::co_reschedule_on_current_executor;
+  // On draft 18 an earlier cancel reaches the publisher before its handler.
+  co_await streamBaton;
   cancelSource.requestCancellation();
   EXPECT_THROW(co_await std::move(subscribeFut), folly::OperationCancelled);
-  // Verify that the publisher's WebTransport received a stop sending on the
-  // object stream
-  co_await streamBaton;
+  // The object stream ends with the subscriber's STOP_SENDING or the
+  // publisher's reset, whichever comes first.
   auto objectStreamId = serverObjectStreamId();
   auto waits = 0;
-  while (!serverWt_->writeHandles[objectStreamId]->getWriteErr().has_value() &&
+  while (!clientSession_->isClosed() &&
+         !serverWt_->writeHandles[objectStreamId]->getWriteErr().has_value() &&
          waits++ < 6) {
     co_await folly::coro::sleep(std::chrono::milliseconds(250));
   }
+  // A SUBSCRIBE_OK sent before the cancel arrived must not close the session.
+  // Closing would also free the stream handles checked below.
+  EXPECT_FALSE(clientSession_->isClosed());
+  if (clientSession_->isClosed()) {
+    co_return;
+  }
   EXPECT_TRUE(
       serverWt_->writeHandles[objectStreamId]->getWriteErr().has_value());
-  EXPECT_EQ(
-      serverWt_->writeHandles[objectStreamId]->writeException()->error, 0);
+  if (auto* stopSending =
+          serverWt_->writeHandles[objectStreamId]->writeException()) {
+    EXPECT_EQ(stopSending->error, 0);
+  }
 
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
-  // This don't get called by session
-  clientSubscriberStatsCallback_->recordSubscribeLatency(0);
 }
 CO_TEST_P_X(MoQSessionTest, UnsubscribeWithinPublishDone) {
   co_await setupMoQSession();
@@ -1461,5 +1472,45 @@ CO_TEST_P_X(Draft18Test, NoUnsubscribeAfterPublishDone) {
 
   co_await folly::coro::co_reschedule_on_current_executor;
   co_await folly::coro::co_reschedule_on_current_executor;
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// A subscribe whose caller is cancelled before SUBSCRIBE_OK must end the
+// subscription at the peer, so the publisher stops accepting new data for it.
+CO_TEST_P_X(MoQSessionTest, SubscribeCallerCancelledBeforeSubscribeOk) {
+  co_await setupMoQSession();
+
+  folly::coro::Baton serverSawSubscribe;
+  folly::coro::Baton releaseHandler;
+  std::shared_ptr<TrackConsumer> serverPub;
+  EXPECT_CALL(*serverPublisher, subscribe(_, _))
+      .WillOnce([&](auto sub, auto pub) -> TaskSubscribeResult {
+        serverPub = std::move(pub);
+        serverSawSubscribe.post();
+        co_await releaseHandler;
+        co_return makeSubscribeOkResult(sub);
+      });
+
+  folly::CancellationSource cancelSource;
+  auto subscribeFut =
+      folly::coro::co_withExecutor(
+          &eventBase_,
+          folly::coro::co_withCancellation(
+              cancelSource.getToken(),
+              clientSession_->subscribe(
+                  getSubscribe(kTestTrackName), subscribeCallback_)))
+          .start()
+          .via(&eventBase_);
+  co_await serverSawSubscribe;
+
+  cancelSource.requestCancellation();
+  EXPECT_THROW(co_await std::move(subscribeFut), folly::OperationCancelled);
+  releaseHandler.post();
+  co_await folly::coro::sleep(std::chrono::milliseconds(200));
+
+  EXPECT_NE(serverPub, nullptr);
+  if (serverPub) {
+    EXPECT_TRUE(serverPub->beginSubgroup(0, 0, 0).hasError());
+  }
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }

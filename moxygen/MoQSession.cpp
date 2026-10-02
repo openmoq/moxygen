@@ -4784,6 +4784,11 @@ void MoQSession::onRequestError(RequestError error, FrameType frameType) {
       return;
     }
   } else {
+    if (isLocallyIssuedRequestID(error.requestID)) {
+      XLOG(DBG1) << "Error for cancelled request id=" << error.requestID
+                 << " sess=" << this;
+      return;
+    }
     XLOG(ERR) << "Request not found id=" << error.requestID << " sess=" << this;
     close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
     return;
@@ -4835,6 +4840,11 @@ void MoQSession::onSubscribeOk(SubscribeOk subOk) {
 
   auto it = pendingRequests_.find(subOk.requestID);
   if (it == pendingRequests_.end()) {
+    if (isLocallyIssuedRequestID(subOk.requestID)) {
+      XLOG(DBG1) << "SUBSCRIBE_OK for cancelled subscribe ID="
+                 << subOk.requestID << " sess=" << this;
+      return;
+    }
     XLOG(ERR) << "No matching subscribe ID=" << subOk.requestID
               << " sess=" << this;
     close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
@@ -4976,7 +4986,12 @@ class MoQSession::ReceiverSubscriptionHandle
       session_->requestUpdate(requestUpdate, control_);
 
       // Wait for REQUEST_OK or REQUEST_ERROR response
-      co_return co_await std::move(contract.second);
+      // unsubscribe() can reset session_ while this waits.
+      auto session = session_;
+      auto cancelGuard = session->cancelOnExit(requestUpdate.requestID);
+      auto result = co_await std::move(contract.second);
+      cancelGuard.dismiss();
+      co_return result;
     } else {
       session_->requestUpdate(requestUpdate, control_);
 
@@ -5744,7 +5759,10 @@ folly::coro::Task<MoQSession::TrackStatusResult> MoQSession::trackStatus(
       PendingRequestState::makeTrackStatus(std::move(contract.first));
   pending->setBidiControl(std::move(control));
   pendingRequests_.emplace(reqID, std::move(pending));
-  co_return co_await std::move(contract.second);
+  auto cancelGuard = cancelOnExit(reqID);
+  auto result = co_await std::move(contract.second);
+  cancelGuard.dismiss();
+  co_return result;
 }
 
 void MoQSession::onTrackStatusOk(TrackStatusOk trackStatusOk) {
@@ -6272,6 +6290,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
   pendingRequests_.emplace(
       reqID, PendingRequestState::makeSubscribeTrack(trackReceiveState));
   pendingSubscribeTracks_.insert(fullTrackName);
+  auto cancelGuard = cancelOnExit(reqID);
   auto subscribeResultTry =
       co_await co_awaitTry(trackReceiveState->subscribeFuture());
   if (subscribeResultTry.hasException()) {
@@ -6281,9 +6300,9 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
         subscriberStatsCallback_,
         onSubscribeError,
         SubscribeErrorCode::INTERNAL_ERROR);
-    trackReceiveState->cancel();
     co_yield folly::coro::co_error(subscribeResultTry.exception());
   }
+  cancelGuard.dismiss();
   auto subscribeResult = subscribeResultTry.value();
   XLOG(DBG1) << "Subscribe ready trackReceiveState=" << trackReceiveState
              << " requestID=" << reqID;
@@ -6793,7 +6812,9 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
   pendingRequests_.emplace(
       trackReceiveState->getRequestID(),
       PendingRequestState::makeFetch(trackReceiveState));
+  auto cancelGuard = cancelOnExit(reqID);
   auto fetchResult = co_await trackReceiveState->fetchFuture();
+  cancelGuard.dismiss();
   XLOG(DBG1) << __func__
              << " fetchReady trackReceiveState=" << trackReceiveState;
   if (fetchResult.hasError()) {
@@ -6844,6 +6865,43 @@ void MoQSession::fetchError(const FetchError& fetchErr, ReplyContext& ctx) {
     return;
   }
   ctx.flushFinal();
+}
+
+void MoQSession::cancelLocalRequest(RequestID requestID) {
+  auto it = pendingRequests_.find(requestID);
+  if (it == pendingRequests_.end()) {
+    return;
+  }
+  auto pending = std::move(it->second);
+  pendingRequests_.erase(it);
+  const auto& control = pending->bidiControl();
+  // Sending the cancel can re-enter and close the session, so local state is
+  // cleared first.
+  switch (pending->type()) {
+    case PendingRequestState::Type::FETCH:
+      fetchCancel({requestID}, control);
+      return;
+    case PendingRequestState::Type::SUBSCRIBE_TRACK: {
+      const auto& trackReceiveState = *pending->tryGetSubscribeTrack();
+      trackReceiveState->cancel();
+      pendingSubscribeTracks_.erase(trackReceiveState->fullTrackName());
+      if (!control && moqFrameWriter_.writeUnsubscribe(
+                          controlWriteBuf_, Unsubscribe{requestID})) {
+        controlWriteEvent_.signal();
+      }
+      break;
+    }
+    case PendingRequestState::Type::PUBLISH:
+    case PendingRequestState::Type::REQUEST_UPDATE:
+      // A REQUEST_UPDATE has no stream of its own. A PUBLISH ends through the
+      // consumer returned to its caller.
+      return;
+    default:
+      break;
+  }
+  if (control) {
+    control->cancel(ResetStreamErrorCode::CANCELLED);
+  }
 }
 
 void MoQSession::fetchCancel(
@@ -7661,6 +7719,11 @@ void MoQSession::onRequestOk(RequestOk requestOk, FrameType frameType) {
   auto reqIt = pendingRequests_.find(reqId);
 
   if (reqIt == pendingRequests_.end()) {
+    if (isLocallyIssuedRequestID(reqId)) {
+      XLOG(DBG1) << "REQUEST_OK for cancelled reqID=" << reqId
+                 << " sess=" << this;
+      return;
+    }
     XLOG(ERR) << "No matching request for reqID=" << reqId << " sess=" << this;
     close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
     return;

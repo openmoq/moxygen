@@ -395,3 +395,48 @@ CO_TEST_P_X(MoQSessionTest, SubscribeNamespaceError) {
 
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+
+// A subscribeNamespace whose caller is cancelled before the reply must release
+// the caller's handle.
+CO_TEST_P_X(MoQSessionTest, SubscribeNamespaceCallerCancelledBeforeOk) {
+  co_await setupMoQSession();
+
+  folly::coro::Baton serverSawSubscribeNamespace;
+  folly::coro::Baton releaseHandler;
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillOnce(
+          [&](auto subNs, auto /* handler */)
+              -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+            serverSawSubscribeNamespace.post();
+            co_await releaseHandler;
+            co_return std::make_shared<MockSubscribeNamespaceHandle>(
+                SubscribeNamespaceOk(
+                    {.requestID = subNs.requestID,
+                     .requestSpecificParams = {}}));
+          });
+
+  auto clientHandle =
+      std::make_shared<testing::StrictMock<MockNamespacePublishHandle>>();
+  std::weak_ptr<Publisher::NamespacePublishHandle> weakClientHandle =
+      clientHandle;
+  folly::CancellationSource cancelSource;
+  auto subscribeNamespaceFut =
+      folly::coro::co_withExecutor(
+          &eventBase_,
+          folly::coro::co_withCancellation(
+              cancelSource.getToken(),
+              clientSession_->subscribeNamespace(
+                  getSubscribeNamespace(), std::move(clientHandle))))
+          .start()
+          .via(&eventBase_);
+  co_await serverSawSubscribeNamespace;
+
+  cancelSource.requestCancellation();
+  EXPECT_THROW(
+      co_await std::move(subscribeNamespaceFut), folly::OperationCancelled);
+  releaseHandler.post();
+  co_await folly::coro::sleep(std::chrono::milliseconds(200));
+
+  EXPECT_TRUE(weakClientHandle.expired());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
