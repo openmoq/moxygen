@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include <folly/Function.h>
 #include <folly/coro/Baton.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
 #include "moxygen/MoQClientBase.h"
@@ -110,18 +109,7 @@ class MoQTestClient : public Subscriber,
       const std::string& versions = "",
       PublishOrder order = PublishOrder::SubscribeFirst);
 
-  // Sends SUBSCRIBE_TRACKS and validates the track that the relay forwards in
-  // a PUBLISH. The publisher can start at any time.
-  folly::coro::Task<moxygen::TrackNamespace> receivePublish(
-      MoQTestParameters params);
-
   void setLogger(const std::shared_ptr<MLogger>& logger);
-
-  // Validates this many whole groups, starting after the first group received,
-  // and then unsubscribes. 0 validates the whole track.
-  void setGroupsToValidate(uint64_t groups) {
-    groupsToValidate_ = groups;
-  }
 
   // Subscriber: accept the relay's PUBLISH by handing back the receiver that
   // validates the track.
@@ -129,8 +117,9 @@ class MoQTestClient : public Subscriber,
       PublishRequest pub,
       std::shared_ptr<SubscriptionHandle> handle) override;
 
-  // The only close path: the request runs to a verdict, then this drains so
-  // the peer sees a clean close and the event loop exits.
+  // Ends the run, from a verdict or from a signal.  Drains so the peer sees a
+  // clean close, or closes outright when the verdict was a failure and the
+  // peer may never wind the track down.
   void shutdown();
 
   // Completes when the track finishes, validation fails, or shutdown() runs.
@@ -184,21 +173,14 @@ class MoQTestClient : public Subscriber,
         std::optional<TrackAlias> trackAlias,
         const ObjectHeader& objHeader,
         Payload payload) override {
-      client_.deliver([this,
-                       trackAlias = std::move(trackAlias),
-                       objHeader,
-                       payload = std::move(payload)]() mutable {
-        client_.onObject(state_, trackAlias, objHeader, std::move(payload));
-      });
-      return FlowControlState::UNBLOCKED;
+      return client_.onObject(
+          state_, std::move(trackAlias), objHeader, std::move(payload));
     }
 
     void onObjectStatus(
         std::optional<TrackAlias> trackAlias,
         const ObjectHeader& objHeader) override {
-      client_.deliver([this, trackAlias = std::move(trackAlias), objHeader] {
-        client_.onObjectStatus(state_, trackAlias, objHeader);
-      });
+      client_.onObjectStatus(state_, std::move(trackAlias), objHeader);
     }
 
     void onEndOfStream() override {
@@ -206,17 +188,15 @@ class MoQTestClient : public Subscriber,
     }
 
     void onError(ResetStreamErrorCode code) override {
-      client_.deliver([this, code] { client_.onError(state_, code); });
+      client_.onError(state_, code);
     }
 
-    void onPublishDone(PublishDone done) override {
-      client_.deliver([this, done = std::move(done)]() mutable {
-        client_.onPublishDone(std::move(done));
-      });
+    void onPublishDone(PublishDone /* done */) override {
+      client_.onPublishDone();
     }
 
     void onAllDataReceived() override {
-      client_.deliver([this] { client_.onAllDataReceived(state_); });
+      client_.onAllDataReceived(state_);
     }
 
    private:
@@ -245,10 +225,8 @@ class MoQTestClient : public Subscriber,
         uint64_t subgroupID,
         Priority priority,
         BeginSubgroupOptions options) override {
-      client_.deliver([this, groupID, subgroupID, priority, options] {
-        client_.validateSubgroupHeader(
-            state_, groupID, subgroupID, priority, options);
-      });
+      client_.validateSubgroupHeader(
+          state_, groupID, subgroupID, priority, options);
       return ObjectReceiver::beginSubgroup(
           groupID, subgroupID, priority, options);
     }
@@ -278,7 +256,7 @@ class MoQTestClient : public Subscriber,
       const ObjectHeader& objHeader);
   void onEndOfStream();
   void onError(ReceiveState& state, ResetStreamErrorCode);
-  void onPublishDone(PublishDone done);
+  void onPublishDone();
   void onAllDataReceived(ReceiveState& state);
 
   class ObjectDeadline : public quic::QuicTimerCallback {
@@ -329,7 +307,7 @@ class MoQTestClient : public Subscriber,
   };
 
   void armObjectDeadlines();
-  void armRequestDeadline(std::chrono::milliseconds lead = {});
+  ForwardingPreference deadlineForwardingPreference(uint64_t group) const;
   std::chrono::milliseconds objectInterval() const;
   void cancelDeadlines();
   void objectDeadlineExpired(uint64_t group, uint64_t id);
@@ -337,8 +315,8 @@ class MoQTestClient : public Subscriber,
   void finishRequest();
 
   RequestDeadline requestDeadline_{*this};
-  // Set by receivePublish(), which arms the deadlines when the PUBLISH arrives.
-  bool awaitingPublish_{false};
+  // Last group the joining FETCH half covers; unset when there is no join.
+  std::optional<uint64_t> fetchHalfLastGroup_;
   bool publishDoneReceived_{false};
   // A datagram that arrives after its deadline is as good as dropped.
   uint64_t datagramDrops_{0};
@@ -369,24 +347,6 @@ class MoQTestClient : public Subscriber,
   // The slice of the track the current request covers
   MoQTestFetchWindow window_;
 
-  // The groups window opens at the first object received, or for a join at the
-  // backfill's first group. Objects outside it are ignored.
-  uint64_t groupsToValidate_{0};
-  bool groupsWindowOpen_{false};
-  // A join's window depends on the join's reply. Events that arrive before the
-  // reply are held and replayed in order.
-  bool joinWindowPending_{false};
-  std::vector<folly::Function<void()>> pendingEvents_;
-  void deliver(folly::Function<void()> event);
-  void releaseHeldEvents();
-  MoQTestFetchWindow initialWindow(const MoQTestParameters& params) const;
-  void openGroupsWindow(uint64_t firstGroup, std::chrono::milliseconds lead);
-  bool outsideGroupsWindow(uint64_t group) const;
-  // Opens the window on the first object, then reports whether it ignores one.
-  bool ignoredByGroupsWindow(ReceiveState& state, uint64_t group);
-  void finishGroupsWindowIfComplete(ReceiveState& state);
-  void buildScoreboard(std::chrono::milliseconds lead);
-
   // Scoreboard of expected (group, objectId) pairs, each owning the deadline it
   // must arrive by, so scoring an object off also cancels its timer.
   // When receiving: if present, erase; if absent, it's a duplicate
@@ -395,8 +355,16 @@ class MoQTestClient : public Subscriber,
   std::map<std::pair<uint64_t, uint64_t>, std::unique_ptr<ObjectDeadline>>
       expectedObjects_;
 
+  // What the scoreboard started with; it drains as objects arrive, and the drop
+  // budget and request deadline are both fractions of the whole track.
+  uint64_t totalExpected_{0};
+
   // Set when a delivery-semantics check fails; suppresses the final SUCCESS
   bool semanticsFailed_{false};
+
+  // Whether the run reached a FAILURE verdict, which decides whether shutdown
+  // drains the session or closes it.
+  bool verdictFailed_{false};
 
   // Set once we cancel the request ourselves; the peer answers with a stream
   // reset that must not count against the track
