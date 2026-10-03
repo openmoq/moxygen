@@ -351,19 +351,17 @@ void MoQServer::Handler::onHeadersComplete(
         txn_->sendHeadersWithEOM(resp);
         return;
       }
+    } else if (
+        std::find(
+            supportedProtocols.begin(),
+            supportedProtocols.end(),
+            kAlpnMoqtLegacy) == supportedProtocols.end()) {
+      // In-band ClientSetup negotiates only draft 14.
+      XLOG(DBG4) << "WebTransport protocol missing and draft 14 not offered";
+      resp.setStatusCode(400);
+      txn_->sendHeadersWithEOM(resp);
+      return;
     }
-  } else if (
-      std::find(
-          supportedProtocols.begin(),
-          supportedProtocols.end(),
-          kAlpnMoqtLegacy) == supportedProtocols.end()) {
-    // In-band ClientSetup negotiates only draft 14.
-    XLOG(DBG4) << "WebTransport protocol missing and draft 14 not offered";
-    resp.setStatusCode(400);
-  }
-  if (resp.getStatusCode() != 200) {
-    txn_->sendHeadersWithEOM(resp);
-    return;
   }
   txn_->sendHeaders(resp);
   auto wt = txn_->getWebTransport();
