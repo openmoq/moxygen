@@ -191,7 +191,7 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::subscribe(
   }
 
   // Set Current Request
-  initializeExpecteds(params, initialWindow(params));
+  initializeExpecteds(params, resolveFetchWindow(params));
   startReceiving(subState_, ReceivingType::SUBSCRIBE);
 
   // Subscribe to the receiver
@@ -226,11 +226,6 @@ Subscriber::PublishResult MoQTestClient::publish(
   // Keep the handle so a validation failure can unsubscribe.
   if (handle) {
     subHandle_ = std::move(handle);
-  }
-  if (awaitingPublish_) {
-    awaitingPublish_ = false;
-    armObjectDeadlines();
-    armRequestDeadline();
   }
 
   PublishOk ok;
@@ -355,46 +350,10 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::publishTrack(
     onFailure(std::runtime_error(pubRes.exception().what().toStdString()));
     co_return trackNamespace.value();
   }
-  armObjectDeadlines();
 
   co_await doneBaton_;
   // Drained here rather than up front: draining the subscriber session before
   // the PUBLISH arrives would reject it.
-  shutdown();
-  co_return trackNamespace.value();
-}
-
-folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::receivePublish(
-    MoQTestParameters params) {
-  auto trackNamespace = convertMoqTestParamToTrackNamespace(params);
-  if (trackNamespace.hasError()) {
-    XLOG(ERR)
-        << "MoQTest verification result: "
-        << "FAILURE! Reason: Error Converting Parameters to TrackNamespace: "
-        << trackNamespace.error().what();
-    moqClient_->moqSession_->drain();
-    co_yield folly::coro::co_error(trackNamespace.error());
-  }
-
-  requestID_ = kDefaultRequestId;
-  initializeExpecteds(params, initialWindow(params));
-  startReceiving(subState_, ReceivingType::SUBSCRIBE);
-  // The deadlines start at the PUBLISH, or at the groups window, because the
-  // publisher can start at any time.
-  cancelDeadlines();
-  awaitingPublish_ = groupsToValidate_ == 0;
-
-  auto subRes = co_await folly::coro::co_awaitTry(
-      subscribeTracks(trackNamespace.value()));
-  if (subRes.hasException()) {
-    XLOG(ERR) << "MoQTest verification result: FAILURE! Reason: "
-              << subRes.exception().what();
-    shutdown();
-    co_return trackNamespace.value();
-  }
-
-  co_await doneBaton_;
-  // Draining before the PUBLISH arrives would reject it.
   shutdown();
   co_return trackNamespace.value();
 }
@@ -490,10 +449,9 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::join(
   // Neither half starts where the client would guess: the publisher resolves
   // the backfill against its own Largest, and the subscription picks up from
   // there.
-  initializeExpecteds(params, initialWindow(params));
+  initializeExpecteds(params, resolveFetchWindow(params));
   startReceiving(subState_, ReceivingType::SUBSCRIBE, /*seeded=*/false);
   startReceiving(fetchState_, ReceivingType::FETCH, /*seeded=*/false);
-  joinWindowPending_ = groupsToValidate_ > 0;
 
   auto res = co_await moqClient_->moqSession_->join(
       sub,
@@ -543,9 +501,6 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::join(
       const uint64_t startGroup = joiningStartGroup(joinStart, *largest);
       validateJoiningFetchOk(
           fetchHandle_->fetchOk(), params, *largest, startGroup);
-      if (groupsToValidate_) {
-        openGroupsWindow(startGroup, std::chrono::milliseconds(0));
-      }
       trimExpectedBefore(startGroup);
       if (fetchState_.endOfGroupOmitted) {
         // The backfill stops at Largest, so a group the two halves split
@@ -574,9 +529,6 @@ ObjectReceiverCallback::FlowControlState MoQTestClient::onObject(
     const ObjectHeader& objHeader,
     Payload payload) {
   XLOG(DBG1) << "MoQTest DEBUGGING: Calling onObject";
-  if (ignoredByGroupsWindow(state, objHeader.group)) {
-    return ObjectReceiverCallback::FlowControlState::UNBLOCKED;
-  }
 
   // A zero-length object arrives with no payload buffer at all.
   auto payloadStr = payload ? payload->toString() : std::string();
@@ -595,7 +547,6 @@ ObjectReceiverCallback::FlowControlState MoQTestClient::onObject(
 
   // Adjust the expected data (If Still receiving data, leave unblocked)
   adjustExpected(state, params_, objHeader);
-  finishGroupsWindowIfComplete(state);
   return ObjectReceiverCallback::FlowControlState::UNBLOCKED;
 }
 
@@ -604,9 +555,6 @@ void MoQTestClient::onObjectStatus(
     const std::optional<TrackAlias>& /* trackAlias */,
     const ObjectHeader& objHeader) {
   XLOG(DBG1) << "MoQTest DEBUGGING: calling onObjectStatus";
-  if (ignoredByGroupsWindow(state, objHeader.group)) {
-    return;
-  }
 
   ObjectHeader header = objHeader;
   // Validate the received data
@@ -647,7 +595,6 @@ void MoQTestClient::onObjectStatus(
     XLOG(DBG1)
         << "MoQTest DEBUGGING: onObjectStatus: No more data to be expected";
   }
-  finishGroupsWindowIfComplete(state);
 }
 
 void MoQTestClient::onEndOfStream() {
@@ -864,10 +811,6 @@ void MoQTestClient::validateSubgroupHeader(
   // so neither the end-of-group signal nor the first-object signal describes a
   // whole subgroup until the cursor has a position.
   if (!state.seeded) {
-    return;
-  }
-  // The group before the window can arrive partway through.
-  if (groupsToValidate_ && outsideGroupsWindow(groupID)) {
     return;
   }
 

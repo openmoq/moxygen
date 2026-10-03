@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include <folly/Function.h>
 #include <folly/coro/Baton.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
 #include "moxygen/MoQClientBase.h"
@@ -110,18 +109,7 @@ class MoQTestClient : public Subscriber,
       const std::string& versions = "",
       PublishOrder order = PublishOrder::SubscribeFirst);
 
-  // Sends SUBSCRIBE_TRACKS and validates the track that the relay forwards in
-  // a PUBLISH. The publisher can start at any time.
-  folly::coro::Task<moxygen::TrackNamespace> receivePublish(
-      MoQTestParameters params);
-
   void setLogger(const std::shared_ptr<MLogger>& logger);
-
-  // Validates this many whole groups, starting after the first group received,
-  // and then unsubscribes. 0 validates the whole track.
-  void setGroupsToValidate(uint64_t groups) {
-    groupsToValidate_ = groups;
-  }
 
   // Subscriber: accept the relay's PUBLISH by handing back the receiver that
   // validates the track.
@@ -185,21 +173,14 @@ class MoQTestClient : public Subscriber,
         std::optional<TrackAlias> trackAlias,
         const ObjectHeader& objHeader,
         Payload payload) override {
-      client_.deliver([this,
-                       trackAlias = std::move(trackAlias),
-                       objHeader,
-                       payload = std::move(payload)]() mutable {
-        client_.onObject(state_, trackAlias, objHeader, std::move(payload));
-      });
-      return FlowControlState::UNBLOCKED;
+      return client_.onObject(
+          state_, std::move(trackAlias), objHeader, std::move(payload));
     }
 
     void onObjectStatus(
         std::optional<TrackAlias> trackAlias,
         const ObjectHeader& objHeader) override {
-      client_.deliver([this, trackAlias = std::move(trackAlias), objHeader] {
-        client_.onObjectStatus(state_, trackAlias, objHeader);
-      });
+      client_.onObjectStatus(state_, std::move(trackAlias), objHeader);
     }
 
     void onEndOfStream() override {
@@ -207,7 +188,7 @@ class MoQTestClient : public Subscriber,
     }
 
     void onError(ResetStreamErrorCode code) override {
-      client_.deliver([this, code] { client_.onError(state_, code); });
+      client_.onError(state_, code);
     }
 
     void onPublishDone(PublishDone /* done */) override {
@@ -215,7 +196,7 @@ class MoQTestClient : public Subscriber,
     }
 
     void onAllDataReceived() override {
-      client_.deliver([this] { client_.onAllDataReceived(state_); });
+      client_.onAllDataReceived(state_);
     }
 
    private:
@@ -244,10 +225,8 @@ class MoQTestClient : public Subscriber,
         uint64_t subgroupID,
         Priority priority,
         BeginSubgroupOptions options) override {
-      client_.deliver([this, groupID, subgroupID, priority, options] {
-        client_.validateSubgroupHeader(
-            state_, groupID, subgroupID, priority, options);
-      });
+      client_.validateSubgroupHeader(
+          state_, groupID, subgroupID, priority, options);
       return ObjectReceiver::beginSubgroup(
           groupID, subgroupID, priority, options);
     }
