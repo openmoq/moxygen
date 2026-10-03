@@ -307,6 +307,51 @@ CO_TEST_P_X(V18PlusSubscribeTracksTest, UnsubscribeTracksAfterSessionClosed) {
   EXPECT_NO_THROW(result.value()->unsubscribeTracks());
 }
 
+// A subscribeTracks whose caller is cancelled before the reply must release
+// the caller's handle.
+CO_TEST_P_X(V18PlusSubscribeTracksTest, SubscribeTracksCallerCancelledBeforeOk) {
+  co_await setupMoQSession();
+
+  folly::coro::Baton serverSawSubscribeTracks;
+  folly::coro::Baton releaseHandler;
+  EXPECT_CALL(*serverPublisher, subscribeTracks(_, _))
+      .WillOnce(
+          [&](auto subTracks, auto /* publishBlockedHandle */)
+              -> folly::coro::Task<Publisher::SubscribeTracksResult> {
+            serverSawSubscribeTracks.post();
+            co_await releaseHandler;
+            co_return std::make_shared<MockSubscribeTracksHandle>(
+                SubscribeTracksOk(
+                    {.requestID = subTracks.requestID,
+                     .requestSpecificParams = {}}));
+          });
+
+  auto clientHandle =
+      std::make_shared<testing::StrictMock<MockPublishBlockedHandle>>();
+  std::weak_ptr<Publisher::PublishBlockedHandle> weakClientHandle =
+      clientHandle;
+  folly::CancellationSource cancelSource;
+  auto subscribeTracksFut =
+      folly::coro::co_withExecutor(
+          &eventBase_,
+          folly::coro::co_withCancellation(
+              cancelSource.getToken(),
+              clientSession_->subscribeTracks(
+                  getSubscribeTracks(), std::move(clientHandle))))
+          .start()
+          .via(&eventBase_);
+  co_await serverSawSubscribeTracks;
+
+  cancelSource.requestCancellation();
+  EXPECT_THROW(
+      co_await std::move(subscribeTracksFut), folly::OperationCancelled);
+  releaseHandler.post();
+  co_await folly::coro::sleep(std::chrono::milliseconds(200));
+
+  EXPECT_TRUE(weakClientHandle.expired());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     V18PlusSubscribeTracksTest,
     V18PlusSubscribeTracksTest,

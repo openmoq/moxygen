@@ -204,6 +204,7 @@ class MoQRelaySession : public MoQSession {
   void onPublishNamespaceDone(PublishNamespaceDone pubNsDone) override;
   void onRequestOk(RequestOk ok, FrameType frameType) override;
   void onUnsubscribeNamespace(UnsubscribeNamespace unsub) override;
+  void cancelLocalRequest(RequestID requestID) override;
 
   // Helper methods for handling RequestOk for different request types
   void handlePublishNamespaceOkFromRequestOk(
