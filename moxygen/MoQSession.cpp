@@ -1441,10 +1441,10 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
 
   void unsubscribe() {
     cancelGoawayResetTimer();
+    peerCancelSource_.requestCancellation();
     if (!subscriptionHandle_) {
-      XLOG(ERR) << "Received Unsubscribe before sending SUBSCRIBE_OK id="
-                << requestID_ << " trackPub=" << this;
-      // TODO: cancel handleSubscribe?
+      XLOG(DBG1) << "Received Unsubscribe before sending SUBSCRIBE_OK id="
+                 << requestID_ << " trackPub=" << this;
     } else {
       subscriptionHandle_->unsubscribe();
     }
@@ -1627,6 +1627,7 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
   void cancel() {
     cancelGoawayResetTimer();
     cancelled_ = true;
+    peerCancelSource_.requestCancellation();
     // reset -> onStreamComplete -> fetchComplete: handles pubTracks_.erase
     // and retireRequestID
     reset(ResetStreamErrorCode::CANCELLED);
@@ -3359,7 +3360,10 @@ bool MoQSession::BidiRequestCallback::handleFirstFrame(RequestID reqId) {
     control_->setOnPeerTermination(std::move(onPeerTerminationFn_));
   }
   replyContext_ = std::make_shared<BidiStreamReplyContext>(
-      control_, session_->cancellationSource_.getToken());
+      control_,
+      folly::cancellation_token_merge(
+          session_->cancellationSource_.getToken(),
+          control_->getPeerCancelToken()));
   return true;
 }
 
@@ -4430,14 +4434,21 @@ folly::coro::Task<void> MoQSession::handleSubscribe(
   //// publishHandler_
   params.eraseAllParamsOfType(TrackRequestParamKey::DELIVERY_TIMEOUT);
 
+  auto peerCancelToken = trackPublisher->getPeerCancelToken();
   auto subscribeResult = co_await co_awaitTry(co_withCancellation(
-      cancellationSource_.getToken(),
+      folly::cancellation_token_merge(
+          cancellationSource_.getToken(), peerCancelToken),
       publishHandler_->subscribe(
           std::move(sub),
           std::static_pointer_cast<TrackConsumer>(trackPublisher))));
   auto publisherIt = pubTracks_.find(requestID);
-  if (publisherIt == pubTracks_.end() ||
+  if (peerCancelToken.isCancellationRequested() ||
+      publisherIt == pubTracks_.end() ||
       publisherIt->second.get() != trackPublisher.get()) {
+    // The subscriber cancelled before this handle was installed.
+    if (subscribeResult.hasValue() && subscribeResult->hasValue()) {
+      subscribeResult->value()->unsubscribe();
+    }
     co_return;
   }
   if (subscribeResult.hasException()) {
@@ -5379,7 +5390,8 @@ folly::coro::Task<void> MoQSession::handleFetch(
     co_return;
   }
   auto fetchResult = co_await co_awaitTry(co_withCancellation(
-      cancellationSource_.getToken(),
+      folly::cancellation_token_merge(
+          cancellationSource_.getToken(), fetchPublisher->getPeerCancelToken()),
       publishHandler_->fetch(
           std::move(fetch), fetchPublisher->getStreamPublisher())));
   if (fetchResult.hasException() || fetchResult->hasError()) {
@@ -5391,6 +5403,13 @@ folly::coro::Task<void> MoQSession::handleFetch(
     // because the stream creation is deferred until the user actually
     // writes something to a stream.
     fetchPublisher->reset(ResetStreamErrorCode::INTERNAL_ERROR);
+  }
+  if (fetchPublisher->isCancelled()) {
+    // The fetch was cancelled before this handle was installed.
+    if (fetchResult.hasValue() && fetchResult->hasValue()) {
+      fetchResult->value()->fetchCancel();
+    }
+    co_return;
   }
 
   if (fetchResult.hasException()) {
@@ -5409,14 +5428,13 @@ folly::coro::Task<void> MoQSession::handleFetch(
     auto fetchErr = std::move(fetchResult->error());
     fetchErr.requestID = requestID; // In case app got it wrong
     fetchError(fetchErr, *replyContext);
-  } else if (!fetchPublisher->isCancelled()) {
+  } else {
     auto fetchHandle = std::move(fetchResult->value());
     auto fetchOkMsg = fetchHandle->fetchOk();
     fetchOkMsg.requestID = requestID;
     fetchOk(fetchOkMsg, *replyContext);
     fetchPublisher->setFetchHandle(std::move(fetchHandle));
-  } // else, no need to fetchError, state has been removed on both sides
-    // already
+  }
 }
 
 void MoQSession::onFetchCancel(FetchCancel fetchCancel) {
@@ -8035,8 +8053,10 @@ std::shared_ptr<ReplyContext> MoQSession::makeReplyContext(
     XCHECK(control->writeHandle())
         << "BidiStreamControl handed to makeReplyContext must have a live "
            "write handle";
+    auto token = folly::cancellation_token_merge(
+        cancellationSource_.getToken(), control->getPeerCancelToken());
     return std::make_shared<BidiStreamReplyContext>(
-        std::move(control), cancellationSource_.getToken());
+        std::move(control), std::move(token));
   }
   return controlStreamReplyContext();
 }

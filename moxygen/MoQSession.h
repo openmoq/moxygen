@@ -504,6 +504,10 @@ class MoQSession : public Subscriber,
       session_ = session;
     }
 
+    folly::CancellationToken getPeerCancelToken() const {
+      return peerCancelSource_.getToken();
+    }
+
     // Priority for one schedulable element of this request, encoded from the
     // subscriber priority, publisher priority and group order.
     quic::PriorityQueue::Priority elementPriority(
@@ -668,6 +672,7 @@ class MoQSession : public Subscriber,
     bool publishDoneSent_{false};
     bool requestStreamGoawaySent_{false};
     bool goawayResetPending_{false};
+    folly::CancellationSource peerCancelSource_;
 
    private:
     class GoawayResetTimeoutCallback;
