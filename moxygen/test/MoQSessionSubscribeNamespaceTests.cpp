@@ -81,10 +81,13 @@ class RelayHopNamespacePublishHandle
   }
 
   void namespaceMsg(const TrackNamespace&) override {}
-  void namespaceDoneMsg(const TrackNamespace&) override {}
+  void namespaceDoneMsg(const TrackNamespace&) override {
+    namespaceDoneBaton.post();
+  }
 
   std::optional<Namespace> message;
   folly::coro::Baton namespaceBaton;
+  folly::coro::Baton namespaceDoneBaton;
 };
 
 // Verifies that after NAMESPACE + NAMESPACE_DONE, a second NAMESPACE
@@ -172,6 +175,9 @@ CO_TEST_P_X(V16PlusSubscribeNamespaceTest, NamespaceDoneDoesNotCloseStream) {
 CO_TEST_P_X(
     V16PlusSubscribeNamespaceTest,
     NamespacePreservesRelayHopParameters) {
+  if (getDraftMajorVersion(GetParam().serverVersion) < 18) {
+    co_return;
+  }
   relayHopsSupported_ = true;
   co_await setupMoQSession();
   EXPECT_TRUE(
@@ -235,6 +241,18 @@ CO_TEST_P_X(
       EXPECT_EQ(hopPath.value(), (std::vector<uint64_t>{11, 22, 33}));
     }
   }
+
+  clientNamespacePublishHandle->namespaceBaton.reset();
+  outgoing.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::ROUTE_COST), uint64_t{8}));
+  serverPublishHandle->namespaceMsg(outgoing);
+  co_await clientNamespacePublishHandle->namespaceBaton;
+  EXPECT_EQ(
+      clientNamespacePublishHandle->message->params
+          .getFirstParam(TrackRequestParamKey::ROUTE_COST)
+          ->asUint64,
+      8);
+  EXPECT_FALSE(clientSession_->isClosed());
 
   EXPECT_CALL(*clientSubscriberStatsCallback_, onUnsubscribeNamespace());
   EXPECT_CALL(*serverPublisherStatsCallback_, onUnsubscribeNamespace());
