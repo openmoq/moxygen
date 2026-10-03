@@ -359,3 +359,58 @@ CO_TEST_P_X(MoQSessionTest, SubscribeNamespaceError) {
 
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+
+CO_TEST_P_X(Draft18Test, SubscribeNamespaceStreamClosedBeforeAcceptance) {
+  co_await setupMoQSession();
+  EXPECT_CALL(*serverPublisherStatsCallback_, onSubscribeNamespaceSuccess())
+      .Times(0);
+  for (bool reset : {false, true}) {
+    folly::coro::Baton started;
+    folly::coro::Baton accept;
+    auto incoming =
+        std::make_shared<testing::StrictMock<MockSubscribeNamespaceHandle>>(
+            SubscribeNamespaceOk{.requestID = RequestID(reset ? 2 : 0)});
+    unsigned withdrawals = 0;
+    EXPECT_CALL(*incoming, unsubscribeNamespace()).WillOnce([&] {
+      ++withdrawals;
+    });
+    EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+        .WillOnce(
+            [&](auto, auto)
+                -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+              started.post();
+              co_await accept;
+              co_return incoming;
+            });
+    auto stream = clientWt_->createBidiStream();
+    EXPECT_TRUE(stream.hasValue());
+    if (!stream) {
+      co_return;
+    }
+    auto request = getSubscribeNamespace();
+    request.requestID = RequestID(reset ? 2 : 0);
+    MoQFrameWriter writer;
+    writer.initializeVersion(kVersionDraft18);
+    folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+    EXPECT_TRUE(writer.writeSubscribeNamespace(buf, request).hasValue());
+    stream->writeHandle->writeStreamData(buf.move(), false, nullptr);
+    co_await started;
+    if (reset) {
+      stream->writeHandle->resetStream(
+          folly::to_underlying(ResetStreamErrorCode::CANCELLED));
+    } else {
+      stream->writeHandle->writeStreamData(nullptr, true, nullptr);
+    }
+    for (int i = 0; i < 25; ++i) {
+      co_await folly::coro::co_reschedule_on_current_executor;
+    }
+    accept.post();
+    for (int i = 0; i < 25; ++i) {
+      co_await folly::coro::co_reschedule_on_current_executor;
+    }
+    EXPECT_EQ(withdrawals, 1);
+    EXPECT_FALSE(serverSession_->isClosed());
+    testing::Mock::VerifyAndClearExpectations(incoming.get());
+  }
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}

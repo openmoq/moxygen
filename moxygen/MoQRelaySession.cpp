@@ -1178,6 +1178,9 @@ void MoQRelaySession::onPublishNamespaceImpl(
         *replyContext);
     return;
   }
+  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
+    requestUpdateReplyContexts_.emplace(pubNs.requestID, replyContext);
+  }
   co_withExecutor(
       exec_.get(),
       co_withCancellation(
@@ -1190,6 +1193,12 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
     PublishNamespace publishNamespace,
     std::shared_ptr<ReplyContext> replyContext) {
   co_await folly::coro::co_safe_point;
+  bool accepted = false;
+  SCOPE_EXIT {
+    if (!accepted) {
+      requestUpdateReplyContexts_.erase(publishNamespace.requestID);
+    }
+  };
   folly::RequestContextScopeGuard guard;
   setRequestSession();
   auto pubNsCb = std::make_shared<SubscriberPublishNamespaceCallback>(
@@ -1201,6 +1210,15 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
       cancellationSource_.getToken(),
       subscribeHandler_->publishNamespace(
           publishNamespace, std::move(pubNsCb))));
+  if (isClosed() || replyContext->cancelled() ||
+      (getDraftMajorVersion(*getNegotiatedVersion()) >= 18 &&
+       !requestUpdateReplyContexts_.contains(publishNamespace.requestID))) {
+    if (publishNamespaceResult.hasValue() &&
+        publishNamespaceResult->hasValue()) {
+      publishNamespaceResult->value()->publishNamespaceDone();
+    }
+    co_return;
+  }
   if (publishNamespaceResult.hasException()) {
     XLOG(ERR) << "Exception in Subscriber callback ex="
               << publishNamespaceResult.exception().what().toStdString();
@@ -1224,10 +1242,7 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
     auto publishNamespaceOkMsg = handle->publishNamespaceOk();
     publishNamespaceOk(publishNamespaceOkMsg, *replyContext);
     publishNamespaceHandles_[publishNamespace.requestID] = std::move(handle);
-    if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
-      // Retain the bidi reply context so a failed REQUEST_UPDATE can close it.
-      requestUpdateReplyContexts_[publishNamespace.requestID] = replyContext;
-    }
+    accepted = true;
     if (getDraftMajorVersion(*getNegotiatedVersion()) < 16) {
       // Legacy: also store NS->RequestID mapping for lookups
       legacySubscriberNamespaceToReqId_[publishNamespace.trackNamespace] =
@@ -1325,14 +1340,16 @@ void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone pubNsDone) {
     legacySubscriberNamespaceToReqId_.erase(nsIt);
   }
 
+  const bool knownRequest = requestUpdateReplyContexts_.erase(reqId) != 0;
   auto it = publishNamespaceHandles_.find(reqId);
   if (it == publishNamespaceHandles_.end()) {
-    XLOG(ERR) << "PublishNamespaceDone for unknown requestID=" << reqId;
+    if (!knownRequest) {
+      XLOG(ERR) << "PublishNamespaceDone for unknown requestID=" << reqId;
+    }
     return;
   }
   handle = std::move(it->second);
   publishNamespaceHandles_.erase(it);
-  requestUpdateReplyContexts_.erase(reqId);
 
   // Common action
   handle->publishNamespaceDone();
@@ -1536,6 +1553,10 @@ void MoQRelaySession::onSubscribeNamespaceImpl(
         std::move(subNsReply));
     return;
   }
+  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
+    requestUpdateReplyContexts_.emplace(
+        sa.requestID, subNsReply->replyContext());
+  }
   co_withExecutor(
       exec_.get(),
       co_withCancellation(
@@ -1587,6 +1608,12 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
     SubscribeNamespace subNs,
     std::shared_ptr<SubNSReply> subNsReply) {
   co_await folly::coro::co_safe_point;
+  bool accepted = false;
+  SCOPE_EXIT {
+    if (!accepted) {
+      requestUpdateReplyContexts_.erase(subNs.requestID);
+    }
+  };
   folly::RequestContextScopeGuard guard;
   setRequestSession();
   std::shared_ptr<MoQNamespacePublishHandle> publishHandle;
@@ -1597,6 +1624,14 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
   auto subNsResult = co_await co_awaitTry(co_withCancellation(
       cancellationSource_.getToken(),
       publishHandler_->subscribeNamespace(subNs, publishHandle)));
+  if (isClosed() || subNsReply->replyContext()->cancelled() ||
+      (getDraftMajorVersion(*getNegotiatedVersion()) >= 18 &&
+       !requestUpdateReplyContexts_.contains(subNs.requestID))) {
+    if (subNsResult.hasValue() && subNsResult->hasValue()) {
+      subNsResult->value()->unsubscribeNamespace();
+    }
+    co_return;
+  }
   if (subNsResult.hasException()) {
     XLOG(ERR) << "Exception in Publisher callback ex="
               << subNsResult.exception().what().toStdString();
@@ -1618,18 +1653,11 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
   } else {
     auto handle = std::move(subNsResult->value());
     auto subNsOk = handle->subscribeNamespaceOk();
-    std::shared_ptr<ReplyContext> replyContext;
-    if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
-      // Retain the bidi reply context so a failed REQUEST_UPDATE can close it.
-      replyContext = subNsReply->replyContext();
-    }
     subscribeNamespaceOk(subNsOk, std::move(subNsReply));
 
     // Store by RequestID (primary key)
     subscribeNamespaceHandles_[subNs.requestID] = std::move(handle);
-    if (replyContext) {
-      requestUpdateReplyContexts_[subNs.requestID] = std::move(replyContext);
-    }
+    accepted = true;
     if (getDraftMajorVersion(*getNegotiatedVersion()) < 15) {
       // Legacy: also store NS->RequestID mapping for lookups
       legacySubscribeNamespaceToReqId_[subNs.trackNamespacePrefix] =
@@ -1696,9 +1724,12 @@ void MoQRelaySession::onUnsubscribeNamespace(UnsubscribeNamespace unsub) {
     legacySubscribeNamespaceToReqId_.erase(nsIt);
   }
 
+  const bool knownRequest = requestUpdateReplyContexts_.erase(requestID) != 0;
   auto saIt = subscribeNamespaceHandles_.find(requestID);
   if (saIt == subscribeNamespaceHandles_.end()) {
-    XLOG(ERR) << "Invalid unsub publishNamespace requestID=" << requestID;
+    if (!knownRequest) {
+      XLOG(ERR) << "Invalid unsub publishNamespace requestID=" << requestID;
+    }
     return;
   }
   handle = saIt->second;
@@ -1708,7 +1739,6 @@ void MoQRelaySession::onUnsubscribeNamespace(UnsubscribeNamespace unsub) {
   setRequestSession();
   handle->unsubscribeNamespace();
   subscribeNamespaceHandles_.erase(requestID);
-  requestUpdateReplyContexts_.erase(requestID);
 
   retireRequestID(/*signalWriteLoop=*/true);
 }
