@@ -9,6 +9,7 @@
 #include "moxygen/MoQLocation.h"
 #include "moxygen/MoQSession.h"
 
+#include <folly/Executor.h>
 #include <folly/container/F14Set.h>
 #include <folly/hash/Hash.h>
 
@@ -153,7 +154,12 @@ class MoQForwarder : public TrackConsumer {
         tombstonedSubgroups;
     MoQForwarder* forwarder;
     bool shouldForward;
+    bool passive{false};
+    bool pinned{false};
     bool receivedPublishDone_{false};
+    bool isPinned() const {
+      return pinned;
+    }
 
     void detach() {
       forwarder = nullptr;
@@ -161,8 +167,8 @@ class MoQForwarder : public TrackConsumer {
 
    private:
     // Updates shouldForward and keeps forwardingSubscribers_ in sync,
-    // firing forwardChanged when the count crosses zero.  Shared by
-    // onPublishOk and requestUpdate.
+    // firing forwardChanged when the count crosses zero or after a refusal.
+    // Shared by onPublishOk and requestUpdate.
     void updateForwardState(bool newForward);
   };
 
@@ -173,6 +179,11 @@ class MoQForwarder : public TrackConsumer {
     return subscribers_.empty();
   }
 
+  std::shared_ptr<Subscriber> getSubscriber(SessionId sessionId) const {
+    auto it = subscribers_.find(sessionId);
+    return it != subscribers_.end() ? it->second : nullptr;
+  }
+
   std::shared_ptr<MoQForwarder::Subscriber> addSubscriber(
       SessionId sessionId,
       const SubscribeRequest& subReq,
@@ -181,6 +192,15 @@ class MoQForwarder : public TrackConsumer {
   std::shared_ptr<MoQForwarder::Subscriber> addSubscriber(
       SessionId sessionId,
       bool forward);
+
+  // A passive subscriber receives objects but does not count toward
+  // forwardChanged or onEmpty. A subscriber without a session takes its id
+  // from MoQSession::makeSessionId().
+  std::shared_ptr<MoQForwarder::Subscriber> addSubscriber(
+      SessionId sessionId,
+      bool forward,
+      std::shared_ptr<TrackConsumer> consumer,
+      bool passive = false);
 
   folly::Expected<SubscribeRange, FetchError> resolveJoiningFetch(
       SessionId sessionId,
@@ -368,10 +388,25 @@ class MoQForwarder : public TrackConsumer {
 
   void addForwardingSubscriber();
 
+  // Fires forwardChanged(true) after a refusal without a count change.
+  void renewForwarding();
+
   void removeForwardingSubscriber();
 
   uint64_t numForwardingSubscribers() const {
     return forwardingSubscribers_;
+  }
+
+  size_t subscriberCount() const {
+    return subscribers_.size();
+  }
+
+  uint64_t totalGroupsReceived() const {
+    return totalGroupsReceived_;
+  }
+
+  uint64_t totalObjectsReceived() const {
+    return totalObjectsReceived_;
   }
 
  private:
@@ -437,7 +472,23 @@ class MoQForwarder : public TrackConsumer {
   // the upstream Largest Group advances (indicating the request was fulfilled).
   std::optional<uint64_t> outstandingNewGroupRequest_{};
   std::shared_ptr<Callback> callback_;
+  // Increments totalObjectsReceived_ and, when the group changes,
+  // totalGroupsReceived_.  Call once per incoming object regardless of delivery
+  // mode (subgroup stream, objectStream, datagram).
+  void countReceivedObject(uint64_t groupID);
+
   uint64_t forwardingSubscribers_{0};
+  // True from refusing a subgroup to the publisher until the next
+  // forwardChanged(true).
+  bool refusedUpstream_{false};
+  uint32_t passiveCount_{0};
+  uint64_t totalGroupsReceived_{0};
+  uint64_t totalObjectsReceived_{0};
+  // NOTE: counts distinct group transitions, not distinct group IDs.
+  // If subgroups for a group arrive interleaved with another group (e.g. under
+  // NewestFirst delivery or due to retransmission), a group may be counted more
+  // than once.  This is a best-effort counter for diagnostics only.
+  uint64_t lastGroupSeen_{std::numeric_limits<uint64_t>::max()};
   bool draining_{false};
 };
 

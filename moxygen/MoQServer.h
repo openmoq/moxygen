@@ -11,6 +11,7 @@
 #include <quic/logging/QLogger.h>
 #include <moxygen/MoQEarlyDataHandler.h>
 #include <moxygen/MoQServerBase.h>
+#include <quic/logging/QLogger.h>
 
 #include <folly/init/Init.h>
 #include <folly/io/async/EventBaseLocal.h>
