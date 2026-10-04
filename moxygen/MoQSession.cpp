@@ -2949,7 +2949,9 @@ MoQSession::PublisherImpl::PublisherImpl(
       groupOrder_(groupOrder),
       version_(version),
       bytesBufferedThreshold_(bytesBufferedThreshold) {
-  moqFrameWriter_.initializeVersion(version);
+  moqFrameWriter_.initializeVersion(
+      version,
+      session_ ? session_->getNegotiatedExtensions() : SetupExtensions());
 }
 
 MoQSession::PublisherImpl::~PublisherImpl() {
