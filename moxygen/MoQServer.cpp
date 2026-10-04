@@ -337,31 +337,29 @@ void MoQServer::Handler::onHeadersComplete(
   XLOG(DBG1) << "MoQServer WebTransport: supported protocols: "
              << folly::join(", ", supportedProtocols);
   std::optional<std::string> negotiatedProtocol;
-  if (!supportedProtocols.empty()) {
-    if (auto wtAvailableProtocols =
-            HTTPWebTransport::getWTAvailableProtocols(*req)) {
-      if (auto wtProtocol = HTTPWebTransport::negotiateWTProtocol(
-              wtAvailableProtocols.value(), supportedProtocols)) {
-        HTTPWebTransport::setWTProtocol(resp, wtProtocol.value());
-        negotiatedProtocol = wtProtocol.value();
-        XLOG(DBG1) << "WebTransport: Negotiated protocol: " << *wtProtocol;
-      } else {
-        XLOG(DBG4) << "Failed to negotiate WebTransport protocol";
-        resp.setStatusCode(400);
-        txn_->sendHeadersWithEOM(resp);
-        return;
-      }
-    } else if (
-        std::find(
-            supportedProtocols.begin(),
-            supportedProtocols.end(),
-            kAlpnMoqtLegacy) == supportedProtocols.end()) {
-      // In-band ClientSetup negotiates only draft 14.
-      XLOG(DBG4) << "WebTransport protocol missing and draft 14 not offered";
+  if (auto wtAvailableProtocols =
+          HTTPWebTransport::getWTAvailableProtocols(*req)) {
+    if (auto wtProtocol = HTTPWebTransport::negotiateWTProtocol(
+            wtAvailableProtocols.value(), supportedProtocols)) {
+      HTTPWebTransport::setWTProtocol(resp, wtProtocol.value());
+      negotiatedProtocol = wtProtocol.value();
+      XLOG(DBG1) << "WebTransport: Negotiated protocol: " << *wtProtocol;
+    } else {
+      XLOG(DBG4) << "Failed to negotiate WebTransport protocol";
       resp.setStatusCode(400);
       txn_->sendHeadersWithEOM(resp);
       return;
     }
+  } else if (
+      std::find(
+          supportedProtocols.begin(),
+          supportedProtocols.end(),
+          kAlpnMoqtLegacy) == supportedProtocols.end()) {
+    // In-band ClientSetup negotiates only draft 14.
+    XLOG(DBG4) << "WebTransport protocol missing and draft 14 not offered";
+    resp.setStatusCode(400);
+    txn_->sendHeadersWithEOM(resp);
+    return;
   }
   txn_->sendHeaders(resp);
   auto wt = txn_->getWebTransport();
