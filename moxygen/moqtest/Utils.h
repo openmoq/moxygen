@@ -36,6 +36,9 @@ convertMoqTestParamToTrackNamespace(const MoQTestParameters& params);
 folly::Expected<moxygen::MoQTestParameters, std::runtime_error>
 convertTrackNamespaceToMoqTestParam(TrackNamespace* track);
 
+// Splits a '/'-separated --ns_prefix into tuples.
+std::vector<std::string> parseNsPrefix(const std::string& prefix);
+
 std::vector<Extension> getExtensions(
     int integerExtensionId,
     int variableExtensionId,
