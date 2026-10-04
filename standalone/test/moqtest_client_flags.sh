@@ -35,5 +35,7 @@ expect groups 'only applies with --request=subscribe or subscribe_tracks' \
   --groups=1 --request=fetch
 expect groups_subscribe_tracks 'does not support datagram' \
   --groups=1 --request=subscribe_tracks --forwarding_preference=3
+# An unknown flag would stop the client before the --groups check.
+expect ns_prefix 'only applies with' --ns_prefix=a --groups=1 --request=fetch
 
 exit "$fail"

@@ -56,6 +56,10 @@ bool parseInt64Flag(
 } // namespace
 
 DEFINE_string(url, "http://localhost:9999", "URL to connect to");
+DEFINE_string(
+    ns_prefix,
+    "",
+    "Namespace tuples before moq-test-00, '/'-separated");
 DEFINE_int64(forwarding_preference, 0, "Forwarding preference");
 DEFINE_uint64(start_group, moxygen::kDefaultStart, "Start group for MoQParams");
 DEFINE_uint64(
@@ -226,6 +230,7 @@ int main(int argc, char** argv) {
 
   // Initialize Client with url and moq params
   moxygen::MoQTestParameters defaultMoqParams;
+  defaultMoqParams.nsPrefix = moxygen::parseNsPrefix(FLAGS_ns_prefix);
   defaultMoqParams.forwardingPreference =
       moxygen::ForwardingPreference(FLAGS_forwarding_preference);
   defaultMoqParams.startGroup = FLAGS_start_group;
