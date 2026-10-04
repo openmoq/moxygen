@@ -5,14 +5,13 @@
  */
 
 #include <folly/coro/BlockingWait.h>
-#include <folly/io/async/AsyncSignalHandler.h>
-#include <csignal>
 #include <limits>
 #include "folly/init/Init.h"
 #include "folly/io/async/ScopedEventBaseThread.h"
 #include "moxygen/mlog/FileMLogger.h"
 #include "moxygen/moqtest/MoQTestClient.h"
 #include "moxygen/samples/util/Utils.h"
+#include "moxygen/util/SignalHandler.h"
 
 namespace {
 
@@ -279,27 +278,8 @@ int main(int argc, char** argv) {
 
   // Drain on SIGINT/SIGTERM. We don't terminate the loop here: draining closes
   // the session, which flushes CONNECTION_CLOSE and lets evb.loop() return.
-  class SigHandler : public folly::AsyncSignalHandler {
-   public:
-    SigHandler(folly::EventBase* evb, std::shared_ptr<moxygen::MoQTestClient> c)
-        : folly::AsyncSignalHandler(evb), client_(std::move(c)) {
-      registerSignalHandler(SIGINT);
-      registerSignalHandler(SIGTERM);
-    }
-    void signalReceived(int) noexcept override {
-      client_->shutdown();
-      unreg();
-    }
-
-    void unreg() {
-      unregisterSignalHandler(SIGINT);
-      unregisterSignalHandler(SIGTERM);
-    }
-
-   private:
-    std::shared_ptr<moxygen::MoQTestClient> client_;
-  };
-  SigHandler sigHandler(&evb, client);
+  moxygen::SignalHandler sigHandler(
+      &evb, [&client](int) { client->shutdown(); }, /*terminateLoop=*/false);
 
   try {
     // Connect Client to Server
@@ -314,7 +294,7 @@ int main(int argc, char** argv) {
     // the loop alive.
     auto onComplete = [&sigHandler, &client](auto&&) {
       client->shutdown();
-      sigHandler.unreg();
+      sigHandler.unregister();
     };
     if (FLAGS_request == "subscribe" && joinStart) {
       XLOG(INFO) << "Joining from group " << *joinStart << " at "
