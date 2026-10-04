@@ -191,12 +191,15 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::subscribe(
   }
 
   // Set Current Request
-  initializeExpecteds(params, resolveFetchWindow(params));
+  initializeExpecteds(params, initialWindow(params));
   startReceiving(subState_, ReceivingType::SUBSCRIBE);
 
   // Subscribe to the receiver
   auto res = co_await moqClient_->moqSession_->subscribe(sub, subReceiver_);
-  armObjectDeadlines();
+  // The groups window arms its own when the first object arrives.
+  if (!groupsToValidate_) {
+    armObjectDeadlines();
+  }
 
   if (!res.hasError()) {
     subHandle_ = res.value();
@@ -375,10 +378,11 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::receivePublish(
   }
 
   requestID_ = kDefaultRequestId;
-  initializeExpecteds(params, resolveFetchWindow(params));
+  initializeExpecteds(params, initialWindow(params));
   startReceiving(subState_, ReceivingType::SUBSCRIBE);
-  // The publisher can start at any time, so the deadlines start at its PUBLISH.
-  awaitingPublish_ = true;
+  // The deadlines start at the PUBLISH, or at the groups window, because the
+  // publisher can start at any time.
+  awaitingPublish_ = groupsToValidate_ == 0;
 
   auto subRes = co_await folly::coro::co_awaitTry(
       subscribeTracks(trackNamespace.value()));
@@ -486,9 +490,10 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::join(
   // Neither half starts where the client would guess: the publisher resolves
   // the backfill against its own Largest, and the subscription picks up from
   // there.
-  initializeExpecteds(params, resolveFetchWindow(params));
+  initializeExpecteds(params, initialWindow(params));
   startReceiving(subState_, ReceivingType::SUBSCRIBE, /*seeded=*/false);
   startReceiving(fetchState_, ReceivingType::FETCH, /*seeded=*/false);
+  joinWindowPending_ = groupsToValidate_ > 0;
 
   auto res = co_await moqClient_->moqSession_->join(
       sub,
@@ -538,6 +543,9 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::join(
       const uint64_t startGroup = joiningStartGroup(joinStart, *largest);
       validateJoiningFetchOk(
           fetchHandle_->fetchOk(), params, *largest, startGroup);
+      if (groupsToValidate_) {
+        openGroupsWindow(startGroup, std::chrono::milliseconds(0));
+      }
       trimExpectedBefore(startGroup);
       if (fetchState_.endOfGroupOmitted) {
         // The backfill stops at Largest, so a group the two halves split
@@ -553,8 +561,11 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::join(
   }
 
   // Armed after the trim, so the backfilled prefix does not schedule deadlines
-  // only to have them destroyed.
-  armObjectDeadlines();
+  // only to have them destroyed.  The groups window arms its own.
+  if (!groupsToValidate_) {
+    armObjectDeadlines();
+  }
+  releaseHeldEvents();
 
   co_await doneBaton_;
   co_return trackNamespace.value();
@@ -566,6 +577,9 @@ ObjectReceiverCallback::FlowControlState MoQTestClient::onObject(
     const ObjectHeader& objHeader,
     Payload payload) {
   XLOG(DBG1) << "MoQTest DEBUGGING: Calling onObject";
+  if (ignoredByGroupsWindow(state, objHeader.group)) {
+    return ObjectReceiverCallback::FlowControlState::UNBLOCKED;
+  }
 
   // A zero-length object arrives with no payload buffer at all.
   auto payloadStr = payload ? payload->toString() : std::string();
@@ -584,6 +598,7 @@ ObjectReceiverCallback::FlowControlState MoQTestClient::onObject(
 
   // Adjust the expected data (If Still receiving data, leave unblocked)
   adjustExpected(state, params_, objHeader);
+  finishGroupsWindowIfComplete(state);
   return ObjectReceiverCallback::FlowControlState::UNBLOCKED;
 }
 
@@ -592,6 +607,9 @@ void MoQTestClient::onObjectStatus(
     const std::optional<TrackAlias>& /* trackAlias */,
     const ObjectHeader& objHeader) {
   XLOG(DBG1) << "MoQTest DEBUGGING: calling onObjectStatus";
+  if (ignoredByGroupsWindow(state, objHeader.group)) {
+    return;
+  }
 
   ObjectHeader header = objHeader;
   // Validate the received data
@@ -632,6 +650,7 @@ void MoQTestClient::onObjectStatus(
     XLOG(DBG1)
         << "MoQTest DEBUGGING: onObjectStatus: No more data to be expected";
   }
+  finishGroupsWindowIfComplete(state);
 }
 
 void MoQTestClient::onEndOfStream() {
@@ -752,7 +771,7 @@ constexpr std::chrono::milliseconds kDeadlineSlack{1000};
 constexpr std::chrono::milliseconds kObjectDrift{10};
 } // namespace
 
-void MoQTestClient::armObjectDeadlines() {
+void MoQTestClient::armObjectDeadlines(std::chrono::milliseconds lead) {
   for (auto& [unused, cb] : expectedObjects_) {
     moqExecutor_->scheduleTimeout(cb.get(), cb->timeout());
   }
@@ -761,7 +780,7 @@ void MoQTestClient::armObjectDeadlines() {
   // leaves the session holding PUBLISH_DONE.
   moqExecutor_->scheduleTimeout(
       &requestDeadline_,
-      int64_t(totalExpected_) * objectInterval() + kDeadlineSlack +
+      lead + int64_t(totalExpected_) * objectInterval() + kDeadlineSlack +
           moqClient_->moqSession_->getMoqSettings()
               .publishDoneStreamCountTimeout);
 }
@@ -829,6 +848,23 @@ void MoQTestClient::finishRequest() {
   }
 }
 
+void MoQTestClient::deliver(folly::Function<void()> event) {
+  if (joinWindowPending_) {
+    pendingEvents_.push_back(std::move(event));
+  } else {
+    event();
+  }
+}
+
+void MoQTestClient::releaseHeldEvents() {
+  joinWindowPending_ = false;
+  auto pending = std::move(pendingEvents_);
+  pendingEvents_.clear();
+  for (auto& event : pending) {
+    event();
+  }
+}
+
 void MoQTestClient::onPublishDone() {
   publishDoneReceived_ = true;
 }
@@ -848,6 +884,10 @@ void MoQTestClient::validateSubgroupHeader(
   // so neither the end-of-group signal nor the first-object signal describes a
   // whole subgroup until the cursor has a position.
   if (!state.seeded) {
+    return;
+  }
+  // The group before the window can arrive partway through.
+  if (groupsToValidate_ && outsideGroupsWindow(groupID)) {
     return;
   }
 
@@ -1315,27 +1355,86 @@ void MoQTestClient::initializeExpecteds(
   fetchHalfLastGroup_.reset();
   subState_ = ReceiveState{};
   fetchState_ = ReceiveState{};
-
-  expectedObjects_.clear();
-  // Deadlines come off the object's index, so this assumes expectedObjectsIn
-  // returns them in arrival order.  Interleaved subgroups only need monotone.
-  int64_t n = 0;
-  for (const auto& key : expectedObjectsIn(params, window)) {
-    expectedObjects_.emplace(
-        key,
-        std::make_unique<ObjectDeadline>(
-            *this,
-            key.first,
-            key.second,
-            n++ * objectInterval() + kDeadlineSlack));
-  }
-  totalExpected_ = expectedObjects_.size();
+  groupsWindowOpen_ = false;
+  joinWindowPending_ = false;
+  pendingEvents_.clear();
+  buildScoreboard(std::chrono::milliseconds(0));
 
   // Only relevant for Datagram Forwarding Preference
   datagramObjects_ = 0;
   datagramDrops_ = 0;
 
   publishDoneReceived_ = false;
+}
+
+void MoQTestClient::buildScoreboard(std::chrono::milliseconds lead) {
+  expectedObjects_.clear();
+  // Deadlines come off the object's index, so this assumes expectedObjectsIn
+  // returns them in arrival order.  Interleaved subgroups only need monotone.
+  int64_t n = 0;
+  for (const auto& key : expectedObjectsIn(params_, window_)) {
+    expectedObjects_.emplace(
+        key,
+        std::make_unique<ObjectDeadline>(
+            *this,
+            key.first,
+            key.second,
+            lead + n++ * objectInterval() + kDeadlineSlack));
+  }
+  totalExpected_ = expectedObjects_.size();
+}
+
+MoQTestFetchWindow MoQTestClient::initialWindow(
+    const MoQTestParameters& params) const {
+  // The track's position is known only once the first object arrives.
+  return groupsToValidate_ ? MoQTestFetchWindow{} : resolveFetchWindow(params);
+}
+
+void MoQTestClient::openGroupsWindow(
+    uint64_t firstGroup,
+    std::chrono::milliseconds lead) {
+  groupsWindowOpen_ = true;
+  const uint64_t last =
+      firstGroup + (groupsToValidate_ - 1) * params_.groupIncrement;
+  // An end object of 0 selects the whole end group.
+  window_ = resolveFetchWindow(
+      params_,
+      StandaloneFetch(
+          AbsoluteLocation{firstGroup, 0}, AbsoluteLocation{last, 0}));
+  buildScoreboard(lead);
+  armObjectDeadlines(lead);
+  XLOG(INFO) << "MoQTest: validating groups " << window_.first.group << ".."
+             << window_.last.group;
+}
+
+bool MoQTestClient::outsideGroupsWindow(uint64_t group) const {
+  return !groupsWindowOpen_ || group < window_.first.group ||
+      group > window_.last.group;
+}
+
+bool MoQTestClient::ignoredByGroupsWindow(ReceiveState& state, uint64_t group) {
+  if (!groupsToValidate_) {
+    return false;
+  }
+  if (!groupsWindowOpen_) {
+    // The first group received can be partial, so the window starts after it.
+    // The rest of that group arrives before the window's first object.
+    openGroupsWindow(
+        group + params_.groupIncrement,
+        objectInterval() *
+            int64_t(params_.objectsPerGroup + params_.sendEndOfGroupMarkers));
+    startReceiving(state, state.type);
+  }
+  return state.done || outsideGroupsWindow(group);
+}
+
+void MoQTestClient::finishGroupsWindowIfComplete(ReceiveState& state) {
+  if (!groupsToValidate_ || state.done || !expectedObjects_.empty()) {
+    return;
+  }
+  // The track runs on past the window, so the client ends the request.
+  cancelRequest();
+  finishRequest();
 }
 
 void MoQTestClient::seedCursor(
