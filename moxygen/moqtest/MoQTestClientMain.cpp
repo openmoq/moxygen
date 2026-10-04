@@ -127,6 +127,12 @@ DEFINE_string(
     "ran before the subscription. A non-negative value is the absolute group "
     "to fetch from; a negative value counts that many groups back from where "
     "the subscription begins. Empty means a plain SUBSCRIBE.");
+DEFINE_uint64(
+    groups,
+    0,
+    "Validate this many groups after the first one received (with "
+    "--join_start, from the backfill's first group), then unsubscribe. 0 = the "
+    "whole track.");
 DEFINE_string(
     publish_order,
     "subscribe_first",
@@ -203,6 +209,18 @@ int main(int argc, char** argv) {
     XLOG(ERR) << "--join_start=" << FLAGS_join_start << " is out of range";
     return 1;
   }
+  if (FLAGS_groups && FLAGS_request != "subscribe" &&
+      FLAGS_request != "subscribe_tracks") {
+    XLOG(ERR) << "--groups only applies with --request=subscribe or "
+                 "subscribe_tracks";
+    return 1;
+  }
+  if (FLAGS_groups &&
+      moxygen::ForwardingPreference(FLAGS_forwarding_preference) ==
+          moxygen::ForwardingPreference::DATAGRAM) {
+    XLOG(ERR) << "--groups does not support datagram forwarding";
+    return 1;
+  }
 
   folly::EventBase evb;
   XLOG(INFO) << "Starting MoQTestClient";
@@ -250,6 +268,7 @@ int main(int argc, char** argv) {
   auto url = proxygen::URL(FLAGS_url);
   std::shared_ptr<moxygen::MoQTestClient> client =
       moxygen::MoQTestClient::create(&evb, url, transportType);
+  client->setGroupsToValidate(FLAGS_groups);
 
   std::shared_ptr<moxygen::MLogger> logger;
   if (FLAGS_log) {

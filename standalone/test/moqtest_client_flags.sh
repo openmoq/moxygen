@@ -29,5 +29,11 @@ expect() {
 
 # The request type is checked only after connecting, so look at the help.
 expect subscribe_tracks '"subscribe_tracks"' --helpon=MoQTestClientMain
+# --groups is checked against the request before connecting. Reaching the
+# datagram check means subscribe_tracks passed the request check.
+expect groups 'only applies with --request=subscribe or subscribe_tracks' \
+  --groups=1 --request=fetch
+expect groups_subscribe_tracks 'does not support datagram' \
+  --groups=1 --request=subscribe_tracks --forwarding_preference=3
 
 exit "$fail"
