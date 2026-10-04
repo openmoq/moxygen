@@ -205,6 +205,7 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
       toSubscribeRange(subReq, largest_),
       std::move(consumer),
       subReq.forward);
+  subscriber->pinned = true;
   // If the session already has a subscriber (e.g. from a prior
   // addSubscriber(sessionId, forward) call), emplace is a no-op. Return the
   // existing in-map entry and only increment the forwarding count when a new
