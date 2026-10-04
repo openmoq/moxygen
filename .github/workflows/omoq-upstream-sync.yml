@@ -250,13 +250,34 @@ jobs:
           git push origin "$FULL_SHA:refs/heads/$BRANCH"
           echo "Created branch $BRANCH"
 
-          # Pre-merge main into sync branch to resolve expected conflicts
-          # (github_hashes files diverge every sync; upstream version wins)
+          # Pre-merge main into sync branch to resolve expected conflicts.
+          # Only the upstream-owned github_hashes files take upstream's side;
+          # any other conflict goes to a person, because main can be ahead of
+          # upstream and a blanket "-X ours" drops fork changes.
           git config user.email "omoq-sync-bot[bot]@users.noreply.github.com"
           git config user.name "omoq-sync-bot[bot]"
           git fetch origin "$BRANCH"
           git checkout -B "$BRANCH" "origin/$BRANCH"
-          if ! git merge origin/main -X ours --no-edit; then
+          merged=true
+          if ! git merge origin/main --no-edit; then
+            git diff --name-only --diff-filter=U -z -- \
+              'build/deps/github_hashes/facebook/*' \
+              'build/deps/github_hashes/facebookincubator/*' |
+              while IFS= read -r -d '' f; do
+                if git cat-file -e ":2:$f" 2>/dev/null; then
+                  git checkout --ours -- "$f" && git add -- "$f"
+                else
+                  # Upstream deleted the file; take the deletion.
+                  git rm -q -- "$f"
+                fi
+              done
+            if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+              merged=false
+            else
+              git commit --no-edit
+            fi
+          fi
+          if [ "$merged" != true ]; then
             echo "::error::Merge conflicts could not be auto-resolved."
             echo "has_conflicts=true" >> "$GITHUB_OUTPUT"
             git merge --abort
