@@ -10,6 +10,8 @@ language: en-US
 
 reviews:
   profile: chill
+  # Request changes on actionable findings; approve once they are resolved.
+  request_changes_workflow: true
 
   path_filters:
     - "!pics/**"
@@ -51,6 +53,14 @@ reviews:
         (https://github.com/openmoq/moqx) forks MoQRelay and MoQCache as
         MoqxRelay and MoqxCache and builds on MoQForwarder, so those changes
         may need a matching port there.
+
+        A sync PR must not drop fork code. main is often ahead of upstream,
+        and the merge and any follow-up commits on the sync branch can lose
+        fork-only behavior, flags or tests in files both sides changed.
+        Compare the result with main's parent for every file the fork had
+        changed, and request changes for any fork code that is gone, unless
+        upstream now carries the same feature or fix. Say which fork commit
+        the dropped code came from.
 
     - path: "moxygen/**/*.{h,cpp}"
       instructions: |
