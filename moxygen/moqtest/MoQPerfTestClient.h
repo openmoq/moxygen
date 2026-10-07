@@ -16,6 +16,7 @@
 #include "moxygen/MoQClientBase.h"
 #include "moxygen/ObjectReceiver.h"
 #include "moxygen/events/MoQFollyExecutorImpl.h"
+#include "moxygen/moqtest/AtomicLatency.h"
 #include "moxygen/moqtest/LatencyHistogram.h"
 #include "moxygen/moqtest/Types.h"
 #include "moxygen/samples/util/Utils.h"
@@ -50,13 +51,8 @@ class SubscriberState {
   // Drain the MoQ session
   void drain();
 
-  // Statistics
   MoQPerfTestClient& testClient_;
   size_t id_;
-  uint64_t objectsReceived_{0};
-  uint64_t bytesReceived_{0};
-  uint64_t totalLatencyMs_{0};
-  uint64_t latencyObjects_{0};
   bool hasError_{false};
 
  private:
@@ -118,26 +114,22 @@ class MoQPerfTestClient {
   // Run the performance test
   folly::coro::Task<void> run();
 
-  // Get test results
   struct TestResults {
     size_t subscribersReached{0}; // peak
-    size_t currentSubscribers{0}; // current active count
+    size_t currentSubscribers{0};
     uint64_t totalObjects{0};
     uint64_t totalBytes{0};
-    uint64_t totalLatencyMs{0}; // cumulative sum (for final avg)
-    uint64_t latencyObjects{0}; // cumulative count (for final avg)
-    struct IntervalLatency {
-      uint64_t sumMs{0};
-      uint64_t count{0};
-      uint64_t minMs{std::numeric_limits<uint64_t>::max()};
-      uint64_t maxMs{0};
-    } intervalLatency;
+    uint64_t totalLatencyMs{0};
+    uint64_t latencyObjects{0};
+    // Drained by each call, so only the aggregator should ask for it.
+    AtomicLatency::Interval intervalLatency;
     uint32_t totalResets{0};
     uint32_t totalFailures{0};
     uint32_t durationSeconds{0};
     bool trackEnded{false};
   };
 
+  // Safe from any thread.
   TestResults getResults() const;
 
   // Safe to call from any thread: reads the atomic bucket counters.
@@ -149,7 +141,7 @@ class MoQPerfTestClient {
   void recordTrackRestart();
   void removeSubscriber(size_t id);
   void updateLargestObjectSeen(const AbsoluteLocation& location);
-  void recordLatency(uint64_t latencyMs);
+  void recordObject(uint64_t bytes, std::optional<uint64_t> latencyMs);
   std::optional<AbsoluteLocation> getLargestObjectSeen() const;
 
  private:
@@ -178,29 +170,21 @@ class MoQPerfTestClient {
   uint32_t failuresInCurrentInterval_{0};
   bool trackRestarted_{false};
   std::optional<AbsoluteLocation> largestObjectSeen_;
-  std::chrono::steady_clock::time_point startTime_;
+  std::atomic<std::chrono::steady_clock::time_point> startTime_;
 
   // Atomic cross-thread state (accessed from aggregation thread in getResults)
+  std::atomic<size_t> currentSubscribers_{0};
   std::atomic<size_t> peakSubscribers_{0};
   std::atomic<uint32_t> totalResets_{0};
   std::atomic<uint32_t> totalFailures_{0};
   std::atomic<uint32_t> numCompleted_{0};
-  std::atomic<uint64_t> cumulativeObjects_{0};
-  std::atomic<uint64_t> cumulativeBytes_{0};
-  std::atomic<uint64_t> cumulativeLatencyMs_{0};
-  std::atomic<uint64_t> cumulativeLatencyObjects_{0};
-  // Interval latency — reset on each getResults() call
-  mutable std::atomic<uint64_t> intervalLatencySum_{0};
-  mutable std::atomic<uint64_t> intervalLatencyCount_{0};
-  mutable std::atomic<uint64_t> intervalLatencyMin_{
-      std::numeric_limits<uint64_t>::max()};
-  mutable std::atomic<uint64_t> intervalLatencyMax_{0};
+  std::atomic<uint64_t> objects_{0};
+  std::atomic<uint64_t> bytes_{0};
+  mutable AtomicLatency latency_;
   // Cumulative latency histogram (whole run). Atomic so snapshotLatencyHist()
   // can read it from the aggregation thread without hopping onto evb_.
   std::array<std::atomic<uint64_t>, LatencyHistogram::kNumBuckets>
       latencyBuckets_{};
-  std::atomic<uint64_t> latencyHistSum_{0};
-  std::atomic<uint64_t> latencyHistCount_{0};
 };
 
 } // namespace moxygen
