@@ -123,6 +123,7 @@ class MoQPerfTestClient {
     uint64_t latencyObjects{0};
     // Drained by each call, so only the aggregator should ask for it.
     AtomicLatency::Interval intervalLatency;
+    LatencyHistogram latency;
     uint32_t totalResets{0};
     uint32_t totalFailures{0};
     uint32_t durationSeconds{0};
@@ -131,9 +132,6 @@ class MoQPerfTestClient {
 
   // Safe from any thread.
   TestResults getResults() const;
-
-  // Safe to call from any thread: reads the atomic bucket counters.
-  LatencyHistogram snapshotLatencyHist() const;
 
   void completed();
   void recordReset();
@@ -180,11 +178,7 @@ class MoQPerfTestClient {
   std::atomic<uint32_t> numCompleted_{0};
   std::atomic<uint64_t> objects_{0};
   std::atomic<uint64_t> bytes_{0};
-  mutable AtomicLatency latency_;
-  // Cumulative latency histogram (whole run). Atomic so snapshotLatencyHist()
-  // can read it from the aggregation thread without hopping onto evb_.
-  std::array<std::atomic<uint64_t>, LatencyHistogram::kNumBuckets>
-      latencyBuckets_{};
+  mutable AtomicLatencyHistogram latency_;
 };
 
 } // namespace moxygen

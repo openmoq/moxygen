@@ -9,7 +9,6 @@
 #include <sstream>
 #include <vector>
 
-#include <folly/FileUtil.h>
 #include <folly/coro/Sleep.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
 #include <folly/init/Init.h>
@@ -17,6 +16,7 @@
 #include <folly/logging/xlog.h>
 
 #include "moxygen/moqtest/MoQPerfTestClient.h"
+#include "moxygen/moqtest/PromMetrics.h"
 #include "moxygen/samples/util/Utils.h"
 
 // Declared in MoQPerfTestClient.cpp.
@@ -102,76 +102,34 @@ Totals sumResults(const Clients& clients) {
     t.latencySumMs += r.totalLatencyMs;
     t.latencyObjects += r.latencyObjects;
     t.interval.merge(r.intervalLatency);
-    t.latency.merge(client->snapshotLatencyHist());
+    t.latency.merge(r.latency);
   }
   return t;
 }
 
-std::string escapeLabelValue(const std::string& v) {
-  std::string out;
-  out.reserve(v.size());
-  for (char c : v) {
-    if (c == '\\' || c == '"') {
-      out.push_back('\\');
-    }
-    out.push_back(c);
-  }
-  return out;
-}
-
-// Rewrite the whole .prom file each tick. Buckets are cumulative over the run,
-// so Prometheus rate()/histogram_quantile() work across scrapes. writeFileAtomic
-// does the temp-write + rename the textfile collector requires.
+// Rewrite the whole .prom file each tick.
 void writePromFile(
     const std::string& path,
     const std::string& labels,
     const Totals& t,
     double throughputMbps) {
-  std::ostringstream os;
-  auto gauge = [&](const char* name, const char* help, double value) {
-    os << "# HELP " << name << " " << help << "\n"
-       << "# TYPE " << name << " gauge\n"
-       << name << "{" << labels << "} " << value << "\n";
-  };
-  auto counter = [&](const char* name, const char* help, uint64_t value) {
-    os << "# HELP " << name << " " << help << "\n"
-       << "# TYPE " << name << " counter\n"
-       << name << "{" << labels << "} " << value << "\n";
-  };
-
-  gauge("moqperf_subscribers", "Active subscribers", t.currentSubscribers);
-  gauge(
+  moxygen::PromWriter w(labels);
+  w.gauge("moqperf_subscribers", "Active subscribers", t.currentSubscribers);
+  w.gauge(
       "moqperf_throughput_mbps", "Interval throughput in Mbps", throughputMbps);
-  counter("moqperf_objects_total", "Objects received", t.objects);
-  counter("moqperf_bytes_total", "Bytes received", t.bytes);
-  counter("moqperf_resets_total", "Subgroup resets", t.resets);
-  counter("moqperf_failures_total", "Subscribe failures", t.failures);
-  gauge(
+  w.counter("moqperf_objects_total", "Objects received", t.objects);
+  w.counter("moqperf_bytes_total", "Bytes received", t.bytes);
+  w.counter("moqperf_resets_total", "Subgroup resets", t.resets);
+  w.counter("moqperf_failures_total", "Subscribe failures", t.failures);
+  w.gauge(
       "moqperf_latency_avg_ms",
       "Run-average end-to-end object latency in ms",
       t.avgLatencyMs());
-
-  const char* h = "moqperf_object_latency_seconds";
-  os << "# HELP " << h << " End-to-end object latency in seconds\n"
-     << "# TYPE " << h << " histogram\n";
-  auto cum = t.latency.cumulative();
-  for (size_t i = 0; i < moxygen::LatencyHistogram::kNumBounds; ++i) {
-    double leSec = static_cast<double>(moxygen::kLatencyBucketsMs[i]) / 1000.0;
-    os << h << "_bucket{" << labels << ",le=\"" << leSec << "\"} " << cum[i]
-       << "\n";
-  }
-  os << h << "_bucket{" << labels << ",le=\"+Inf\"} "
-     << cum[moxygen::LatencyHistogram::kNumBounds] << "\n";
-  os << h << "_sum{" << labels << "} "
-     << (static_cast<double>(t.latency.sum()) / 1000.0) << "\n";
-  os << h << "_count{" << labels << "} " << t.latency.count() << "\n";
-
-  auto data = os.str();
-  try {
-    folly::writeFileAtomic(path, folly::StringPiece(data));
-  } catch (const std::exception& ex) {
-    XLOG(ERR) << "Failed to write metrics file " << path << ": " << ex.what();
-  }
+  w.histogram(
+      "moqperf_object_latency_seconds",
+      "End-to-end object latency in seconds",
+      {{"", t.latency}});
+  w.writeFile(path);
 }
 
 folly::coro::Task<void> aggregateStats(
@@ -270,11 +228,13 @@ int main(int argc, char** argv) {
 
   std::string versionsLabel = FLAGS_versions.empty() ? "all" : FLAGS_versions;
   std::ostringstream labelStream;
-  labelStream << "transport=\"" << escapeLabelValue(transportName) << "\""
+  labelStream << "transport=\"" << moxygen::escapeLabelValue(transportName)
+              << "\""
               << ",subs=\"" << FLAGS_subscriber_max << "\""
               << ",first_object_size=\"" << FLAGS_first_object_size << "\""
               << ",other_object_size=\"" << FLAGS_other_object_size << "\""
-              << ",versions=\"" << escapeLabelValue(versionsLabel) << "\"";
+              << ",versions=\"" << moxygen::escapeLabelValue(versionsLabel)
+              << "\"";
   std::string promLabels = labelStream.str();
 
   try {

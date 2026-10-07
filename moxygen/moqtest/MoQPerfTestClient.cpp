@@ -503,8 +503,6 @@ void MoQPerfTestClient::recordObject(
   objects_.fetch_add(1, std::memory_order_relaxed);
   bytes_.fetch_add(bytes, std::memory_order_relaxed);
   if (latencyMs) {
-    latencyBuckets_[LatencyHistogram::bucketIndex(*latencyMs)].fetch_add(
-        1, std::memory_order_relaxed);
     latency_.record(*latencyMs);
   }
 }
@@ -521,21 +519,12 @@ MoQPerfTestClient::TestResults MoQPerfTestClient::getResults() const {
   results.totalLatencyMs = latency_.sumMs();
   results.latencyObjects = latency_.count();
   results.intervalLatency = latency_.takeInterval();
+  results.latency = latency_.snapshot();
   results.durationSeconds =
       std::chrono::duration_cast<std::chrono::seconds>(
           std::chrono::steady_clock::now() - startTime_.load())
           .count();
   return results;
-}
-
-LatencyHistogram MoQPerfTestClient::snapshotLatencyHist() const {
-  LatencyHistogram hist;
-  for (size_t i = 0; i < latencyBuckets_.size(); ++i) {
-    hist.addRawBucket(i, latencyBuckets_[i].load(std::memory_order_relaxed));
-  }
-  hist.addSum(latency_.sumMs());
-  hist.addCount(latency_.count());
-  return hist;
 }
 
 } // namespace moxygen
