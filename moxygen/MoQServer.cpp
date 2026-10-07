@@ -9,14 +9,14 @@
 #include <folly/String.h>
 #include <folly/logging/xlog.h>
 #include <folly/net/NetOps.h>
+#include <moxygen/MoQTypes.h>
+#include <moxygen/events/MoQFollyExecutorImpl.h>
 #include <proxygen/httpserver/samples/hq/FizzContext.h>
 #include <proxygen/lib/http/session/HQSession.h>
 #include <proxygen/lib/http/webtransport/HTTPWebTransport.h>
 #include <proxygen/lib/http/webtransport/QuicWebTransport.h>
 #include <proxygen/lib/http/webtransport/QuicWtSession.h>
 #include <quic/common/address/QuicSocketAddressBridge.h>
-#include <moxygen/MoQTypes.h>
-#include <moxygen/events/MoQFollyExecutorImpl.h>
 
 #include <utility>
 
@@ -85,7 +85,10 @@ MoQServer::MoQServer(
       fizzContext_(std::move(fizzContext)),
       useQuicWtSession_(std::move(options.useQuicWtSession)) {
   params_.serverThreads = 1;
-  params_.txnTimeout = options.txnTimeout;
+  // Wangle skips scheduling a non-positive timeout, which would disable it.
+  if (options.txnTimeout.count() > 0) {
+    params_.txnTimeout = options.txnTimeout;
+  }
   params_.transportSettings = options.transportSettings
       ? *options.transportSettings
       : defaultTransportSettings();
@@ -334,21 +337,29 @@ void MoQServer::Handler::onHeadersComplete(
   XLOG(DBG1) << "MoQServer WebTransport: supported protocols: "
              << folly::join(", ", supportedProtocols);
   std::optional<std::string> negotiatedProtocol;
-  if (!supportedProtocols.empty()) {
-    if (auto wtAvailableProtocols =
-            HTTPWebTransport::getWTAvailableProtocols(*req)) {
-      if (auto wtProtocol = HTTPWebTransport::negotiateWTProtocol(
-              wtAvailableProtocols.value(), supportedProtocols)) {
-        HTTPWebTransport::setWTProtocol(resp, wtProtocol.value());
-        negotiatedProtocol = wtProtocol.value();
-        XLOG(DBG1) << "WebTransport: Negotiated protocol: " << *wtProtocol;
-      } else {
-        XLOG(DBG4) << "Failed to negotiate WebTransport protocol";
-        resp.setStatusCode(400);
-        txn_->sendHeadersWithEOM(resp);
-        return;
-      }
+  if (auto wtAvailableProtocols =
+          HTTPWebTransport::getWTAvailableProtocols(*req)) {
+    if (auto wtProtocol = HTTPWebTransport::negotiateWTProtocol(
+            wtAvailableProtocols.value(), supportedProtocols)) {
+      HTTPWebTransport::setWTProtocol(resp, wtProtocol.value());
+      negotiatedProtocol = wtProtocol.value();
+      XLOG(DBG1) << "WebTransport: Negotiated protocol: " << *wtProtocol;
+    } else {
+      XLOG(DBG4) << "Failed to negotiate WebTransport protocol";
+      resp.setStatusCode(400);
+      txn_->sendHeadersWithEOM(resp);
+      return;
     }
+  } else if (
+      std::find(
+          supportedProtocols.begin(),
+          supportedProtocols.end(),
+          kAlpnMoqtLegacy) == supportedProtocols.end()) {
+    // In-band ClientSetup negotiates only draft 14.
+    XLOG(DBG4) << "WebTransport protocol missing and draft 14 not offered";
+    resp.setStatusCode(400);
+    txn_->sendHeadersWithEOM(resp);
+    return;
   }
   txn_->sendHeaders(resp);
   auto wt = txn_->getWebTransport();

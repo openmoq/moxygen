@@ -6,7 +6,10 @@
 
 #include <folly/coro/BlockingWait.h>
 #include <folly/coro/Sleep.h>
+#include <folly/executors/IOThreadPoolExecutor.h>
+#include <folly/executors/thread_factory/NamedThreadFactory.h>
 #include <folly/futures/ThreadWheelTimekeeper.h>
+#include <folly/io/async/EventBaseManager.h>
 #include <moxygen/MoQLocation.h>
 #include <moxygen/MoQQmuxServer.h>
 #include <moxygen/MoQServer.h>
@@ -683,9 +686,19 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // Outlives the worker, whose EB runs the session this owns.
+  std::unique_ptr<MoQRelayClient> relayClient;
+
   // DatePublisher state is single-threaded; share one worker EB across stacks.
-  folly::ScopedEventBaseThread worker("MoQDateWorker");
-  std::vector<folly::EventBase*> workerEvbs{worker.getEventBase()};
+  // waitForAll: proxygen detaches this EB's WebTransport CONNECT stream only on
+  // the delivery ack for the EOM that closing the relay session queues.
+  folly::IOThreadPoolExecutor worker(
+      1,
+      std::make_shared<folly::NamedThreadFactory>("MoQDateWorker"),
+      folly::EventBaseManager::get(),
+      folly::IOThreadPoolExecutor::Options().setWaitForAll(true));
+  auto* workerEvb = worker.getEventBase();
+  std::vector<folly::EventBase*> workerEvbs{workerEvb};
   folly::SocketAddress addr("::", FLAGS_port);
   if (quicServer) {
     quicServer->start(addr, workerEvbs);
@@ -696,10 +709,8 @@ int main(int argc, char* argv[]) {
   }
 
   // Create relay client if relay URL is specified
-  std::unique_ptr<MoQRelayClient> relayClient;
   if (!FLAGS_relay_url.empty()) {
-    relayClient =
-        createRelayClient(worker.getEventBase(), publisher, loggerFactory);
+    relayClient = createRelayClient(workerEvb, publisher, loggerFactory);
     if (!relayClient) {
       return 1;
     }
@@ -723,13 +734,16 @@ int main(int argc, char* argv[]) {
       .start();
 
   auto* relayClientPtr = relayClient.get();
-  moxygen::SignalHandler handler(&evb, [&cancelSrc, relayClientPtr](int) {
-    cancelSrc.requestCancellation();
-    if (relayClientPtr) {
-      relayClientPtr->getEventBase()->add(
-          [relayClientPtr] { relayClientPtr->shutdown(); });
-    }
-  });
+  // terminateLoop=false: the loop has to outlive the relay session's close.
+  moxygen::SignalHandler handler(
+      &evb,
+      [&cancelSrc, relayClientPtr, workerEvb](int) {
+        cancelSrc.requestCancellation();
+        if (relayClientPtr) {
+          workerEvb->add([relayClientPtr] { relayClientPtr->shutdown(); });
+        }
+      },
+      /*terminateLoop=*/false);
 
   evb.loop();
   for (auto& server : servers) {
