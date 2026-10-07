@@ -7,21 +7,24 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+
+#include "moxygen/moqtest/AtomicLatency.h"
 
 namespace moxygen {
 
 // Fixed exponential latency bucket upper bounds, in milliseconds (inclusive).
 // Chosen to resolve the single-digit-ms range where end-to-end latency normally
 // lives while still capturing multi-second tails.
-inline constexpr std::array<uint64_t, 13> kLatencyBucketsMs = {
-    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
+inline constexpr std::array<uint64_t, 13> kLatencyBucketsMs =
+    {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
 
 // Plain (non-atomic) value type holding a fixed-boundary latency histogram,
 // shaped for Prometheus export. Used to accumulate/merge snapshots and format
-// output on a single thread. Live cross-thread accumulation lives in the client
-// as atomics; snapshotLatencyHist() converts those into one of these.
+// output on a single thread. Live cross-thread accumulation lives in
+// AtomicLatencyHistogram, whose snapshot() converts into one of these.
 //
 // buckets_[i] counts observations in bucket i; buckets_[kNumBounds] is the +Inf
 // overflow bucket (values above the last explicit bound).
@@ -89,6 +92,33 @@ class LatencyHistogram {
   std::array<uint64_t, kNumBuckets> buckets_{};
   uint64_t sum_{0};
   uint64_t count_{0};
+};
+
+// AtomicLatency plus the cumulative buckets for Prometheus export.
+class AtomicLatencyHistogram : public AtomicLatency {
+ public:
+  void record(uint64_t latencyMs) {
+    buckets_[LatencyHistogram::bucketIndex(latencyMs)].fetch_add(
+        1, std::memory_order_relaxed);
+    AtomicLatency::record(latencyMs);
+  }
+
+  LatencyHistogram snapshot() const {
+    LatencyHistogram hist;
+    // The count comes from these buckets so +Inf matches the finite buckets.
+    uint64_t count = 0;
+    for (size_t i = 0; i < buckets_.size(); ++i) {
+      auto n = buckets_[i].load(std::memory_order_relaxed);
+      hist.addRawBucket(i, n);
+      count += n;
+    }
+    hist.addSum(sumMs());
+    hist.addCount(count);
+    return hist;
+  }
+
+ private:
+  std::array<std::atomic<uint64_t>, LatencyHistogram::kNumBuckets> buckets_{};
 };
 
 } // namespace moxygen
