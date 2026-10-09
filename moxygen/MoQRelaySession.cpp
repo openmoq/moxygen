@@ -1404,7 +1404,7 @@ class SubNsStreamCallback : public MoQControlCodec::ControlCallback {
 
   void onNamespace(Namespace ns) override {
     if (namespacePublishHandle_) {
-      namespacePublishHandle_->namespaceMsg(ns.trackNamespaceSuffix);
+      namespacePublishHandle_->namespaceMsg(ns);
     }
   }
 
@@ -1615,19 +1615,24 @@ class MoQNamespacePublishHandle : public Publisher::NamespacePublishHandle {
  public:
   MoQNamespacePublishHandle(
       std::shared_ptr<SubNSReply> subNsReply,
-      uint64_t negotiatedVersion)
+      uint64_t negotiatedVersion,
+      SetupExtensions extensions)
       : subNsReply_(std::move(subNsReply)) {
-    moqFrameWriter_.initializeVersion(negotiatedVersion);
+    moqFrameWriter_.initializeVersion(negotiatedVersion, extensions);
   }
 
-  void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) override {
-    Namespace ns;
-    ns.trackNamespaceSuffix = trackNamespaceSuffix;
+  void namespaceMsg(const Namespace& ns) override {
     auto writeResult = subNsReply_->namespaceMsg(ns);
     if (!writeResult) {
       XLOG(ERR) << "writeNamespace failed";
       return;
     }
+  }
+
+  void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) override {
+    Namespace ns;
+    ns.trackNamespaceSuffix = trackNamespaceSuffix;
+    namespaceMsg(ns);
   }
 
   void namespaceDoneMsg(const TrackNamespace& trackNamespaceSuffix) override {
@@ -1654,7 +1659,7 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
   std::shared_ptr<MoQNamespacePublishHandle> publishHandle;
   if (getDraftMajorVersion(*negotiatedVersion_) >= 16) {
     publishHandle = std::make_shared<MoQNamespacePublishHandle>(
-        subNsReply, *negotiatedVersion_);
+        subNsReply, *negotiatedVersion_, getNegotiatedExtensions());
   }
   auto token = co_await folly::coro::co_current_cancellation_token;
   auto subNsResult = co_await co_awaitTry(
