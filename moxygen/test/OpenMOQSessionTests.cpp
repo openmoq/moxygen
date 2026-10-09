@@ -102,6 +102,39 @@ CO_TEST_P_X(Draft18Test, ClusterPeersAdvertiseIndependentLinkCosts) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
+namespace {
+class StubPublisher : public MoQSession::PublisherImpl {
+ public:
+  using PublisherImpl::PublisherImpl;
+  void terminatePublish(PublishDone, ResetStreamErrorCode) override {}
+  void sessionClosed(ResetStreamErrorCode) override {}
+  void resetForGoaway(ResetStreamErrorCode) override {}
+  void onStreamComplete(const ObjectHeader&) override {}
+  bool hasOpenDataStreams() const override {
+    return false;
+  }
+  void onTooManyBytesBuffered() override {}
+};
+} // namespace
+
+// A publisher's writer, and the stream writers copied from it, are built after
+// setup and must still carry the negotiated extensions.
+CO_TEST_P_X(RelayHopsNegotiationTest, PublisherWriterTakesNegotiatedExtensions) {
+  relayHopsSupported_ = true;
+  co_await setupMoQSession();
+  auto version = *serverSession_->getNegotiatedVersion();
+  StubPublisher publisher(
+      serverSession_.get(),
+      FullTrackName{TrackNamespace{{"ns"}}, "track"},
+      RequestID(0),
+      kDefaultPriority,
+      GroupOrder::OldestFirst,
+      version,
+      0);
+  EXPECT_TRUE(
+      publisher.getNegotiatedExtensions().has(SetupExtension::RelayHops));
+}
+
 CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWithoutAdvertisement) {
   co_await setupMoQSession();
   EXPECT_FALSE(

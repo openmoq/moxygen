@@ -995,6 +995,21 @@ CO_TEST_P_X(
       });
 }
 
+// A request queued on the session's executor can start after close().
+CO_TEST_P_X(MoQSessionTest, LocalNamespaceRequestsFailAfterClose) {
+  co_await setupMoQSession();
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+
+  auto pubNs = co_await clientSession_->publishNamespace(getPublishNamespace());
+  EXPECT_TRUE(pubNs.hasError());
+  auto subNs = co_await clientSession_->subscribeNamespace(
+      getSubscribeNamespace(), nullptr);
+  EXPECT_TRUE(subNs.hasError());
+  auto subTracks =
+      co_await clientSession_->subscribeTracks(getSubscribeTracks(), nullptr);
+  EXPECT_TRUE(subTracks.hasError());
+}
+
 class Draft18GoawayTimeoutTest : public MoQSessionTest {
  protected:
   folly::coro::Task<std::shared_ptr<Publisher::SubscriptionHandle>>
@@ -1317,6 +1332,7 @@ CO_TEST_P_X(
 
   folly::coro::Baton cancelBaton;
   EXPECT_CALL(*pubHandle, fetchCancel()).WillOnce([&] { cancelBaton.post(); });
+  EXPECT_CALL(*fetchCallback_, reset(ResetStreamErrorCode::CANCELLED));
   res.value()->fetchCancel();
   co_await cancelBaton;
 

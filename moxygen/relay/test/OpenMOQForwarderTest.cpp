@@ -29,6 +29,15 @@ struct ForwardChangedTracker : public MoQForwarder::Callback {
   int emptyCalls{0};
   int forwardChangedCalls{0};
 };
+
+struct DestroyOnEmpty : public MoQForwarder::Callback {
+  explicit DestroyOnEmpty(std::shared_ptr<MoQForwarder>& forwarderRef)
+      : forwarderRef_(forwarderRef) {}
+  void onEmpty(MoQForwarder*) override {
+    forwarderRef_.reset();
+  }
+  std::shared_ptr<MoQForwarder>& forwarderRef_;
+};
 } // namespace
 
 const TrackNamespace kOpenFwdTestNamespace{{"test", "namespace"}};
@@ -88,18 +97,58 @@ class OpenMOQForwarderTest : public ::testing::Test {
     return forwarder.addSubscriber(
         session->sessionId(), sub, std::move(consumer));
   }
+
+  AssertionResult applyForwardUpdate(
+      const std::shared_ptr<MoQForwarder::Subscriber>& subscriber,
+      RequestID requestID,
+      bool forward) {
+    RequestUpdate update;
+    update.requestID = requestID;
+    update.existingRequestID = RequestID(1);
+    update.forward = forward;
+    auto res = folly::coro::blockingWait(subscriber->requestUpdate(update));
+    if (!res.hasValue()) {
+      return AssertionFailure() << "REQUEST_UPDATE failed";
+    }
+    return AssertionSuccess();
+  }
+
+  // A subscriber whose only subgroup stops sending on object 0, which
+  // tombstones it and makes the forwarder refuse the publisher's next object.
+  std::shared_ptr<MockTrackConsumer> createStopSendingConsumer() {
+    auto consumer = createMockConsumer();
+    EXPECT_CALL(*consumer, beginSubgroup(0, 0, _, _))
+        .WillOnce([this](
+                      uint64_t,
+                      uint64_t,
+                      uint8_t,
+                      TrackConsumer::BeginSubgroupOptions) {
+          auto sg = createMockSubgroupConsumer();
+          EXPECT_CALL(*sg, object(0, _, _, false))
+              .WillOnce(Return(folly::makeUnexpected(
+                  MoQPublishError(
+                      MoQPublishError::CANCELLED, "stop sending"))));
+          return folly::
+              makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                  sg);
+        });
+    return consumer;
+  }
 };
 
-TEST_F(OpenMOQForwarderTest, SubscriberIsPinnedReflectsPinnedField) {
+TEST_F(OpenMOQForwarderTest, SubscribeRequestSubscriberIsPinned) {
   auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
   auto session = createMockSession();
   auto consumer = createMockConsumer();
   auto subscriber = addSubscriber(*forwarder, session, consumer);
   ASSERT_NE(subscriber, nullptr);
-
-  EXPECT_FALSE(subscriber->isPinned());
-  subscriber->pinned = true;
   EXPECT_TRUE(subscriber->isPinned());
+
+  // The PUBLISH path leaves pinning to the caller.
+  auto published = forwarder->addSubscriber(
+      createMockSession()->sessionId(), /*forward=*/true);
+  ASSERT_NE(published, nullptr);
+  EXPECT_FALSE(published->isPinned());
 }
 
 TEST_F(OpenMOQForwarderTest, MintedSessionIdsAreDistinct) {
@@ -590,6 +639,157 @@ TEST_F(OpenMOQForwarderTest, ForwardUpdateClearsChannelTombstoneWhileForwarding)
   EXPECT_NE(renewed, nullptr);
 
   subgroup->reset(ResetStreamErrorCode::SESSION_CLOSED);
+}
+
+TEST_F(OpenMOQForwarderTest, CountersStartAtZero) {
+  MoQForwarder fwd(kOpenFwdTestTrackName);
+  EXPECT_EQ(fwd.subscriberCount(), 0u);
+  EXPECT_EQ(fwd.totalObjectsReceived(), 0u);
+  EXPECT_EQ(fwd.totalGroupsReceived(), 0u);
+
+  // With no subscribers, beginSubgroup pushes back on the publisher and does
+  // not count anything.
+  auto sgRes = fwd.beginSubgroup(0, 0, kDefaultPriority);
+  ASSERT_FALSE(sgRes.hasValue());
+  EXPECT_EQ(sgRes.error().code, MoQPublishError::CANCELLED);
+  EXPECT_EQ(fwd.totalObjectsReceived(), 0u);
+  EXPECT_EQ(fwd.totalGroupsReceived(), 0u);
+}
+
+TEST_F(OpenMOQForwarderTest, CountsObjectStreamsAndDatagrams) {
+  MoQForwarder fwd(kOpenFwdTestTrackName);
+
+  fwd.objectStream(ObjectHeader(0, 0, 0), test::makeBuf());
+  EXPECT_EQ(fwd.totalObjectsReceived(), 1u);
+  EXPECT_EQ(fwd.totalGroupsReceived(), 1u);
+
+  fwd.datagram(ObjectHeader(0, 0, 1), test::makeBuf());
+  EXPECT_EQ(fwd.totalObjectsReceived(), 2u);
+  EXPECT_EQ(fwd.totalGroupsReceived(), 1u);
+
+  fwd.datagram(ObjectHeader(1, 0, 0), test::makeBuf());
+  EXPECT_EQ(fwd.totalObjectsReceived(), 3u);
+  EXPECT_EQ(fwd.totalGroupsReceived(), 2u);
+}
+
+// The forwarding count does not cross zero on a second arrival, so the
+// forwarder renews forwarding itself after refusing the publisher.
+TEST_F(OpenMOQForwarderTest, SubscriberArrivalAfterRefusalRenewsForwarding) {
+  auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
+  auto tracker = std::make_shared<ForwardChangedTracker>();
+  forwarder->setCallback(tracker);
+
+  ASSERT_NE(
+      addSubscriber(
+          *forwarder,
+          createMockSession(),
+          createStopSendingConsumer(),
+          RequestID(1)),
+      nullptr);
+  EXPECT_EQ(tracker->forwardChangedCalls, 1);
+
+  auto subgroup = forwarder->beginSubgroup(0, 0, 0).value();
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+  EXPECT_FALSE(subgroup->object(1, test::makeBuf(10)).hasValue());
+
+  ASSERT_NE(
+      addSubscriber(
+          *forwarder, createMockSession(), createMockConsumer(), RequestID(2)),
+      nullptr);
+  EXPECT_EQ(tracker->forwardChangedCalls, 2);
+
+  // That arrival cleared the refusal.
+  ASSERT_NE(
+      addSubscriber(
+          *forwarder, createMockSession(), createMockConsumer(), RequestID(3)),
+      nullptr);
+  EXPECT_EQ(tracker->forwardChangedCalls, 2);
+
+  subgroup->reset(ResetStreamErrorCode::SESSION_CLOSED);
+}
+
+// Ending a subgroup every subscriber tombstoned is not a refusal.
+TEST_F(OpenMOQForwarderTest, TombstonedEndDoesNotRenewForwarding) {
+  auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
+  auto tracker = std::make_shared<ForwardChangedTracker>();
+  forwarder->setCallback(tracker);
+
+  auto subHandle = addSubscriber(
+      *forwarder,
+      createMockSession(),
+      createStopSendingConsumer(),
+      RequestID(1));
+  ASSERT_NE(subHandle, nullptr);
+  EXPECT_EQ(tracker->forwardChangedCalls, 1);
+
+  auto subgroup = forwarder->beginSubgroup(0, 0, 0).value();
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+  EXPECT_TRUE(subgroup->endOfSubgroup().hasValue());
+
+  EXPECT_TRUE(applyForwardUpdate(subHandle, RequestID(2), /*forward=*/true));
+  EXPECT_EQ(tracker->forwardChangedCalls, 1);
+
+  ASSERT_NE(
+      addSubscriber(
+          *forwarder, createMockSession(), createMockConsumer(), RequestID(3)),
+      nullptr);
+  EXPECT_EQ(tracker->forwardChangedCalls, 1);
+}
+
+TEST_F(OpenMOQForwarderTest, ForwardUpdateAfterRefusalRenewsForwarding) {
+  auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
+  auto tracker = std::make_shared<ForwardChangedTracker>();
+  forwarder->setCallback(tracker);
+
+  auto subHandle = addSubscriber(
+      *forwarder,
+      createMockSession(),
+      createStopSendingConsumer(),
+      RequestID(1));
+  ASSERT_NE(subHandle, nullptr);
+  EXPECT_EQ(tracker->forwardChangedCalls, 1);
+
+  auto subgroup = forwarder->beginSubgroup(0, 0, 0).value();
+
+  // Before any refusal, an update does not renew.
+  EXPECT_TRUE(applyForwardUpdate(subHandle, RequestID(2), /*forward=*/true));
+  EXPECT_EQ(tracker->forwardChangedCalls, 1);
+
+  EXPECT_TRUE(subgroup->object(0, test::makeBuf(10)).hasValue());
+  EXPECT_FALSE(subgroup->object(1, test::makeBuf(10)).hasValue());
+
+  EXPECT_TRUE(applyForwardUpdate(subHandle, RequestID(3), /*forward=*/true));
+  EXPECT_EQ(tracker->forwardChangedCalls, 2);
+}
+
+// onEmpty fires mid-iteration once only a passive subscriber is left, and the
+// callback destroys the forwarder while forEachSubscriber is still walking it.
+TEST_F(
+    OpenMOQForwarderTest,
+    RemoveLastNonPassiveDuringIterationWithPassiveTail) {
+  auto forwarder = std::make_shared<MoQForwarder>(kOpenFwdTestTrackName);
+  auto callback = std::make_shared<DestroyOnEmpty>(forwarder);
+  forwarder->setCallback(callback);
+
+  auto nonPassive = createMockConsumer();
+  EXPECT_CALL(*nonPassive, objectStream(_, _, _))
+      .WillOnce(Return(folly::makeUnexpected(
+          MoQPublishError(MoQPublishError::WRITE_ERROR, "transport broken"))));
+  forwarder->addSubscriber(
+      createMockSession()->sessionId(),
+      /*forward=*/true,
+      nonPassive,
+      /*passive=*/false);
+
+  auto passive = createMockConsumer();
+  ON_CALL(*passive, objectStream(_, _, _))
+      .WillByDefault(Return(folly::makeExpected<MoQPublishError>(folly::unit)));
+  forwarder->addSubscriber(
+      MoQSession::makeSessionId(), /*forward=*/true, passive, /*passive=*/true);
+
+  forwarder->objectStream(ObjectHeader(0, 0, 0, 0, 10), test::makeBuf(10));
+
+  EXPECT_EQ(forwarder, nullptr);
 }
 
 } // namespace moxygen::test

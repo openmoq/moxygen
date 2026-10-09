@@ -129,8 +129,9 @@ class MoQTestClient : public Subscriber,
       PublishRequest pub,
       std::shared_ptr<SubscriptionHandle> handle) override;
 
-  // The only close path: the request runs to a verdict, then this drains so
-  // the peer sees a clean close and the event loop exits.
+  // Ends the run, from a verdict or from a signal.  Drains so the peer sees a
+  // clean close, or closes outright when the verdict was a failure and the
+  // peer may never wind the track down.
   void shutdown();
 
   // Completes when the track finishes, validation fails, or shutdown() runs.
@@ -209,10 +210,8 @@ class MoQTestClient : public Subscriber,
       client_.deliver([this, code] { client_.onError(state_, code); });
     }
 
-    void onPublishDone(PublishDone done) override {
-      client_.deliver([this, done = std::move(done)]() mutable {
-        client_.onPublishDone(std::move(done));
-      });
+    void onPublishDone(PublishDone /* done */) override {
+      client_.deliver([this] { client_.onPublishDone(); });
     }
 
     void onAllDataReceived() override {
@@ -278,7 +277,7 @@ class MoQTestClient : public Subscriber,
       const ObjectHeader& objHeader);
   void onEndOfStream();
   void onError(ReceiveState& state, ResetStreamErrorCode);
-  void onPublishDone(PublishDone done);
+  void onPublishDone();
   void onAllDataReceived(ReceiveState& state);
 
   class ObjectDeadline : public quic::QuicTimerCallback {
@@ -328,8 +327,8 @@ class MoQTestClient : public Subscriber,
     MoQTestClient& client_;
   };
 
-  void armObjectDeadlines();
-  void armRequestDeadline(std::chrono::milliseconds lead = {});
+  void armObjectDeadlines(std::chrono::milliseconds lead = {});
+  ForwardingPreference deadlineForwardingPreference(uint64_t group) const;
   std::chrono::milliseconds objectInterval() const;
   void cancelDeadlines();
   void objectDeadlineExpired(uint64_t group, uint64_t id);
@@ -337,6 +336,8 @@ class MoQTestClient : public Subscriber,
   void finishRequest();
 
   RequestDeadline requestDeadline_{*this};
+  // Last group the joining FETCH half covers; unset when there is no join.
+  std::optional<uint64_t> fetchHalfLastGroup_;
   // Set by receivePublish(), which arms the deadlines when the PUBLISH arrives.
   bool awaitingPublish_{false};
   bool publishDoneReceived_{false};
@@ -395,8 +396,16 @@ class MoQTestClient : public Subscriber,
   std::map<std::pair<uint64_t, uint64_t>, std::unique_ptr<ObjectDeadline>>
       expectedObjects_;
 
+  // What the scoreboard started with; it drains as objects arrive, and the drop
+  // budget and request deadline are both fractions of the whole track.
+  uint64_t totalExpected_{0};
+
   // Set when a delivery-semantics check fails; suppresses the final SUCCESS
   bool semanticsFailed_{false};
+
+  // Whether the run reached a FAILURE verdict, which decides whether shutdown
+  // drains the session or closes it.
+  bool verdictFailed_{false};
 
   // Set once we cancel the request ourselves; the peer answers with a stream
   // reset that must not count against the track

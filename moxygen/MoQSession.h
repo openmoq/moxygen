@@ -15,6 +15,7 @@
 
 #include <folly/CancellationToken.h>
 #include <folly/MaybeManagedPtr.h>
+#include <folly/ScopeGuard.h>
 #include <folly/container/F14Map.h>
 #include <folly/container/IntrusiveList.h>
 #include <folly/coro/Promise.h>
@@ -26,6 +27,7 @@
 #include <moxygen/stats/MoQStats.h>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include "moxygen/mlog/MLogger.h"
 #include "moxygen/util/TimedBaton.h"
 
@@ -54,6 +56,7 @@ struct MoQSettings {
   // Timeout for waiting for in-flight streams when PUBLISH_DONE is received
   std::chrono::milliseconds publishDoneStreamCountTimeout{
       std::chrono::seconds(2)};
+  std::chrono::milliseconds requestTimeout{0};
 };
 
 class ReplyContext;
@@ -774,8 +777,8 @@ class MoQSession : public Subscriber,
     std::vector<FrameType> allowedFrames;
     folly::Function<void(RequestID, std::optional<ResetStreamErrorCode>)>
         onPeerTermination;
-    // If true, peer FIN fires onPeerTermination (FIN-cancels-the-request, per
-    // SUBSCRIBE_NAMESPACE spec). If false, only peer RST fires it.
+    // Drafts 16-17 let a peer FIN unsubscribe from a namespace. Draft 18
+    // cancels only by RST or STOP_SENDING.
     bool finIsCancellation{false};
   };
   std::optional<BidiStreamConfig> getBidiStreamConfig(FrameType frameType);
@@ -890,9 +893,24 @@ class MoQSession : public Subscriber,
       folly::Function<void(RequestID, std::optional<ResetStreamErrorCode>)>
           onPeerTermination = nullptr);
 
+  // For a request stream opened at either end: appTeardown (may be null) runs
+  // first, then every request that can only be answered on the stream fails.
+  void setOnPeerTermination(
+      const std::shared_ptr<BidiStreamControl>& control,
+      folly::Function<void(RequestID, std::optional<ResetStreamErrorCode>)>
+          appTeardown);
+
+  // Fail every request that can only be answered on this bidi -- the stream's
+  // own request plus any REQUEST_UPDATE queued for a response on it. Called
+  // for each peer-initiated close (FIN, RST, STOP_SENDING); repeat calls for
+  // the same stream are no-ops. The error text comes from control.peerClose().
+  void failRequestsOnStreamClose(BidiStreamControl& control);
+
   // Fail a pending sender request when its bidi closes before the terminal
   // reply. No-op if the entry is already gone.
-  void failPendingRequestOnEarlyClose(RequestID requestID, bool wasReset);
+  void failPendingRequestOnEarlyClose(
+      RequestID requestID,
+      std::string_view reason);
 
  private:
   static const folly::RequestToken& sessionRequestToken();
@@ -1142,6 +1160,29 @@ class MoQSession : public Subscriber,
       Parameters& params,
       const std::optional<uint64_t>& forceVersion = std::nullopt);
   RequestID getNextRequestID();
+  // Cancels the request unless dismissed once its reply arrives. It runs where
+  // the awaiting coroutine resumes, on the session executor.
+  auto cancelOnExit(RequestID requestID) {
+    return folly::makeGuard(
+        [this, requestID] { cancelLocalRequest(requestID); });
+  }
+  // Runs the handler for a peer's request. Its cancellation token fires when
+  // the peer cancels the request or the session closes, and the request stays
+  // registered until the handler returns, whichever path it takes.
+  void spawnInboundHandler(
+      RequestID requestID,
+      folly::coro::Task<void> handler);
+  // Returns whether a handler was still running.
+  bool cancelInboundRequest(RequestID requestID);
+
+  // Drops a pending request we sent and cancels it at the peer.
+  virtual void cancelLocalRequest(RequestID requestID);
+  // A reply can still arrive for a request that was cancelled and erased.
+  bool isLocallyIssuedRequestID(RequestID requestID) const {
+    return requestID.value < nextRequestID_ &&
+        requestID.value % getRequestIDMultiplier() ==
+        nextRequestID_ % getRequestIDMultiplier();
+  }
   // Resolves joining.joiningRequestID (including the std::nullopt auto-resolve
   // case) and validates the resulting state against fullTrackName.  Sets
   // joining.joiningRequestID to the resolved value when std::nullopt is passed.
@@ -1187,14 +1228,14 @@ class MoQSession : public Subscriber,
   void requestUpdateError(
       const SubscribeUpdateError& requestError,
       RequestID existingRequestID,
-      bool terminateExistingRequest = true);
+      bool terminateExisting = true);
 
   // Tear down the request whose REQUEST_UPDATE failed. For SUBSCRIBE/PUBLISH
   // tracks this terminates the subscription with PUBLISH_DONE(UPDATE_FAILED)
   // and resets its subgroups; for FETCH it resets the FETCH data stream.
   // MoQRelaySession overrides this to close the bidi stream of a failed
   // SUBSCRIBE_NAMESPACE / PUBLISH_NAMESPACE update.
-  virtual void terminateRequestUpdateOnError(
+  virtual void terminateExistingRequest(
       RequestID existingRequestID,
       const SubscribeUpdateError& requestError);
 
@@ -1228,6 +1269,8 @@ class MoQSession : public Subscriber,
 
   // Handlers and cancellation needed by MoQRelaySession
   folly::CancellationSource cancellationSource_;
+  folly::F14FastMap<RequestID, folly::CancellationSource, RequestID::hash>
+      inboundRequests_;
   std::shared_ptr<Subscriber> subscribeHandler_;
   std::shared_ptr<Publisher> publishHandler_;
 
@@ -1443,6 +1486,13 @@ class MoQSession : public Subscriber,
       RequestID,
       std::unique_ptr<PendingRequestState>,
       RequestID::hash>::iterator;
+
+  // Drop the per-request bookkeeping (track maps, pending-track sets) for a
+  // request that ended without an OK: an error reply, an early stream close,
+  // or a local cancel.
+  void cleanupUnansweredRequest(
+      PendingRequestState& pendingState,
+      RequestID requestID);
 
   void handleTrackStatusOkFromRequestOk(const RequestOk& requestOk);
   void handlePublishOkFromRequestOk(const RequestOk& requestOk);

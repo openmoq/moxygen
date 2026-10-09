@@ -4,19 +4,33 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <fizz/client/FizzClientContext.h>
+#include <fizz/protocol/DefaultCertificateVerifier.h>
+#include <fizz/protocol/test/CertUtil.h>
+#include <folly/FileUtil.h>
+#include <folly/ScopeGuard.h>
 #include <folly/Singleton.h>
+#include <folly/Synchronized.h>
 #include <folly/coro/BlockingWait.h>
 #include <folly/coro/Task.h>
 #include <folly/coro/Timeout.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/ScopedEventBaseThread.h>
 #include <folly/portability/GTest.h>
+#include <folly/ssl/OpenSSLCertUtils.h>
+#include <folly/ssl/OpenSSLKeyUtils.h>
+#include <folly/testing/TestUtil.h>
 #include <proxygen/httpserver/samples/hq/FizzContext.h>
+#include <proxygen/lib/http/HQConnector.h>
+#include <proxygen/lib/http/HeaderConstants.h>
+#include <proxygen/lib/http/session/HQUpstreamSession.h>
+#include <proxygen/lib/http/webtransport/HTTPWebTransport.h>
 #include <moxygen/MoQClient.h>
 #include <moxygen/MoQConsumers.h>
 #include <moxygen/MoQServer.h>
 #include <moxygen/MoQSession.h>
 #include <moxygen/MoQVersions.h>
+#include <moxygen/MoQWebTransportClient.h>
 #include <moxygen/ObjectReceiver.h>
 #include <moxygen/Publisher.h>
 #include <moxygen/StreamingObjectReceiver.h>
@@ -25,6 +39,7 @@
 #include <moxygen/util/InsecureVerifierDangerousDoNotUseInProduction.h>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <set>
 
@@ -503,30 +518,118 @@ class TestSubscriber : public Subscriber {
   std::shared_ptr<TestObjectCallback> receiverCallback_;
 };
 
+class RecordingQuicObserver : public quic::QuicSocket::ManagedObserver {
+ public:
+  void attached(quic::QuicSocketLite* socket) noexcept override {
+    attachedOnEvb = socket->getEventBase()->isInEventBaseThread();
+  }
+
+  bool attachedOnEvb{false};
+};
+
+class H3ConnectCallback : public proxygen::HQConnector::Callback {
+ public:
+  void connectSuccess(proxygen::HQUpstreamSession* session) override {
+    session_.first.setValue(session);
+  }
+  void connectError(const quic::QuicErrorCode& code) override {
+    session_.first.setException(std::runtime_error(quic::toString(code)));
+  }
+
+  folly::coro::Future<proxygen::HQUpstreamSession*> session() {
+    return std::move(session_.second);
+  }
+
+ private:
+  std::pair<
+      folly::coro::Promise<proxygen::HQUpstreamSession*>,
+      folly::coro::Future<proxygen::HQUpstreamSession*>>
+      session_{
+          folly::coro::makePromiseContract<proxygen::HQUpstreamSession*>()};
+};
+
+// Must outlive the transaction; tests drop the connection before destroying it.
+class ConnectResponseHandler : public proxygen::HTTPTransactionHandler {
+ public:
+  void setTransaction(proxygen::HTTPTransaction*) noexcept override {}
+  void detachTransaction() noexcept override {}
+  void onHeadersComplete(
+      std::unique_ptr<proxygen::HTTPMessage> resp) noexcept override {
+    status_.first.setValue(resp->getStatusCode());
+  }
+  void onBody(std::unique_ptr<folly::IOBuf>) noexcept override {}
+  void onTrailers(std::unique_ptr<proxygen::HTTPHeaders>) noexcept override {}
+  void onEOM() noexcept override {}
+  void onUpgrade(proxygen::UpgradeProtocol) noexcept override {}
+  void onError(const proxygen::HTTPException& ex) noexcept override {
+    if (!status_.first.isFulfilled()) {
+      status_.first.setException(std::runtime_error(ex.what()));
+    }
+  }
+  void onEgressPaused() noexcept override {}
+  void onEgressResumed() noexcept override {}
+
+  folly::coro::Future<uint16_t> status() {
+    return std::move(status_.second);
+  }
+
+ private:
+  std::pair<folly::coro::Promise<uint16_t>, folly::coro::Future<uint16_t>>
+      status_{folly::coro::makePromiseContract<uint16_t>()};
+};
+
+proxygen::HTTPMessage makeWebTransportConnect(
+    const std::vector<std::string>& wtProtocols) {
+  proxygen::HTTPMessage req;
+  req.setHTTPVersion(1, 1);
+  req.setSecure(true);
+  req.getHeaders().set(proxygen::HTTP_HEADER_HOST, "localhost");
+  req.getHeaders().add(
+      proxygen::headers::kSecWebTransportHttp3Draft02,
+      proxygen::headers::kSecWebTransportHttp3Draft02Value);
+  req.setURL(kTestEndpoint);
+  req.setMethod(proxygen::HTTPMethod::CONNECT);
+  req.setUpgradeProtocol(std::string{proxygen::headers::kWebTransport});
+  if (!wtProtocols.empty()) {
+    proxygen::HTTPWebTransport::setWTAvailableProtocols(req, wtProtocols);
+  }
+  return req;
+}
+
 class TestServer : public MoQServer {
  public:
   TestServer(
       std::shared_ptr<TestPublisher> publisher,
       std::shared_ptr<TestSubscriber> subscriber,
-      bool rejectSetup = false)
+      bool rejectSetup = false,
+      const std::string& certPath = "",
+      const std::string& keyPath = "")
       : MoQServer(
-            quic::samples::createFizzServerContextWithInsecureDefault(
-                []() {
-                  std::vector<std::string> alpns = {"h3"};
-                  auto moqt = getDefaultMoqtProtocols(true);
-                  alpns.insert(alpns.end(), moqt.begin(), moqt.end());
-                  alpns.emplace_back(kAlpnMoqtDraft18Latest);
-                  return alpns;
-                }(),
-                fizz::server::ClientAuthMode::None,
-                "",
-                ""),
+            [&] {
+              std::vector<std::string> alpns = {"h3"};
+              auto moqt = getDefaultMoqtProtocols(true);
+              alpns.insert(alpns.end(), moqt.begin(), moqt.end());
+              alpns.emplace_back(kAlpnMoqtDraft18Latest);
+              if (certPath.empty()) {
+                return quic::samples::
+                    createFizzServerContextWithInsecureDefault(
+                        alpns, fizz::server::ClientAuthMode::None, "", "");
+              }
+              return quic::samples::createFizzServerContext(
+                  alpns, fizz::server::ClientAuthMode::None, certPath, keyPath);
+            }(),
             kTestEndpoint),
         publisher_(std::move(publisher)),
         subscriber_(std::move(subscriber)),
         rejectSetup_(rejectSetup) {}
 
   void onNewSession(std::shared_ptr<MoQSession> clientSession) override {
+    EXPECT_TRUE(transportReadySessions_.withRLock([&](const auto& sessions) {
+      return std::any_of(
+          sessions.begin(), sessions.end(), [&](const auto& session) {
+            return session.lock() == clientSession;
+          });
+    }));
     if (publisher_) {
       clientSession->setPublishHandler(publisher_);
     }
@@ -545,7 +648,28 @@ class TestServer : public MoQServer {
     return MoQServer::onClientSetup(std::move(setup), session);
   }
 
+  // Session path seen by each onSessionTransportReady call.
+  folly::Synchronized<std::vector<std::string>> transportReadyPaths;
+  std::atomic<size_t> observersAdded{0};
+
+ protected:
+  void onSessionTransportReady(
+      const std::shared_ptr<MoQSession>& session,
+      QuicTransportObservers& observers) override {
+    if (observers.findObservers<RecordingQuicObserver>().empty()) {
+      auto observer = std::make_shared<RecordingQuicObserver>();
+      EXPECT_TRUE(observers.addObserver(observer));
+      EXPECT_TRUE(observer->attachedOnEvb);
+      ++observersAdded;
+    }
+    EXPECT_EQ(observers.findObservers<RecordingQuicObserver>().size(), 1);
+    transportReadyPaths.wlock()->push_back(session->getPath());
+    transportReadySessions_.wlock()->push_back(session);
+  }
+
  private:
+  folly::Synchronized<std::vector<std::weak_ptr<MoQSession>>>
+      transportReadySessions_;
   std::shared_ptr<TestPublisher> publisher_;
   std::shared_ptr<TestSubscriber> subscriber_;
   bool rejectSetup_{false};
@@ -650,17 +774,30 @@ class MoQIntegrationTest : public ::testing::TestWithParam<uint64_t> {
     co_return callback;
   }
 
-  folly::coro::Task<void> connectClient() {
+  folly::coro::Task<void> connectClient(bool webTransport = false) {
+    co_return co_await connectClientWithVerifier(
+        std::make_shared<InsecureVerifierDangerousDoNotUseInProduction>(),
+        "localhost",
+        webTransport);
+  }
+
+  folly::coro::Task<void> connectClientWithVerifier(
+      std::shared_ptr<fizz::CertificateVerifier> verifier,
+      std::string hostname = "localhost",
+      bool webTransport = false) {
     auto evb = clientEvbThread_.getEventBase();
     auto exec = std::make_shared<MoQFollyExecutorImpl>(evb);
 
     auto url = proxygen::URL(
-        fmt::format("https://localhost:{}{}", serverPort_, kTestEndpoint));
+        fmt::format("https://{}:{}{}", hostname, serverPort_, kTestEndpoint));
 
-    client_ = std::make_unique<MoQClient>(
-        exec,
-        std::move(url),
-        std::make_shared<InsecureVerifierDangerousDoNotUseInProduction>());
+    if (webTransport) {
+      client_ = std::make_unique<MoQWebTransportClient>(
+          exec, std::move(url), std::move(verifier));
+    } else {
+      client_ = std::make_unique<MoQClient>(
+          exec, std::move(url), std::move(verifier));
+    }
 
     quic::TransportSettings ts;
     ts.advertisedInitialConnectionFlowControlWindow = 1024 * 1024;
@@ -676,6 +813,48 @@ class MoQIntegrationTest : public ::testing::TestWithParam<uint64_t> {
     }
 
     co_await client_->setupMoQSession(5s, 5s, nullptr, nullptr, ts, alpns);
+  }
+
+  // MoQWebTransportClient drains its connection after one CONNECT; tests that
+  // need several CONNECTs on one connection use this instead.
+  folly::coro::Task<proxygen::HQUpstreamSession*> connectH3() {
+    H3ConnectCallback callback;
+    proxygen::HQConnector connector(&callback, 5s);
+    quic::TransportSettings ts;
+    ts.datagramConfig.enabled = true;
+    connector.setTransportSettings(ts);
+    connector.setSupportedQuicVersions({quic::QuicVersion::QUIC_V1});
+    connector.setH3Settings(
+        {{proxygen::SettingsId::ENABLE_CONNECT_PROTOCOL, 1},
+         {proxygen::SettingsId::_HQ_DATAGRAM, 1},
+         {proxygen::SettingsId::_HQ_DATAGRAM_RFC, 1},
+         {proxygen::SettingsId::ENABLE_WEBTRANSPORT, 1}});
+    auto fizzContext = std::make_shared<fizz::client::FizzClientContext>();
+    fizzContext->setSupportedAlpns({"h3"});
+    connector.connect(
+        clientEvbThread_.getEventBase(),
+        folly::none,
+        folly::SocketAddress("localhost", serverPort_, true),
+        std::move(fizzContext),
+        std::make_shared<InsecureVerifierDangerousDoNotUseInProduction>(),
+        5s,
+        folly::emptySocketOptionMap,
+        std::string("localhost"));
+    co_return co_await callback.session();
+  }
+
+  // Returns the response status code.
+  folly::coro::Task<uint16_t> sendWebTransportConnect(
+      proxygen::HQUpstreamSession* session,
+      ConnectResponseHandler& handler,
+      const std::vector<std::string>& wtProtocols = {}) {
+    auto* txn = session->newTransaction(&handler);
+    if (!txn) {
+      co_yield folly::coro::co_error(
+          std::runtime_error("Failed to open CONNECT transaction"));
+    }
+    txn->sendHeaders(makeWebTransportConnect(wtProtocols));
+    co_return co_await handler.status();
   }
 
   // FETCH groups advance in the requested order, objects ascend within each
@@ -754,17 +933,209 @@ class MoQIntegrationTest : public ::testing::TestWithParam<uint64_t> {
             }));
   }
 
+  void restartServerWithCertificate(
+      const std::string& certPath,
+      const std::string& keyPath) {
+    server_->stop();
+    server_.reset();
+    server_ = std::make_shared<TestServer>(
+        publisher_, subscriber_, /*rejectSetup=*/false, certPath, keyPath);
+    server_->start(folly::SocketAddress("::", 0));
+    server_->waitUntilInitialized();
+
+    auto fds = server_->getAllListeningSocketFDs();
+    ASSERT_FALSE(fds.empty());
+    folly::SocketAddress boundAddr;
+    boundAddr.setFromLocalAddress(folly::NetworkSocket::fromFd(fds[0]));
+    serverPort_ = boundAddr.getPort();
+  }
+
+  std::shared_ptr<fizz::CertificateVerifier> useServerCertificate(
+      const std::string& serverIdentity,
+      bool trustServerIssuer,
+      bool ipIdentity = false) {
+    auto trustedCa = fizz::test::createCert(
+        "Trusted Root CA",
+        /*ca=*/true,
+        /*issuer=*/nullptr,
+        fizz::KeyType::P256);
+    auto untrustedCa = fizz::test::createCert(
+        "Untrusted Root CA",
+        /*ca=*/true,
+        /*issuer=*/nullptr,
+        fizz::KeyType::P256);
+    auto* serverCa = trustServerIssuer ? &trustedCa : &untrustedCa;
+    auto leaf = fizz::test::createCert(
+        {.cn = serverIdentity,
+         .sans = ipIdentity ? std::vector<std::string>{}
+                            : std::vector<std::string>{serverIdentity},
+         .ipSans = ipIdentity ? std::vector<std::string>{serverIdentity}
+                              : std::vector<std::string>{},
+         .ca = false,
+         .issuer = serverCa,
+         .keyType = fizz::KeyType::P256});
+
+    certificateDir_ = std::make_unique<folly::test::TemporaryDirectory>();
+    auto caPath = (certificateDir_->path() / "ca.pem").string();
+    auto leafCertPath = (certificateDir_->path() / "leaf.pem").string();
+    auto leafKeyPath = (certificateDir_->path() / "leaf_key.pem").string();
+    EXPECT_TRUE(
+        folly::writeFile(
+            folly::ssl::OpenSSLCertUtils::pemEncode(*trustedCa.cert),
+            caPath.c_str()));
+    EXPECT_TRUE(
+        folly::writeFile(
+            folly::ssl::OpenSSLCertUtils::pemEncode(*leaf.cert),
+            leafCertPath.c_str()));
+    EXPECT_TRUE(
+        folly::writeFile(
+            folly::ssl::OpenSSLKeyUtils::encodePrivateKeyAsPEM(leaf.key.get()),
+            leafKeyPath.c_str()));
+
+    restartServerWithCertificate(leafCertPath, leafKeyPath);
+    std::unique_ptr<fizz::DefaultCertificateVerifier> verifier;
+    fizz::Error err;
+    EXPECT_EQ(
+        fizz::DefaultCertificateVerifier::createFromCAFile(
+            verifier, err, fizz::VerificationContext::Client, caPath.c_str()),
+        fizz::Status::Success);
+    return verifier;
+  }
+
   std::shared_ptr<TestPublisher> publisher_;
   std::shared_ptr<TestSubscriber> subscriber_;
   std::shared_ptr<TestServer> server_;
   std::unique_ptr<MoQClient> client_;
+  std::unique_ptr<folly::test::TemporaryDirectory> certificateDir_;
   uint16_t serverPort_{0};
   folly::ScopedEventBaseThread clientEvbThread_{"MoQIntegrationTestClient"};
 };
 
+TEST_P(MoQIntegrationTest, RejectsWrongTlsIdentity) {
+  auto verifier =
+      useServerCertificate("wrong.example.com", /*trustServerIssuer=*/true);
+
+  runTest(
+      folly::coro::co_invoke(
+          [this, verifier = std::move(verifier)]() mutable
+              -> folly::coro::Task<void> {
+            auto result = co_await folly::coro::co_awaitTry(
+                connectClientWithVerifier(std::move(verifier)));
+            EXPECT_TRUE(result.hasException())
+                << "a trusted certificate for the wrong host must be rejected";
+          }));
+}
+
+TEST_P(MoQIntegrationTest, AcceptsMatchingTlsIdentity) {
+  auto verifier = useServerCertificate("localhost", /*trustServerIssuer=*/true);
+
+  runTest(
+      folly::coro::co_invoke(
+          [this, verifier = std::move(verifier)]() mutable
+              -> folly::coro::Task<void> {
+            co_await connectClientWithVerifier(std::move(verifier));
+          }));
+}
+
+TEST_P(MoQIntegrationTest, RejectsUntrustedTlsCertificate) {
+  auto verifier =
+      useServerCertificate("localhost", /*trustServerIssuer=*/false);
+
+  runTest(
+      folly::coro::co_invoke(
+          [this, verifier = std::move(verifier)]() mutable
+              -> folly::coro::Task<void> {
+            auto result = co_await folly::coro::co_awaitTry(
+                connectClientWithVerifier(std::move(verifier)));
+            EXPECT_TRUE(result.hasException());
+          }));
+}
+
+TEST_P(MoQIntegrationTest, AcceptsMatchingIpTlsIdentity) {
+  auto verifier = useServerCertificate(
+      "127.0.0.1", /*trustServerIssuer=*/true, /*ipIdentity=*/true);
+
+  runTest(
+      folly::coro::co_invoke(
+          [this, verifier = std::move(verifier)]() mutable
+              -> folly::coro::Task<void> {
+            co_await connectClientWithVerifier(
+                std::move(verifier), "127.0.0.1");
+          }));
+}
+
+TEST_P(MoQIntegrationTest, RejectsWrongIpTlsIdentity) {
+  auto verifier = useServerCertificate(
+      "127.0.0.2", /*trustServerIssuer=*/true, /*ipIdentity=*/true);
+
+  runTest(
+      folly::coro::co_invoke(
+          [this, verifier = std::move(verifier)]() mutable
+              -> folly::coro::Task<void> {
+            auto result = co_await folly::coro::co_awaitTry(
+                connectClientWithVerifier(std::move(verifier), "127.0.0.1"));
+            EXPECT_TRUE(result.hasException());
+          }));
+}
+
 // ============================================================================
 // Core Publish/Subscribe Flow Tests
 // ============================================================================
+
+TEST_P(MoQIntegrationTest, TransportReady_DirectQuic) {
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    co_await connectClient();
+    EXPECT_EQ(server_->transportReadyPaths.rlock()->size(), 1);
+  }));
+}
+
+TEST_P(MoQIntegrationTest, TransportReady_WebTransport) {
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    co_await connectClient(true);
+    const std::vector<std::string> expectedPaths{kTestEndpoint};
+    EXPECT_EQ(server_->transportReadyPaths.copy(), expectedPaths);
+    auto callback = co_await subscribeAndReceive();
+    if (callback) {
+      co_await callback->waitForObjects(kDefaultObjectCount);
+    }
+  }));
+}
+
+TEST_P(MoQIntegrationTest, TransportReady_WebTransportSessionsShareObservers) {
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    ConnectResponseHandler first;
+    ConnectResponseHandler second;
+    auto* session = co_await connectH3();
+    SCOPE_EXIT {
+      session->dropConnection();
+    };
+
+    auto firstStatus = co_await sendWebTransportConnect(session, first);
+    auto secondStatus = co_await sendWebTransportConnect(session, second);
+
+    EXPECT_EQ(firstStatus, 200);
+    EXPECT_EQ(secondStatus, 200);
+    const std::vector<std::string> expectedPaths{kTestEndpoint, kTestEndpoint};
+    EXPECT_EQ(server_->transportReadyPaths.copy(), expectedPaths);
+    EXPECT_EQ(server_->observersAdded.load(), 1);
+  }));
+}
+
+TEST_P(MoQIntegrationTest, TransportReady_RejectedWebTransportConnect) {
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    ConnectResponseHandler handler;
+    auto* session = co_await connectH3();
+    SCOPE_EXIT {
+      session->dropConnection();
+    };
+
+    auto status =
+        co_await sendWebTransportConnect(session, handler, {"moqt-unknown"});
+
+    EXPECT_EQ(status, 400);
+    EXPECT_TRUE(server_->transportReadyPaths.rlock()->empty());
+  }));
+}
 
 TEST_P(MoQIntegrationTest, PublishAndSubscribe_BasicDataFlow) {
   runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {

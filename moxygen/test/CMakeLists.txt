@@ -97,6 +97,7 @@ moxygen_add_test(TARGET MoQSessionTests
     MoQSessionPublishTests.cpp
     MoQSessionSubscribeNamespaceTests.cpp
     MoQSessionSubscribeTests.cpp
+    MoQSessionSubscribeTracksTests.cpp
     MoQSessionTests.cpp
     MoQSessionTrackStatusTests.cpp
   DEPENDS
@@ -111,6 +112,15 @@ moxygen_add_test(TARGET OpenMOQSessionTests
   DEPENDS
     moqsessiontestcommon
     testmain
+)
+
+moxygen_add_test(TARGET OpenMOQServerTests
+  PREFIX "OpenMOQServer"
+  SOURCES
+    OpenMOQServerTests.cpp
+  DEPENDS
+    moxygen_moq_server
+    moxygen_moq_webtransport_client
 )
 
 moxygen_add_test(TARGET MoQDeliveryTimerTests
