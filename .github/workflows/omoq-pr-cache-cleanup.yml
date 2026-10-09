@@ -1,0 +1,42 @@
+name: pr cache cleanup
+
+# Caches saved on a PR's merge ref are only restorable by that PR, but they
+# count against the repo-wide 10 GB budget until 7-day expiry — several stale
+# PRs' ccache generations are enough to push the repo over and get main's
+# entries evicted. Delete them the moment the PR closes.
+#
+# pull_request_target: gives the write-scoped token fork PRs lack. Safe here —
+# nothing checks out or executes PR code.
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  actions: write
+
+jobs:
+  delete-pr-caches:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Delete caches on the closed PR's ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          REF="refs/pull/${{ github.event.pull_request.number }}/merge"
+          gh cache list --ref "$REF" --limit 100 --json id,key,sizeInBytes > caches.json
+
+          if [ "$(jq length caches.json)" -eq 0 ]; then
+            echo "==> no caches on $REF"
+            exit 0
+          fi
+
+          FREED=0
+          while IFS=$'\t' read -r id size key; do
+            echo "  deleting $key ($((size / 1048576)) MB)"
+            if gh cache delete "$id"; then
+              FREED=$((FREED + size))
+            fi
+          done < <(jq -r '.[] | "\(.id)\t\(.sizeInBytes)\t\(.key)"' caches.json)
+          echo "==> freed $((FREED / 1048576)) MB from $REF"
