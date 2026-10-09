@@ -370,7 +370,7 @@ jobs:
           # Same tree and flags as the instrumented pass, counters applied.
           # Code the training never reached stays plain -O3.
           FLAGS="${{ matrix.cxx_flags }} -fno-lto -fprofile-use=$PGO_PROFILE_DIR -fprofile-partial-training -Wno-missing-profile"
-          cmake -B _build \
+          cmake -B _build -S standalone \
             -DCMAKE_C_FLAGS="$FLAGS" \
             -DCMAKE_CXX_FLAGS="$FLAGS" \
             -DCMAKE_EXE_LINKER_FLAGS="-fno-lto" \
