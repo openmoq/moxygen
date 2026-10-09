@@ -26,6 +26,7 @@ name: version release
 # clock vs the ~2 hours a serial create+upload would take.
 #
 # Usage: Actions → version release → Run workflow → enter version (e.g. 1.2.3)
+#        Tick pgo to ship profile-guided portable tarballs (about an hour more).
 
 on:
   workflow_dispatch:
@@ -38,6 +39,11 @@ on:
         description: 'Commit to release (default: the branch rolling snapshot). Must be on the dispatched branch with a published snapshot.'
         required: false
         type: string
+      pgo:
+        description: 'Profile-guided optimization for the portable tarballs: instrumented build, loopback training, rebuild (about an hour more)'
+        required: false
+        type: boolean
+        default: false
 
 # Serialize per-version dispatches: prevents two runs with the same
 # version from both passing validate's tag-doesn't-exist check and
@@ -197,6 +203,10 @@ jobs:
           # --draft: invisible to consumers (and to by-tag lookups) until
           # finalize flips it, so a release either exists complete or not at
           # all — never public with assets still uploading.
+          PGO_NOTE=""
+          if [[ "${{ inputs.pgo }}" == "true" ]]; then
+            PGO_NOTE="Portable tarballs are profile-guided optimized: trained over loopback with moqrelayserver under moqtest_server publisher and moqperf_test_client load (openmoq/scripts/pgo-train.sh), then rebuilt with -fprofile-use -fprofile-partial-training."
+          fi
           gh release create "$TAG" \
             --draft \
             --target "$SNAPSHOT_SHA" \
@@ -218,6 +228,7 @@ jobs:
           - \`moxygen-linux-{amd64,arm64}-dbg.tar.gz\` — split debug symbols (.debug sidecar)
 
           Portable tarballs are compiled with frame pointers preserved (\`-fno-omit-frame-pointer -fasynchronous-unwind-tables\`) so signal-handler stack unwinding (folly::symbolizer) works against the .dbg sidecar even at \`-O3\`.
+          ${PGO_NOTE}
           EOF
           )"
 
@@ -259,6 +270,8 @@ jobs:
 
     name: portable (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
+    env:
+      PGO_PROFILE_DIR: ${{ github.workspace }}/_pgo
 
     steps:
       # Build the resolved commit, not the branch tip — the tip can move
@@ -307,11 +320,24 @@ jobs:
           # BUILD_TESTS=ON intentional: the moxygen tarball ships
           # lib/cmake/GTest/GTestConfig.cmake which moqx's test/CMakeLists.txt
           # consumes. No tests run because BUILD_TESTING=OFF.
+          #
+          # pgo: this pass is instrumented; "Train PGO profile and rebuild"
+          # reconfigures the same tree with the counters applied. No ccache
+          # on PGO passes: their objects would churn the 1G cache the plain
+          # build relies on.
+          FLAGS="${{ matrix.cxx_flags }} -fno-lto"
+          LINK_FLAGS="-fno-lto"
+          LAUNCHER=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+          if [[ "${{ inputs.pgo }}" == "true" ]]; then
+            mkdir -p "$PGO_PROFILE_DIR"
+            FLAGS+=" -fprofile-generate=$PGO_PROFILE_DIR -fprofile-update=atomic"
+            LINK_FLAGS+=" -fprofile-generate=$PGO_PROFILE_DIR"
+            LAUNCHER=()
+          fi
           cmake -B _build -S standalone -G Ninja \
             -DCMAKE_C_COMPILER=${{ matrix.cc }} \
             -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            "${LAUNCHER[@]}" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DBUILD_TESTS=ON \
@@ -321,10 +347,10 @@ jobs:
             -DBUNDLE_DEPS=ON \
             -DBUNDLE_DEPS_STATIC_SYSLIBS=ON \
             -DCMAKE_DISABLE_FIND_PACKAGE_LibUnwind=TRUE \
-            -DCMAKE_C_FLAGS="${{ matrix.cxx_flags }} -fno-lto" \
-            -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }} -fno-lto" \
-            -DCMAKE_EXE_LINKER_FLAGS="-fno-lto" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-fno-lto" \
+            -DCMAKE_C_FLAGS="$FLAGS" \
+            -DCMAKE_CXX_FLAGS="$FLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS="$LINK_FLAGS" \
+            -DCMAKE_SHARED_LINKER_FLAGS="$LINK_FLAGS" \
             -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install"
 
       - name: Build
@@ -332,6 +358,26 @@ jobs:
 
       - name: Install
         run: cmake --install _build
+
+      - name: Train PGO profile and rebuild
+        if: inputs.pgo
+        shell: bash
+        run: |
+          bash openmoq/scripts/pgo-train.sh \
+            --prefix "$GITHUB_WORKSPACE/install" \
+            --profile-dir "$PGO_PROFILE_DIR" \
+            --work-dir "$RUNNER_TEMP/pgo-train"
+          # Same tree and flags as the instrumented pass, counters applied.
+          # Code the training never reached stays plain -O3.
+          FLAGS="${{ matrix.cxx_flags }} -fno-lto -fprofile-use=$PGO_PROFILE_DIR -fprofile-partial-training -Wno-missing-profile"
+          cmake -B _build \
+            -DCMAKE_C_FLAGS="$FLAGS" \
+            -DCMAKE_CXX_FLAGS="$FLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fno-lto" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fno-lto"
+          cmake --build _build -j$(getconf _NPROCESSORS_ONLN)
+          rm -rf "$GITHUB_WORKSPACE/install"
+          cmake --install _build
 
       - name: Package
         run: |
