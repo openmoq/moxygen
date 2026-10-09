@@ -27,13 +27,12 @@ namespace moxygen {
 class BidiStreamControl {
  public:
   // finIsCancellation: true => peer FIN also fires the peer-termination
-  // callback (responder semantics, e.g. SUBSCRIBE_NAMESPACE). False => only
-  // peer RST.
+  // callback. False => only peer RST or STOP_SENDING.
   explicit BidiStreamControl(
       proxygen::WebTransport::StreamWriteHandle* writeHandle,
       folly::CancellationToken sessionShutdownToken,
       uint64_t negotiatedVersion,
-      bool finIsCancellation = true);
+      bool finIsCancellation);
 
   ~BidiStreamControl() = default;
   BidiStreamControl(const BidiStreamControl&) = delete;
@@ -48,6 +47,12 @@ class BidiStreamControl {
 
   folly::CancellationToken getReadCancelToken() const {
     return readCancelSource_.getToken();
+  }
+
+  // Cancelled by the peer's RESET_STREAM, STOP_SENDING, or a FIN when
+  // finIsCancellation. It is never disarmed.
+  folly::CancellationToken getPeerCancelToken() const {
+    return peerCancelSource_.getToken();
   }
 
   // Set once per stream (sender: before read loop; responder: on first
@@ -77,6 +82,19 @@ class BidiStreamControl {
   // Invoked by the read loop on FIN/RST exit. Idempotent.
   void firePeerTermination(
       std::optional<ResetStreamErrorCode> errorCode = std::nullopt);
+
+  // How the peer closed the request stream. The first close wins.
+  enum class PeerClose : uint8_t { None, Fin, Reset, StopSending };
+
+  void setPeerClose(PeerClose type) {
+    if (peerClose_ == PeerClose::None) {
+      peerClose_ = type;
+    }
+  }
+
+  PeerClose peerClose() const {
+    return peerClose_;
+  }
 
   // Local cancel: RST our write half, cancel the read source (the read
   // loop's exit guard STOP_SENDINGs the read half), and clear the
@@ -128,6 +146,7 @@ class BidiStreamControl {
 
   proxygen::WebTransport::StreamWriteHandle* writeHandle_{nullptr};
   folly::CancellationSource readCancelSource_;
+  folly::CancellationSource peerCancelSource_;
   // Used to suppress firePeerTermination() during shutdown; cleanup() can't
   // always reach this control to clear it directly.
   folly::CancellationToken sessionShutdownToken_;
@@ -138,7 +157,8 @@ class BidiStreamControl {
   std::optional<RequestID> requestID_;
   std::optional<folly::CancellationCallback> writeCancelCb_;
   std::deque<RequestID> responseIDQueue_;
-  bool finIsCancellation_{true};
+  PeerClose peerClose_{PeerClose::None};
+  bool finIsCancellation_{false};
   bool readLoopExited_{false};
 };
 

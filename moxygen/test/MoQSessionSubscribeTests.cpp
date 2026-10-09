@@ -927,7 +927,11 @@ CO_TEST_P_X(MoQSessionTest, SubscriberCancelsBeforeSubscribeOK) {
               co_await folly::coro::co_reschedule_on_current_executor;
               co_return mockSubscriptionHandle;
             });
-      });
+      },
+      MoQControlCodec::Direction::SERVER,
+      /*error=*/std::nullopt,
+      // The publisher never replies if the unsubscribe beats its handler.
+      /*expectResultStat=*/false);
 
   auto subscribeRequest = getSubscribe(kTestTrackName);
   auto sg = std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
@@ -941,26 +945,33 @@ CO_TEST_P_X(MoQSessionTest, SubscriberCancelsBeforeSubscribeOK) {
               clientSession_->subscribe(subscribeRequest, subscribeCallback_)))
           .start()
           .via(&eventBase_);
-  co_await folly::coro::co_reschedule_on_current_executor;
+  // On draft 18 an earlier cancel reaches the publisher before its handler.
+  co_await streamBaton;
   cancelSource.requestCancellation();
   EXPECT_THROW(co_await std::move(subscribeFut), folly::OperationCancelled);
-  // Verify that the publisher's WebTransport received a stop sending on the
-  // object stream
-  co_await streamBaton;
+  // The object stream ends with the subscriber's STOP_SENDING or the
+  // publisher's reset, whichever comes first.
   auto objectStreamId = serverObjectStreamId();
   auto waits = 0;
-  while (!serverWt_->writeHandles[objectStreamId]->getWriteErr().has_value() &&
+  while (!clientSession_->isClosed() &&
+         !serverWt_->writeHandles[objectStreamId]->getWriteErr().has_value() &&
          waits++ < 6) {
     co_await folly::coro::sleep(std::chrono::milliseconds(250));
   }
+  // A SUBSCRIBE_OK sent before the cancel arrived must not close the session.
+  // Closing would also free the stream handles checked below.
+  EXPECT_FALSE(clientSession_->isClosed());
+  if (clientSession_->isClosed()) {
+    co_return;
+  }
   EXPECT_TRUE(
       serverWt_->writeHandles[objectStreamId]->getWriteErr().has_value());
-  EXPECT_EQ(
-      serverWt_->writeHandles[objectStreamId]->writeException()->error, 0);
+  if (auto* stopSending =
+          serverWt_->writeHandles[objectStreamId]->writeException()) {
+    EXPECT_EQ(stopSending->error, 0);
+  }
 
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
-  // This don't get called by session
-  clientSubscriberStatsCallback_->recordSubscribeLatency(0);
 }
 CO_TEST_P_X(MoQSessionTest, UnsubscribeWithinPublishDone) {
   co_await setupMoQSession();
@@ -1332,9 +1343,8 @@ CO_TEST_P_X(MoQSessionTest, SubscriptionEndStatFiredOnAbandonedPublisher) {
 
 // === Draft 18+ bidi early-close coverage ===
 
-// Sender-side: when a request's bidi closes (FIN or RST) before the peer
-// sends its terminal reply, the pending request must fail with
-// INTERNAL_ERROR rather than strand the coroutine forever.
+// A request whose bidi closes before the terminal reply must fail with
+// INTERNAL_ERROR, and the error text names how the peer closed it.
 CO_TEST_P_X(Draft18Test, SubscribeFailsOnPeerFinWithoutReply) {
   co_await setupMoQSession();
 
@@ -1347,7 +1357,7 @@ CO_TEST_P_X(Draft18Test, SubscribeFailsOnPeerFinWithoutReply) {
         co_return makeSubscribeOkResult(sub);
       });
 
-  std::optional<RequestErrorCode> errorCode;
+  std::optional<RequestError> error;
   folly::coro::Baton done;
   folly::coro::co_withExecutor(
       MoQExecutor_.get(),
@@ -1355,7 +1365,7 @@ CO_TEST_P_X(Draft18Test, SubscribeFailsOnPeerFinWithoutReply) {
         auto result = co_await clientSession_->subscribe(
             getSubscribe(kTestTrackName), subscribeCallback_);
         if (result.hasError()) {
-          errorCode = result.error().errorCode;
+          error = result.error();
         }
         done.post();
       }))
@@ -1368,9 +1378,100 @@ CO_TEST_P_X(Draft18Test, SubscribeFailsOnPeerFinWithoutReply) {
       nullptr, /*fin=*/true, nullptr);
 
   co_await done;
-  EXPECT_TRUE(errorCode.has_value());
-  if (errorCode.has_value()) {
-    EXPECT_EQ(*errorCode, RequestErrorCode::INTERNAL_ERROR);
+  EXPECT_TRUE(error.has_value());
+  if (error.has_value()) {
+    EXPECT_EQ(error->errorCode, RequestErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(error->reasonPhrase, "peer FINed without terminal reply");
+  }
+
+  releaseHandler.post();
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// Same as above, but the peer RESETs its write half (the exceptionalExit path
+// out of controlReadLoop) rather than FINing it cleanly.
+CO_TEST_P_X(Draft18Test, SubscribeFailsOnPeerResetWithoutReply) {
+  co_await setupMoQSession();
+
+  folly::coro::Baton serverSawSubscribe;
+  folly::coro::Baton releaseHandler;
+  EXPECT_CALL(*serverPublisher, subscribe(_, _))
+      .WillOnce([&](auto sub, auto /* pub */) -> TaskSubscribeResult {
+        serverSawSubscribe.post();
+        co_await releaseHandler;
+        co_return makeSubscribeOkResult(sub);
+      });
+
+  std::optional<RequestError> error;
+  folly::coro::Baton done;
+  folly::coro::co_withExecutor(
+      MoQExecutor_.get(),
+      folly::coro::co_invoke([&]() -> folly::coro::Task<void> {
+        auto result = co_await clientSession_->subscribe(
+            getSubscribe(kTestTrackName), subscribeCallback_);
+        if (result.hasError()) {
+          error = result.error();
+        }
+        done.post();
+      }))
+      .start();
+
+  co_await serverSawSubscribe;
+
+  serverWt_->writeHandles.at(0)->resetStream(
+      folly::to_underlying(ResetStreamErrorCode::CANCELLED));
+
+  co_await done;
+  EXPECT_TRUE(error.has_value());
+  if (error.has_value()) {
+    EXPECT_EQ(error->errorCode, RequestErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(error->reasonPhrase, "peer reset request stream");
+  }
+
+  releaseHandler.post();
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// Same as above, but the peer STOP_SENDINGs our write half, which cancels the
+// read loop before it can fail the pending subscribe.
+CO_TEST_P_X(Draft18Test, SubscribeFailsOnPeerStopSendingWithoutReply) {
+  co_await setupMoQSession();
+
+  folly::coro::Baton serverSawSubscribe;
+  folly::coro::Baton releaseHandler;
+  EXPECT_CALL(*serverPublisher, subscribe(_, _))
+      .WillOnce([&](auto sub, auto /* pub */) -> TaskSubscribeResult {
+        serverSawSubscribe.post();
+        co_await releaseHandler;
+        co_return makeSubscribeOkResult(sub);
+      });
+
+  std::optional<RequestError> error;
+  folly::coro::Baton done;
+  folly::coro::co_withExecutor(
+      MoQExecutor_.get(),
+      folly::coro::co_invoke([&]() -> folly::coro::Task<void> {
+        auto result = co_await clientSession_->subscribe(
+            getSubscribe(kTestTrackName), subscribeCallback_);
+        if (result.hasError()) {
+          error = result.error();
+        }
+        done.post();
+      }))
+      .start();
+
+  co_await serverSawSubscribe;
+
+  // Server STOP_SENDINGs the subscribe bidi (stream id 0, client-initiated)
+  // with no reply, cancelling the client's write half.
+  serverWt_->readHandles.at(0)->stopSending(
+      folly::to_underlying(ResetStreamErrorCode::CANCELLED));
+
+  co_await done;
+  EXPECT_TRUE(error.has_value());
+  if (error.has_value()) {
+    EXPECT_EQ(error->errorCode, RequestErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(error->reasonPhrase, "peer stopped reading the request stream");
   }
 
   releaseHandler.post();
@@ -1461,5 +1562,259 @@ CO_TEST_P_X(Draft18Test, NoUnsubscribeAfterPublishDone) {
 
   co_await folly::coro::co_reschedule_on_current_executor;
   co_await folly::coro::co_reschedule_on_current_executor;
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// A subscribe whose caller is cancelled before SUBSCRIBE_OK must end the
+// subscription at the peer: the publisher stops accepting new data for it and
+// its subscription handle is unsubscribed.
+CO_TEST_P_X(MoQSessionTest, SubscribeCallerCancelledBeforeSubscribeOk) {
+  co_await setupMoQSession();
+
+  folly::coro::Baton serverSawSubscribe;
+  folly::coro::Baton releaseHandler;
+  std::shared_ptr<TrackConsumer> serverPub;
+  bool serverSawUnsubscribe = false;
+  std::shared_ptr<MockSubscriptionHandle> serverHandle;
+  EXPECT_CALL(*serverPublisher, subscribe(_, _))
+      .WillOnce([&](auto sub, auto pub) -> TaskSubscribeResult {
+        serverPub = std::move(pub);
+        serverSawSubscribe.post();
+        co_await releaseHandler;
+        serverHandle = makeSubscribeOkResult(sub);
+        EXPECT_CALL(*serverHandle, unsubscribe()).WillRepeatedly([&] {
+          serverSawUnsubscribe = true;
+        });
+        co_return serverHandle;
+      });
+
+  folly::CancellationSource cancelSource;
+  auto subscribeFut =
+      folly::coro::co_withExecutor(
+          &eventBase_,
+          folly::coro::co_withCancellation(
+              cancelSource.getToken(),
+              clientSession_->subscribe(
+                  getSubscribe(kTestTrackName), subscribeCallback_)))
+          .start()
+          .via(&eventBase_);
+  co_await serverSawSubscribe;
+
+  cancelSource.requestCancellation();
+  EXPECT_THROW(co_await std::move(subscribeFut), folly::OperationCancelled);
+  releaseHandler.post();
+  co_await folly::coro::sleep(std::chrono::milliseconds(200));
+
+  EXPECT_NE(serverPub, nullptr);
+  if (serverPub) {
+    EXPECT_TRUE(serverPub->beginSubgroup(0, 0, 0).hasError());
+  }
+  EXPECT_TRUE(serverSawUnsubscribe);
+  if (serverHandle) {
+    testing::Mock::VerifyAndClearExpectations(serverHandle.get());
+  }
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// Y's caller is cancelled from inside X's SUBSCRIBE_OK processing while Y's
+// own SUBSCRIBE_OK is already queued behind it (same control-stream read
+// before draft 18, an already-scheduled bidi read on draft 18). Y's
+// SUBSCRIBE_OK is then processed before Y's coroutine resumes. The
+// cancellation must still end Y at the peer.
+CO_TEST_P_X(MoQSessionTest, SubscribeCancelledWhileSubscribeOkQueued) {
+  co_await setupMoQSession();
+
+  const FullTrackName trackX{TrackNamespace{{"foo"}}, "x"};
+  const FullTrackName trackY{TrackNamespace{{"foo"}}, "y"};
+  folly::coro::Baton serverSawX;
+  folly::coro::Baton serverSawY;
+  folly::coro::Baton releaseX;
+  folly::coro::Baton releaseY;
+  std::shared_ptr<TrackConsumer> serverPubY;
+  std::shared_ptr<MockSubscriptionHandle> serverHandleX;
+  std::shared_ptr<MockSubscriptionHandle> serverHandleY;
+  bool serverSawUnsubscribeY = false;
+  EXPECT_CALL(*serverPublisher, subscribe(_, _))
+      .Times(2)
+      .WillRepeatedly([&](auto sub, auto pub) -> TaskSubscribeResult {
+        // gmock destroys its copy of this action once it returns.
+        return folly::coro::co_invoke(
+            [&, sub, pub]() mutable -> TaskSubscribeResult {
+              const bool isY = sub.fullTrackName == trackY;
+              if (isY) {
+                serverPubY = std::move(pub);
+                serverSawY.post();
+                co_await releaseY;
+              } else {
+                serverSawX.post();
+                co_await releaseX;
+              }
+              auto handle = makeSubscribeOkResult(sub);
+              if (isY) {
+                EXPECT_CALL(*handle, unsubscribe()).WillRepeatedly([&] {
+                  serverSawUnsubscribeY = true;
+                });
+                serverHandleY = handle;
+              } else {
+                EXPECT_CALL(*handle, unsubscribe()).Times(testing::AnyNumber());
+                serverHandleX = handle;
+              }
+              co_return handle;
+            });
+      });
+
+  std::string trace;
+  folly::CancellationSource cancelY;
+  bool yCallerResumed = false;
+  bool cancelledWithYOkSent = false;
+  size_t ySubgroups = 0;
+  auto consumerX = std::make_shared<testing::NiceMock<MockTrackConsumer>>();
+  auto consumerY = std::make_shared<testing::NiceMock<MockTrackConsumer>>();
+  ON_CALL(*consumerX, setTrackAlias(_)).WillByDefault([&](TrackAlias) {
+    // The server writes SUBSCRIBE_OK right after its handler returns.
+    cancelledWithYOkSent = serverHandleY != nullptr && !yCallerResumed;
+    trace += folly::to<std::string>(
+        "[X SUBSCRIBE_OK: Y OK sent=",
+        serverHandleY != nullptr,
+        ", cancel Y] ");
+    cancelY.requestCancellation();
+    return folly::Expected<folly::Unit, MoQPublishError>(folly::unit);
+  });
+  ON_CALL(*consumerY, setTrackAlias(_)).WillByDefault([&](TrackAlias) {
+    trace += folly::to<std::string>(
+        "[Y SUBSCRIBE_OK: cancel requested=",
+        cancelY.isCancellationRequested(),
+        ", Y caller resumed=",
+        yCallerResumed,
+        "] ");
+    return folly::Expected<folly::Unit, MoQPublishError>(folly::unit);
+  });
+  ON_CALL(*consumerY, beginSubgroup(_, _, _, _))
+      .WillByDefault([&](auto, auto, auto, auto) {
+        ++ySubgroups;
+        return folly::makeUnexpected(
+            MoQPublishError(MoQPublishError::CANCELLED, "abandoned"));
+      });
+  for (const auto& consumer : {consumerX, consumerY}) {
+    ON_CALL(*consumer, publishDone(_))
+        .WillByDefault(
+            testing::Return(
+                folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
+  }
+
+  auto subscribeX =
+      folly::coro::co_withExecutor(
+          &eventBase_,
+          clientSession_->subscribe(getSubscribe(trackX), consumerX))
+          .start()
+          .via(&eventBase_);
+  auto subscribeY =
+      folly::coro::co_withExecutor(
+          &eventBase_,
+          folly::coro::co_withCancellation(
+              cancelY.getToken(),
+              folly::coro::co_invoke(
+                  [&]() -> folly::coro::Task<Publisher::SubscribeResult> {
+                    auto res = co_await folly::coro::co_awaitTry(
+                        clientSession_->subscribe(
+                            getSubscribe(trackY), consumerY));
+                    yCallerResumed = true;
+                    trace += "[Y caller resumed] ";
+                    co_return std::move(res).value();
+                  })))
+          .start()
+          .via(&eventBase_);
+  co_await serverSawX;
+  co_await serverSawY;
+
+  // Both handlers resume, in this order, before the client reads either reply.
+  releaseX.post();
+  releaseY.post();
+  auto resultX = co_await folly::coro::co_awaitTry(std::move(subscribeX));
+  EXPECT_TRUE(resultX.hasValue() && resultX->hasValue());
+  auto resultY = co_await folly::coro::co_awaitTry(std::move(subscribeY));
+  EXPECT_TRUE(resultY.hasException<folly::OperationCancelled>()) << trace;
+  EXPECT_TRUE(cancelledWithYOkSent) << trace;
+  co_await folly::coro::sleep(std::chrono::milliseconds(200));
+
+  EXPECT_TRUE(serverSawUnsubscribeY) << trace;
+  EXPECT_NE(serverPubY, nullptr);
+  if (serverPubY) {
+    auto subgroup = serverPubY->beginSubgroup(0, 0, 0);
+    EXPECT_TRUE(subgroup.hasError()) << trace;
+    if (subgroup.hasValue()) {
+      subgroup.value()->object(
+          0, moxygen::test::makeBuf(10), noExtensions(), true);
+      co_await folly::coro::sleep(std::chrono::milliseconds(100));
+    }
+  }
+  EXPECT_EQ(ySubgroups, 0) << trace;
+
+  for (const auto& handle : {serverHandleX, serverHandleY}) {
+    if (handle) {
+      testing::Mock::VerifyAndClearExpectations(handle.get());
+    }
+  }
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQSessionTest, SubscribeTimesOutBeforeSubscribeOk) {
+  co_await setupMoQSession();
+  MoQSettings moqSettings;
+  moqSettings.requestTimeout = std::chrono::milliseconds(50);
+  clientSession_->setMoqSettings(moqSettings);
+
+  folly::coro::Baton releaseHandler;
+  bool serverSawUnsubscribe = false;
+  std::shared_ptr<MockSubscriptionHandle> serverHandle;
+  EXPECT_CALL(*serverPublisher, subscribe(_, _))
+      .WillOnce([&](auto sub, auto /*pub*/) -> TaskSubscribeResult {
+        co_await releaseHandler;
+        serverHandle = makeSubscribeOkResult(sub);
+        EXPECT_CALL(*serverHandle, unsubscribe()).WillRepeatedly([&] {
+          serverSawUnsubscribe = true;
+        });
+        co_return serverHandle;
+      });
+  EXPECT_CALL(
+      *clientSubscriberStatsCallback_,
+      onSubscribeError(SubscribeErrorCode::TIMEOUT));
+  auto consumer = std::make_shared<testing::StrictMock<MockTrackConsumer>>();
+  std::weak_ptr<TrackConsumer> weakConsumer = consumer;
+
+  auto res = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), std::move(consumer));
+  EXPECT_TRUE(res.hasError());
+  if (res.hasError()) {
+    EXPECT_EQ(res.error().errorCode, SubscribeErrorCode::TIMEOUT);
+  }
+  releaseHandler.post();
+  co_await folly::coro::sleep(std::chrono::milliseconds(200));
+
+  EXPECT_TRUE(weakConsumer.expired());
+  EXPECT_TRUE(serverSawUnsubscribe);
+  EXPECT_FALSE(clientSession_->isClosed());
+  if (serverHandle) {
+    testing::Mock::VerifyAndClearExpectations(serverHandle.get());
+  }
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQSessionTest, SubscribeRepliedWithinRequestTimeout) {
+  co_await setupMoQSession();
+  MoQSettings moqSettings;
+  moqSettings.requestTimeout = std::chrono::seconds(5);
+  clientSession_->setMoqSettings(moqSettings);
+  expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
+    pub->publishDone(getTrackEndedPublishDone(sub.requestID));
+    co_return makeSubscribeOkResult(sub);
+  });
+  expectPublishDone();
+
+  auto res = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+
+  EXPECT_FALSE(res.hasError());
+  co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }

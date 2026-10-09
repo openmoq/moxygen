@@ -357,6 +357,14 @@ const folly::F14FastSet<FrameType> kAllowedFramesForFillTimeout = {
 const folly::F14FastSet<FrameType> kAllowedFramesForTrackNamespacePrefix = {
     FrameType::REQUEST_UPDATE};
 
+// v22+ INCLUDE_PROPERTIES (0x35): MAY appear in SUBSCRIBE, TRACK_STATUS,
+// FETCH, or SUBSCRIBE_TRACKS.
+const folly::F14FastSet<FrameType> kAllowedFramesForIncludeProperties = {
+    FrameType::SUBSCRIBE,
+    FrameType::TRACK_STATUS,
+    FrameType::FETCH,
+    FrameType::SUBSCRIBE_TRACKS};
+
 const folly::F14FastSet<FrameType> kAllowedFramesForTrackFilter = {
     FrameType::SUBSCRIBE_NAMESPACE};
 
@@ -391,6 +399,8 @@ const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
         {TrackRequestParamKey::FILL_TIMEOUT, kAllowedFramesForFillTimeout},
         {TrackRequestParamKey::TRACK_NAMESPACE_PREFIX,
          kAllowedFramesForTrackNamespacePrefix},
+        {TrackRequestParamKey::INCLUDE_PROPERTIES,
+         kAllowedFramesForIncludeProperties},
         {TrackRequestParamKey::TRACK_FILTER, kAllowedFramesForTrackFilter},
         {TrackRequestParamKey::HOP_PATH, kAllowedFramesForHopPath},
         {TrackRequestParamKey::EXCLUDE_HOP, kAllowedFramesForExcludeHop},
@@ -417,9 +427,16 @@ static bool isV18OnlyParamKey(TrackRequestParamKey key) {
   }
 }
 
+static bool isV22OnlyParamKey(TrackRequestParamKey key) {
+  return key == TrackRequestParamKey::INCLUDE_PROPERTIES;
+}
+
 bool Parameters::isKnownParamKey(uint64_t key, uint64_t majorVersion) {
   auto typedKey = static_cast<TrackRequestParamKey>(key);
   if (majorVersion < 18 && isV18OnlyParamKey(typedKey)) {
+    return false;
+  }
+  if (majorVersion < 22 && isV22OnlyParamKey(typedKey)) {
     return false;
   }
   return kParamAllowlist.find(typedKey) != kParamAllowlist.end();
@@ -466,6 +483,12 @@ bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
   // v18-only parameter keys.
   if (isV18OnlyParamKey(key) &&
       (!majorVersion_.has_value() || *majorVersion_ < 18)) {
+    return false;
+  }
+
+  // INCLUDE_PROPERTIES did not exist before draft 22.
+  if (isV22OnlyParamKey(key) &&
+      (!majorVersion_.has_value() || *majorVersion_ < 22)) {
     return false;
   }
 
