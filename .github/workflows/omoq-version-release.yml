@@ -367,6 +367,10 @@ jobs:
             --prefix "$GITHUB_WORKSPACE/install" \
             --profile-dir "$PGO_PROFILE_DIR" \
             --work-dir "$RUNNER_TEMP/pgo-train"
+          # The instrumented install goes before reconfiguring: find_package
+          # searches CMAKE_INSTALL_PREFIX, and standalone takes a googletest it
+          # finds there over FetchContent.
+          rm -rf "$GITHUB_WORKSPACE/install"
           # Same tree and flags as the instrumented pass, counters applied.
           # Code the training never reached stays plain -O3.
           FLAGS="${{ matrix.cxx_flags }} -fno-lto -fprofile-use=$PGO_PROFILE_DIR -fprofile-partial-training -Wno-missing-profile"
@@ -376,7 +380,6 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS="-fno-lto" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fno-lto"
           cmake --build _build -j$(getconf _NPROCESSORS_ONLN)
-          rm -rf "$GITHUB_WORKSPACE/install"
           cmake --install _build
 
       - name: Package
