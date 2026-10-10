@@ -1,0 +1,120 @@
+name: tmp pgo e2e
+
+# TEMPORARY, delete before merging ci/pgo-portable-build. Proves the pgo path of
+# version-release portable-build on a hosted runner without cutting a release:
+# builds linux-amd64 plain and pgo at this branch's head, the same steps and
+# flags as the real job, and uploads both tarballs as workflow artifacts for
+# the moqx A/B. Triggers only when this file changes.
+
+on:
+  push:
+    branches: [ci/pgo-portable-build]
+    paths: ['.github/workflows/tmp-pgo-e2e.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    strategy:
+      fail-fast: false
+      matrix:
+        pgo: [false, true]
+    name: portable linux-amd64 (pgo=${{ matrix.pgo }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    env:
+      PGO_PROFILE_DIR: ${{ github.workspace }}/_pgo
+      CXX_FLAGS: "-march=x86-64-v2 -fno-omit-frame-pointer -fasynchronous-unwind-tables"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: bash standalone/install-system-deps.sh
+
+      - name: Cache FetchContent downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            _build/_deps/*-src
+            _build/_deps/*-subbuild
+          key: portable-linux-amd64-deps-${{ hashFiles('build/deps/github_hashes/**/*-rev.txt', 'standalone/patches/**') }}
+          restore-keys: |
+            portable-linux-amd64-deps-
+
+      - name: Configure
+        shell: bash
+        run: |
+          FLAGS="$CXX_FLAGS -fno-lto"
+          LINK_FLAGS="-fno-lto"
+          if [[ "${{ matrix.pgo }}" == "true" ]]; then
+            mkdir -p "$PGO_PROFILE_DIR"
+            FLAGS+=" -fprofile-generate=$PGO_PROFILE_DIR -fprofile-update=atomic"
+            LINK_FLAGS+=" -fprofile-generate=$PGO_PROFILE_DIR"
+          fi
+          cmake -B _build -S standalone -G Ninja \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_TESTS=ON \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_MOQTEST=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUNDLE_DEPS=ON \
+            -DBUNDLE_DEPS_STATIC_SYSLIBS=ON \
+            -DCMAKE_DISABLE_FIND_PACKAGE_LibUnwind=TRUE \
+            -DCMAKE_C_FLAGS="$FLAGS" \
+            -DCMAKE_CXX_FLAGS="$FLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS="$LINK_FLAGS" \
+            -DCMAKE_SHARED_LINKER_FLAGS="$LINK_FLAGS" \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install"
+
+      - name: Build
+        run: cmake --build _build -j$(getconf _NPROCESSORS_ONLN)
+
+      - name: Install
+        run: cmake --install _build
+
+      - name: Train PGO profile and rebuild
+        if: matrix.pgo
+        shell: bash
+        run: |
+          bash openmoq/scripts/pgo-train.sh \
+            --prefix "$GITHUB_WORKSPACE/install" \
+            --profile-dir "$PGO_PROFILE_DIR" \
+            --work-dir "$RUNNER_TEMP/pgo-train"
+          # The instrumented install goes before reconfiguring: find_package
+          # searches CMAKE_INSTALL_PREFIX, and standalone takes a googletest it
+          # finds there over FetchContent.
+          rm -rf "$GITHUB_WORKSPACE/install"
+          FLAGS="$CXX_FLAGS -fno-lto -fprofile-use=$PGO_PROFILE_DIR -fprofile-partial-training -Wno-missing-profile"
+          cmake -B _build -S standalone \
+            -DCMAKE_C_FLAGS="$FLAGS" \
+            -DCMAKE_CXX_FLAGS="$FLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fno-lto" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fno-lto"
+          cmake --build _build -j$(getconf _NPROCESSORS_ONLN)
+          cmake --install _build
+
+      - name: Package
+        run: |
+          bash openmoq/scripts/collect-artifacts-standalone.sh \
+            --install-prefix "$GITHUB_WORKSPACE/install" \
+            --output moxygen-linux-amd64.tar.gz \
+            --debug-output moxygen-linux-amd64-dbg.tar.gz
+          ls -lh moxygen-linux-amd64*.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moxygen-linux-amd64-${{ matrix.pgo && 'pgo' || 'plain' }}
+          path: moxygen-linux-amd64.tar.gz
+          retention-days: 7
+
+      - name: Upload training logs
+        if: matrix.pgo
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-training-logs
+          path: ${{ runner.temp }}/pgo-train/**/client.log
+          retention-days: 7
