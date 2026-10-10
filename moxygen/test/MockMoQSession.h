@@ -74,6 +74,9 @@ class MockMoQSession : public MoQSession {
       (),
       (const, override));
 
+  MOCK_METHOD(uint64_t, getPeerHopID, (), (const, noexcept, override));
+  MOCK_METHOD(uint64_t, getRelayLinkCost, (), (const, noexcept, override));
+
   MOCK_METHOD(
       bool,
       negotiatedSetupExtension,
