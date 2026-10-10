@@ -2353,6 +2353,41 @@ class MoQSession::FetchTrackReceiveState
     : public MoQSession::TrackReceiveStateBase {
  public:
   using FetchResult = folly::Expected<FetchOk, FetchError>;
+
+  class StallTimeout : public quic::QuicTimerCallback {
+   public:
+    StallTimeout(
+        std::weak_ptr<MoQSession> session,
+        std::shared_ptr<MoQExecutor> exec,
+        RequestID requestID,
+        std::chrono::milliseconds timeout)
+        : session_(std::move(session)),
+          exec_(std::move(exec)),
+          requestID_(requestID),
+          timeout_(timeout) {}
+
+    void restart() {
+      cancelTimerCallback();
+      exec_->scheduleTimeout(this, timeout_);
+    }
+
+    void timeoutExpired() noexcept override {
+      exec_->add([session = session_, requestID = requestID_] {
+        if (const auto alive = session.lock()) {
+          alive->onFetchStalled(requestID);
+        }
+      });
+    }
+
+    void callbackCanceled() noexcept override {}
+
+   private:
+    const std::weak_ptr<MoQSession> session_;
+    const std::shared_ptr<MoQExecutor> exec_;
+    const RequestID requestID_;
+    const std::chrono::milliseconds timeout_;
+  };
+
   FetchTrackReceiveState(
       FullTrackName fullTrackName,
       RequestID requestID,
@@ -2389,7 +2424,26 @@ class MoQSession::FetchTrackReceiveState
     callback_.reset();
   }
 
+  void armStallTimeout(MoQSession* session, std::chrono::milliseconds timeout) {
+    stallTimeout_ = std::make_unique<StallTimeout>(
+        session->weak_from_this(), session->exec_, requestID_, timeout);
+    stallTimeout_->restart();
+  }
+
+  void noteDataActivity() {
+    if (stallTimeout_ && stallTimeout_->isTimerCallbackScheduled()) {
+      stallTimeout_->restart();
+    }
+  }
+
+  void cancelStallTimeout() {
+    if (stallTimeout_) {
+      stallTimeout_->cancelTimerCallback();
+    }
+  }
+
   void resetFetchCallback(MoQSession* session) {
+    cancelStallTimeout();
     callback_.reset();
     if (fetchOkAndAllDataReceived()) {
       // Fetch data stream closed: FIN our bidi to release it cleanly.
@@ -2401,7 +2455,9 @@ class MoQSession::FetchTrackReceiveState
     }
   }
 
-  void cancel(MoQSession* session) {
+  void cancel(
+      MoQSession* session,
+      ResetStreamErrorCode consumerError = ResetStreamErrorCode::CANCELLED) {
     cancelSource_.requestCancellation();
     // RST the bidi (e.g. fetch-stream-open timeout); peer interprets as cancel.
     if (bidiControl_) {
@@ -2411,11 +2467,12 @@ class MoQSession::FetchTrackReceiveState
     auto callback = callback_;
     resetFetchCallback(session);
     if (callback) {
-      callback->reset(ResetStreamErrorCode::CANCELLED);
+      callback->reset(consumerError);
     }
   }
 
   void sessionClosed() {
+    cancelStallTimeout();
     if (!fetchEstablished_) {
       return;
     }
@@ -2468,6 +2525,7 @@ class MoQSession::FetchTrackReceiveState
   ResetStreamErrorCode dataStreamCancelCode_{
       ResetStreamErrorCode::INTERNAL_ERROR};
   bool fetchEstablished_{false};
+  std::unique_ptr<StallTimeout> stallTimeout_;
 };
 
 const std::shared_ptr<BidiStreamControl>&
@@ -4371,6 +4429,9 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
     MoQCodec::ParseResult result = MoQCodec::ParseResult::ERROR_TERMINATE;
     try {
       result = codec.onIngress(std::move(streamData.data), streamData.fin);
+      if (fetchState) {
+        fetchState->noteDataActivity();
+      }
 
       // Handle BLOCKED state (subgroup alias not yet known)
       if (result == MoQCodec::ParseResult::BLOCKED) {
@@ -4546,6 +4607,9 @@ folly::coro::Task<void> MoQSession::handleSubscribe(
   auto requestID = sub.requestID;
   auto fullTrackName = sub.fullTrackName;
   auto& params = sub.params;
+  const bool sendTrackProperties =
+      getDraftMajorVersion(*getNegotiatedVersion()) < 22 ||
+      sub.includeProperties;
 
   // TODO: Formalize after parameter refactor
   // We should only keep e2e params here and remove everything else
@@ -4591,6 +4655,10 @@ folly::coro::Task<void> MoQSession::handleSubscribe(
     setPublisherPriorityFromParams(
         subOk.params, subOk.extensions, trackPublisher);
     trackPublisher->subscribeOkSent(subOk);
+
+    if (!sendTrackProperties) {
+      subOk.extensions = Extensions{};
+    }
 
     // TODO: verify TrackAlias is unique
     sendSubscribeOk(subOk, *replyContext);
@@ -5466,6 +5534,9 @@ folly::coro::Task<void> MoQSession::handleFetch(
   folly::RequestContextScopeGuard guard;
   setRequestSession();
   auto requestID = fetch.requestID;
+  const bool sendTrackProperties =
+      getDraftMajorVersion(*getNegotiatedVersion()) < 22 ||
+      fetch.includeProperties;
   if (!fetchPublisher->getStreamPublisher()) {
     XLOG(ERR) << "Fetch Publisher killed sess=" << this;
     fetchError(
@@ -5514,6 +5585,9 @@ folly::coro::Task<void> MoQSession::handleFetch(
     auto fetchHandle = std::move(fetchResult->value());
     auto fetchOkMsg = fetchHandle->fetchOk();
     fetchOkMsg.requestID = requestID;
+    if (!sendTrackProperties) {
+      fetchOkMsg.extensions = Extensions{};
+    }
     fetchOk(fetchOkMsg, *replyContext);
     fetchPublisher->setFetchHandle(std::move(fetchHandle));
   }
@@ -5581,7 +5655,20 @@ void MoQSession::onFetchOk(FetchOk fetchOk) {
     }
     fetches_.erase(fetchIt);
     checkForCloseOnDrain();
+  } else if (moqSettings_.requestTimeout > std::chrono::milliseconds::zero()) {
+    trackReceiveState->armStallTimeout(this, moqSettings_.requestTimeout);
   }
+}
+
+void MoQSession::onFetchStalled(RequestID requestID) {
+  auto fetchIt = fetches_.find(requestID);
+  if (fetchIt == fetches_.end()) {
+    return;
+  }
+  XLOG(DBG1) << __func__ << " id=" << requestID << " sess=" << this;
+  const auto state = fetchIt->second;
+  const auto control = state->bidiControl();
+  fetchCancel({requestID}, control, ResetStreamErrorCode::DELIVERY_TIMEOUT);
 }
 
 void MoQSession::onTrackStatus(TrackStatus trackStatus) {
@@ -5634,6 +5721,9 @@ folly::coro::Task<void> MoQSession::handleTrackStatus(
   co_await folly::coro::co_safe_point;
   folly::RequestContextScopeGuard guard;
   setRequestSession();
+  const bool sendTrackProperties =
+      getDraftMajorVersion(*getNegotiatedVersion()) < 22 ||
+      trackStatus.includeProperties;
   auto token = co_await folly::coro::co_current_cancellation_token;
   auto trackStatusResult =
       co_await co_awaitTry(publishHandler_->trackStatus(trackStatus));
@@ -5661,6 +5751,9 @@ folly::coro::Task<void> MoQSession::handleTrackStatus(
     auto trackStatOk = std::move(trackStatusResult->value());
     trackStatOk.requestID = trackStatus.requestID;
     trackStatOk.fullTrackName = trackStatus.fullTrackName;
+    if (!sendTrackProperties) {
+      trackStatOk.trackProperties = Extensions{};
+    }
     trackStatusOk(trackStatOk, *replyContext);
   }
   retireRequestID(/*signalWriteLoop=*/false);
@@ -7060,7 +7153,8 @@ void MoQSession::cancelLocalRequest(RequestID requestID) {
 
 void MoQSession::fetchCancel(
     const FetchCancel& fetchCan,
-    const std::shared_ptr<BidiStreamControl>& control) {
+    const std::shared_ptr<BidiStreamControl>& control,
+    ResetStreamErrorCode consumerError) {
   XLOG(DBG1) << __func__ << " sess=" << this;
 
   // Log FetchCancel
@@ -7074,7 +7168,7 @@ void MoQSession::fetchCancel(
               << " sess=" << this;
     return;
   }
-  trackIt->second->cancel(this);
+  trackIt->second->cancel(this, consumerError);
   // Draft 18+ cancels via the bidi; older drafts send FetchCancel on control.
   if (control && getDraftMajorVersion(*negotiatedVersion_) >= 18) {
     control->cancel(ResetStreamErrorCode::CANCELLED);

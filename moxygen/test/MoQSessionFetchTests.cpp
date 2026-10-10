@@ -6,9 +6,36 @@
 
 #include "moxygen/test/MoQSessionTestCommon.h"
 
+#include "moxygen/MoQTrackProperties.h"
+
 using namespace moxygen;
 using namespace moxygen::test;
 using testing::_;
+
+CO_TEST_P_X(Draft22Test, FetchOmitsUnrequestedTrackProperties) {
+  co_await setupMoQSession();
+  expectFetch([](Fetch fetch, auto) -> TaskFetchResult {
+    EXPECT_FALSE(fetch.includeProperties);
+    auto ok = makeFetchOkResult(fetch, AbsoluteLocation{0, 1})->fetchOk();
+    ok.extensions.insertMutableExtension(
+        Extension{kPublisherPriorityExtensionType, 100});
+    co_return std::make_shared<MockFetchHandle>(std::move(ok));
+  });
+  expectFetchSuccess();
+
+  auto request = getFetch({0, 0}, {0, 1});
+  request.includeProperties = false;
+  auto result = co_await clientSession_->fetch(request, fetchCallback_);
+  EXPECT_TRUE(result.hasValue());
+  if (result.hasError()) {
+    clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+    co_return;
+  }
+  EXPECT_TRUE(result.value()->fetchOk().extensions.empty());
+
+  EXPECT_CALL(*fetchCallback_, reset(_));
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
 
 // === FETCH tests ===
 
@@ -1266,5 +1293,81 @@ CO_TEST_P_X(MoQSessionTest, FetchTimesOutBeforeFetchOk) {
   if (serverHandle) {
     testing::Mock::VerifyAndClearExpectations(serverHandle.get());
   }
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQSessionTest, FetchThatStallsAfterFetchOkIsReset) {
+  co_await setupMoQSession();
+  MoQSettings moqSettings;
+  moqSettings.requestTimeout = std::chrono::milliseconds(100);
+  clientSession_->setMoqSettings(moqSettings);
+
+  bool serverSawFetchCancel = false;
+  std::shared_ptr<FetchConsumer> serverPub;
+  std::shared_ptr<MockFetchHandle> serverHandle;
+  EXPECT_CALL(*serverPublisher, fetch(_, _))
+      .WillOnce([&](Fetch fetch, auto pub) -> TaskFetchResult {
+        serverPub = std::move(pub);
+        serverHandle = makeFetchOkResult(fetch, AbsoluteLocation{0, 0});
+        EXPECT_CALL(*serverHandle, fetchCancel()).WillRepeatedly([&] {
+          serverSawFetchCancel = true;
+        });
+        co_return serverHandle;
+      });
+  expectFetchSuccess();
+  EXPECT_CALL(*clientSubscriberStatsCallback_, recordFetchLatency(_));
+  bool consumerReset = false;
+  auto consumer = std::make_shared<testing::StrictMock<MockFetchConsumer>>();
+  EXPECT_CALL(*consumer, reset(ResetStreamErrorCode::DELIVERY_TIMEOUT))
+      .WillOnce([&] { consumerReset = true; });
+
+  auto res = co_await clientSession_->fetch(
+      getFetch({0, 0}, {0, 1}), std::move(consumer));
+  EXPECT_TRUE(res.hasValue());
+  co_await folly::coro::sleep(std::chrono::milliseconds(400));
+
+  EXPECT_TRUE(consumerReset);
+  EXPECT_TRUE(serverSawFetchCancel);
+  EXPECT_FALSE(clientSession_->isClosed());
+  if (serverHandle) {
+    testing::Mock::VerifyAndClearExpectations(serverHandle.get());
+  }
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQSessionTest, FetchWhoseDataKeepsArrivingIsNotReset) {
+  co_await setupMoQSession();
+  MoQSettings moqSettings;
+  moqSettings.requestTimeout = std::chrono::milliseconds(500);
+  clientSession_->setMoqSettings(moqSettings);
+
+  constexpr uint64_t kObjects = 30;
+  std::shared_ptr<FetchConsumer> serverPub;
+  expectFetch([&serverPub](Fetch fetch, auto pub) -> TaskFetchResult {
+    serverPub = std::move(pub);
+    co_return makeFetchOkResult(fetch, AbsoluteLocation{0, kObjects - 1});
+  });
+  expectFetchSuccess();
+  EXPECT_CALL(*clientSubscriberStatsCallback_, recordFetchLatency(_));
+  EXPECT_CALL(*fetchCallback_, object(0, 0, _, _, _, _, _))
+      .Times(kObjects)
+      .WillRepeatedly(testing::Return(folly::unit));
+
+  auto res = co_await clientSession_->fetch(
+      getFetch({0, 0}, {0, kObjects}), fetchCallback_);
+  EXPECT_TRUE(res.hasValue());
+  for (uint64_t objectID = 0; objectID < kObjects; ++objectID) {
+    co_await folly::coro::sleep(std::chrono::milliseconds(20));
+    serverPub->object(
+        0,
+        0,
+        objectID,
+        moxygen::test::makeBuf(10),
+        noExtensions(),
+        /*finFetch=*/objectID == kObjects - 1);
+  }
+  co_await folly::coro::sleep(std::chrono::milliseconds(600));
+
+  EXPECT_FALSE(clientSession_->isClosed());
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
