@@ -352,6 +352,10 @@ folly::Try<moxygen::Setup> MoQSessionTest::onClientSetup(
           SetupParameter{
               folly::to_underlying(SetupKey::AUTHORITY), "moq.example"});
     }
+    if (relayHopsSupported_ || serverRelayHopsSupported_) {
+      ss.params.insertParam(SetupParameter{
+          folly::to_underlying(SetupKey::RELAY_HOPS), std::string{}});
+    }
     return ss;
   }());
 }
@@ -373,6 +377,10 @@ folly::coro::Task<void> MoQSessionTest::setupMoQSession() {
         SetupParameter{
             folly::to_underlying(SetupKey::MAX_REQUEST_ID),
             initialMaxRequestID_});
+    if (relayHopsSupported_ || serverRelayHopsSupported_) {
+      serverSetupMsg.params.insertParam(SetupParameter{
+          folly::to_underlying(SetupKey::RELAY_HOPS), std::string{}});
+    }
     serverSession_->sendSetup(std::move(serverSetupMsg));
   }
 
@@ -638,6 +646,10 @@ moxygen::Setup MoQSessionTest::getClientSetup(uint64_t initialMaxRequestID) {
   setup.params.insertParam(
       SetupParameter{
           folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE), 16});
+  if (relayHopsSupported_ || clientRelayHopsSupported_) {
+    setup.params.insertParam(SetupParameter{
+        folly::to_underlying(SetupKey::RELAY_HOPS), std::string{}});
+  }
   return setup;
 }
 

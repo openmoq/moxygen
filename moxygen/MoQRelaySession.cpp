@@ -860,6 +860,12 @@ MoQRelaySession::publishNamespace(
         durationMsec.count());
   };
   const auto& trackNamespace = pubNs.trackNamespace;
+  if (isClosed()) {
+    co_return folly::makeUnexpected(PublishNamespaceError(
+        {failedLocalRequestID(),
+         PublishNamespaceErrorCode::INTERNAL_ERROR,
+         "closed session"}));
+  }
   if (shouldFailNewLocalRequestDueToGoaway()) {
     co_return folly::makeUnexpected(PublishNamespaceError(
         {failedLocalRequestID(),
@@ -1404,7 +1410,7 @@ class SubNsStreamCallback : public MoQControlCodec::ControlCallback {
 
   void onNamespace(Namespace ns) override {
     if (namespacePublishHandle_) {
-      namespacePublishHandle_->namespaceMsg(ns.trackNamespaceSuffix);
+      namespacePublishHandle_->namespaceMsg(ns);
     }
   }
 
@@ -1476,6 +1482,12 @@ MoQRelaySession::subscribeNamespace(
   XLOG(DBG1) << __func__ << " prefix=" << sa.trackNamespacePrefix
              << " sess=" << this;
   const auto& trackNamespace = sa.trackNamespacePrefix;
+  if (isClosed()) {
+    co_return folly::makeUnexpected(SubscribeNamespaceError(
+        {failedLocalRequestID(),
+         SubscribeNamespaceErrorCode::INTERNAL_ERROR,
+         "closed session"}));
+  }
   if (shouldFailNewLocalRequestDueToGoaway()) {
     co_return folly::makeUnexpected(SubscribeNamespaceError(
         {failedLocalRequestID(),
@@ -1615,19 +1627,24 @@ class MoQNamespacePublishHandle : public Publisher::NamespacePublishHandle {
  public:
   MoQNamespacePublishHandle(
       std::shared_ptr<SubNSReply> subNsReply,
-      uint64_t negotiatedVersion)
+      uint64_t negotiatedVersion,
+      SetupExtensions extensions)
       : subNsReply_(std::move(subNsReply)) {
-    moqFrameWriter_.initializeVersion(negotiatedVersion);
+    moqFrameWriter_.initializeVersion(negotiatedVersion, extensions);
   }
 
-  void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) override {
-    Namespace ns;
-    ns.trackNamespaceSuffix = trackNamespaceSuffix;
+  void namespaceMsg(const Namespace& ns) override {
     auto writeResult = subNsReply_->namespaceMsg(ns);
     if (!writeResult) {
       XLOG(ERR) << "writeNamespace failed";
       return;
     }
+  }
+
+  void namespaceMsg(const TrackNamespace& trackNamespaceSuffix) override {
+    Namespace ns;
+    ns.trackNamespaceSuffix = trackNamespaceSuffix;
+    namespaceMsg(ns);
   }
 
   void namespaceDoneMsg(const TrackNamespace& trackNamespaceSuffix) override {
@@ -1654,7 +1671,7 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
   std::shared_ptr<MoQNamespacePublishHandle> publishHandle;
   if (getDraftMajorVersion(*negotiatedVersion_) >= 16) {
     publishHandle = std::make_shared<MoQNamespacePublishHandle>(
-        subNsReply, *negotiatedVersion_);
+        subNsReply, *negotiatedVersion_, getNegotiatedExtensions());
   }
   auto token = co_await folly::coro::co_current_cancellation_token;
   auto subNsResult = co_await co_awaitTry(
@@ -1850,6 +1867,12 @@ MoQRelaySession::subscribeTracks(
     }
     co_return std::make_shared<NamespaceBackedSubscribeTracksHandle>(
         std::move(res.value()));
+  }
+  if (isClosed()) {
+    co_return folly::makeUnexpected(SubscribeTracksError(
+        {failedLocalRequestID(),
+         SubscribeTracksErrorCode::INTERNAL_ERROR,
+         "closed session"}));
   }
   // Mirror subscribe/subscribeNamespace/publishNamespace: don't start a new
   // local request after we've received a GOAWAY.
