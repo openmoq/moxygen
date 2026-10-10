@@ -31,6 +31,14 @@ class ReplyContext {
     flush(/*fin=*/true);
   }
 
+  // FIN the bidi reply stream once the peer FINs its side; no-op for
+  // control-stream contexts.
+  virtual void finAfterPeerFin() {}
+
+  // Hold finAfterPeerFin()'s FIN while a REQUEST_UPDATE reply is pending.
+  virtual void holdFin() {}
+  virtual void releaseFin() {}
+
   // STOP_SENDING + RESET the bidi reply stream; no-op for control-stream
   // contexts. Idempotent.
   virtual void cancel(ResetStreamErrorCode /*code*/) {}
