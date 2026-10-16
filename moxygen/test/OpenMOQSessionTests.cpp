@@ -131,8 +131,9 @@ CO_TEST_P_X(RelayHopsNegotiationTest, PublisherWriterTakesNegotiatedExtensions) 
       GroupOrder::OldestFirst,
       version,
       0);
-  EXPECT_TRUE(
-      publisher.getNegotiatedExtensions().has(SetupExtension::RelayHops));
+  EXPECT_EQ(
+      publisher.getNegotiatedExtensions().has(SetupExtension::RelayHops),
+      getDraftMajorVersion(version) >= 18);
 }
 
 CO_TEST_P_X(RelayHopsNegotiationTest, RemainsDisabledWithoutAdvertisement) {
