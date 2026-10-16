@@ -151,6 +151,32 @@ TEST_F(MoQTrackTest, testConversionWithInvalidEndParams) {
   EXPECT_TRUE(params.hasError());
 }
 
+TEST_F(MoQTrackTest, testConversionWithPrefix) {
+  CreatDefaultTrackNamespace();
+  track_.trackNamespace.insert(track_.trackNamespace.begin(), {"a", "b"});
+  auto params = moxygen::convertTrackNamespaceToMoqTestParam(&track_);
+  ASSERT_FALSE(params.hasError());
+  EXPECT_EQ(params.value().nsPrefix, std::vector<std::string>({"a", "b"}));
+  EXPECT_EQ(params.value().lastGroupInTrack, 10);
+
+  auto roundTrip = moxygen::convertMoqTestParamToTrackNamespace(params.value());
+  ASSERT_FALSE(roundTrip.hasError());
+  EXPECT_EQ(roundTrip.value().trackNamespace, track_.trackNamespace);
+}
+
+TEST_F(MoQTrackTest, testConversionWithTrailingTuple) {
+  CreatDefaultTrackNamespace();
+  track_.trackNamespace.emplace_back("0");
+  auto params = moxygen::convertTrackNamespaceToMoqTestParam(&track_);
+  EXPECT_TRUE(params.hasError());
+}
+
+TEST_F(MoQTrackTest, testParseNsPrefix) {
+  EXPECT_TRUE(moxygen::parseNsPrefix("").empty());
+  EXPECT_EQ(
+      moxygen::parseNsPrefix("a/b"), std::vector<std::string>({"a", "b"}));
+}
+
 TEST_F(MoQTrackTest, testConversionWithTrackNamespaceHavingNonDigitValues) {
   CreatDefaultTrackNamespace();
   track_.trackNamespace[1] = "a";
@@ -413,4 +439,37 @@ TEST_F(MoQTrackTest, testFetchForwardingPreferenceOnlyRemapsDatagram) {
         ForwardingPreference::TWO_SUBGROUPS_PER_GROUP}) {
     EXPECT_EQ(moxygen::fetchForwardingPreference(preference), preference);
   }
+}
+
+TEST_F(MoQTrackTest, testPayloadEmbedsOffset) {
+  auto buf = moxygen::makePayload(70000);
+  EXPECT_TRUE(moxygen::validatePayload(70000, buf.get()));
+  auto payload = buf->moveToFbString().toStdString();
+  EXPECT_EQ(payload.size(), 70000);
+  EXPECT_EQ(payload[0], '\0');
+  EXPECT_EQ(payload[1], 't');
+  EXPECT_EQ(payload[255], 't');
+  EXPECT_EQ(payload[256], '\x01');
+  EXPECT_EQ(payload[0xff00], '\xff');
+  EXPECT_EQ(payload[0x10000], '\0');
+  EXPECT_EQ(payload[0x10100], '\x01');
+
+  // A chain split off the 64KiB boundary validates the same as one buffer.
+  auto split = folly::IOBuf::copyBuffer(payload.substr(0, 65000));
+  split->appendToChain(folly::IOBuf::copyBuffer(payload.substr(65000)));
+  EXPECT_TRUE(moxygen::validatePayload(70000, split.get()));
+
+  auto shifted = folly::IOBuf::copyBuffer(payload.substr(1) + "t");
+  EXPECT_FALSE(moxygen::validatePayload(70000, shifted.get()));
+  EXPECT_EQ(moxygen::findPayloadMismatch(shifted.get()), 0);
+  auto truncated = folly::IOBuf::copyBuffer(payload.substr(0, 69999));
+  EXPECT_FALSE(moxygen::validatePayload(70000, truncated.get()));
+  auto allT = folly::IOBuf::copyBuffer(std::string(512, 't'));
+  EXPECT_EQ(moxygen::findPayloadMismatch(allT.get()), 0);
+  auto corrupt = folly::IOBuf::copyBuffer(payload);
+  corrupt->writableData()[0x10100] = 't';
+  EXPECT_EQ(moxygen::findPayloadMismatch(corrupt.get()), 0x10100);
+
+  EXPECT_TRUE(moxygen::validatePayload(0, nullptr));
+  EXPECT_EQ(moxygen::makePayload(0)->computeChainDataLength(), 0);
 }

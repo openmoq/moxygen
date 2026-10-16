@@ -36,6 +36,9 @@ convertMoqTestParamToTrackNamespace(const MoQTestParameters& params);
 folly::Expected<moxygen::MoQTestParameters, std::runtime_error>
 convertTrackNamespaceToMoqTestParam(TrackNamespace* track);
 
+// Splits a '/'-separated --ns_prefix into tuples.
+std::vector<std::string> parseNsPrefix(const std::string& prefix);
+
 std::vector<Extension> getExtensions(
     int integerExtensionId,
     int variableExtensionId,
@@ -134,7 +137,14 @@ std::set<std::pair<uint64_t, uint64_t>> expectedObjectsIn(
 folly::Expected<AbsoluteLocation, std::runtime_error> parseLocation(
     const std::string& value);
 
-bool validatePayload(int objectSize, std::string payload);
+// 't' fill, except byte 256*k holds k & 0xff, so a shifted or spliced payload
+// fails validation. The chain wraps a static 64KiB copy of the pattern.
+std::unique_ptr<folly::IOBuf> makePayload(size_t objectSize);
+
+// First offset that differs from the pattern, else the length (0 for null).
+size_t findPayloadMismatch(const folly::IOBuf* payload);
+
+bool validatePayload(int objectSize, const folly::IOBuf* payload);
 
 bool validateExtensionSize(
     std::vector<Extension> extensions,

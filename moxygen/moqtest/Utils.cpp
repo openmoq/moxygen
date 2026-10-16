@@ -106,45 +106,52 @@ convertMoqTestParamToTrackNamespace(const MoQTestParameters& params) {
       std::to_string((params.testVariableExtension)),
       std::to_string(params.publisherDeliveryTimeout),
   });
+  trackNamespace.trackNamespace.insert(
+      trackNamespace.trackNamespace.begin(),
+      params.nsPrefix.begin(),
+      params.nsPrefix.end());
   return trackNamespace;
 }
 
 folly::Expected<moxygen::MoQTestParameters, std::runtime_error>
 convertTrackNamespaceToMoqTestParam(TrackNamespace* track) {
-  // Check if TrackNamespace is of length 16
-  if ((track->trackNamespace).size() != kNumParams) {
+  // Any tuples ahead of the last 16 are nsPrefix.
+  const auto& tuples = track->trackNamespace;
+  if (tuples.size() < kNumParams) {
     return folly::makeUnexpected(
-        std::runtime_error("TrackNamespace is not of length 16"));
+        std::runtime_error("TrackNamespace is shorter than 16"));
   }
+  const auto prefixLen = tuples.size() - kNumParams;
+  const auto field = [&tuples, prefixLen](size_t i) -> const std::string& {
+    return tuples[prefixLen + i];
+  };
   // Check if TrackNamespace is correct protocol (Tuple Field 0)
-  if ((track->trackNamespace)[0] != kField0) {
+  if (field(0) != kField0) {
     return folly::makeUnexpected(
-        std::runtime_error("Tuple element 0 is not moq-test-00"));
+        std::runtime_error("Tuple Field 0 is not moq-test-00"));
   }
 
   // Create Empty MoQTestParameters
   MoQTestParameters params = MoQTestParameters();
+  params.nsPrefix.assign(tuples.begin(), tuples.begin() + prefixLen);
 
   // Assign values to appropriate positions in params
   try {
-    params.forwardingPreference =
-        ForwardingPreference(std::stoi((track->trackNamespace)[1]));
-    params.startGroup = std::stoull((track->trackNamespace)[2]);
-    params.startObject = std::stoull((track->trackNamespace)[3]);
-    params.lastGroupInTrack = std::stoull((track->trackNamespace)[4]);
-    params.lastObjectInTrack = std::stoull((track->trackNamespace)[5]);
-    params.objectsPerGroup = std::stoull((track->trackNamespace)[6]);
-    params.sizeOfObjectZero = std::stoull((track->trackNamespace)[7]);
-    params.sizeOfObjectGreaterThanZero =
-        std::stoull((track->trackNamespace)[8]);
-    params.objectFrequency = std::stoull((track->trackNamespace)[9]);
-    params.groupIncrement = std::stoull((track->trackNamespace)[10]);
-    params.objectIncrement = std::stoull((track->trackNamespace)[11]);
-    params.sendEndOfGroupMarkers =
-        static_cast<bool>(std::stoi((track->trackNamespace)[12]));
-    params.testIntegerExtension = (std::stoi((track->trackNamespace)[13]));
-    params.testVariableExtension = (std::stoi((track->trackNamespace)[14]));
-    params.publisherDeliveryTimeout = std::stoull((track->trackNamespace)[15]);
+    params.forwardingPreference = ForwardingPreference(std::stoi(field(1)));
+    params.startGroup = std::stoull(field(2));
+    params.startObject = std::stoull(field(3));
+    params.lastGroupInTrack = std::stoull(field(4));
+    params.lastObjectInTrack = std::stoull(field(5));
+    params.objectsPerGroup = std::stoull(field(6));
+    params.sizeOfObjectZero = std::stoull(field(7));
+    params.sizeOfObjectGreaterThanZero = std::stoull(field(8));
+    params.objectFrequency = std::stoull(field(9));
+    params.groupIncrement = std::stoull(field(10));
+    params.objectIncrement = std::stoull(field(11));
+    params.sendEndOfGroupMarkers = static_cast<bool>(std::stoi(field(12)));
+    params.testIntegerExtension = std::stoi(field(13));
+    params.testVariableExtension = std::stoi(field(14));
+    params.publisherDeliveryTimeout = std::stoull(field(15));
   } catch (const std::exception& e) {
     return folly::makeUnexpected(
         std::runtime_error(
@@ -160,6 +167,12 @@ convertTrackNamespaceToMoqTestParam(TrackNamespace* track) {
   }
 
   return params;
+}
+
+std::vector<std::string> parseNsPrefix(const std::string& prefix) {
+  std::vector<std::string> tuples;
+  folly::split('/', prefix, tuples, /*ignoreEmpty=*/true);
+  return tuples;
 }
 
 std::vector<Extension> getExtensions(
@@ -500,17 +513,60 @@ bool validateVarExtensions(Extension varExt, MoQTestParameters* params) {
       static_cast<uint64_t>(2 * params->testVariableExtension + 1));
 }
 
+namespace {
+constexpr size_t kPayloadPeriod = 1 << 16;
+
+const std::string& payloadPattern() {
+  static const std::string pattern = [] {
+    std::string p(kPayloadPeriod, 't');
+    for (size_t offset = 0; offset < kPayloadPeriod; offset += 256) {
+      p[offset] = static_cast<char>(offset >> 8);
+    }
+    return p;
+  }();
+  return pattern;
+}
+} // namespace
+
+std::unique_ptr<folly::IOBuf> makePayload(size_t objectSize) {
+  const auto& pattern = payloadPattern();
+  auto payload = folly::IOBuf::wrapBuffer(
+      pattern.data(), std::min(kPayloadPeriod, objectSize));
+  for (size_t offset = kPayloadPeriod; offset < objectSize;
+       offset += kPayloadPeriod) {
+    payload->appendToChain(folly::IOBuf::wrapBuffer(
+        pattern.data(), std::min(kPayloadPeriod, objectSize - offset)));
+  }
+  return payload;
+}
+
+size_t findPayloadMismatch(const folly::IOBuf* payload) {
+  if (!payload) {
+    return 0;
+  }
+  auto pattern = reinterpret_cast<const uint8_t*>(payloadPattern().data());
+  size_t offset = 0;
+  for (auto range : *payload) {
+    while (!range.empty()) {
+      size_t patternOffset = offset % kPayloadPeriod;
+      size_t len = std::min(range.size(), kPayloadPeriod - patternOffset);
+      auto end = range.begin() + len;
+      auto it =
+          std::mismatch(range.begin(), end, pattern + patternOffset).first;
+      if (it != end) {
+        return offset + (it - range.begin());
+      }
+      offset += len;
+      range.advance(len);
+    }
+  }
+  return offset;
+}
+
 // Payload Validation Helper Function
-bool validatePayload(int objectSize, std::string payload) {
-  int payloadLength = (payload).length();
-  if (payloadLength != objectSize) {
-    return false;
-  }
-
-  if (payload != std::string(payloadLength, 't')) {
-    return false;
-  }
-
-  return true;
+bool validatePayload(int objectSize, const folly::IOBuf* payload) {
+  size_t length = payload ? payload->computeChainDataLength() : 0;
+  return objectSize >= 0 && length == static_cast<size_t>(objectSize) &&
+      findPayloadMismatch(payload) == length;
 }
 } // namespace moxygen

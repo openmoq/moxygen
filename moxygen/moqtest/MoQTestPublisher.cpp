@@ -76,9 +76,9 @@ void MoQTestPublisher::cancelAll() {
   }
   // Move before cancelling: cancel() can resume a waiting publish inline, and
   // that coroutine erases its own entry on the way out.
-  auto pending = std::move(pendingUnpauses_);
-  pendingUnpauses_.clear();
-  for (auto& p : pending) {
+  auto published = std::move(publishedTracks_);
+  publishedTracks_.clear();
+  for (auto& p : published) {
     p->cancel();
   }
   auto fetches = std::move(activeFetches_);
@@ -253,9 +253,9 @@ folly::coro::Task<folly::coro::Task<void>> MoQTestPublisher::startPublishTrack(
   // Only the first unpause is honored. If the peer pauses again mid-track we
   // keep generating and the forwarder drops the objects, which for a test
   // publisher is simpler than parking and re-arming.
-  auto unpauseCb = std::make_shared<PendingUnpause>();
-  forwarder->setCallback(unpauseCb);
-  pendingUnpauses_.push_back(unpauseCb);
+  auto published = std::make_shared<PublishedTrack>();
+  forwarder->setCallback(published);
+  publishedTracks_.push_back(published);
 
   auto subscriber =
       forwarder->addSubscriber(session->sessionId(), /*forward=*/false);
@@ -291,20 +291,24 @@ folly::coro::Task<folly::coro::Task<void>> MoQTestPublisher::startPublishTrack(
   subscriber->onPublishOk(pubResult.value().value());
 
   co_return streamPublishedTrack(
-      std::move(unpauseCb), std::move(forwarder), params, requestID);
+      std::move(published), std::move(forwarder), params, requestID);
 }
 
 folly::coro::Task<void> MoQTestPublisher::streamPublishedTrack(
-    std::shared_ptr<PendingUnpause> unpauseCb,
+    std::shared_ptr<PublishedTrack> published,
     std::shared_ptr<MoQForwarder> forwarder,
     MoQTestParameters params,
     RequestID requestID) {
   // Drop the registration however this track ends, so a long-lived publisher
   // doesn't accumulate one fulfilled entry per publish.
   auto unregister = folly::makeGuard(
-      [this, unpauseCb] { std::erase(pendingUnpauses_, unpauseCb); });
-  co_await unpauseCb->unpaused.getFuture();
-  co_await sendTrackData(params, requestID, std::move(forwarder));
+      [this, published] { std::erase(publishedTracks_, published); });
+  co_await published->unpaused.getFuture();
+  auto token = folly::cancellation_token_merge(
+      co_await folly::coro::co_current_cancellation_token,
+      published->cancelSource.getToken());
+  co_await folly::coro::co_withCancellation(
+      std::move(token), sendTrackData(params, requestID, std::move(forwarder)));
 }
 
 folly::coro::Task<void> MoQTestPublisher::publishTrack(
@@ -353,8 +357,7 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerGroup(
       if (objectId < lastObjectInGroup(params) ||
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
-        std::string p = std::string(objectSize, 't');
-        auto objectPayload = folly::IOBuf::copyBuffer(p);
+        auto objectPayload = makePayload(objectSize);
         auto res = subConsumer->object(
             objectId,
             std::move(objectPayload),
@@ -413,8 +416,7 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerObject(
       if (objectId < lastObjectInGroup(params) ||
           !params.sendEndOfGroupMarkers) {
         // Begin Delivering Object With Payload
-        std::string p = std::string(objectSize, 't');
-        auto objectPayload = folly::IOBuf::copyBuffer(p);
+        auto objectPayload = makePayload(objectSize);
         auto res = subConsumer->object(
             objectId,
             std::move(objectPayload),
@@ -496,8 +498,7 @@ folly::coro::Task<void> MoQTestPublisher::sendTwoSubgroupsPerGroup(
         // Begin Delivering Object With Payload
         int index = objectId % 2;
         XLOG(DBG1) << "Sending Object " << objectId << " to Subgroup " << index;
-        std::string p = std::string(objectSize, 't');
-        auto objectPayload = folly::IOBuf::copyBuffer(p);
+        auto objectPayload = makePayload(objectSize);
         auto res = subConsumers[index]->object(
             objectId,
             std::move(objectPayload),
@@ -579,7 +580,7 @@ folly::coro::Task<void> MoQTestPublisher::sendDatagram(
         header.length = 0;
       } else {
         objectSize = getObjectSize(objectId, &params);
-        objectPayload = folly::IOBuf::copyBuffer(std::string(objectSize, 't'));
+        objectPayload = makePayload(objectSize);
         // Add Integer/Variable Extensions if needed
         header.extensions = Extensions(
             getExtensions(
@@ -779,8 +780,7 @@ folly::coro::Task<void> MoQTestPublisher::fetchObjects(
       auto res = folly::makeExpected<MoQPublishError>(folly::unit);
       if (objectId < lastObjectInGroup(params) || !sendEndOfGroupMarkers) {
         int objectSize = getObjectSize(objectId, &params);
-        auto objectPayload =
-            folly::IOBuf::copyBuffer(std::string(objectSize, 't'));
+        auto objectPayload = makePayload(objectSize);
         res = callback->object(
             groupNum,
             subgroupId,
