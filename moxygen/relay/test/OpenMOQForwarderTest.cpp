@@ -169,9 +169,9 @@ TEST_F(OpenMOQForwarderTest, GetSubscriberFindsBySessionId) {
   auto channelHandle = forwarder->addSubscriber(
       channelId, /*forward=*/true, createMockConsumer());
 
-  EXPECT_EQ(forwarder->getSubscriber(session->sessionId()), sessionHandle);
-  EXPECT_EQ(forwarder->getSubscriber(channelId), channelHandle);
-  EXPECT_EQ(forwarder->getSubscriber(MoQSession::makeSessionId()), nullptr);
+  EXPECT_EQ(forwarder->findSubscriber(session->sessionId()), sessionHandle);
+  EXPECT_EQ(forwarder->findSubscriber(channelId), channelHandle);
+  EXPECT_EQ(forwarder->findSubscriber(MoQSession::makeSessionId()), nullptr);
 }
 
 TEST_F(OpenMOQForwarderTest, PassiveSubscriberDoesNotTriggerForwardChanged) {

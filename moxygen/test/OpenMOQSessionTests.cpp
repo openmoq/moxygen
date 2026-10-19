@@ -15,6 +15,7 @@ using namespace moxygen::test;
 // moqsessiontestcommon instantiates these for MoQSessionTests. This binary does
 // not define any of their tests.
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(Draft18Test);
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(Draft22Test);
 GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(PreDraft18Test);
 
 using OpenMOQSetupTest = MoQSessionTest;

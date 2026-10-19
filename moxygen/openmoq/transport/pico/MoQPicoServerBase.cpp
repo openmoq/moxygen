@@ -520,6 +520,10 @@ bool MoQPicoServerBase::initH3Zero() {
     wtPathTable_[i].path_length = endpoints[i].size();
     wtPathTable_[i].path_callback = wtPathCallback;
     wtPathTable_[i].path_app_ctx = this;
+    // h3zero rejects extended CONNECT on a route without a connect_protocol.
+    wtPathTable_[i].connect_protocol = H3ZERO_WEBTRANSPORT_H3_PROTOCOL;
+    wtPathTable_[i].connect_protocol_length =
+        strlen(H3ZERO_WEBTRANSPORT_H3_PROTOCOL);
   }
   // Null terminator
   wtPathTable_[endpoints.size()] = {};
