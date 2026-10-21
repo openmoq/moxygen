@@ -3,7 +3,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # Test utilities
-add_library(moqtest_utils Utils.cpp)
+add_library(moqtest_utils Utils.cpp PromMetrics.cpp)
 target_include_directories(
   moqtest_utils PUBLIC
   $<BUILD_INTERFACE:${MOXYGEN_FBCODE_ROOT}>
@@ -203,6 +203,42 @@ target_link_libraries(
 
 install(
     TARGETS moqperf_test_client
+    EXPORT moxygen-exports
+    ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
+    LIBRARY DESTINATION ${LIB_INSTALL_DIR}
+)
+
+# moqmeeting_client
+add_executable(
+  moqmeeting_client
+  MoQMeetingClient.cpp
+  MoQMeetingClientMain.cpp
+)
+set_target_properties(
+  moqmeeting_client
+  PROPERTIES
+    BUILD_RPATH ${DEPS_LIBRARIES_DIR}
+    INSTALL_RPATH ${DEPS_LIBRARIES_DIR}
+)
+target_include_directories(
+  moqmeeting_client PUBLIC $<BUILD_INTERFACE:${MOXYGEN_FBCODE_ROOT}>
+)
+target_compile_options(
+  moqmeeting_client PRIVATE
+  ${_MOXYGEN_COMMON_COMPILE_OPTIONS}
+)
+target_link_libraries(
+  moqmeeting_client PUBLIC
+  moqtest_utils
+  moxygen_moq_relay_session
+  moxygen_moq_test_publisher
+  moxygen_samples_util_qmux_relay_utils
+  Folly::folly_init_init
+  Folly::folly_io_async_scoped_event_base_thread
+)
+
+install(
+    TARGETS moqmeeting_client
     EXPORT moxygen-exports
     ARCHIVE DESTINATION ${LIB_INSTALL_DIR}
     LIBRARY DESTINATION ${LIB_INSTALL_DIR}

@@ -40,6 +40,14 @@ folly::Expected<std::string, ErrorCode> parseFixedString(
     folly::io::Cursor& cursor,
     size_t& length);
 
+folly::Expected<std::string, ErrorCode> encodeRelayHopPath(
+    const std::vector<uint64_t>& hopPath,
+    uint64_t version) noexcept;
+
+folly::Expected<std::vector<uint64_t>, ErrorCode> decodeRelayHopPath(
+    std::string_view encoded,
+    uint64_t version) noexcept;
+
 inline StreamType getSubgroupStreamType(
     uint64_t version,
     SubgroupIDFormat format,
@@ -299,14 +307,30 @@ class MoQFrameParser {
       size_t& length,
       ObjectHeader& objectHeader) const noexcept;
 
-  void initializeVersion(uint64_t versionIn) {
+  // Framers built after the setup exchange should pass the session's
+  // extensions here; the session's own pair learns its version first and picks
+  // the extensions up later via setNegotiatedExtensions().
+  void initializeVersion(uint64_t versionIn, SetupExtensions extensions = {}) {
     XCHECK(!version_) << "Version already initialized";
     version_ = versionIn;
     useMoQVarint_ = getDraftMajorVersion(versionIn) >= 17;
+    extensions_ = extensions;
   }
 
   std::optional<uint64_t> getVersion() const {
     return version_;
+  }
+
+  void setNegotiatedExtensions(SetupExtensions extensions) noexcept {
+    extensions_ = extensions;
+  }
+
+  SetupExtensions getNegotiatedExtensions() const noexcept {
+    return extensions_;
+  }
+
+  bool hasExtension(SetupExtension extension) const noexcept {
+    return extensions_.has(extension);
   }
 
   // Decode a TRACK_NAMESPACE_PREFIX parameter value (a Track Namespace tuple,
@@ -365,6 +389,9 @@ class MoQFrameParser {
     previousFetchPriority_ = std::nullopt;
     fetchGroupOrder_ = GroupOrder::OldestFirst;
   }
+
+  std::optional<TrackFilter> extractTrackFilter(
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
  private:
   MoQTokenCache& getTokenCache() const noexcept {
@@ -525,6 +552,7 @@ class MoQFrameParser {
 
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
+  SetupExtensions extensions_;
   mutable MoQTokenCache fallbackTokenCache_;
   MoQTokenCache* tokenCache_{nullptr};
   mutable std::optional<uint64_t> previousObjectID_;
@@ -740,14 +768,28 @@ class MoQFrameWriter {
       const std::string& tokenValue,
       const std::optional<uint64_t>& forceVersion = std::nullopt) const;
 
-  void initializeVersion(uint64_t versionIn) {
+  // See MoQFrameParser::initializeVersion.
+  void initializeVersion(uint64_t versionIn, SetupExtensions extensions = {}) {
     XCHECK(!version_) << "Version already initialized";
     version_ = versionIn;
     useMoQVarint_ = getDraftMajorVersion(versionIn) >= 17;
+    extensions_ = extensions;
   }
 
   std::optional<uint64_t> getVersion() const {
     return version_;
+  }
+
+  void setNegotiatedExtensions(SetupExtensions extensions) noexcept {
+    extensions_ = extensions;
+  }
+
+  SetupExtensions getNegotiatedExtensions() const noexcept {
+    return extensions_;
+  }
+
+  bool hasExtension(SetupExtension extension) const noexcept {
+    return extensions_.has(extension);
   }
 
   // Encode a TrackNamespace as a TRACK_NAMESPACE_PREFIX parameter (a Track
@@ -901,6 +943,7 @@ class MoQFrameWriter {
 
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
+  SetupExtensions extensions_;
   mutable std::optional<uint64_t> previousObjectID_;
   // Context for FETCH object delta encoding
   mutable std::optional<uint64_t> previousFetchGroup_;
