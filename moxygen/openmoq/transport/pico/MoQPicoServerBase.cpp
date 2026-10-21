@@ -596,15 +596,10 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
   if (wtProtoRet == 0 && streamCtx->ps.stream_state.wt_protocol) {
     selectedProto = streamCtx->ps.stream_state.wt_protocol;
     XLOG(DBG1) << "WebTransport selected protocol: " << selectedProto;
-  } else if (
-      std::find(alpnProtocols.begin(), alpnProtocols.end(), kAlpnMoqtLegacy) ==
-      alpnProtocols.end()) {
-    // In-band ClientSetup negotiates only draft 14.
-    XLOG(DBG1) << "WT subprotocol not negotiated and draft 14 not offered";
-    return -1;
   } else {
-    // No WT subprotocol negotiated; fall back to in-band ClientSetup.
-    XLOG(DBG1) << "WT subprotocol not negotiated; using in-band ClientSetup";
+    // The WT protocol is the only source of the MoQT version.
+    XLOG(DBG1) << "WT subprotocol not negotiated";
+    return -1;
   }
 
   // Create PicoH3WebTransport adapter
@@ -633,9 +628,7 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
         std::string(reinterpret_cast<const char*>(hdr.path), hdr.path_length));
   }
 
-  if (selectedProto) {
-    moqSession->validateAndSetVersionFromAlpn(selectedProto);
-  }
+  moqSession->validateAndSetVersionFromAlpn(selectedProto);
 
   // Store session context on the control stream. Data streams inherit it via
   // path_callback in PicoH3WebTransport::markStreamActiveImpl, so all stream

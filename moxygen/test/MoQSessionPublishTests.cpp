@@ -24,6 +24,168 @@ CO_TEST_P_X(MoQSessionTest, NoPublishHandler) {
   EXPECT_TRUE(res.hasError());
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+CO_TEST_P_X(Draft22Test, PublishOkDoesNotOverrideInitialForwardState) {
+  co_await setupMoQSessionForPublish(initialMaxRequestID_);
+
+  PublishRequest publish;
+  publish.fullTrackName =
+      FullTrackName{TrackNamespace{{"test"}}, "paused-track"};
+  publish.forward = false;
+
+  EXPECT_CALL(*serverSubscriber, publish(_, _))
+      .WillOnce([](const PublishRequest& actual, auto) {
+        return makePublishOkResult(actual);
+      });
+
+  auto result =
+      clientSession_->publish(std::move(publish), makePublishHandle());
+  CO_ASSERT_TRUE(result.hasValue());
+  auto initiated = std::move(result.value());
+  const auto reply = co_await std::move(initiated.reply);
+  CO_ASSERT_TRUE(reply.hasValue());
+
+  const auto subgroup = initiated.consumer->beginSubgroup(0, 0, 0);
+  EXPECT_TRUE(subgroup.hasError());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(Draft22Test, PublishHandleDefersUpdateUntilPublishOk) {
+  co_await setupMoQSessionForPublish(initialMaxRequestID_);
+
+  PublishRequest publish;
+  publish.fullTrackName =
+      FullTrackName{TrackNamespace{{"test"}}, "updated-track"};
+  publish.forward = true;
+
+  std::shared_ptr<SubscriptionHandle> publishHandle;
+  folly::coro::Baton publishReceived;
+  folly::coro::Baton allowPublishOk;
+  EXPECT_CALL(*serverSubscriber, publish(_, _))
+      .WillOnce([&](const PublishRequest& actual, auto handle) {
+        publishHandle = std::move(handle);
+        auto accepted = makePublishOkResult(actual);
+        accepted->consumerReady = true;
+        accepted->reply = folly::coro::co_invoke(
+            [&, requestID = actual.requestID]()
+                -> folly::coro::Task<folly::Expected<PublishOk, PublishError>> {
+              co_await allowPublishOk;
+              co_return PublishOk{.requestID = requestID};
+            });
+        publishReceived.post();
+        return accepted;
+      });
+
+  bool updateProcessed = false;
+  auto handle = makePublishHandle();
+  EXPECT_CALL(*handle, requestUpdateCalled)
+      .WillOnce([&](const RequestUpdate& update) {
+        EXPECT_EQ(update.forward, false);
+        updateProcessed = true;
+      });
+  EXPECT_CALL(*handle, requestUpdateResult)
+      .WillOnce(testing::Return(RequestOk{}));
+  EXPECT_CALL(*serverSubscriberStatsCallback_, onRequestUpdate());
+  EXPECT_CALL(*clientPublisherStatsCallback_, onRequestUpdate());
+
+  auto result = clientSession_->publish(std::move(publish), handle);
+  CO_ASSERT_TRUE(result.hasValue());
+  auto initiated = std::move(result.value());
+  co_await publishReceived;
+  co_await rescheduleN(2);
+
+  std::optional<SubscriptionHandle::RequestUpdateResult> updateResult;
+  folly::coro::Baton updateStarted;
+  folly::coro::Baton updateDone;
+  folly::coro::co_withExecutor(
+      MoQExecutor_.get(),
+      folly::coro::co_invoke([&]() -> folly::coro::Task<void> {
+        RequestUpdate update;
+        update.forward = false;
+        updateStarted.post();
+        updateResult = co_await publishHandle->requestUpdate(std::move(update));
+        updateDone.post();
+      }))
+      .start();
+
+  co_await updateStarted;
+  co_await rescheduleN(2);
+  EXPECT_FALSE(updateProcessed);
+
+  allowPublishOk.post();
+  const auto reply = co_await std::move(initiated.reply);
+  CO_ASSERT_TRUE(reply.hasValue());
+  co_await updateDone;
+  CO_ASSERT_TRUE(updateResult.has_value());
+  EXPECT_TRUE(updateResult->hasValue());
+  EXPECT_TRUE(updateProcessed);
+
+  const auto subgroup = initiated.consumer->beginSubgroup(0, 0, 0);
+  EXPECT_TRUE(subgroup.hasError());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    Draft22Test,
+    PublishHandleUpdateStopsOnSessionCloseBeforePublishOk) {
+  co_await setupMoQSessionForPublish(initialMaxRequestID_);
+
+  PublishRequest publish;
+  publish.fullTrackName =
+      FullTrackName{TrackNamespace{{"test"}}, "closed-track"};
+
+  std::shared_ptr<SubscriptionHandle> publishHandle;
+  folly::coro::Baton publishReceived;
+  folly::coro::Baton allowPublishOk;
+  EXPECT_CALL(*serverSubscriber, publish(_, _))
+      .WillOnce([&](const PublishRequest& actual, auto handle) {
+        publishHandle = std::move(handle);
+        auto accepted = makePublishOkResult(actual);
+        accepted->consumerReady = true;
+        accepted->reply = folly::coro::co_invoke(
+            [&, requestID = actual.requestID]()
+                -> folly::coro::Task<folly::Expected<PublishOk, PublishError>> {
+              co_await allowPublishOk;
+              co_return PublishOk{.requestID = requestID};
+            });
+        publishReceived.post();
+        return accepted;
+      });
+
+  auto result =
+      clientSession_->publish(std::move(publish), makePublishHandle());
+  CO_ASSERT_TRUE(result.hasValue());
+  auto initiated = std::move(result.value());
+  co_await publishReceived;
+
+  std::optional<SubscriptionHandle::RequestUpdateResult> updateResult;
+  folly::coro::Baton updateStarted;
+  folly::coro::Baton updateDone;
+  folly::coro::co_withExecutor(
+      MoQExecutor_.get(),
+      folly::coro::co_invoke([&]() -> folly::coro::Task<void> {
+        RequestUpdate update;
+        update.forward = false;
+        updateStarted.post();
+        updateResult = co_await publishHandle->requestUpdate(std::move(update));
+        updateDone.post();
+      }))
+      .start();
+
+  co_await updateStarted;
+  co_await rescheduleN(2);
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+  co_await updateDone;
+
+  CO_ASSERT_TRUE(updateResult.has_value());
+  CO_ASSERT_TRUE(updateResult->hasError());
+  EXPECT_EQ(updateResult->error().errorCode, RequestErrorCode::INTERNAL_ERROR);
+  EXPECT_EQ(updateResult->error().reasonPhrase, "Session closed");
+
+  allowPublishOk.post();
+  co_await rescheduleN(2);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, DuplicatePublishRequestID) {
   co_await setupMoQSessionForPublish(initialMaxRequestID_);
 
@@ -405,6 +567,62 @@ CO_TEST_P_X(MoQSessionTest, PublishConnectionDropCleanup) {
     // (This test mainly ensures no crashes occur during cleanup)
   }
 }
+// The subscriber unsubscribes while its reply to the PUBLISH is still pending,
+// so the PUBLISH gets an error reply.
+CO_TEST_P_X(MoQSessionTest, PublishUnsubscribedBeforeReply) {
+  co_await setupMoQSessionForPublish(initialMaxRequestID_);
+
+  std::shared_ptr<SubscriptionHandle> serverHandle;
+  folly::coro::Baton serverSawPublish;
+  auto releaseReply = std::make_shared<folly::coro::Baton>();
+  EXPECT_CALL(*serverSubscriber, publish(_, _))
+      .WillOnce(
+          [&](const PublishRequest& actualPub,
+              std::shared_ptr<SubscriptionHandle> handle)
+              -> Subscriber::PublishResult {
+            serverHandle = std::move(handle);
+            auto consumer =
+                std::make_shared<testing::NiceMock<MockTrackConsumer>>();
+            auto requestID = actualPub.requestID;
+            serverSawPublish.post();
+            return Subscriber::PublishConsumerAndReplyTask{
+                std::static_pointer_cast<TrackConsumer>(consumer),
+                folly::coro::co_invoke(
+                    [releaseReply, requestID]()
+                        -> folly::coro::Task<
+                            folly::Expected<PublishOk, PublishError>> {
+                      co_await *releaseReply;
+                      co_return PublishOk{.requestID = requestID};
+                    })};
+          });
+
+  auto publishResult = clientSession_->publish(
+      PublishRequest{
+          .requestID = RequestID(0),
+          .fullTrackName =
+              FullTrackName{TrackNamespace{{"test"}}, "test-track"},
+          .trackAlias = TrackAlias(100),
+          .groupOrder = GroupOrder::Default,
+          .largest = AbsoluteLocation{0, 100},
+          .forward = true},
+      makePublishHandle());
+  EXPECT_TRUE(publishResult.hasValue());
+  if (!publishResult.hasValue()) {
+    co_return;
+  }
+  co_await serverSawPublish;
+
+  serverHandle->unsubscribe();
+  auto reply = co_await folly::coro::co_awaitTry(
+      folly::coro::timeout(
+          std::move(publishResult.value().reply), std::chrono::seconds(1)));
+  EXPECT_TRUE(reply.hasValue() && reply->hasError());
+
+  releaseReply->post();
+  co_await rescheduleN(4);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, PublishHandleCancel) {
   co_await setupMoQSessionForPublish(initialMaxRequestID_);
 
@@ -1224,6 +1442,72 @@ CO_TEST_P_X(
 
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+
+// After a delivery timeout resets the subgroup, writing the next object fails
+// with CANCELLED, not API_ERROR.
+CO_TEST_P_X(MoQSessionTest, DeliveryTimeoutResetCancelsLaterObjects) {
+  co_await setupMoQSessionForPublish(initialMaxRequestID_);
+
+  PublishRequest pub{
+      RequestID(0),
+      FullTrackName{TrackNamespace{{"test"}}, "test-track"},
+      TrackAlias(100),
+      GroupOrder::Default,
+      AbsoluteLocation{0, 100},
+      true,
+  };
+  setPublisherDeliveryTimeout(pub, std::chrono::milliseconds(50));
+
+  EXPECT_CALL(*serverSubscriber, publish(_, _))
+      .WillOnce([](const PublishRequest& p, auto) -> Subscriber::PublishResult {
+        auto consumer =
+            std::make_shared<testing::NiceMock<MockTrackConsumer>>();
+        ON_CALL(*consumer, setTrackAlias(_))
+            .WillByDefault(
+                testing::Return(
+                    folly::Expected<folly::Unit, MoQPublishError>(
+                        folly::unit)));
+        ON_CALL(*consumer, publishDone(_))
+            .WillByDefault(testing::Return(folly::unit));
+        PublishOk ok{
+            p.requestID,
+            true,
+            128,
+            GroupOrder::Default,
+            LocationType::LargestObject,
+            std::nullopt,
+            std::make_optional(uint64_t(0))};
+        return Subscriber::PublishConsumerAndReplyTask{
+            std::static_pointer_cast<TrackConsumer>(consumer),
+            folly::coro::makeTask<folly::Expected<PublishOk, PublishError>>(
+                std::move(ok))};
+      });
+  folly::coro::Baton timedOut;
+  EXPECT_CALL(
+      *clientPublisherStatsCallback_,
+      onSubgroupReset(ResetStreamErrorCode::DELIVERY_TIMEOUT))
+      .WillOnce([&](auto) { timedOut.post(); });
+
+  auto result = clientSession_->publish(std::move(pub), makePublishHandle());
+  EXPECT_TRUE(result.hasValue());
+  auto consumer = result.value().consumer;
+  EXPECT_TRUE((co_await std::move(result.value().reply)).hasValue());
+
+  // Object 0 is never acknowledged, so its delivery timer resets the stream.
+  auto sgp = consumer->beginSubgroup(0, 0, 0).value();
+  clientWt_->writeHandles.rbegin()->second->setImmediateDelivery(false);
+  EXPECT_TRUE(sgp->object(0, moxygen::test::makeBuf(10)).hasValue());
+  co_await timedOut;
+
+  auto next = sgp->object(1, moxygen::test::makeBuf(10));
+  EXPECT_TRUE(next.hasError());
+  if (next.hasError()) {
+    EXPECT_EQ(next.error().code, MoQPublishError::CANCELLED);
+  }
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, PublishConsumerObjectStreamAfterSessionClose) {
   co_await setupMoQSessionForPublish(initialMaxRequestID_);
 

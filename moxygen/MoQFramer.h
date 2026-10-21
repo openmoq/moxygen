@@ -66,7 +66,7 @@ inline StreamType getSubgroupStreamType(
       (format == SubgroupIDFormat::FirstObject ? SG_SUBGROUP_VALUE : 0) |
       (includeExtensions ? SG_HAS_EXTENSIONS : 0) |
       (endOfGroup ? SG_HAS_END_OF_GROUP : 0) |
-      (majorVersion >= 15 && !priorityPresent ? SG_PRIORITY_NOT_PRESENT : 0) |
+      (!priorityPresent ? SG_PRIORITY_NOT_PRESENT : 0) |
       (majorVersion >= 18 && beginsWithFirstObject ? SG_FIRST_OBJECT : 0));
 }
 
@@ -91,10 +91,7 @@ inline SubgroupOptions getSubgroupOptions(
                                             : SubgroupIDFormat::Zero;
   options.hasEndOfGroup =
       folly::to_underlying(streamType) & SG_HAS_END_OF_GROUP;
-  // In Draft 15+, check if priority is not present
-  if (majorVersion >= 15) {
-    options.priorityPresent = !(streamTypeInt & SG_PRIORITY_NOT_PRESENT);
-  }
+  options.priorityPresent = !(streamTypeInt & SG_PRIORITY_NOT_PRESENT);
   options.beginsWithFirstObject =
       majorVersion >= 18 && (streamTypeInt & SG_FIRST_OBJECT);
   return options;
@@ -105,28 +102,23 @@ bool datagramPriorityPresent(uint64_t version, DatagramType datagramType);
 bool subgroupPriorityPresent(uint64_t version, StreamType streamType);
 
 inline DatagramType getDatagramType(
-    uint64_t version,
+    uint64_t /*version*/,
     bool status,
     bool includeExtensions,
     bool endOfGroup,
     bool isObjectIdZero,
     bool priorityPresent = true) {
-  auto majorVersion = getDraftMajorVersion(version);
-  if (majorVersion == 11) {
-    return DatagramType(
-        (status ? DG_HAS_STATUS_V11 : 0) |
-        (includeExtensions ? DG_HAS_EXTENSIONS : 0));
-  } else if (status) {
+  if (status) {
     return DatagramType(
         DG_IS_STATUS | (includeExtensions ? DG_HAS_EXTENSIONS : 0) |
         (isObjectIdZero ? DG_OBJECT_ID_ZERO : 0) |
-        (majorVersion >= 15 && !priorityPresent ? DG_PRIORITY_NOT_PRESENT : 0));
+        (!priorityPresent ? DG_PRIORITY_NOT_PRESENT : 0));
   } else {
     return DatagramType(
         (includeExtensions ? DG_HAS_EXTENSIONS : 0) |
         (endOfGroup ? DG_HAS_END_OF_GROUP : 0) |
         (isObjectIdZero ? DG_OBJECT_ID_ZERO : 0) |
-        (majorVersion >= 15 && !priorityPresent ? DG_PRIORITY_NOT_PRESENT : 0));
+        (!priorityPresent ? DG_PRIORITY_NOT_PRESENT : 0));
   }
 }
 
@@ -200,7 +192,8 @@ class MoQFrameParser {
 
   folly::Expected<SubscribeRequest, ErrorCode> parseSubscribeRequest(
       folly::io::Cursor& cursor,
-      size_t length) const noexcept;
+      size_t length,
+      FrameType semanticFrameType = FrameType::SUBSCRIBE) const noexcept;
 
   folly::Expected<RequestUpdate, ErrorCode> parseRequestUpdate(
       folly::io::Cursor& cursor,
@@ -248,10 +241,6 @@ class MoQFrameParser {
       const noexcept;
 
   folly::Expected<TrackStatus, ErrorCode> parseTrackStatus(
-      folly::io::Cursor& cursor,
-      size_t length) const noexcept;
-
-  folly::Expected<TrackStatusOk, ErrorCode> parseTrackStatusOk(
       folly::io::Cursor& cursor,
       size_t length) const noexcept;
 
@@ -308,11 +297,7 @@ class MoQFrameParser {
       size_t length,
       FrameType frameType) const noexcept;
 
-  folly::Expected<UnsubscribeNamespace, ErrorCode> parseUnsubscribeNamespace(
-      folly::io::Cursor& cursor,
-      size_t length) const noexcept;
-
-  // v16+ messages for SUBSCRIBE_NAMESPACE response stream
+  // Messages on the SUBSCRIBE_NAMESPACE response stream
   folly::Expected<Namespace, ErrorCode> parseNamespace(
       folly::io::Cursor& cursor,
       size_t length) const noexcept;
@@ -417,14 +402,8 @@ class MoQFrameParser {
     return tokenCache_ ? *tokenCache_ : fallbackTokenCache_;
   }
 
-  // Legacy FETCH object parser (draft <= 14)
-  folly::Expected<ObjectHeader, ErrorCode> parseFetchObjectHeaderLegacy(
-      folly::io::Cursor& cursor,
-      size_t& length,
-      const ObjectHeader& headerTemplate) const noexcept;
-
-  // Draft-15+ FETCH object parser with Serialization Flags
-  folly::Expected<FetchObjectParseResult, ErrorCode> parseFetchObjectDraft15(
+  // FETCH object parser with Serialization Flags
+  folly::Expected<FetchObjectParseResult, ErrorCode> parseFetchObjectHeaderImpl(
       folly::io::Cursor& cursor,
       size_t& length,
       const ObjectHeader& headerTemplate) const noexcept;
@@ -521,11 +500,6 @@ class MoQFrameParser {
       std::optional<bool>& forwardField,
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
-  // Version translation: convert track property params to extensions for < v16
-  void convertTrackPropertyParamsToExtensions(
-      const TrackRequestParameters& params,
-      Extensions& extensions) const noexcept;
-
   folly::Expected<std::string, ErrorCode> parseFixedString(
       folly::io::Cursor& cursor,
       size_t& length) const noexcept;
@@ -586,12 +560,12 @@ class MoQFrameParser {
   mutable MoQTokenCache fallbackTokenCache_;
   MoQTokenCache* tokenCache_{nullptr};
   mutable std::optional<uint64_t> previousObjectID_;
-  // Context for FETCH object delta encoding (draft-15+)
+  // Context for FETCH object delta encoding
   mutable std::optional<uint64_t> previousFetchGroup_;
   mutable std::optional<uint64_t> previousFetchSubgroup_;
   mutable std::optional<uint8_t> previousFetchPriority_;
   mutable GroupOrder fetchGroupOrder_{GroupOrder::OldestFirst};
-  // Context for extension delta decoding (draft-16+)
+  // Context for extension delta decoding
   mutable uint64_t previousExtensionType_ = 0;
 };
 
@@ -760,11 +734,7 @@ class MoQFrameWriter {
       folly::IOBufQueue& writeBuf,
       const SubscribeNamespaceOk& subscribeNamespaceOk) const noexcept;
 
-  WriteResult writeUnsubscribeNamespace(
-      folly::IOBufQueue& writeBuf,
-      const UnsubscribeNamespace& unsubscribeNamespace) const noexcept;
-
-  // v16+ messages for SUBSCRIBE_NAMESPACE response stream
+  // Messages on the SUBSCRIBE_NAMESPACE response stream
   WriteResult writeNamespace(folly::IOBufQueue& writeBuf, const Namespace& ns)
       const noexcept;
 
@@ -962,17 +932,11 @@ class MoQFrameWriter {
 
   WriteResult writeSubscribeRequestHelper(
       folly::IOBufQueue& writeBuf,
-      const SubscribeRequest& subscribeRequest) const noexcept;
+      const SubscribeRequest& subscribeRequest,
+      FrameType semanticFrameType = FrameType::SUBSCRIBE) const noexcept;
 
-  // Legacy FETCH object writer (draft <= 14)
-  void writeFetchObjectHeaderLegacy(
-      folly::IOBufQueue& writeBuf,
-      const ObjectHeader& objectHeader,
-      size_t& size,
-      bool& error) const noexcept;
-
-  // Draft-15+ FETCH object writer with Serialization Flags
-  void writeFetchObjectDraft15(
+  // FETCH object writer with Serialization Flags
+  void writeFetchObjectHeaderImpl(
       folly::IOBufQueue& writeBuf,
       const ObjectHeader& objectHeader,
       size_t& size,
@@ -981,16 +945,11 @@ class MoQFrameWriter {
 
   void resetWriterFetchContext() const noexcept;
 
-  // Version translation: convert track property extensions to params for < v16
-  void convertTrackPropertyExtensionsToParams(
-      const Extensions& extensions,
-      TrackRequestParameters& params) const noexcept;
-
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
   SetupExtensions extensions_;
   mutable std::optional<uint64_t> previousObjectID_;
-  // Context for FETCH object delta encoding (draft-15+)
+  // Context for FETCH object delta encoding
   mutable std::optional<uint64_t> previousFetchGroup_;
   mutable std::optional<uint64_t> previousFetchSubgroup_;
   mutable std::optional<uint8_t> previousFetchPriority_;

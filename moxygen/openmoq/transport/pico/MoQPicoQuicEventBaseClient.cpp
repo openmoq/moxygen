@@ -314,7 +314,7 @@ void MoQPicoQuicEventBaseClient::onConnectionReady(void* vcnx) {
           auto negotiatedVersion = moqSession->getNegotiatedVersion();
           XLOG(DBG1) << "MoQ SETUP complete, negotiated draft-"
                      << getDraftMajorVersion(
-                            negotiatedVersion.value_or(kVersionDraft14));
+                            negotiatedVersion.value_or(kVersionDraftCurrent));
         } catch (const std::exception& ex) {
           XLOG(ERR) << "MoQ SETUP failed: " << ex.what();
           co_return;

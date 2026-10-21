@@ -534,8 +534,9 @@ std::unique_ptr<folly::IOBuf> makePayload(size_t objectSize) {
       pattern.data(), std::min(kPayloadPeriod, objectSize));
   for (size_t offset = kPayloadPeriod; offset < objectSize;
        offset += kPayloadPeriod) {
-    payload->appendToChain(folly::IOBuf::wrapBuffer(
-        pattern.data(), std::min(kPayloadPeriod, objectSize - offset)));
+    payload->appendToChain(
+        folly::IOBuf::wrapBuffer(
+            pattern.data(), std::min(kPayloadPeriod, objectSize - offset)));
   }
   return payload;
 }

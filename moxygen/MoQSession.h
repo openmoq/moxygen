@@ -414,7 +414,15 @@ class MoQSession : public Subscriber,
     return maxRequestID_;
   }
 
-  void validateAndSetVersionFromAlpn(const std::string& alpn);
+  // Sets the negotiated version from the ALPN or WT protocol. Returns false,
+  // leaving the version unset, if the protocol maps to no supported version.
+  bool validateAndSetVersionFromAlpn(const std::string& alpn);
+
+  // Sets a version no ALPN maps to, such as a draft that is implemented but
+  // not yet supported.
+  void setNegotiatedVersionForTesting(uint64_t version) {
+    initializeNegotiatedVersion(version);
+  }
 
   static GroupOrder resolveGroupOrder(GroupOrder pubOrder, GroupOrder subOrder);
 
@@ -792,7 +800,6 @@ class MoQSession : public Subscriber,
       proxygen::WebTransport::StreamData initialData) noexcept;
 
   // Used to tease apart the control stream from subscribe namespace streams.
-  // This is only called for draft >= 16.
   folly::coro::Task<void> bidiStreamDemuxer(
       ReadHandleRef readHandle,
       proxygen::WebTransport::StreamWriteHandle* writeHandle) noexcept;
@@ -1047,9 +1054,10 @@ class MoQSession : public Subscriber,
       ResetStreamErrorCode consumerError = ResetStreamErrorCode::CANCELLED);
   void onFetchStalled(RequestID requestID);
 
+  class ReceiverSubscriptionHandle;
   folly::coro::Task<void> handlePublish(
       PublishRequest publish,
-      std::shared_ptr<Publisher::SubscriptionHandle> publishHandle,
+      std::shared_ptr<ReceiverSubscriptionHandle> publishHandle,
       std::shared_ptr<ReplyContext> replyContext);
   // Returns false if the peer reused a live track alias.
   bool installPublishReceiveState(
@@ -1063,7 +1071,6 @@ class MoQSession : public Subscriber,
       const PublishError& publishError,
       ReplyContext& replyContext);
 
-  class ReceiverSubscriptionHandle;
   class ReceiverFetchHandle;
 
   void onClientSetup(Setup clientSetup) override;
@@ -1584,7 +1591,7 @@ class MoQSession : public Subscriber,
   std::optional<uint64_t> negotiatedVersion_;
 
   // Shared receive-side auth token cache. All codecs that parse auth tokens
-  // (control stream, draft16+ SUBSCRIBE_NAMESPACE bidi streams, etc.) point to
+  // (control stream, SUBSCRIBE_NAMESPACE bidi streams, etc.) point to
   // this cache so that aliases registered on one stream are visible on all
   // others and the total budget is enforced once rather than per-codec.
   static constexpr uint64_t kMaxReceiveTokenCacheSize{4096};
@@ -1678,7 +1685,6 @@ class MoQSession : public Subscriber,
   std::optional<RequestID> receivedGoawayRequestID_;
 
   uint64_t nextRequestID_{0};
-  uint64_t nextExpectedPeerRequestID_{0};
   uint64_t nextPeerRequestIDForGoaway_{0};
   uint64_t maxRequestID_{0};
 

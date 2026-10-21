@@ -10,6 +10,7 @@
 #include <folly/logging/xlog.h>
 #include <folly/net/NetOps.h>
 #include <moxygen/MoQTypes.h>
+#include <moxygen/MoQVersions.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
 #include <proxygen/httpserver/samples/hq/FizzContext.h>
 #include <proxygen/lib/http/session/HQSession.h>
@@ -200,6 +201,17 @@ void MoQServer::createMoQQuicSession(
     alpn = *stdAlpn;
     XLOG(DBG1) << "Server: Negotiated ALPN: " << *alpn;
   }
+  if (!alpn || !getVersionFromAlpn(*alpn)) {
+    XLOG(ERR) << "Server: no supported MoQT version for ALPN "
+              << alpn.value_or("<none>");
+    quic::ApplicationErrorCode err(
+        folly::to_underlying(
+            SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED));
+    quicSocket->close(
+        quic::QuicError(
+            quic::QuicErrorCode(err), std::string("unsupported MoQT ALPN")));
+    return;
+  }
 
   // Capture connection IDs and addresses before moving the socket
   auto clientCid = quicSocket->getClientConnectionId();
@@ -235,10 +247,7 @@ void MoQServer::createMoQQuicSession(
     moqSession->setLogger(logger);
   }
 
-  // Configure session based on negotiated ALPN
-  if (alpn) {
-    moqSession->validateAndSetVersionFromAlpn(*alpn);
-  }
+  moqSession->validateAndSetVersionFromAlpn(*alpn);
 
   if (useQuicWtSession) {
     static_cast<proxygen::QuicWtSession*>(wtPtr)->setHandler(moqSession.get());
@@ -340,26 +349,19 @@ void MoQServer::Handler::onHeadersComplete(
           HTTPWebTransport::getWTAvailableProtocols(*req)) {
     if (auto wtProtocol = HTTPWebTransport::negotiateWTProtocol(
             wtAvailableProtocols.value(), supportedProtocols)) {
-      HTTPWebTransport::setWTProtocol(resp, wtProtocol.value());
       negotiatedProtocol = wtProtocol.value();
-      XLOG(DBG1) << "WebTransport: Negotiated protocol: " << *wtProtocol;
-    } else {
-      XLOG(DBG4) << "Failed to negotiate WebTransport protocol";
-      resp.setStatusCode(400);
-      txn_->sendHeadersWithEOM(resp);
-      return;
     }
-  } else if (
-      std::find(
-          supportedProtocols.begin(),
-          supportedProtocols.end(),
-          kAlpnMoqtLegacy) == supportedProtocols.end()) {
-    // In-band ClientSetup negotiates only draft 14.
-    XLOG(DBG4) << "WebTransport protocol missing and draft 14 not offered";
+  }
+  // The WT protocol is the only source of the MoQT version, so refuse the
+  // session rather than create one without a version.
+  if (!negotiatedProtocol || !getVersionFromAlpn(*negotiatedProtocol)) {
+    XLOG(DBG4) << "Failed to negotiate a MoQT WebTransport protocol";
     resp.setStatusCode(400);
     txn_->sendHeadersWithEOM(resp);
     return;
   }
+  HTTPWebTransport::setWTProtocol(resp, *negotiatedProtocol);
+  XLOG(DBG1) << "WebTransport: Negotiated protocol: " << *negotiatedProtocol;
   txn_->sendHeaders(resp);
   auto wt = txn_->getWebTransport();
   if (!wt) {
@@ -399,10 +401,7 @@ void MoQServer::Handler::onHeadersComplete(
     clientSession_->setLogger(logger);
   }
 
-  // Configure session based on negotiated WebTransport protocol
-  if (negotiatedProtocol) {
-    clientSession_->validateAndSetVersionFromAlpn(*negotiatedProtocol);
-  }
+  clientSession_->validateAndSetVersionFromAlpn(*negotiatedProtocol);
 
   if (quicSocket) {
     QuicTransportObservers observers(*quicSocket);

@@ -31,7 +31,7 @@ DEFINE_bool(verbose, false, "Enable verbose output (env: VERBOSE=1)");
 DEFINE_string(
     versions,
     "",
-    "Comma-separated MoQ draft versions (e.g. '14,16'). Empty = all "
+    "Comma-separated MoQ draft versions (e.g. '16,18'). Empty = all "
     "supported. (env: MOQT_VERSIONS)");
 DEFINE_int32(connect_timeout, 2000, "Connect timeout in milliseconds");
 DEFINE_int32(transaction_timeout, 2000, "Transaction timeout in milliseconds");
@@ -83,6 +83,7 @@ const std::vector<std::string> kAllTests = {
     "subscribe-error",
     "announce-subscribe",
     "publish-namespace-done",
+    "publish-namespace-multi-publisher-retention",
     "subscribe-before-announce"};
 
 bool isUseQuicTransport(const std::string& url) {
@@ -104,6 +105,8 @@ folly::coro::Task<moxygen::InteropTestResult> runTest(
     co_return co_await client.testAnnounceSubscribe();
   } else if (testName == "publish-namespace-done") {
     co_return co_await client.testPublishNamespaceDone();
+  } else if (testName == "publish-namespace-multi-publisher-retention") {
+    co_return co_await client.testPublishNamespaceMultiPublisherRetention();
   } else if (testName == "subscribe-before-announce") {
     co_return co_await client.testSubscribeBeforeAnnounce();
   } else {
