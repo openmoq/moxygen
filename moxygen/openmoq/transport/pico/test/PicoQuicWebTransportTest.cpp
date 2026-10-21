@@ -25,7 +25,7 @@ class PicoQuicWebTransportTest : public Test {
         /*cert_file_name=*/nullptr,
         /*key_file_name=*/nullptr,
         /*cert_root_file_name=*/nullptr,
-        /*default_alpn=*/"moq-00",
+        /*default_alpn=*/"moqt-16",
         /*default_callback_fn=*/nullptr,
         /*default_callback_ctx=*/nullptr,
         /*cnx_id_callback=*/nullptr,
@@ -49,7 +49,7 @@ class PicoQuicWebTransportTest : public Test {
         picoquic_current_time(),
         /*preferred_version=*/0,
         /*sni=*/"test",
-        /*alpn=*/"moq-00",
+        /*alpn=*/"moqt-16",
         /*client_mode=*/1);
     ASSERT_NE(cnx_, nullptr);
     // Stands in for the peer's transport parameters from a handshake.

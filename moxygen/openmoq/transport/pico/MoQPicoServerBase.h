@@ -34,7 +34,7 @@ class PicoH3WebTransport;
  * MoQPicoQuicEventBaseServer (EventBase-based).
  *
  * Supports two connection modes:
- * - QUIC transport (ALPN: moqt-16, moqt-15, moq-00)
+ * - QUIC transport (ALPN: moqt-16, moqt-18)
  * - WebTransport: MOQT over WebTransport over HTTP/3 (ALPN: h3)
  *
  * Subclasses must set executor_ before calling createQuicContext().
