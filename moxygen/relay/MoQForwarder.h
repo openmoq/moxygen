@@ -154,6 +154,9 @@ class MoQForwarder : public TrackConsumer {
         tombstonedSubgroups;
     MoQForwarder* forwarder;
     bool shouldForward;
+    // Largest as of the last Forward State 0 -> 1 transition. A joining FETCH
+    // ends here so that it meets the subscription without a gap or overlap.
+    std::optional<AbsoluteLocation> joiningLocation;
     bool passive{false};
     bool pinned{false};
     bool receivedPublishDone_{false};

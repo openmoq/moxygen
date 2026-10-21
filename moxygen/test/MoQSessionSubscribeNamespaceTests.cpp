@@ -489,10 +489,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeNamespaceCallerCancelledBeforeOk) {
   co_await folly::coro::sleep(std::chrono::milliseconds(200));
 
   EXPECT_TRUE(weakClientHandle.expired());
-  // Before draft 16 the request has no stream of its own to cancel.
-  if (getDraftMajorVersion(getServerSelectedVersion()) >= 16) {
-    EXPECT_TRUE(serverSawUnsubscribe);
-  }
+  EXPECT_TRUE(serverSawUnsubscribe);
   if (serverHandle) {
     testing::Mock::VerifyAndClearExpectations(serverHandle.get());
   }
@@ -542,7 +539,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeNamespaceCancelledWhileOkQueued) {
   co_await serverSawSubscribeNamespace;
 
   // The reply arrives on the newest client-initiated bidi: the request's own
-  // stream, or the control stream before draft 16.
+  // stream.
   std::shared_ptr<proxygen::test::FakeStreamHandle> replyStream;
   for (const auto& [id, handle] : serverWt_->writeHandles) {
     if (id % 4 == 0) {
@@ -568,10 +565,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeNamespaceCancelledWhileOkQueued) {
   co_await folly::coro::sleep(std::chrono::milliseconds(200));
 
   EXPECT_TRUE(weakClientHandle.expired());
-  // Before draft 16 the request does not have its own stream to cancel.
-  if (getDraftMajorVersion(getServerSelectedVersion()) >= 16) {
-    EXPECT_TRUE(serverSawUnsubscribe);
-  }
+  EXPECT_TRUE(serverSawUnsubscribe);
   if (serverHandle) {
     testing::Mock::VerifyAndClearExpectations(serverHandle.get());
   }

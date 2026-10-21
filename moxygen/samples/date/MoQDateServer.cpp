@@ -44,7 +44,7 @@ DEFINE_string(ns, "moq-date", "Namespace for date track");
 DEFINE_string(
     versions,
     "",
-    "Comma-separated MoQ draft versions (e.g. \"14,16\"). Empty = all supported.");
+    "Comma-separated MoQ draft versions (e.g. \"16,18\"). Empty = all supported.");
 DEFINE_int32(delivery_timeout, 0, "the delivery timeout in ms for server");
 DEFINE_bool(
     insecure,
@@ -186,9 +186,7 @@ class DatePublisher : public Publisher {
         .requestID = trackStatus.requestID,
         .expires = std::chrono::milliseconds(0),
         .groupOrder = GroupOrder::OldestFirst,
-        .largest = *forwarder_.largest(),
-        .fullTrackName = trackStatus.fullTrackName,
-        .statusCode = TrackStatusCode(0)};
+        .largest = *forwarder_.largest()};
   }
 
   folly::coro::Task<SubscribeResult> subscribe(

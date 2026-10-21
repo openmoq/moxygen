@@ -386,12 +386,10 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateForwardingFalse) {
   std::shared_ptr<MockSubscriptionHandle> mockSubscriptionHandle = nullptr;
   folly::coro::Baton subscribeUpdateProcessed;
 
-  // For v15+, we set the largest location in subscribeOk so the session
-  // will include it in the response to SubscribeUpdate
+  // The largest location set in subscribeOk is echoed in the response to
+  // SubscribeUpdate.
   const std::optional<AbsoluteLocation> expectedLargest =
-      (getDraftMajorVersion(getServerSelectedVersion()) >= 15)
-      ? std::optional<AbsoluteLocation>(AbsoluteLocation{100, 200})
-      : std::optional<AbsoluteLocation>(AbsoluteLocation{0, 0});
+      AbsoluteLocation{100, 200};
 
   expectPublishDone();
   expectSubscribe(
@@ -415,9 +413,8 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateForwardingFalse) {
 
         mockSubscriptionHandle = makeSubscribeOkResult(sub, expectedLargest);
 
-        // Set up mock expectations for subscribeUpdate for both versions
-        // For v<15: fire-and-forget, async processing
-        // For v15+: request-response, will return the mock result
+        // Set up mock expectations for subscribeUpdate; it is
+        // request-response and returns the mock result.
         expectSubscribeUpdate(mockSubscriptionHandle, subscribeUpdateProcessed);
 
         co_return mockSubscriptionHandle;
@@ -456,26 +453,22 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateForwardingFalse) {
   auto updateResult = co_await subscribeHandler->requestUpdate(subscribeUpdate);
   EXPECT_TRUE(updateResult.hasValue());
 
-  // For v15+, verify that the response contains the LARGEST_OBJECT parameter
-  if (getDraftMajorVersion(getServerSelectedVersion()) >= 15) {
-    const auto& response = updateResult.value();
-    EXPECT_EQ(response.requestSpecificParams.size(), 1)
-        << "Response should contain LARGEST_OBJECT parameter";
-    EXPECT_EQ(
-        response.requestSpecificParams.at(0).key,
-        folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT));
-    // The LARGEST_OBJECT should match what was set in the SubscribeOk
-    EXPECT_EQ(
-        response.requestSpecificParams.at(0).largestObject->group,
-        expectedLargest->group);
-    EXPECT_EQ(
-        response.requestSpecificParams.at(0).largestObject->object,
-        expectedLargest->object);
-  }
+  // Verify that the response contains the LARGEST_OBJECT parameter
+  const auto& response = updateResult.value();
+  EXPECT_EQ(response.requestSpecificParams.size(), 1)
+      << "Response should contain LARGEST_OBJECT parameter";
+  EXPECT_EQ(
+      response.requestSpecificParams.at(0).key,
+      folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT));
+  // The LARGEST_OBJECT should match what was set in the SubscribeOk
+  EXPECT_EQ(
+      response.requestSpecificParams.at(0).largestObject->group,
+      expectedLargest->group);
+  EXPECT_EQ(
+      response.requestSpecificParams.at(0).largestObject->object,
+      expectedLargest->object);
 
   // Wait for subscribe update to be processed on the server side
-  // For v<15, this waits for the async processing to complete
-  // For v15+, this waits for the response handling to complete
   co_await subscribeUpdateProcessed;
 
   EXPECT_CALL(*serverPublisherStatsCallback_, onSubscriptionStreamClosed());
@@ -1066,15 +1059,7 @@ CO_TEST_P_X(MoQSessionTest, PublishDoneIgnoredAfterClose) {
       co_await clientSession_->subscribe(subscribeRequest, subscribeCallback_);
   EXPECT_FALSE(res.hasError());
 }
-using V14PlusTests = MoQSessionTest;
-
-INSTANTIATE_TEST_SUITE_P(
-    V14PlusTests,
-    V14PlusTests,
-    testing::Values(
-        VersionParams{{kVersionDraft14}, kVersionDraft14},
-        VersionParams{{kVersionDraft18}, kVersionDraft18}));
-CO_TEST_P_X(V14PlusTests, SubscribeUpdateWithRequestID) {
+CO_TEST_P_X(MoQSessionTest, SubscribeUpdateWithRequestID) {
   co_await setupMoQSession();
   std::shared_ptr<MockSubscriptionHandle> mockSubscriptionHandle = nullptr;
   std::shared_ptr<TrackConsumer> trackConsumer = nullptr;
@@ -1090,41 +1075,36 @@ CO_TEST_P_X(V14PlusTests, SubscribeUpdateWithRequestID) {
         mockSubscriptionHandle =
             makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
 
-        // Set up mock expectations for subscribeUpdate for both versions.
-        // For v15+, verify the session-assigned requestID (= original + 2).
-        // The existingRequestID field is only carried on the wire in v15-17;
+        // Set up mock expectations for subscribeUpdate. Verify the
+        // session-assigned requestID (= original + 2).
+        // The existingRequestID field is only carried on the wire in v16-17;
         // draft 18+ moves SUBSCRIBE_UPDATE to a per-request bidi stream so the
         // original requestID is stream-implicit and not reconstructable
         // server-side.
         const auto majorVersion =
             getDraftMajorVersion(getServerSelectedVersion());
-        if (majorVersion >= 15) {
-          // Capture original requestID by value: at v18 the bidi-stream
-          // codepath fires this lambda after `sub` is destroyed.
-          const auto originalRequestID = sub.requestID.value;
-          EXPECT_CALL(*mockSubscriptionHandle, requestUpdateCalled)
-              .WillOnce(
-                  testing::Invoke([originalRequestID,
-                                   &subscribeUpdateProcessed,
-                                   majorVersion](const auto& actualUpdate) {
-                    if (majorVersion < 18) {
-                      EXPECT_EQ(
-                          actualUpdate.existingRequestID.value,
-                          originalRequestID);
-                    }
+        // Capture original requestID by value: at v18 the bidi-stream
+        // codepath fires this lambda after `sub` is destroyed.
+        const auto originalRequestID = sub.requestID.value;
+        EXPECT_CALL(*mockSubscriptionHandle, requestUpdateCalled)
+            .WillOnce(
+                testing::Invoke([originalRequestID,
+                                 &subscribeUpdateProcessed,
+                                 majorVersion](const auto& actualUpdate) {
+                  if (majorVersion < 18) {
                     EXPECT_EQ(
-                        actualUpdate.requestID.value, originalRequestID + 2);
+                        actualUpdate.existingRequestID.value,
+                        originalRequestID);
+                  }
+                  EXPECT_EQ(
+                      actualUpdate.requestID.value, originalRequestID + 2);
 
-                    subscribeUpdateProcessed.post();
-                  }));
-          EXPECT_CALL(*mockSubscriptionHandle, requestUpdateResult)
-              .WillOnce(
-                  testing::Return(
-                      folly::Expected<RequestOk, RequestError>(RequestOk{})));
-        } else {
-          expectSubscribeUpdate(
-              mockSubscriptionHandle, subscribeUpdateProcessed);
-        }
+                  subscribeUpdateProcessed.post();
+                }));
+        EXPECT_CALL(*mockSubscriptionHandle, requestUpdateResult)
+            .WillOnce(
+                testing::Return(
+                    folly::Expected<RequestOk, RequestError>(RequestOk{})));
 
         co_return mockSubscriptionHandle;
       });

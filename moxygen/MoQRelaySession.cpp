@@ -38,11 +38,9 @@ class MoQRelaySession::SubscriberPublishNamespaceCallback
  public:
   SubscriberPublishNamespaceCallback(
       MoQRelaySession& session,
-      const TrackNamespace& ns,
       RequestID requestID,
       std::shared_ptr<ReplyContext> replyContext)
       : session_(session),
-        trackNamespace_(ns),
         requestID_(requestID),
         replyContext_(std::move(replyContext)) {}
 
@@ -51,9 +49,6 @@ class MoQRelaySession::SubscriberPublishNamespaceCallback
       std::string reasonPhrase) override {
     PublishNamespaceCancel pubNsCan;
     pubNsCan.requestID = requestID_;
-    if (getDraftMajorVersion(*session_.getNegotiatedVersion()) < 16) {
-      pubNsCan.trackNamespace = trackNamespace_;
-    }
     pubNsCan.errorCode = errorCode;
     pubNsCan.reasonPhrase = std::move(reasonPhrase);
     session_.publishNamespaceCancel(pubNsCan, std::move(replyContext_));
@@ -61,7 +56,6 @@ class MoQRelaySession::SubscriberPublishNamespaceCallback
 
  private:
   MoQRelaySession& session_;
-  TrackNamespace trackNamespace_;
   RequestID requestID_;
   std::shared_ptr<ReplyContext> replyContext_;
 };
@@ -71,11 +65,9 @@ class MoQRelaySession::PublisherPublishNamespaceHandle
  public:
   PublisherPublishNamespaceHandle(
       std::shared_ptr<MoQRelaySession> session,
-      TrackNamespace trackNamespace,
       PublishNamespaceOk pubNsOk,
       std::shared_ptr<ReplyContext> replyCtx)
       : Subscriber::PublishNamespaceHandle(std::move(pubNsOk)),
-        trackNamespace_(std::move(trackNamespace)),
         session_(std::move(session)),
         replyCtx_(std::move(replyCtx)) {}
   PublisherPublishNamespaceHandle(const PublisherPublishNamespaceHandle&) =
@@ -92,11 +84,7 @@ class MoQRelaySession::PublisherPublishNamespaceHandle
   void publishNamespaceDone() override {
     if (session_) {
       PublishNamespaceDone pubNsDone;
-      if (getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 16) {
-        pubNsDone.requestID = publishNamespaceOk().requestID;
-      } else {
-        pubNsDone.trackNamespace = trackNamespace_;
-      }
+      pubNsDone.requestID = publishNamespaceOk().requestID;
       session_->publishNamespaceDone(pubNsDone, std::move(replyCtx_));
       session_.reset();
     }
@@ -112,7 +100,6 @@ class MoQRelaySession::PublisherPublishNamespaceHandle
   }
 
  private:
-  TrackNamespace trackNamespace_;
   std::shared_ptr<MoQRelaySession> session_;
   std::shared_ptr<ReplyContext> replyCtx_;
 };
@@ -122,11 +109,9 @@ class MoQRelaySession::SubscribeNamespaceHandle
  public:
   SubscribeNamespaceHandle(
       std::shared_ptr<MoQRelaySession> session,
-      TrackNamespace trackNamespacePrefix,
       SubscribeNamespaceOk subNsOk,
-      std::shared_ptr<BidiStreamControl> control = nullptr)
+      std::shared_ptr<BidiStreamControl> control)
       : Publisher::SubscribeNamespaceHandle(std::move(subNsOk)),
-        trackNamespacePrefix_(std::move(trackNamespacePrefix)),
         session_(std::move(session)),
         control_(std::move(control)) {}
   SubscribeNamespaceHandle(const SubscribeNamespaceHandle&) = delete;
@@ -143,22 +128,11 @@ class MoQRelaySession::SubscribeNamespaceHandle
         session_.reset();
         return;
       }
-      if (control_) {
-        // Draft 16+: the spec accepts either FIN or RESET_STREAM as the
-        // cancel signal; RST matches SUBSCRIBE / FETCH / SUBSCRIBE_TRACKS.
-        MOQ_SUBSCRIBER_STATS(
-            session_->subscriberStatsCallback_, onUnsubscribeNamespace);
-        control_->cancel(ResetStreamErrorCode::CANCELLED);
-      } else {
-        // Draft <=15: Send UnsubscribeNamespace on the control stream
-        UnsubscribeNamespace msg;
-        if (getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 15) {
-          msg.requestID = subscribeNamespaceOk_->requestID;
-        } else {
-          msg.trackNamespacePrefix = trackNamespacePrefix_;
-        }
-        session_->unsubscribeNamespace(msg);
-      }
+      // The spec accepts either FIN or RESET_STREAM as the cancel signal; RST
+      // matches SUBSCRIBE / FETCH / SUBSCRIBE_TRACKS.
+      MOQ_SUBSCRIBER_STATS(
+          session_->subscriberStatsCallback_, onUnsubscribeNamespace);
+      control_->cancel(ResetStreamErrorCode::CANCELLED);
       session_.reset();
     }
   }
@@ -172,16 +146,6 @@ class MoQRelaySession::SubscribeNamespaceHandle
               RequestErrorCode::INTERNAL_ERROR,
               "SUBSCRIBE_NAMESPACE subscription no longer active"});
     }
-    // Updating a SUBSCRIBE_NAMESPACE via REQUEST_UPDATE only exists at draft
-    // 16+; earlier drafts have no such message for it.
-    auto version = session_->getNegotiatedVersion();
-    if (!version || getDraftMajorVersion(*version) < 16) {
-      co_return folly::makeUnexpected(
-          RequestError{
-              reqUpdate.requestID,
-              RequestErrorCode::NOT_SUPPORTED,
-              "REQUEST_UPDATE for SUBSCRIBE_NAMESPACE requires draft 16+"});
-    }
     // Forward the update to the peer on this subscription's own bidi stream.
     // The prefix (or other mutable state) is carried in reqUpdate.params and
     // decoded by the responder; this side is a pure forwarder.
@@ -190,7 +154,6 @@ class MoQRelaySession::SubscribeNamespaceHandle
   }
 
  private:
-  TrackNamespace trackNamespacePrefix_;
   std::shared_ptr<MoQRelaySession> session_;
   std::shared_ptr<BidiStreamControl> control_;
 };
@@ -411,13 +374,11 @@ void MoQRelaySession::cleanupRelayState() {
     }
   }
   publishNamespaceCallbacks_.clear();
-  legacyPublisherNamespaceToReqId_.clear();
 
   for (auto& pubNs : publishNamespaceHandles_) {
     pubNs.second->publishNamespaceDone();
   }
   publishNamespaceHandles_.clear();
-  legacySubscriberNamespaceToReqId_.clear();
 
   // Clean up subscribeNamespace handles
   for (auto& subNs : subscribeNamespaceHandles_) {
@@ -426,7 +387,6 @@ void MoQRelaySession::cleanupRelayState() {
     }
   }
   subscribeNamespaceHandles_.clear();
-  legacySubscribeNamespaceToReqId_.clear();
   requestUpdateReplyContexts_.clear();
 
   // Draft 18+: drop subscribeTracks handles too.
@@ -453,83 +413,83 @@ void MoQRelaySession::cleanup() {
 }
 
 void MoQRelaySession::onRequestUpdate(RequestUpdate requestUpdate) {
-  // Only intercept for v16+ and namespace requests
-  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 16) {
-    auto existingRequestID = requestUpdate.existingRequestID;
-    auto requestID = requestUpdate.requestID;
+  auto existingRequestID = requestUpdate.existingRequestID;
+  auto requestID = requestUpdate.requestID;
 
-    // Check publishNamespaceHandles_ for PUBLISH_NAMESPACE (formerly ANNOUNCE)
-    auto pubNsIt = publishNamespaceHandles_.find(existingRequestID);
-    if (pubNsIt != publishNamespaceHandles_.end()) {
-      if (closeSessionIfRequestIDInvalid(requestID, false, true)) {
-        return;
-      }
-      if (shouldRejectNewPeerRequestDueToGoaway()) {
-        XLOG(DBG1)
-            << "Rejecting publishNamespace request update, GOAWAY/draining sess="
-            << this;
-        requestUpdateError(
-            RequestError{
-                requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
-            existingRequestID);
-        return;
-      }
-      if (closeSessionIfRequestIDInvalid(
-              existingRequestID, false, false, false)) {
-        return;
-      }
-      handlePublishNamespaceRequestUpdate(requestUpdate, pubNsIt->second);
+  // Check publishNamespaceHandles_ for PUBLISH_NAMESPACE (formerly ANNOUNCE)
+  auto pubNsIt = publishNamespaceHandles_.find(existingRequestID);
+  if (pubNsIt != publishNamespaceHandles_.end()) {
+    if (closeSessionIfRequestIDInvalid(requestID, false, true)) {
       return;
     }
-
-    // Check subscribeNamespaceHandles_ for SUBSCRIBE_NAMESPACE (formerly
-    // SUBSCRIBE_ANNOUNCES)
-    auto subNsIt = subscribeNamespaceHandles_.find(existingRequestID);
-    if (subNsIt != subscribeNamespaceHandles_.end()) {
-      if (closeSessionIfRequestIDInvalid(requestID, false, true)) {
-        return;
-      }
-      if (shouldRejectNewPeerRequestDueToGoaway()) {
-        XLOG(DBG1)
-            << "Rejecting subscribeNamespace request update, GOAWAY/draining sess="
-            << this;
-        requestUpdateError(
-            RequestError{
-                requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
-            existingRequestID);
-        return;
-      }
-      if (closeSessionIfRequestIDInvalid(
-              existingRequestID, false, false, false)) {
-        return;
-      }
-      handleSubscribeNamespaceRequestUpdate(requestUpdate, subNsIt->second);
+    retireRequestID(/*signalWriteLoop=*/true);
+    if (shouldRejectNewPeerRequestDueToGoaway()) {
+      XLOG(DBG1)
+          << "Rejecting publishNamespace request update, GOAWAY/draining sess="
+          << this;
+      requestUpdateError(
+          RequestError{
+              requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
+          existingRequestID);
       return;
     }
-
-    // Check subscribeTracksHandles_ for SUBSCRIBE_TRACKS
-    auto subTracksIt = subscribeTracksHandles_.find(existingRequestID);
-    if (subTracksIt != subscribeTracksHandles_.end()) {
-      if (closeSessionIfRequestIDInvalid(requestID, false, true)) {
-        return;
-      }
-      if (shouldRejectNewPeerRequestDueToGoaway()) {
-        XLOG(DBG1)
-            << "Rejecting subscribeTracks request update, GOAWAY/draining sess="
-            << this;
-        requestUpdateError(
-            RequestError{
-                requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
-            existingRequestID);
-        return;
-      }
-      if (closeSessionIfRequestIDInvalid(
-              existingRequestID, false, false, false)) {
-        return;
-      }
-      handleSubscribeTracksRequestUpdate(requestUpdate, subTracksIt->second);
+    if (closeSessionIfRequestIDInvalid(
+            existingRequestID, false, false, false)) {
       return;
     }
+    handlePublishNamespaceRequestUpdate(requestUpdate, pubNsIt->second);
+    return;
+  }
+
+  // Check subscribeNamespaceHandles_ for SUBSCRIBE_NAMESPACE (formerly
+  // SUBSCRIBE_ANNOUNCES)
+  auto subNsIt = subscribeNamespaceHandles_.find(existingRequestID);
+  if (subNsIt != subscribeNamespaceHandles_.end()) {
+    if (closeSessionIfRequestIDInvalid(requestID, false, true)) {
+      return;
+    }
+    retireRequestID(/*signalWriteLoop=*/true);
+    if (shouldRejectNewPeerRequestDueToGoaway()) {
+      XLOG(DBG1)
+          << "Rejecting subscribeNamespace request update, GOAWAY/draining sess="
+          << this;
+      requestUpdateError(
+          RequestError{
+              requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
+          existingRequestID);
+      return;
+    }
+    if (closeSessionIfRequestIDInvalid(
+            existingRequestID, false, false, false)) {
+      return;
+    }
+    handleSubscribeNamespaceRequestUpdate(requestUpdate, subNsIt->second);
+    return;
+  }
+
+  // Check subscribeTracksHandles_ for SUBSCRIBE_TRACKS
+  auto subTracksIt = subscribeTracksHandles_.find(existingRequestID);
+  if (subTracksIt != subscribeTracksHandles_.end()) {
+    if (closeSessionIfRequestIDInvalid(requestID, false, true)) {
+      return;
+    }
+    retireRequestID(/*signalWriteLoop=*/true);
+    if (shouldRejectNewPeerRequestDueToGoaway()) {
+      XLOG(DBG1)
+          << "Rejecting subscribeTracks request update, GOAWAY/draining sess="
+          << this;
+      requestUpdateError(
+          RequestError{
+              requestID, RequestErrorCode::GOING_AWAY, "Session going away"},
+          existingRequestID);
+      return;
+    }
+    if (closeSessionIfRequestIDInvalid(
+            existingRequestID, false, false, false)) {
+      return;
+    }
+    handleSubscribeTracksRequestUpdate(requestUpdate, subTracksIt->second);
+    return;
   }
 
   // Delegate to base class for all other cases
@@ -562,28 +522,26 @@ void MoQRelaySession::handlePublishNamespaceRequestUpdate(
                     cancellationSource_.getToken(),
                     pubNsHandle->requestUpdate(std::move(update))));
 
-                // Only send responses for v15+
-                if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
-                  if (updateResult.hasException()) {
-                    XLOG(ERR) << "Exception in requestUpdate ex="
-                              << updateResult.exception().what();
-                    requestUpdateError(
-                        RequestError{
-                            updateRequestID,
-                            RequestErrorCode::INTERNAL_ERROR,
-                            "Exception in requestUpdate"},
-                        existingRequestID);
-                  } else if (updateResult->hasError()) {
-                    auto updateErr = updateResult->error();
-                    updateErr.requestID =
-                        updateRequestID; // In case app got it wrong
-                    requestUpdateError(updateErr, existingRequestID);
-                  } else {
-                    RequestOk requestOk{
-                        .requestID = updateRequestID,
-                        .requestSpecificParams = {}};
-                    requestUpdateOk(requestOk, existingRequestID);
-                  }
+                if (updateResult.hasException()) {
+                  XLOG(ERR) << "Exception in requestUpdate ex="
+                            << updateResult.exception().what();
+                  requestUpdateError(
+                      RequestError{
+                          updateRequestID,
+                          RequestErrorCode::INTERNAL_ERROR,
+                          "Exception in requestUpdate"},
+                      existingRequestID);
+                } else if (updateResult->hasError()) {
+                  auto updateErr = updateResult->error();
+                  updateErr.requestID =
+                      updateRequestID; // In case app got it wrong
+                  requestUpdateError(updateErr, existingRequestID);
+                } else {
+                  RequestOk requestOk{
+                      .requestID = updateRequestID,
+                      .requestSpecificParams = {},
+                      .trackProperties = {}};
+                  requestUpdateOk(requestOk, existingRequestID);
                 }
               })))
       .start();
@@ -712,28 +670,26 @@ void MoQRelaySession::handleSubscribeNamespaceRequestUpdate(
                     subscribeNamespaceHandle->requestUpdate(
                         std::move(update))));
 
-                // Only send responses for v15+
-                if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
-                  if (updateResult.hasException()) {
-                    XLOG(ERR) << "Exception in requestUpdate ex="
-                              << updateResult.exception().what();
-                    requestUpdateError(
-                        RequestError{
-                            updateRequestID,
-                            RequestErrorCode::INTERNAL_ERROR,
-                            "Exception in requestUpdate"},
-                        existingRequestID);
-                  } else if (updateResult->hasError()) {
-                    auto updateErr = updateResult->error();
-                    updateErr.requestID =
-                        updateRequestID; // In case app got it wrong
-                    requestUpdateError(updateErr, existingRequestID);
-                  } else {
-                    RequestOk requestOk{
-                        .requestID = updateRequestID,
-                        .requestSpecificParams = {}};
-                    requestUpdateOk(requestOk, existingRequestID);
-                  }
+                if (updateResult.hasException()) {
+                  XLOG(ERR) << "Exception in requestUpdate ex="
+                            << updateResult.exception().what();
+                  requestUpdateError(
+                      RequestError{
+                          updateRequestID,
+                          RequestErrorCode::INTERNAL_ERROR,
+                          "Exception in requestUpdate"},
+                      existingRequestID);
+                } else if (updateResult->hasError()) {
+                  auto updateErr = updateResult->error();
+                  updateErr.requestID =
+                      updateRequestID; // In case app got it wrong
+                  requestUpdateError(updateErr, existingRequestID);
+                } else {
+                  RequestOk requestOk{
+                      .requestID = updateRequestID,
+                      .requestSpecificParams = {},
+                      .trackProperties = {}};
+                  requestUpdateOk(requestOk, existingRequestID);
                 }
               })))
       .start();
@@ -773,12 +729,11 @@ void MoQRelaySession::terminateExistingRequest(
   // peer-initiated close would take (which also erases the reply context).
   it->second->flushFinal();
   if (isSubNs) {
-    onUnsubscribeNamespace(
-        UnsubscribeNamespace{existingRequestID, std::nullopt});
+    onUnsubscribeNamespace(UnsubscribeNamespace{existingRequestID});
   } else if (isPubNs) {
     PublishNamespaceDone done;
     done.requestID = existingRequestID;
-    onPublishNamespaceDone(std::move(done));
+    onPublishNamespaceDone(done);
   } else {
     onSubscribeTracksStreamClosed(existingRequestID);
   }
@@ -810,28 +765,26 @@ void MoQRelaySession::handleSubscribeTracksRequestUpdate(
                     cancellationSource_.getToken(),
                     subscribeTracksHandle->requestUpdate(std::move(update))));
 
-                // Only send responses for v15+
-                if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
-                  if (updateResult.hasException()) {
-                    XLOG(ERR) << "Exception in requestUpdate ex="
-                              << updateResult.exception().what();
-                    requestUpdateError(
-                        RequestError{
-                            updateRequestID,
-                            RequestErrorCode::INTERNAL_ERROR,
-                            "Exception in requestUpdate"},
-                        existingRequestID);
-                  } else if (updateResult->hasError()) {
-                    auto updateErr = updateResult->error();
-                    updateErr.requestID =
-                        updateRequestID; // In case app got it wrong
-                    requestUpdateError(updateErr, existingRequestID);
-                  } else {
-                    RequestOk requestOk{
-                        .requestID = updateRequestID,
-                        .requestSpecificParams = {}};
-                    requestUpdateOk(requestOk, existingRequestID);
-                  }
+                if (updateResult.hasException()) {
+                  XLOG(ERR) << "Exception in requestUpdate ex="
+                            << updateResult.exception().what();
+                  requestUpdateError(
+                      RequestError{
+                          updateRequestID,
+                          RequestErrorCode::INTERNAL_ERROR,
+                          "Exception in requestUpdate"},
+                      existingRequestID);
+                } else if (updateResult->hasError()) {
+                  auto updateErr = updateResult->error();
+                  updateErr.requestID =
+                      updateRequestID; // In case app got it wrong
+                  requestUpdateError(updateErr, existingRequestID);
+                } else {
+                  RequestOk requestOk{
+                      .requestID = updateRequestID,
+                      .requestSpecificParams = {},
+                      .trackProperties = {}};
+                  requestUpdateOk(requestOk, existingRequestID);
                 }
               })))
       .start();
@@ -859,7 +812,6 @@ MoQRelaySession::publishNamespace(
         recordPublishNamespaceLatency,
         durationMsec.count());
   };
-  const auto& trackNamespace = pubNs.trackNamespace;
   if (isClosed()) {
     co_return folly::makeUnexpected(PublishNamespaceError(
         {failedLocalRequestID(),
@@ -905,9 +857,7 @@ MoQRelaySession::publishNamespace(
       folly::Expected<PublishNamespaceOk, PublishNamespaceError>>();
   auto pending = MoQRelayPendingRequestState::makePublishNamespace(
       PendingPublishNamespace{
-          trackNamespace, // Use saved copy instead of pubNs.trackNamespace
-          std::move(contract.first),
-          std::move(publishNamespaceCallback)});
+          std::move(contract.first), std::move(publishNamespaceCallback)});
   pending->setBidiControl(std::move(control));
   pendingRequests_.emplace(pubNs.requestID, std::move(pending));
   auto cancelGuard = cancelOnExit(pubNs.requestID);
@@ -923,7 +873,6 @@ MoQRelaySession::publishNamespace(
     MOQ_PUBLISHER_STATS(publisherStatsCallback_, onPublishNamespaceSuccess);
     co_return std::make_shared<PublisherPublishNamespaceHandle>(
         std::static_pointer_cast<MoQRelaySession>(shared_from_this()),
-        trackNamespace,
         std::move(publishNamespaceResult.value()),
         std::move(replyCtx));
   }
@@ -947,9 +896,7 @@ void MoQRelaySession::onRequestOk(RequestOk requestOk, FrameType frameType) {
     close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
     return;
   }
-  if (*getNegotiatedVersion() > 14) {
-    frameType = reqIt->second->getOkFrameType();
-  }
+  frameType = reqIt->second->getOkFrameType();
   if (!validateRequestOkTrackProperties(requestOk, frameType)) {
     // Session was closed; do not erase pending state - close() will tear down.
     return;
@@ -1021,26 +968,10 @@ void MoQRelaySession::onPublishNamespaceCancel(
 
   std::shared_ptr<Subscriber::PublishNamespaceCallback> cb;
 
-  RequestID reqId;
-  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 16) {
-    XCHECK(publishNamespaceCancel.requestID.has_value());
-    XLOG(DBG1) << __func__ << " requestID=" << *publishNamespaceCancel.requestID
-               << " sess=" << this;
-    reqId = *publishNamespaceCancel.requestID;
-  } else {
-    // Legacy: translate NS -> RequestID
-    XLOG(DBG1) << __func__ << " ns=" << publishNamespaceCancel.trackNamespace
-               << " sess=" << this;
-    auto nsIt = legacyPublisherNamespaceToReqId_.find(
-        publishNamespaceCancel.trackNamespace);
-    if (nsIt == legacyPublisherNamespaceToReqId_.end()) {
-      XLOG(ERR) << "Invalid publishNamespace cancel ns="
-                << publishNamespaceCancel.trackNamespace;
-      return;
-    }
-    reqId = nsIt->second;
-    legacyPublisherNamespaceToReqId_.erase(nsIt);
-  }
+  XCHECK(publishNamespaceCancel.requestID.has_value());
+  XLOG(DBG1) << __func__ << " requestID=" << *publishNamespaceCancel.requestID
+             << " sess=" << this;
+  RequestID reqId = *publishNamespaceCancel.requestID;
 
   auto it = publishNamespaceCallbacks_.find(reqId);
   if (it == publishNamespaceCallbacks_.end()) {
@@ -1069,10 +1000,6 @@ void MoQRelaySession::cancelLocalRequest(RequestID requestID) {
     return;
   }
   pendingRequests_.erase(it);
-  // Before draft 16, PUBLISH_NAMESPACE_DONE has no request ID to send.
-  if (getDraftMajorVersion(*getNegotiatedVersion()) < 16) {
-    return;
-  }
   PublishNamespaceDone pubNsDone;
   pubNsDone.requestID = requestID;
   if (moqFrameWriter_.writePublishNamespaceDone(controlWriteBuf_, pubNsDone)) {
@@ -1104,58 +1031,24 @@ void MoQRelaySession::publishNamespaceDone(
   };
 
   bool found = false;
-  std::optional<RequestID> reqId;
-
-  // Try resolve requestID
-  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 16) {
-    XCHECK(pubNsDone.requestID.has_value());
-    XLOG(DBG1) << __func__ << " requestID=" << *pubNsDone.requestID
-               << " sess=" << this;
-    reqId = *pubNsDone.requestID;
-  } else {
-    XLOG(DBG1) << __func__ << " ns=" << pubNsDone.trackNamespace
-               << " sess=" << this;
-    // Legacy: translate NS -> RequestID
-    auto nsIt = legacyPublisherNamespaceToReqId_.find(pubNsDone.trackNamespace);
-    if (nsIt != legacyPublisherNamespaceToReqId_.end()) {
-      reqId = nsIt->second;
-      legacyPublisherNamespaceToReqId_.erase(nsIt);
-    }
-    // If not found, reqId remains nullopt - will search pending by namespace
-  }
+  XCHECK(pubNsDone.requestID.has_value());
+  XLOG(DBG1) << __func__ << " requestID=" << *pubNsDone.requestID
+             << " sess=" << this;
+  RequestID reqId = *pubNsDone.requestID;
 
   // Find and remove publishNamespace
-  if (reqId.has_value()) {
-    auto it = publishNamespaceCallbacks_.find(*reqId);
+  {
+    auto it = publishNamespaceCallbacks_.find(reqId);
     if (it != publishNamespaceCallbacks_.end()) {
       publishNamespaceCallbacks_.erase(it);
       found = true;
     } else {
       // Check pending requests by RequestID
-      auto pendingIt = pendingRequests_.find(*reqId);
+      auto pendingIt = pendingRequests_.find(reqId);
       if (pendingIt != pendingRequests_.end()) {
-        failPendingPublishNamespace(pendingIt, *reqId);
+        failPendingPublishNamespace(pendingIt, reqId);
         found = true;
       }
-    }
-  } else {
-    // Legacy: search pending by namespace
-    // TODO: This is a scan. Optimize
-    auto pendingIt = std::find_if(
-        pendingRequests_.begin(),
-        pendingRequests_.end(),
-        [&pubNsDone](const auto& pair) {
-          if (auto* publishNamespacePtr =
-                  MoQRelayPendingRequestState::tryGetPublishNamespace(
-                      pair.second.get())) {
-            return publishNamespacePtr->trackNamespace ==
-                pubNsDone.trackNamespace;
-          }
-          return false;
-        });
-    if (pendingIt != pendingRequests_.end()) {
-      failPendingPublishNamespace(pendingIt, pendingIt->first);
-      found = true;
     }
   }
 
@@ -1231,10 +1124,7 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
   folly::RequestContextScopeGuard guard;
   setRequestSession();
   auto pubNsCb = std::make_shared<SubscriberPublishNamespaceCallback>(
-      *this,
-      publishNamespace.trackNamespace,
-      publishNamespace.requestID,
-      replyContext);
+      *this, publishNamespace.requestID, replyContext);
   auto token = co_await folly::coro::co_current_cancellation_token;
   auto publishNamespaceResult =
       co_await co_awaitTry(subscribeHandler_->publishNamespace(
@@ -1273,11 +1163,6 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
     if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
       // Retain the bidi reply context so a failed REQUEST_UPDATE can close it.
       requestUpdateReplyContexts_[publishNamespace.requestID] = replyContext;
-    }
-    if (getDraftMajorVersion(*getNegotiatedVersion()) < 16) {
-      // Legacy: also store NS->RequestID mapping for lookups
-      legacySubscriberNamespaceToReqId_[publishNamespace.trackNamespace] =
-          publishNamespace.requestID;
     }
   }
 }
@@ -1347,29 +1232,12 @@ void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone pubNsDone) {
         ControlMessageType::PARSED);
   }
 
-  // Version-specific lookup, common action
   std::shared_ptr<Subscriber::PublishNamespaceHandle> handle;
 
-  RequestID reqId;
-  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 16) {
-    XCHECK(pubNsDone.requestID.has_value());
-    XLOG(DBG1) << __func__ << " requestID=" << *pubNsDone.requestID
-               << " sess=" << this;
-    reqId = *pubNsDone.requestID;
-  } else {
-    // Legacy: translate NS -> RequestID
-    XLOG(DBG1) << __func__ << " ns=" << pubNsDone.trackNamespace
-               << " sess=" << this;
-    auto nsIt =
-        legacySubscriberNamespaceToReqId_.find(pubNsDone.trackNamespace);
-    if (nsIt == legacySubscriberNamespaceToReqId_.end()) {
-      XLOG(ERR) << "PublishNamespaceDone for unknown namespace ns="
-                << pubNsDone.trackNamespace;
-      return;
-    }
-    reqId = nsIt->second;
-    legacySubscriberNamespaceToReqId_.erase(nsIt);
-  }
+  XCHECK(pubNsDone.requestID.has_value());
+  XLOG(DBG1) << __func__ << " requestID=" << *pubNsDone.requestID
+             << " sess=" << this;
+  RequestID reqId = *pubNsDone.requestID;
 
   auto it = publishNamespaceHandles_.find(reqId);
   if (it == publishNamespaceHandles_.end()) {
@@ -1481,7 +1349,6 @@ MoQRelaySession::subscribeNamespace(
     std::shared_ptr<NamespacePublishHandle> namespacePublishHandle) {
   XLOG(DBG1) << __func__ << " prefix=" << sa.trackNamespacePrefix
              << " sess=" << this;
-  const auto& trackNamespace = sa.trackNamespacePrefix;
   if (isClosed()) {
     co_return folly::makeUnexpected(SubscribeNamespaceError(
         {failedLocalRequestID(),
@@ -1554,36 +1421,9 @@ MoQRelaySession::subscribeNamespace(
     MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscribeNamespaceSuccess);
     co_return std::make_shared<SubscribeNamespaceHandle>(
         std::static_pointer_cast<MoQRelaySession>(shared_from_this()),
-        trackNamespace,
         std::move(subNsResult.value()),
         std::move(sendResult.value()));
   }
-}
-
-void MoQRelaySession::unsubscribeNamespace(
-    const UnsubscribeNamespace& unsubNs) {
-  // Log the appropriate field based on what's present
-  if (unsubNs.trackNamespacePrefix.has_value()) {
-    XLOG(DBG1) << __func__ << " prefix=" << unsubNs.trackNamespacePrefix.value()
-               << " sess=" << this;
-  } else if (unsubNs.requestID.has_value()) {
-    XLOG(DBG1) << __func__ << " requestID=" << unsubNs.requestID.value()
-               << " sess=" << this;
-  }
-
-  MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onUnsubscribeNamespace);
-  auto res =
-      moqFrameWriter_.writeUnsubscribeNamespace(controlWriteBuf_, unsubNs);
-  if (!res) {
-    XLOG(ERR) << "writeUnsubscribeNamespace failed sess=" << this;
-    return;
-  }
-
-  if (logger_) {
-    logger_->logUnsubscribeNamespace(unsubNs);
-  }
-
-  controlWriteEvent_.signal();
 }
 
 // SubscribeNamespace publisher methods
@@ -1668,11 +1508,8 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
   co_await folly::coro::co_safe_point;
   folly::RequestContextScopeGuard guard;
   setRequestSession();
-  std::shared_ptr<MoQNamespacePublishHandle> publishHandle;
-  if (getDraftMajorVersion(*negotiatedVersion_) >= 16) {
-    publishHandle = std::make_shared<MoQNamespacePublishHandle>(
-        subNsReply, *negotiatedVersion_, getNegotiatedExtensions());
-  }
+  auto publishHandle = std::make_shared<MoQNamespacePublishHandle>(
+      subNsReply, *negotiatedVersion_, getNegotiatedExtensions());
   auto token = co_await folly::coro::co_current_cancellation_token;
   auto subNsResult = co_await co_awaitTry(
       publishHandler_->subscribeNamespace(subNs, publishHandle));
@@ -1716,11 +1553,6 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
     if (replyContext) {
       requestUpdateReplyContexts_[subNs.requestID] = std::move(replyContext);
     }
-    if (getDraftMajorVersion(*getNegotiatedVersion()) < 15) {
-      // Legacy: also store NS->RequestID mapping for lookups
-      legacySubscribeNamespaceToReqId_[subNs.trackNamespacePrefix] =
-          subNs.requestID;
-    }
   }
 }
 
@@ -1750,37 +1582,13 @@ void MoQRelaySession::onUnsubscribeNamespace(UnsubscribeNamespace unsub) {
     return;
   }
 
-  // Version-based lookup
   std::shared_ptr<Publisher::SubscribeNamespaceHandle> handle;
-  RequestID requestID;
-  TrackNamespace ns;
-
-  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
-    // v15+: Direct lookup by Request ID
-    if (!unsub.requestID.has_value()) {
-      XLOG(ERR) << __func__ << " missing requestID for v15+, sess=" << this;
-      return;
-    }
-    requestID = unsub.requestID.value();
-    XLOG(DBG1) << __func__ << " requestID=" << requestID << " sess=" << this;
-  } else {
-    // <v15: Two-step lookup via namespace
-    if (!unsub.trackNamespacePrefix.has_value()) {
-      XLOG(ERR) << __func__
-                << " missing trackNamespacePrefix for <v15, sess=" << this;
-      return;
-    }
-    ns = unsub.trackNamespacePrefix.value();
-    XLOG(DBG1) << __func__ << " prefix=" << ns << " sess=" << this;
-
-    auto nsIt = legacySubscribeNamespaceToReqId_.find(ns);
-    if (nsIt == legacySubscribeNamespaceToReqId_.end()) {
-      XLOG(ERR) << "Invalid unsub publishNamespace nsp=" << ns;
-      return;
-    }
-    requestID = nsIt->second;
-    legacySubscribeNamespaceToReqId_.erase(nsIt);
+  if (!unsub.requestID.has_value()) {
+    XLOG(ERR) << __func__ << " missing requestID sess=" << this;
+    return;
   }
+  RequestID requestID = unsub.requestID.value();
+  XLOG(DBG1) << __func__ << " requestID=" << requestID << " sess=" << this;
 
   auto saIt = subscribeNamespaceHandles_.find(requestID);
   if (saIt == subscribeNamespaceHandles_.end()) {
@@ -1853,8 +1661,7 @@ MoQRelaySession::subscribeTracks(
     // SUBSCRIBE_TRACKS doesn't exist before draft 18; fall back to
     // SUBSCRIBE_NAMESPACE, which has the same effect (the publisher PUBLISHes
     // matching tracks). On draft 16-17 the PUBLISH option requests this
-    // explicitly; on draft 14-15 there is no options field and the legacy
-    // behavior already includes PUBLISH, so the option is simply ignored.
+    // explicitly.
     SubscribeNamespace subNs;
     subNs.trackNamespacePrefix = subTracks.trackNamespacePrefix;
     subNs.forward = subTracks.forward;
@@ -2085,11 +1892,6 @@ bool MoQRelaySession::handlePublishNamespaceOkFromRequestOk(
   }
   publishNamespaceCallbacks_[requestOk.requestID] =
       std::move(publishNamespacePtr->callback);
-  if (getDraftMajorVersion(*getNegotiatedVersion()) < 16) {
-    // Legacy: also store NS->RequestID mapping for lookups
-    legacyPublisherNamespaceToReqId_[publishNamespacePtr->trackNamespace] =
-        requestOk.requestID;
-  }
   return true;
 }
 

@@ -357,6 +357,21 @@ const folly::F14FastSet<FrameType> kAllowedFramesForFillTimeout = {
 const folly::F14FastSet<FrameType> kAllowedFramesForTrackNamespacePrefix = {
     FrameType::REQUEST_UPDATE};
 
+static bool isLegacyPublishOkSubscriptionParameter(TrackRequestParamKey key) {
+  switch (key) {
+    case TrackRequestParamKey::OBJECT_DELIVERY_TIMEOUT:
+    case TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT:
+    case TrackRequestParamKey::SUBSCRIBER_PRIORITY:
+    case TrackRequestParamKey::SUBSCRIPTION_FILTER:
+    case TrackRequestParamKey::GROUP_ORDER:
+    case TrackRequestParamKey::FORWARD:
+    case TrackRequestParamKey::NEW_GROUP_REQUEST:
+      return true;
+    default:
+      return false;
+  }
+}
+
 const folly::F14FastSet<FrameType> kAllowedFramesForTrackFilter = {
     FrameType::SUBSCRIBE_NAMESPACE};
 
@@ -445,13 +460,21 @@ bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
     return true;
   }
 
+  const bool isDraft22OrLater =
+      majorVersion_.has_value() && *majorVersion_ >= 22;
+  const bool isPublishOkResponse = frameType_ == FrameType::PUBLISH_OK ||
+      frameType_ == FrameType::REQUEST_OK;
+  if (isDraft22OrLater && isPublishOkResponse &&
+      isLegacyPublishOkSubscriptionParameter(key)) {
+    return false;
+  }
   if (key == TrackRequestParamKey::OBJECT_DELIVERY_TIMEOUT &&
       majorVersion_.has_value() && *majorVersion_ >= 18) {
     return kAllowedFramesForObjectDeliveryTimeoutV18.contains(frameType_);
   }
 
-  // v16+ version-specific restrictions for track property params
-  if (majorVersion_.has_value() && *majorVersion_ >= 16) {
+  // Version-specific restrictions for track property params
+  if (majorVersion_.has_value()) {
     switch (key) {
       case TrackRequestParamKey::MAX_CACHE_DURATION:
         // Key 0x04 is reinterpreted as RENDEZVOUS_TIMEOUT in v18+; allowed
@@ -462,7 +485,7 @@ bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
         }
         return false;
       case TrackRequestParamKey::PUBLISHER_PRIORITY:
-        // Extensions-only in v16+, not allowed as a param.
+        // Extensions-only, not allowed as a param.
         return false;
       default:
         break;
@@ -491,7 +514,8 @@ bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
 
   auto it = kParamAllowlist.find(key);
   if (it == kParamAllowlist.end()) {
-    // TODO: Make this strict when we drop V15- support
+    // The wire parser rejects unknown keys (isKnownParamKey); local callers
+    // may still carry application-defined ones.
     return true;
   }
 

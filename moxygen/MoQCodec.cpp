@@ -561,25 +561,19 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       break;
     }
     case FrameType::FETCH_ERROR:
-    case FrameType::PUBLISH_NAMESPACE_ERROR: // same value as
-                                             // FrameType::NAMESPACE
+    case FrameType::NAMESPACE:
     case FrameType::SUBSCRIBE_NAMESPACE_ERROR:
-    case FrameType::PUBLISH_ERROR:
-      if (getDraftMajorVersion(*moqFrameParser_.getVersion()) >= 16) {
-        auto res = moqFrameParser_.parseNamespace(cursor, curFrameLength_);
-        if (res) {
-          if (callback_) {
-            callback_->onNamespace(std::move(res.value()));
-          }
-        } else {
-          return folly::makeUnexpected(res.error());
+    case FrameType::PUBLISH_ERROR: {
+      auto res = moqFrameParser_.parseNamespace(cursor, curFrameLength_);
+      if (res) {
+        if (callback_) {
+          callback_->onNamespace(std::move(res.value()));
         }
-        break;
-      } else if (getDraftMajorVersion(*moqFrameParser_.getVersion()) > 14) {
-        XLOG(ERR) << "Old frame type=" << folly::to_underlying(curFrameType_);
-        return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+      } else {
+        return folly::makeUnexpected(res.error());
       }
-      [[fallthrough]];
+      break;
+    }
     // case FrameType::SUBSCRIBE_ERROR:
     case FrameType::REQUEST_ERROR: {
       auto res = moqFrameParser_.parseRequestError(
@@ -729,11 +723,9 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       break;
     }
     case FrameType::SUBSCRIBE_NAMESPACE_OK:
-      if (getDraftMajorVersion(*moqFrameParser_.getVersion()) > 14) {
-        XLOG(ERR) << "Old frame type=" << folly::to_underlying(curFrameType_);
-        return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-      }
-      [[fallthrough]];
+    case FrameType::UNSUBSCRIBE_NAMESPACE:
+      XLOG(ERR) << "Old frame type=" << folly::to_underlying(curFrameType_);
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     // case FrameType::PUBLISH_NAMESPACE_OK:
     case FrameType::REQUEST_OK: {
       auto res = moqFrameParser_.parseRequestOk(
@@ -807,18 +799,6 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       }
       break;
     }
-    case FrameType::UNSUBSCRIBE_NAMESPACE: {
-      auto res =
-          moqFrameParser_.parseUnsubscribeNamespace(cursor, curFrameLength_);
-      if (res) {
-        if (callback_) {
-          callback_->onUnsubscribeNamespace(std::move(res.value()));
-        }
-      } else {
-        return folly::makeUnexpected(res.error());
-      }
-      break;
-    }
     case FrameType::TRACK_STATUS: {
       auto res = moqFrameParser_.parseTrackStatus(cursor, curFrameLength_);
       if (res) {
@@ -831,29 +811,11 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       }
       break;
     }
-    case FrameType::TRACK_STATUS_OK: { // same value as
-                                       // FrameType::NAMESPACE_DONE
-      // Version > 14: TRACK_STATUS_OK is deprecated, use REQUEST_OK
-      if (getDraftMajorVersion(*moqFrameParser_.getVersion()) >= 16) {
-        auto res = moqFrameParser_.parseNamespaceDone(cursor, curFrameLength_);
-        if (res) {
-          if (callback_) {
-            callback_->onNamespaceDone(std::move(res.value()));
-          }
-        } else {
-          return folly::makeUnexpected(res.error());
-        }
-        break;
-      } else if (getDraftMajorVersion(*moqFrameParser_.getVersion()) > 14) {
-        XLOG(ERR) << "Received deprecated TRACK_STATUS_OK frame in version="
-                  << getDraftMajorVersion(*moqFrameParser_.getVersion());
-        return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-      }
-
-      auto res = moqFrameParser_.parseTrackStatusOk(cursor, curFrameLength_);
+    case FrameType::NAMESPACE_DONE: {
+      auto res = moqFrameParser_.parseNamespaceDone(cursor, curFrameLength_);
       if (res) {
         if (callback_) {
-          callback_->onTrackStatusOk(std::move(res.value()));
+          callback_->onNamespaceDone(std::move(res.value()));
         }
       } else {
         return folly::makeUnexpected(res.error());

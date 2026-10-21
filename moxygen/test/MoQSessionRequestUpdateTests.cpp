@@ -396,6 +396,78 @@ CO_TEST_P_X(MoQSessionTest, SubscribeRequestUpdateFilterSuccess) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
+// Each REQUEST_UPDATE takes a request ID of its own and must give it back,
+// or a subscriber that updates more often than its initial credit allows is
+// closed with TOO_MANY_REQUESTS.
+CO_TEST_P_X(PreDraft18Test, RequestUpdateRetiresItsRequestID) {
+  co_await setupMoQSession();
+  std::shared_ptr<MockSubscriptionHandle> mockSubscriptionHandle = nullptr;
+  std::shared_ptr<TrackConsumer> trackConsumer = nullptr;
+  expectPublishDone();
+  expectSubscribe(
+      [&mockSubscriptionHandle, &trackConsumer](
+          auto sub, auto pub) -> TaskSubscribeResult {
+        trackConsumer = pub;
+        mockSubscriptionHandle =
+            std::make_shared<MockSubscriptionHandle>(SubscribeOk{
+                sub.requestID,
+                TrackAlias(sub.requestID.value),
+                std::chrono::milliseconds(0),
+                GroupOrder::OldestFirst,
+                AbsoluteLocation{0, 0}, // largest object
+            });
+        co_return mockSubscriptionHandle;
+      });
+
+  auto subscribeRequest = getSubscribe(kTestTrackName);
+  auto res =
+      co_await clientSession_->subscribe(subscribeRequest, subscribeCallback_);
+  auto subscribeHandler = res.value();
+  auto maxRequestIDAfterSubscribe = serverSession_->maxRequestID();
+
+  // Three times the whole initial credit.
+  const size_t kUpdates = 3 * kTestMaxRequestID;
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate())
+      .Times(kUpdates);
+  EXPECT_CALL(*serverPublisherStatsCallback_, onRequestUpdate())
+      .Times(kUpdates);
+  size_t handled = 0;
+  EXPECT_CALL(*mockSubscriptionHandle, requestUpdateCalled)
+      .Times(kUpdates)
+      .WillRepeatedly([&handled](const auto&) { ++handled; });
+  EXPECT_CALL(*mockSubscriptionHandle, requestUpdateResult)
+      .WillRepeatedly(
+          testing::Return(RequestOk{.requestID = subscribeRequest.requestID}));
+  for (size_t i = 0; i < kUpdates; ++i) {
+    SubscribeUpdate update;
+    // start and endGroup are required before draft 15.
+    update.start = AbsoluteLocation{0, 0};
+    update.endGroup = 0;
+    update.priority = kDefaultPriority;
+    update.forward = true;
+    auto updateRes = co_await subscribeHandler->requestUpdate(update);
+    if (updateRes.hasError()) {
+      break;
+    }
+  }
+  // Bounded rather than a baton: without the fix the server closes the
+  // session and the remaining updates never arrive.
+  for (int i = 0; i < 100 && handled < kUpdates; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  EXPECT_EQ(handled, kUpdates);
+  EXPECT_GT(serverSession_->maxRequestID(), maxRequestIDAfterSubscribe);
+  if (handled < kUpdates) {
+    clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+    co_return;
+  }
+
+  trackConsumer->publishDone(
+      getTrackEndedPublishDone(subscribeRequest.requestID));
+  co_await publishDone_;
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 // Test that missing filter fields in SubscribeUpdate preserve existing values
 CO_TEST_P_X(
     MoQSessionTest,
@@ -1569,6 +1641,59 @@ CO_TEST_P_X(Draft18Test, FetchRequestUpdateCoalescesCumulatively) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
+// A REQUEST_UPDATE before FETCH_OK fails and tears down the fetch while the
+// application's fetch handler is still running. The session then cancels the
+// handle that the handler returns and does not send FETCH_OK.
+CO_TEST_P_X(Draft18Test, FetchRequestUpdateBeforeFetchOkCancelsHandler) {
+  co_await setupMoQSession();
+
+  folly::coro::Baton serverSawFetch;
+  folly::coro::Baton releaseHandler;
+  std::optional<RequestID> fetchRequestID;
+  std::shared_ptr<MockFetchHandle> serverHandle;
+  bool serverSawFetchCancel = false;
+  EXPECT_CALL(*serverPublisher, fetch(_, _))
+      .WillOnce([&](Fetch fetch, auto /*pub*/) -> TaskFetchResult {
+        fetchRequestID = fetch.requestID;
+        serverSawFetch.post();
+        co_await releaseHandler;
+        serverHandle = makeFetchOkResult(fetch, AbsoluteLocation{0, 0});
+        EXPECT_CALL(*serverHandle, fetchCancel()).WillRepeatedly([&] {
+          serverSawFetchCancel = true;
+        });
+        co_return serverHandle;
+      });
+  EXPECT_CALL(*serverPublisherStatsCallback_, onRequestUpdate());
+
+  auto fetchFut =
+      folly::coro::co_withExecutor(
+          &eventBase_,
+          clientSession_->fetch(getFetch({0, 0}, {0, 1}), fetchCallback_))
+          .start()
+          .via(&eventBase_);
+  co_await serverSawFetch;
+
+  auto* cb =
+      static_cast<MoQControlCodec::ControlCallback*>(serverSession_.get());
+  RequestUpdate update;
+  update.existingRequestID = *fetchRequestID;
+  update.requestID = RequestID(getRequestIDMultiplier());
+  update.priority = kDefaultPriority + 1;
+  cb->onRequestUpdate(std::move(update));
+  co_await rescheduleN(5);
+
+  releaseHandler.post();
+  auto fetchRes = co_await std::move(fetchFut);
+  EXPECT_TRUE(fetchRes.hasError());
+  co_await rescheduleN(5);
+
+  EXPECT_TRUE(serverSawFetchCancel);
+  if (serverHandle) {
+    testing::Mock::VerifyAndClearExpectations(serverHandle.get());
+  }
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, FetchRequestUpdateNotSupported) {
   co_await setupMoQSession();
   std::shared_ptr<MockFetchHandle> mockFetchHandle = nullptr;
@@ -1882,11 +2007,6 @@ class OutOfOrderFetchRequestUpdateHandle : public MockFetchHandle {
 // runs while requestUpdate is suspended, session_ is nulled but handle_ is
 // not, so there is no existing guard.
 CO_TEST_P_X(MoQSessionTest, FetchRequestUpdateNullSessionAfterAwait) {
-  // This test only applies to v16+ which supports fetch REQUEST_UPDATE.
-  if (getDraftMajorVersion(getServerSelectedVersion()) < 16) {
-    co_return;
-  }
-
   co_await setupMoQSession();
   std::shared_ptr<SuspendingFetchHandle> suspendingHandle;
   std::shared_ptr<FetchConsumer> heldFetchConsumer;
@@ -2380,10 +2500,6 @@ CO_TEST_P_X(Draft18Test, SubscribeNamespaceRequestUpdatePrefixRoundTrip) {
 CO_TEST_P_X(PreDraft18Test, SubscribeNamespaceRequestUpdateRoundTrip) {
   co_await setupMoQSession();
   const auto version = *clientSession_->getNegotiatedVersion();
-  if (getDraftMajorVersion(version) < 16) {
-    // REQUEST_UPDATE for SUBSCRIBE_NAMESPACE only exists at draft 16+.
-    co_return;
-  }
 
   std::shared_ptr<MockSubscribeNamespaceHandle> serverHandle;
   RequestID serverRequestID{0};
@@ -2425,6 +2541,64 @@ CO_TEST_P_X(PreDraft18Test, SubscribeNamespaceRequestUpdateRoundTrip) {
   auto updateResult = co_await handle->requestUpdate(std::move(update));
   co_await updateHandled;
   EXPECT_TRUE(updateResult.hasValue());
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// The relay session handles namespace updates itself and must retire their
+// request IDs too.
+CO_TEST_P_X(
+    PreDraft18Test,
+    SubscribeNamespaceRequestUpdateRetiresItsRequestID) {
+  co_await setupMoQSession();
+  const auto version = *clientSession_->getNegotiatedVersion();
+
+  std::shared_ptr<MockSubscribeNamespaceHandle> serverHandle;
+  RequestID serverRequestID{0};
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillOnce(
+          [&](auto subNs, auto /*handler*/)
+              -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+            serverRequestID = subNs.requestID;
+            serverHandle = std::make_shared<MockSubscribeNamespaceHandle>(
+                SubscribeNamespaceOk(
+                    {.requestID = subNs.requestID,
+                     .requestSpecificParams = {}}));
+            co_return serverHandle;
+          });
+
+  auto subNsResult = co_await clientSession_->subscribeNamespace(
+      getSubscribeNamespace(), nullptr);
+  EXPECT_FALSE(subNsResult.hasError());
+  if (subNsResult.hasError()) {
+    co_return;
+  }
+  auto handle = subNsResult.value();
+  auto maxRequestIDAfterSubscribe = serverSession_->maxRequestID();
+
+  const size_t kUpdates = 3 * kTestMaxRequestID;
+  EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate())
+      .Times(testing::AtMost(kUpdates));
+  size_t handled = 0;
+  EXPECT_CALL(*serverHandle, requestUpdateCalled(_))
+      .WillRepeatedly([&handled](const RequestUpdate&) { ++handled; });
+  EXPECT_CALL(*serverHandle, requestUpdateResult())
+      .WillRepeatedly(testing::Return(RequestOk{.requestID = serverRequestID}));
+  for (size_t i = 0; i < kUpdates; ++i) {
+    RequestUpdate update;
+    update.params.setMajorVersion(getDraftMajorVersion(version));
+    update.priority = kDefaultPriority;
+    update.forward = true;
+    auto updateRes = co_await handle->requestUpdate(std::move(update));
+    if (updateRes.hasError()) {
+      break;
+    }
+  }
+  for (int i = 0; i < 100 && handled < kUpdates; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  EXPECT_EQ(handled, kUpdates);
+  EXPECT_GT(serverSession_->maxRequestID(), maxRequestIDAfterSubscribe);
 
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
@@ -2808,10 +2982,6 @@ CO_TEST_P_X(Draft18Test, SubscribeTracksRequestUpdateFailureClosesBidi) {
 CO_TEST_P_X(PreDraft18Test, SubscribeNamespaceRequestUpdateNormalizesErrorID) {
   co_await setupMoQSession();
   const auto version = *clientSession_->getNegotiatedVersion();
-  if (getDraftMajorVersion(version) < 16) {
-    // REQUEST_UPDATE for SUBSCRIBE_NAMESPACE only exists at draft 16+.
-    co_return;
-  }
 
   std::shared_ptr<MockSubscribeNamespaceHandle> serverHandle;
   EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))

@@ -273,8 +273,4 @@ TEST_F(SetupExtensionsTest, ShippedTableNegotiatesRelayHops) {
   auto draft17 =
       MoQSession::computeNegotiatedExtensions(both, both, kVersionDraft17);
   EXPECT_TRUE(draft17.has(SetupExtension::RelayHops));
-
-  auto draft15 =
-      MoQSession::computeNegotiatedExtensions(both, both, kVersionDraft15);
-  EXPECT_FALSE(draft15.has(SetupExtension::RelayHops));
 }

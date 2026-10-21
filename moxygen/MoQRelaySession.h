@@ -148,7 +148,7 @@ class MoQRelaySession : public MoQSession {
       RequestUpdate requestUpdate,
       std::shared_ptr<Publisher::SubscribeTracksHandle> subscribeTracksHandle);
 
-  // Draft 16+: send a REQUEST_UPDATE for a locally-initiated
+  // Sends a REQUEST_UPDATE for a locally-initiated
   // SUBSCRIBE_NAMESPACE (or SUBSCRIBE_TRACKS) and await the REQUEST_OK /
   // REQUEST_ERROR. Draft 18+ sends it on the subscription's own bidi request
   // stream (correlated FIFO via the stream's responseIDQueue); pre-18 there are
@@ -171,7 +171,6 @@ class MoQRelaySession : public MoQSession {
   void subscribeNamespaceOk(
       const SubscribeNamespaceOk& saOk,
       std::shared_ptr<SubNSReply>&& subNsReply);
-  void unsubscribeNamespace(const UnsubscribeNamespace& unsubNs);
 
   // Draft 18+: SUBSCRIBE_TRACKS handling.
   folly::coro::Task<void> handleSubscribeTracks(
@@ -222,7 +221,6 @@ class MoQRelaySession : public MoQSession {
 
   // PublishNamespace-specific types (moved from base class)
   struct PendingPublishNamespace {
-    TrackNamespace trackNamespace;
     folly::coro::Promise<
         folly::Expected<PublishNamespaceOk, PublishNamespaceError>>
         promise;
@@ -257,18 +255,6 @@ class MoQRelaySession : public MoQSession {
       std::shared_ptr<Publisher::SubscribeTracksHandle>,
       RequestID::hash>
       subscribeTracksHandles_;
-
-  // Legacy TrackNamespace → RequestID translation maps.
-  // Remove these once we drop support for the respective legacy versions.
-  // legacyPublisherPublishNamespaceNsToReqId_: v15- (publisher side)
-  // legacySubscriberPublishNamespaceNsToReqId_: v15- (subscriber side)
-  // legacySubscribeNamespaceNsToReqId_: v14- (subscribe namespace)
-  folly::F14FastMap<TrackNamespace, RequestID, TrackNamespace::hash>
-      legacyPublisherNamespaceToReqId_;
-  folly::F14FastMap<TrackNamespace, RequestID, TrackNamespace::hash>
-      legacySubscriberNamespaceToReqId_;
-  folly::F14FastMap<TrackNamespace, RequestID, TrackNamespace::hash>
-      legacySubscribeNamespaceToReqId_;
 
   // Extended PendingRequestState for publishNamespace support
   class MoQRelayPendingRequestState;

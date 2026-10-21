@@ -125,7 +125,7 @@ class MoQRelay : public Publisher,
     // Helper to check if THIS node (excluding children) has content
     bool hasLocalSessions() const {
       return !publishes.empty() || !sessions.empty() ||
-          !namespacesPublished.empty() || sourceSession != nullptr;
+          sourceSession != nullptr;
     }
 
     // Check if node should be kept (has content OR non-empty children)
@@ -144,8 +144,7 @@ class MoQRelay : public Publisher,
     struct NamespaceSubscriberInfo {
       bool forward{true};
       SubscribeNamespaceOptions options{SubscribeNamespaceOptions::BOTH};
-      // Handle for sending NAMESPACE / NAMESPACE_DONE on the bidi stream
-      // (draft 16+). Null for draft <= 15.
+      // Handle for sending NAMESPACE / NAMESPACE_DONE on the bidi stream.
       std::shared_ptr<Publisher::NamespacePublishHandle> namespacePublishHandle;
       // Draft 18+ only: handle for SUBSCRIBE_TRACKS response-stream followups.
       std::shared_ptr<Publisher::PublishBlockedHandle> publishBlockedHandle;
@@ -159,11 +158,6 @@ class MoQRelay : public Publisher,
     // Sessions with a SUBSCRIBE_NAMESPACE here, with their preferences
     folly::F14FastMap<std::shared_ptr<MoQSession>, NamespaceSubscriberInfo>
         sessions;
-    // All active PUBLISH_NAMESPACEs for this node (includes prefix sessions)
-    folly::F14FastMap<
-        std::shared_ptr<MoQSession>,
-        std::shared_ptr<PublishNamespaceHandle>>
-        namespacesPublished;
     // The session that PUBLISH_NAMESPACEd this node
     std::shared_ptr<MoQSession> sourceSession;
     std::shared_ptr<PublishNamespaceCallback> publishNamespaceCallback;
@@ -292,11 +286,6 @@ class MoQRelay : public Publisher,
   void forwardChanged(MoQForwarder* forwarder) override;
   void newGroupRequested(MoQForwarder* forwarder, uint64_t group) override;
 
-  folly::coro::Task<void> publishNamespaceToSession(
-      std::shared_ptr<MoQSession> session,
-      PublishNamespace pubNs,
-      std::shared_ptr<NamespaceNode> nodePtr);
-
   folly::coro::Task<void> publishToSession(
       std::shared_ptr<MoQSession> session,
       std::shared_ptr<MoQForwarder> forwarder,
@@ -322,7 +311,7 @@ class MoQRelay : public Publisher,
 
   // Namespace-tree analog of publishExistingMatchingTracks: replays existing
   // PUBLISH_NAMESPACEs and matching PUBLISHes under `prefix` to a
-  // SUBSCRIBE_NAMESPACE subscriber, honoring `options` and draft version.
+  // SUBSCRIBE_NAMESPACE subscriber, honoring `options`.
   // Tracks/namespaces under `skipUnderPrefix` are skipped -- already delivered
   // via a prior prefix. Used by the initial SUBSCRIBE_NAMESPACE (no skip) and
   // by REQUEST_UPDATE prefix moves (skip the outgoing prefix's subtree).
@@ -333,8 +322,6 @@ class MoQRelay : public Publisher,
       SubscribeNamespaceOptions options,
       const std::shared_ptr<Publisher::NamespacePublishHandle>&
           namespacePublishHandle,
-      RequestID requestID,
-      uint64_t negotiatedVersion,
       const TrackNamespace* skipUnderPrefix = nullptr);
 
   void publishBlockedToTracksSubscriber(

@@ -178,8 +178,7 @@ class OpenMOQServerTest : public ::testing::Test {
 
 } // namespace
 
-// Without a MoQT protocol to offer, the server cannot negotiate one, and
-// in-band SETUP is only for a server that offers draft 14.
+// Without a MoQT protocol to offer, the server cannot negotiate one.
 TEST_F(OpenMOQServerTest, NoProtocolsRejectsConnectWithoutProtocolHeader) {
   EXPECT_EQ(connectStatus({}), 400);
 }
