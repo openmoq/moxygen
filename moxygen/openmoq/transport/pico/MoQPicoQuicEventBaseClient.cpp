@@ -283,9 +283,13 @@ void MoQPicoQuicEventBaseClient::onConnectionReady(void* vcnx) {
   webTransport->setHandler(moqSession.get());
 
   const char* alpn = picoquic_tls_get_negotiated_alpn(cnx);
-  if (alpn) {
-    XLOG(DBG1) << "Negotiated ALPN: " << alpn;
-    moqSession->validateAndSetVersionFromAlpn(alpn);
+  XLOG(DBG1) << "Negotiated ALPN: " << (alpn ? alpn : "(null)");
+  if (!alpn || !moqSession->validateAndSetVersionFromAlpn(alpn)) {
+    picoquic_close(
+        cnx,
+        folly::to_underlying(
+            SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED));
+    return;
   }
 
   // Switch callback_ctx from `this` to a PicoConnectionContext so subsequent
@@ -313,8 +317,7 @@ void MoQPicoQuicEventBaseClient::onConnectionReady(void* vcnx) {
           (void)serverSetup;
           auto negotiatedVersion = moqSession->getNegotiatedVersion();
           XLOG(DBG1) << "MoQ SETUP complete, negotiated draft-"
-                     << getDraftMajorVersion(
-                            negotiatedVersion.value_or(kVersionDraftCurrent));
+                     << getDraftMajorVersion(*negotiatedVersion);
         } catch (const std::exception& ex) {
           XLOG(ERR) << "MoQ SETUP failed: " << ex.what();
           co_return;

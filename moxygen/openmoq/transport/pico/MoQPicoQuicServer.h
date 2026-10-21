@@ -20,7 +20,7 @@ namespace moxygen {
  * For an EventBase-integrated alternative see MoQPicoQuicEventBaseServer.
  *
  * Supports two connection modes (configured via PicoWebTransportConfig):
- * - Raw MoQ: Direct MoQ over QUIC (ALPN: moqt-16, moqt-15, moq-00)
+ * - Raw MoQ: Direct MoQ over QUIC (ALPN: moqt-16, moqt-18)
  * - WebTransport: MoQ over WebTransport over HTTP/3 (ALPN: h3)
  */
 class MoQPicoQuicServer : public MoQPicoServerBase {

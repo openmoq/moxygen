@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <moxygen/MoQVersions.h>
+
 #include <cstring>
 #include <optional>
 
@@ -15,7 +17,7 @@ namespace moxygen {
  * Protocol types supported by the picoquic MOQT server.
  */
 enum class PicoProtocolType {
-  Quic,          // MOQT over QUIC transport (ALPN: moqt-16, moqt-15, moq-00)
+  Quic,          // MOQT over QUIC transport (ALPN: moqt-16, moqt-18)
   WebTransportH3 // MOQT over WebTransport over HTTP/3 (ALPN: h3)
 };
 
@@ -54,21 +56,10 @@ class PicoProtocolDispatcher {
   }
 
   /**
-   * Check if ALPN indicates QUIC transport (not HTTP/3).
+   * Check if ALPN names a supported MoQT version over QUIC (not HTTP/3).
    */
   static bool isQuic(const char* alpn) {
-    if (!alpn) {
-      return false;
-    }
-    // moqt-NN format (e.g., moqt-16, moqt-15)
-    if (strncmp(alpn, "moqt-", 5) == 0) {
-      return true;
-    }
-    // Legacy moq-00 format
-    if (strcmp(alpn, "moq-00") == 0) {
-      return true;
-    }
-    return false;
+    return alpn && getVersionFromAlpn(alpn).has_value();
   }
 
   /**

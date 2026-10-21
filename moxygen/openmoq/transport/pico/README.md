@@ -138,7 +138,7 @@ provides shared functionality for both transport variants:
 
 | ALPN | Protocol | WebTransport Adapter |
 |------|----------|---------------------|
-| `moqt-16`, `moqt-15`, etc. | QUIC transport | `PicoQuicWebTransport` |
+| `moqt-16`, `moqt-18` | QUIC transport | `PicoQuicWebTransport` |
 | `h3` | HTTP/3 WebTransport | `PicoH3WebTransport` |
 
 ALPN preference order: MOQT ALPNs first (preferred for non-browser clients),

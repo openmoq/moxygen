@@ -26,7 +26,7 @@ DEFINE_string(track_name, "", "Track name");
 DEFINE_string(
     versions,
     "",
-    "Comma-separated MoQ draft versions (e.g. \"14,16\"). Empty = all supported.");
+    "Comma-separated MoQ draft versions (e.g. \"16,18\"). Empty = all supported.");
 DEFINE_string(
     cert_root,
     "",

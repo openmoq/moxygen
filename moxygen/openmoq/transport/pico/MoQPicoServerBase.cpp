@@ -484,13 +484,10 @@ void MoQPicoServerBase::onNewConnectionImpl(void* vcnx) {
   }
   webTransport->setHandler(moqSession.get());
 
+  // picoCallback calls this only for an ALPN that names a supported version.
   const char* alpn = picoquic_tls_get_negotiated_alpn(cnx);
-  if (alpn) {
-    XLOG(DBG1) << "Setting MOQT version from negotiated ALPN: " << alpn;
-    moqSession->validateAndSetVersionFromAlpn(alpn);
-  } else {
-    XLOG(WARN) << "No ALPN was negotiated for connection";
-  }
+  XLOG(DBG1) << "Setting MOQT version from negotiated ALPN: " << alpn;
+  XCHECK(moqSession->validateAndSetVersionFromAlpn(alpn));
 
   auto* ctx = new PicoConnectionContext{
       .webTransport = webTransport, .moqSession = moqSession};
@@ -580,7 +577,7 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
   // Negotiate MOQT version via WebTransport protocol negotiation.
   // The client sends wt-available-protocols, we select from our supported
   // versions. Note: picowt_select_wt_protocol expects ALPN format (e.g.
-  // "moqt-16, moqt-15") not draft numbers, so we convert versions_ first.
+  // "moqt-18, moqt-16") not draft numbers, so we convert versions_ first.
   auto alpnProtocols = getMoqtProtocols(versions_, /*useStandard=*/true);
   std::string alpnList = folly::join(", ", alpnProtocols);
 

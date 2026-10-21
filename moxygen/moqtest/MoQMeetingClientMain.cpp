@@ -35,7 +35,7 @@ DEFINE_string(
 DEFINE_string(
     versions,
     "",
-    "Comma-separated MoQ draft versions (e.g. '14,16'). Empty = all supported.");
+    "Comma-separated MoQ draft versions (e.g. '16,18'). Empty = all supported.");
 DEFINE_uint32(num_threads, 1, "Number of client threads");
 DEFINE_uint32(duration, 60, "Test duration in seconds");
 DEFINE_uint32(participants, 5, "Participants per meeting");
