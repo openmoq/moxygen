@@ -23,7 +23,7 @@ DEFINE_int32(port, 9668, "Relay Server Port");
 DEFINE_string(
     versions,
     "",
-    "Comma-separated MOQT draft versions (e.g. \"14,16\"). Empty = all supported.");
+    "Comma-separated MOQT draft versions (e.g. \"16,18\"). Empty = all supported.");
 DEFINE_int32(
     max_cached_tracks,
     100,

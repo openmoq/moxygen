@@ -1869,9 +1869,6 @@ CO_TEST_P_X(MoQSessionTest, RequestUpdateAfterPublishDone) {
 // A subscriber's REQUEST_UPDATE that is never sent must fail at once. Waiting
 // for a reply that cannot arrive holds the handle and the session forever.
 CO_TEST_P_X(MoQSessionTest, SubscriberRequestUpdateAfterPublishDoneFails) {
-  if (getDraftMajorVersion(getServerSelectedVersion()) < 15) {
-    co_return;
-  }
   co_await setupMoQSession();
   std::shared_ptr<TrackConsumer> trackConsumer = nullptr;
   expectPublishDone();
@@ -1905,9 +1902,6 @@ CO_TEST_P_X(MoQSessionTest, SubscriberRequestUpdateAfterPublishDoneFails) {
 }
 
 CO_TEST_P_X(MoQSessionTest, SubscriberRequestUpdateAfterCloseFails) {
-  if (getDraftMajorVersion(getServerSelectedVersion()) < 15) {
-    co_return;
-  }
   co_await setupMoQSession();
   EXPECT_CALL(*subscribeCallback_, publishDone(_))
       .WillOnce(testing::Return(folly::unit));
