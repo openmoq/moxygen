@@ -8267,8 +8267,10 @@ const std::vector<SetupExtensionDescriptor>& MoQSession::kSetupExtensions() {
        [](const SetupParameters& local,
           const SetupParameters& peer,
           uint64_t version) {
-         return local.hasParam(folly::to_underlying(SetupKey::RELAY_HOPS)) &&
-             peer.hasParam(folly::to_underlying(SetupKey::RELAY_HOPS));
+         const auto draft = getDraftMajorVersion(version);
+         return draft >= 18 &&
+             local.hasParam(folly::to_underlying(SetupKey::HOP_ID)) &&
+             peer.hasParam(folly::to_underlying(SetupKey::HOP_ID));
        }}};
   return kExtensions;
 }
@@ -8303,6 +8305,22 @@ void MoQSession::onSetupParams(SetupParameters params, bool local) {
       *localSetupParams_, *peerSetupParams_, *negotiatedVersion_);
   moqFrameWriter_.setNegotiatedExtensions(negotiatedExtensions_);
   controlCodec_->setNegotiatedExtensions(negotiatedExtensions_);
+}
+
+uint64_t MoQSession::getPeerHopID() const noexcept {
+  if (!negotiatedExtensions_.has(SetupExtension::RelayHops)) {
+    return kMoQClusterAnonHopId;
+  }
+  return peerSetupParams_->getFirstParam(SetupKey::HOP_ID)->asUint64;
+}
+
+uint64_t MoQSession::getRelayLinkCost() const noexcept {
+  if (!negotiatedExtensions_.has(SetupExtension::RelayHops)) {
+    return 1;
+  }
+  // Each endpoint prices its own egress; this is the peer's advertised cost.
+  const auto* cost = peerSetupParams_->getFirstParam(SetupKey::RELAY_COST);
+  return cost ? cost->asUint64 : 1;
 }
 
 /*static*/
