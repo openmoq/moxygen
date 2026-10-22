@@ -291,10 +291,14 @@ TEST(MoQPicoQuicShardedServerTest, SessionExecutorOutlivesStop) {
 TEST(MoQPicoQuicShardedServerTest, WebTransportConnectCreatesSession) {
   auto certs = makeSelfSignedCert();
   auto port = pickFreeUdpPort();
-  folly::ScopedEventBaseThread clientThread("client");
-  auto* clientEvb = clientThread.getEventBase();
+  // loop() returns once the client's H3 connection finishes closing, which
+  // needs the server still running.
+  folly::EventBase evb;
+  auto* clientEvb = &evb;
+  auto keepAlive = folly::getKeepAliveToken(evb);
+  std::thread clientThread([&] { evb.loop(); });
 
-  auto server = std::make_shared<TestShardedServer>(
+  auto server = std::make_unique<TestShardedServer>(
       certs->cert,
       certs->key,
       kEndpoint,
@@ -313,18 +317,21 @@ TEST(MoQPicoQuicShardedServerTest, WebTransportConnectCreatesSession) {
         std::make_shared<MoQFollyExecutorImpl>(clientEvb),
         proxygen::URL(fmt::format("https://localhost:{}{}", port, kEndpoint)),
         std::make_shared<InsecureVerifierDangerousDoNotUseInProduction>());
+    // The timeout cancels and awaits setup, so it cannot outlive the client.
     setup = folly::coro::co_withExecutor(
                 clientEvb,
-                client->setupMoQSession(
-                    std::chrono::seconds(10),
-                    std::chrono::seconds(3),
-                    nullptr,
-                    nullptr,
-                    transportSettings,
-                    alpns))
+                folly::coro::timeout(
+                    client->setupMoQSession(
+                        std::chrono::seconds(10),
+                        std::chrono::seconds(3),
+                        nullptr,
+                        nullptr,
+                        transportSettings,
+                        alpns),
+                    std::chrono::seconds(15)))
                 .start();
   });
-  auto result = std::move(setup).getTry(std::chrono::seconds(15));
+  auto result = std::move(setup).getTry();
   EXPECT_TRUE(result.hasValue()) << result.exception().what();
   if (result.hasValue()) {
     EXPECT_TRUE(
@@ -334,6 +341,8 @@ TEST(MoQPicoQuicShardedServerTest, WebTransportConnectCreatesSession) {
   }
 
   clientEvb->runInEventBaseThreadAndWait([&] { client.reset(); });
+  keepAlive.reset();
+  clientThread.join();
   server->stop();
 }
 
