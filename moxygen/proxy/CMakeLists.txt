@@ -26,15 +26,53 @@ moxygen_add_library(moxygen_proxy_moq_webtransport_bootstrap_handler
     Folly::folly_coro_task
 )
 
+moxygen_add_library(moxygen_proxy_moq_group_cache
+  SRCS
+    MoQGroupCache.cpp
+  DEPS
+    moxygen_proxy_cache_moq_prior_gap_ranges
+    Folly::folly_cpp_attributes
+    Folly::folly_logging_logging
+  EXPORTED_DEPS
+    moxygen_moq_types
+    moxygen_proxy_cache_moq_cache_budget
+    moxygen_proxy_cache_moq_cache_types
+    moxygen_proxy_cache_moq_cached_group
+    moxygen_proxy_cache_moq_id_intervals
+    Folly::folly_function
+)
+
+moxygen_add_library(moxygen_proxy_moq_join_replay
+  SRCS
+    MoQJoinReplay.cpp
+  DEPS
+    Folly::folly_coro_current_executor
+    Folly::folly_coro_detach_on_cancel
+    Folly::folly_coro_future_util
+    Folly::folly_coro_timeout
+    Folly::folly_logging_logging
+    Folly::folly_scope_guard
+  EXPORTED_DEPS
+    moxygen_moq
+    moxygen_moq_consumers
+    moxygen_proxy_moq_group_cache
+    Folly::folly_cancellation_token
+    Folly::folly_coro_task
+    Folly::folly_futures_core
+)
+
 moxygen_add_library(moxygen_proxy_moq_proxy_track
   SRCS
     MoQProxyTrack.cpp
   DEPS
+    moxygen_moq_location
     moxygen_relay_moq_forwarder
     Folly::folly_coro_result
+    Folly::folly_scope_guard
     fmt::fmt
   EXPORTED_DEPS
     moxygen_moq
+    moxygen_proxy_moq_group_cache
     moxygen_proxy_moq_upstream_provider
     Folly::folly_coro_shared_promise
     Folly::folly_coro_task
@@ -44,9 +82,21 @@ moxygen_add_library(moxygen_proxy_moq_proxy_track
 moxygen_add_library(moxygen_proxy_moq_proxy
   SRCS
     MoQProxy.cpp
+  DEPS
+    moxygen_moq_consumers
+    moxygen_proxy_moq_join_replay
+    Folly::folly_coro_current_executor
+    Folly::folly_coro_invoke
+    Folly::folly_coro_result
+    Folly::folly_coro_with_cancellation
   EXPORTED_DEPS
     moxygen_moq
+    moxygen_proxy_moq_group_cache
     moxygen_proxy_moq_proxy_track
     moxygen_proxy_moq_upstream_provider
+    Folly::folly_cancellation_token
     Folly::folly_container_f14_hash
+    Folly::folly_futures_core
 )
+
+add_subdirectory(cache)

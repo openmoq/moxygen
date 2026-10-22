@@ -23,6 +23,7 @@ moxygen_add_test(TARGET MoQPicoQuicShardedServerTests
   DEPENDS
     openmoq_pico_evb_sharded_server_transport
     moxygen_moqclient
+    moxygen_moq_webtransport_client
     moxygen_util_insecure_verifier_dangerous_do_not_use_in_production
     OpenSSL::Crypto
     Folly::folly_coro_blocking_wait
