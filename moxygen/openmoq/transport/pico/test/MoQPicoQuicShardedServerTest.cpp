@@ -291,10 +291,14 @@ TEST(MoQPicoQuicShardedServerTest, SessionExecutorOutlivesStop) {
 TEST(MoQPicoQuicShardedServerTest, WebTransportConnectCreatesSession) {
   auto certs = makeSelfSignedCert();
   auto port = pickFreeUdpPort();
-  folly::ScopedEventBaseThread clientThread("client");
-  auto* clientEvb = clientThread.getEventBase();
+  // loop() returns once the client's H3 connection finishes closing, which
+  // needs the server still running.
+  folly::EventBase evb;
+  auto* clientEvb = &evb;
+  auto keepAlive = folly::getKeepAliveToken(evb);
+  std::thread clientThread([&] { evb.loop(); });
 
-  auto server = std::make_shared<TestShardedServer>(
+  auto server = std::make_unique<TestShardedServer>(
       certs->cert,
       certs->key,
       kEndpoint,
@@ -334,6 +338,8 @@ TEST(MoQPicoQuicShardedServerTest, WebTransportConnectCreatesSession) {
   }
 
   clientEvb->runInEventBaseThreadAndWait([&] { client.reset(); });
+  keepAlive.reset();
+  clientThread.join();
   server->stop();
 }
 
