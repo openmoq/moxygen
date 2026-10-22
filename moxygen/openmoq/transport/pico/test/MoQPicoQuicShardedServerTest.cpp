@@ -18,6 +18,7 @@
 #include <moxygen/MoQClient.h>
 #include <moxygen/MoQSession.h>
 #include <moxygen/MoQVersions.h>
+#include <moxygen/MoQWebTransportClient.h>
 #include <moxygen/ObjectReceiver.h>
 #include <moxygen/Publisher.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
@@ -284,6 +285,56 @@ TEST(MoQPicoQuicShardedServerTest, SessionExecutorOutlivesStop) {
   sessionExecutor->add([ran] { ran->post(); });
   EXPECT_TRUE(ran->try_wait_for(std::chrono::seconds(5)));
   server.reset();
+}
+
+// An HTTP/3 WebTransport CONNECT to a WT endpoint gets a MoQ session.
+TEST(MoQPicoQuicShardedServerTest, WebTransportConnectCreatesSession) {
+  auto certs = makeSelfSignedCert();
+  auto port = pickFreeUdpPort();
+  folly::ScopedEventBaseThread clientThread("client");
+  auto* clientEvb = clientThread.getEventBase();
+
+  auto server = std::make_shared<TestShardedServer>(
+      certs->cert,
+      certs->key,
+      kEndpoint,
+      "",
+      PicoTransportConfig{},
+      PicoWebTransportConfig{
+          .enableWebTransport = true, .wtEndpoints = {kEndpoint}});
+  server->start(folly::SocketAddress("::", port));
+
+  const quic::TransportSettings transportSettings;
+  const auto alpns = getMoqtProtocols("16", /*useStandard=*/true);
+  std::unique_ptr<MoQWebTransportClient> client;
+  folly::SemiFuture<folly::Unit> setup = folly::makeSemiFuture();
+  clientEvb->runInEventBaseThreadAndWait([&] {
+    client = std::make_unique<MoQWebTransportClient>(
+        std::make_shared<MoQFollyExecutorImpl>(clientEvb),
+        proxygen::URL(fmt::format("https://localhost:{}{}", port, kEndpoint)),
+        std::make_shared<InsecureVerifierDangerousDoNotUseInProduction>());
+    setup = folly::coro::co_withExecutor(
+                clientEvb,
+                client->setupMoQSession(
+                    std::chrono::seconds(10),
+                    std::chrono::seconds(3),
+                    nullptr,
+                    nullptr,
+                    transportSettings,
+                    alpns))
+                .start();
+  });
+  auto result = std::move(setup).getTry(std::chrono::seconds(15));
+  EXPECT_TRUE(result.hasValue()) << result.exception().what();
+  if (result.hasValue()) {
+    EXPECT_TRUE(
+        folly::coro::blockingWait(
+            folly::coro::co_withExecutor(
+                clientEvb, serverAnswersSubscribe(client->moqSession_))));
+  }
+
+  clientEvb->runInEventBaseThreadAndWait([&] { client.reset(); });
+  server->stop();
 }
 
 } // namespace moxygen::test
