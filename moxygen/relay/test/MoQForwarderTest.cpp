@@ -5,6 +5,7 @@
  */
 
 #include <folly/coro/BlockingWait.h>
+#include <folly/executors/ManualExecutor.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 #include <moxygen/MoQTrackProperties.h>
@@ -93,6 +94,35 @@ class MoQForwarderTest : public ::testing::Test {
     return AssertionSuccess();
   }
 
+  // Runs on executor_, so a waiting resume stays pending until a drain.
+  folly::SemiFuture<folly::Expected<RequestOk, RequestError>>
+  startForwardUpdate(
+      const std::shared_ptr<MoQForwarder::Subscriber>& subscriber,
+      RequestID requestID,
+      bool forward) {
+    RequestUpdate update;
+    update.requestID = requestID;
+    update.existingRequestID = RequestID(1);
+    update.forward = forward;
+    auto res = folly::coro::co_withExecutor(
+                   &executor_, subscriber->requestUpdate(update))
+                   .start();
+    executor_.drain();
+    return res;
+  }
+
+  static std::optional<AbsoluteLocation> okLargest(const RequestOk& ok) {
+    for (const auto& param : ok.requestSpecificParams) {
+      if (param.key ==
+          folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT)) {
+        return param.largestObject;
+      }
+    }
+    return std::nullopt;
+  }
+
+  folly::ManualExecutor executor_;
+
   AssertionResult pauseAndResumeForwarding(
       const std::shared_ptr<MoQForwarder::Subscriber>& subscriber) {
     auto pauseRes = applyForwardUpdate(subscriber, RequestID(2), false);
@@ -129,6 +159,21 @@ struct CountingCallback : public MoQForwarder::Callback {
   }
   size_t onEmptyCount{0};
   std::vector<bool> forwardChanges;
+};
+
+// Holds each LargestPromise, as a relay does while its upstream update is in
+// flight.
+struct PromiseHoldingCallback : public MoQForwarder::Callback {
+  void onEmpty(MoQForwarder*) override {}
+  void forwardChanged(
+      MoQForwarder*,
+      bool forward,
+      MoQForwarder::LargestPromise largest) override {
+    if (forward) {
+      promises.push_back(std::move(largest));
+    }
+  }
+  std::vector<MoQForwarder::LargestPromise> promises;
 };
 
 struct TestNGRCallback : public MoQForwarder::Callback {
@@ -2016,6 +2061,158 @@ TEST_F(MoQForwarderTest, JoiningFetchAfterResumeAnchorsAtResumeLargest) {
   ASSERT_TRUE(res.hasValue());
   EXPECT_EQ(res->start, (AbsoluteLocation{12, 0}));
   EXPECT_EQ(res->end, (AbsoluteLocation{14, 3}));
+}
+
+// A paused subscriber on a forwarder at {10, 5}.
+class MoQForwarderResumeTest : public MoQForwarderTest {
+ protected:
+  void SetUp() override {
+    forwarder_ = std::make_shared<MoQForwarder>(
+        kFwdTestTrackName, AbsoluteLocation{10, 5});
+    forwarder_->setCallback(callback_);
+    subscriber_ = addPausedSubscriber(RequestID(1));
+  }
+
+  std::shared_ptr<MoQForwarder::Subscriber> addPausedSubscriber(
+      RequestID requestID) {
+    SubscribeRequest sub;
+    sub.fullTrackName = kFwdTestTrackName;
+    sub.requestID = requestID;
+    sub.locType = LocationType::LargestObject;
+    sub.forward = false;
+    return forwarder_->addSubscriber(
+        createMockSession()->sessionId(), sub, createMockConsumer());
+  }
+
+  std::shared_ptr<MoQForwarder> forwarder_;
+  std::shared_ptr<PromiseHoldingCallback> callback_{
+      std::make_shared<PromiseHoldingCallback>()};
+  std::shared_ptr<MoQForwarder::Subscriber> subscriber_;
+};
+
+// Test: the resume's REQUEST_UPDATE_OK waits for upstream and reports the
+// Largest Object from upstream's reply, which ends the gap.
+TEST_F(MoQForwarderResumeTest, ResumeWaitsForUpstreamLargest) {
+  auto ok = startForwardUpdate(subscriber_, RequestID(2), true);
+  ASSERT_EQ(callback_->promises.size(), 1);
+  EXPECT_FALSE(ok.isReady());
+
+  callback_->promises[0].complete(AbsoluteLocation{12, 2});
+  executor_.drain();
+  ASSERT_TRUE(ok.isReady());
+  auto res = std::move(ok).get();
+  ASSERT_TRUE(res.hasValue());
+  EXPECT_EQ(okLargest(*res), (AbsoluteLocation{12, 2}));
+  EXPECT_EQ(forwarder_->largest(), (AbsoluteLocation{12, 2}));
+  EXPECT_EQ(subscriber_->joiningLocation, (AbsoluteLocation{12, 2}));
+}
+
+// Test: an object that arrives before upstream's reply is larger than the
+// reply's Largest Object, so the OK reports the object.
+TEST_F(MoQForwarderResumeTest, ObjectBeforeUpstreamReplyWins) {
+  auto ok = startForwardUpdate(subscriber_, RequestID(2), true);
+  ASSERT_EQ(callback_->promises.size(), 1);
+  forwarder_->updateLargest(12, 3);
+
+  callback_->promises[0].complete(AbsoluteLocation{12, 2});
+  executor_.drain();
+  ASSERT_TRUE(ok.isReady());
+  auto res = std::move(ok).get();
+  ASSERT_TRUE(res.hasValue());
+  EXPECT_EQ(okLargest(*res), (AbsoluteLocation{12, 3}));
+}
+
+// Test: destroying the LargestPromise, as a relay does when its upstream update
+// fails, releases the OK with the forwarder's current Largest.
+TEST_F(MoQForwarderResumeTest, DestroyedPromiseReleasesWithCurrentLargest) {
+  auto ok = startForwardUpdate(subscriber_, RequestID(2), true);
+  ASSERT_EQ(callback_->promises.size(), 1);
+
+  callback_->promises.clear();
+  executor_.drain();
+  ASSERT_TRUE(ok.isReady());
+  auto res = std::move(ok).get();
+  ASSERT_TRUE(res.hasValue());
+  EXPECT_EQ(okLargest(*res), (AbsoluteLocation{10, 5}));
+}
+
+// Test: a second subscriber that resumes while the first resume is in flight
+// does not start another one, and waits on the pending one.
+TEST_F(MoQForwarderResumeTest, SecondResumerWaitsOnPendingResume) {
+  auto second = addPausedSubscriber(RequestID(5));
+  auto firstOk = startForwardUpdate(subscriber_, RequestID(2), true);
+  auto secondOk = startForwardUpdate(second, RequestID(6), true);
+  ASSERT_EQ(callback_->promises.size(), 1);
+  EXPECT_FALSE(secondOk.isReady());
+
+  callback_->promises[0].complete(AbsoluteLocation{12, 2});
+  executor_.drain();
+  ASSERT_TRUE(firstOk.isReady());
+  ASSERT_TRUE(secondOk.isReady());
+  EXPECT_EQ(okLargest(*std::move(firstOk).get()), (AbsoluteLocation{12, 2}));
+  EXPECT_EQ(okLargest(*std::move(secondOk).get()), (AbsoluteLocation{12, 2}));
+}
+
+// Test: forward 1, 0, 1 while upstream answers each in order. The pause does
+// not wait, and the last resume reports the last upstream reply.
+TEST_F(MoQForwarderResumeTest, ForwardFlapReportsNewestResume) {
+  auto resume1 = startForwardUpdate(subscriber_, RequestID(2), true);
+  auto pause = startForwardUpdate(subscriber_, RequestID(3), false);
+  auto resume2 = startForwardUpdate(subscriber_, RequestID(4), true);
+  ASSERT_TRUE(pause.isReady());
+  ASSERT_EQ(callback_->promises.size(), 2);
+
+  callback_->promises[0].complete(AbsoluteLocation{11, 0});
+  executor_.drain();
+  ASSERT_TRUE(resume1.isReady());
+  EXPECT_FALSE(resume2.isReady());
+
+  callback_->promises[1].complete(AbsoluteLocation{12, 2});
+  executor_.drain();
+  ASSERT_TRUE(resume2.isReady());
+  EXPECT_EQ(okLargest(*std::move(resume2).get()), (AbsoluteLocation{12, 2}));
+  EXPECT_EQ(subscriber_->joiningLocation, (AbsoluteLocation{12, 2}));
+}
+
+// Test: the forwarder goes away while a resume waits. The OK still completes.
+TEST_F(MoQForwarderResumeTest, ForwarderDestroyedDuringResume) {
+  auto ok = startForwardUpdate(subscriber_, RequestID(2), true);
+  ASSERT_EQ(callback_->promises.size(), 1);
+  auto largest = std::move(callback_->promises[0]);
+  forwarder_.reset();
+
+  largest.complete(AbsoluteLocation{12, 2});
+  executor_.drain();
+  ASSERT_TRUE(ok.isReady());
+  EXPECT_TRUE(std::move(ok).get().hasValue());
+}
+
+// Test: a LargestPromise that completes while no subscriber waits still reaches
+// the Largest in a new subscriber's SUBSCRIBE_OK.
+TEST_F(MoQForwarderResumeTest, CompletedPromiseAppliesWithoutWaiter) {
+  forwarder_->addForwardingSubscriber();
+  ASSERT_EQ(callback_->promises.size(), 1);
+  callback_->promises[0].complete(AbsoluteLocation{12, 2});
+
+  auto added = addPausedSubscriber(RequestID(5));
+  EXPECT_EQ(added->subscribeOk().largest, (AbsoluteLocation{12, 2}));
+}
+
+// Test: a callback that overrides only forwardChanged(fwd, forward) does not
+// make a resume wait.
+TEST_F(MoQForwarderTest, DefaultCallbackResumeDoesNotWait) {
+  auto forwarder = std::make_shared<MoQForwarder>(
+      kFwdTestTrackName, AbsoluteLocation{10, 5});
+  auto callback = std::make_shared<CountingCallback>();
+  forwarder->setCallback(callback);
+  auto subscriber =
+      addSubscriber(*forwarder, createMockSession(), createMockConsumer());
+  ASSERT_TRUE(applyForwardUpdate(subscriber, RequestID(2), false));
+
+  auto ok = startForwardUpdate(subscriber, RequestID(3), true);
+  ASSERT_TRUE(ok.isReady());
+  EXPECT_EQ(okLargest(*std::move(ok).get()), (AbsoluteLocation{10, 5}));
+  EXPECT_EQ(callback->forwardChanges, (std::vector<bool>{true, false, true}));
 }
 
 // Test: a subscription established by PUBLISH with Forward State 1 joins at

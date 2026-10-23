@@ -214,6 +214,7 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
     XLOG(ERR) << "addSubscriber called on draining track";
     return nullptr;
   }
+  applyFulfilledLargest();
   auto trackAlias = trackAlias_.value_or(subReq.requestID.value);
   XCHECK(consumer);
   consumer->setTrackAlias(trackAlias);
@@ -250,6 +251,7 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
     XLOG(ERR) << "addSubscriber called on draining track";
     return nullptr;
   }
+  applyFulfilledLargest();
   auto subscriber = std::make_shared<MoQForwarder::Subscriber>(
       *this,
       SubscribeOk{
@@ -280,6 +282,7 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
     XLOG(ERR) << "addSubscriber called on draining track";
     return nullptr;
   }
+  applyFulfilledLargest();
   if (consumer && trackAlias_) {
     consumer->setTrackAlias(*trackAlias_);
   }
@@ -770,7 +773,7 @@ void MoQForwarder::addForwardingSubscriber() {
   if (forwardingSubscribers_++ == 0) {
     refusedUpstream_ = false;
     if (callback_) {
-      callback_->forwardChanged(this, true);
+      fireForwardChanged(true);
     }
   } else {
     renewForwarding();
@@ -779,13 +782,44 @@ void MoQForwarder::addForwardingSubscriber() {
 
 void MoQForwarder::renewForwarding() {
   if (std::exchange(refusedUpstream_, false) && callback_) {
-    callback_->forwardChanged(this, true);
+    fireForwardChanged(true);
   }
+}
+
+void MoQForwarder::fireForwardChanged(bool forward) {
+  LargestPromise largest;
+  if (forward) {
+    auto state = std::make_shared<LargestPromise::State>();
+    pendingLargest_.push_back(state);
+    largest = LargestPromise(std::move(state));
+  }
+  callback_->forwardChanged(this, forward, std::move(largest));
+}
+
+void MoQForwarder::applyFulfilledLargest() {
+  std::erase_if(pendingLargest_, [this](const auto& state) {
+    if (!state->isFulfilled()) {
+      return false;
+    }
+    if (auto largest = state->getSemiFuture().value()) {
+      updateLargest(largest->group, largest->object);
+    }
+    return true;
+  });
+}
+
+folly::SemiFuture<folly::Unit> MoQForwarder::largestReady() {
+  applyFulfilledLargest();
+  if (pendingLargest_.empty()) {
+    return folly::makeSemiFuture();
+  }
+  // A subscriber that resumes now reports the newest promise's value.
+  return pendingLargest_.back()->getSemiFuture().unit();
 }
 
 void MoQForwarder::removeForwardingSubscriber() {
   if (--forwardingSubscribers_ == 0 && callback_) {
-    callback_->forwardChanged(this, false);
+    fireForwardChanged(false);
   }
 }
 
@@ -959,26 +993,39 @@ MoQForwarder::Subscriber::requestUpdate(RequestUpdate requestUpdate) {
       .requestID = requestUpdate.requestID,
       .requestSpecificParams = {},
       .trackProperties = {}};
-  if (forwarder) {
-    // Only update forward state if explicitly provided
-    if (requestUpdate.forward.has_value()) {
-      updateForwardState(*requestUpdate.forward);
-      // A subscriber can ask for a refused subgroup again while it is still
-      // forwarding, so the clear cannot wait for a false->true flip.
-      if (shouldForward) {
-        tombstonedSubgroups.clear();
-        if (joiningLocation) {
-          // The end of the gap that the subscriber can now fetch.
-          ok.requestSpecificParams.emplace_back(
-              folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT),
-              *joiningLocation);
-        }
-      }
-    }
-    // Only update new group request if provided
-    forwarder->tryProcessNewGroupRequest(requestUpdate.params);
+  if (!forwarder) {
+    co_return ok;
   }
+  bool resumed = false;
+  // Only update forward state if explicitly provided
+  if (requestUpdate.forward.has_value()) {
+    resumed = !shouldForward && *requestUpdate.forward;
+    updateForwardState(*requestUpdate.forward);
+    // A subscriber can ask for a refused subgroup again while it is still
+    // forwarding, so the clear cannot wait for a false->true flip.
+    if (shouldForward) {
+      tombstonedSubgroups.clear();
+    }
+  }
+  // Only update new group request if provided
+  forwarder->tryProcessNewGroupRequest(requestUpdate.params);
 
+  if (resumed) {
+    // The gap from the pause ends at the Largest Object in upstream's reply.
+    auto ready = forwarder->largestReady();
+    if (!ready.isReady()) {
+      co_await std::move(ready);
+    }
+    if (forwarder && shouldForward) {
+      joiningLocation = forwarder->largest();
+    }
+  }
+  if (requestUpdate.forward.has_value() && shouldForward && joiningLocation) {
+    // The end of the gap that the subscriber can now fetch.
+    ok.requestSpecificParams.emplace_back(
+        folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT),
+        *joiningLocation);
+  }
   co_return ok;
 }
 
