@@ -3325,6 +3325,7 @@ void MoQSession::close(
     wt->closeSession(folly::to_underlying(error));
     XLOG(DBG1) << "requestCancellation from close sess=" << this;
     cancellationSource_.requestCancellation();
+    exec_->add([wt = std::move(wt)]() mutable { wt = nullptr; });
   }
 }
 
@@ -4977,7 +4978,9 @@ void MoQSession::onRequestUpdate(RequestUpdate requestUpdate) {
     logger_->logSubscribeUpdate(requestUpdate, ControlMessageType::PARSED);
   }
 
-  if (shouldRejectNewPeerRequestDueToGoaway()) {
+  if (shouldRejectNewPeerRequestDueToGoaway() &&
+      !(moqSettings_.acceptRequestUpdatesAfterReceivedGoaway && !draining_ &&
+        pubTracks_.contains(existingRequestID))) {
     XLOG(DBG1) << "Rejecting request update, GOAWAY/draining sess=" << this;
     requestUpdateError(
         RequestError{
