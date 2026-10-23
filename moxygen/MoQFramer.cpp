@@ -61,6 +61,7 @@ ParamValueEncoding paramEncodingV18(uint64_t key) {
     case K::FILL_TIMEOUT:
     case K::EXPIRES:
     case K::NEW_GROUP_REQUEST:
+    case K::ROUTE_COST:
     // PUBLISHER_PRIORITY is extensions-only; parsed as varint so the
     // caller's allowlist check can reject it cleanly.
     case K::PUBLISHER_PRIORITY:
@@ -70,6 +71,10 @@ ParamValueEncoding paramEncodingV18(uint64_t key) {
     case K::AUTHORIZATION_TOKEN:
     case K::SUBSCRIPTION_FILTER:
     case K::TRACK_NAMESPACE_PREFIX:
+    case K::HOP_PATH:
+    // TRACK_FILTER (0x29) is a fork-local active proposal; length-prefixed
+    // value decoded via parseVariableParam (see parseTrackFilter).
+    case K::TRACK_FILTER:
       return ParamValueEncoding::LengthPrefixed;
   }
   XLOG(DFATAL) << "paramEncodingV18: unknown key " << key;
@@ -479,6 +484,12 @@ bool datagramTypeEndOfGroup(uint64_t version, DatagramType datagramType);
 
 void writeSize(uint16_t* sizePtr, size_t size, bool& error, uint64_t versionIn);
 
+void writeTrackFilter(
+    folly::IOBufQueue& writeBuf,
+    const TrackFilter& filter,
+    size_t& size,
+    bool& error) noexcept;
+
 bool includeSetupParam(uint64_t version, SetupKey key);
 
 bool isPaddingStreamType(uint64_t version, uint64_t streamType) {
@@ -542,6 +553,86 @@ folly::Expected<std::string, ErrorCode> MoQFrameParser::parseFixedString(
   length -= strLength->first;
   return res;
 }
+
+folly::Expected<std::string, ErrorCode> encodeRelayHopPath(
+    const std::vector<uint64_t>& hopPath,
+    uint64_t version) noexcept {
+  if (hopPath.empty()) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+
+  folly::IOBufQueue encoded{folly::IOBufQueue::cacheChainLength()};
+  MoQFrameWriter writer;
+  writer.initializeVersion(version);
+  size_t size = 0;
+  bool error = false;
+  folly::F14FastSet<uint64_t> seen;
+  for (const auto hop : hopPath) {
+    if (hop != kMoQClusterAnonHopId && !seen.insert(hop).second) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+    writer.writeVarint(encoded, hop, size, error);
+    if (error) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+  }
+  return encoded.move()->moveToFbString().toStdString();
+}
+
+folly::Expected<std::vector<uint64_t>, ErrorCode> decodeRelayHopPath(
+    std::string_view encoded,
+    uint64_t version) noexcept {
+  if (encoded.empty()) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+
+  auto buffer = folly::IOBuf::copyBuffer(encoded);
+  folly::io::Cursor cursor(buffer.get());
+  size_t remaining = encoded.size();
+  std::vector<uint64_t> hopPath;
+  folly::F14FastSet<uint64_t> seen;
+  while (remaining > 0) {
+    const auto decoded = getDraftMajorVersion(version) >= 17
+        ? decodeMoQVarint(cursor, remaining)
+        : quic::follyutils::decodeQuicInteger(cursor, remaining);
+    if (!decoded) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+    if (decoded->first != kMoQClusterAnonHopId &&
+        !seen.insert(decoded->first).second) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+    hopPath.push_back(decoded->first);
+    remaining -= decoded->second;
+  }
+  return hopPath;
+}
+
+namespace {
+bool validClusterAdvertisement(
+    const Parameters& params,
+    uint64_t version,
+    bool negotiated = true,
+    bool update = false) {
+  size_t paths = 0;
+  size_t costs = 0;
+  for (const auto& param : params) {
+    paths += param.key == folly::to_underlying(TrackRequestParamKey::HOP_PATH);
+    costs +=
+        param.key == folly::to_underlying(TrackRequestParamKey::ROUTE_COST);
+  }
+  if (!negotiated) {
+    return paths == 0 && costs == 0;
+  }
+  const auto* path = params.getFirstParam(TrackRequestParamKey::HOP_PATH);
+  if (update && paths == 0 && costs == 0) {
+    return true;
+  }
+  return getDraftMajorVersion(version) >= 18 &&
+      (update ? paths <= 1 : paths == 1) && costs <= 1 &&
+      (!path || decodeRelayHopPath(path->asString, version).hasValue());
+}
+} // namespace
 
 folly::Expected<std::optional<AuthToken>, ErrorCode>
 MoQFrameParser::parseAuthToken(
@@ -757,6 +848,32 @@ MoQFrameParser::parseSubscriptionFilter(
   return filter;
 }
 
+folly::Expected<TrackFilter, ErrorCode> parseTrackFilter(
+    folly::io::Cursor& cursor,
+    size_t& length) noexcept {
+  TrackFilter filter;
+
+  // Parse propertyType
+  auto propertyType = quic::follyutils::decodeQuicInteger(cursor, length);
+  if (!propertyType) {
+    XLOG(DBG4) << "parseTrackFilter: UNDERFLOW on propertyType";
+    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  }
+  length -= propertyType->second;
+  filter.propertyType = propertyType->first;
+
+  // Parse maxSelected (N)
+  auto maxSelected = quic::follyutils::decodeQuicInteger(cursor, length);
+  if (!maxSelected) {
+    XLOG(DBG4) << "parseTrackFilter: UNDERFLOW on maxSelected";
+    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  }
+  length -= maxSelected->second;
+  filter.maxSelected = maxSelected->first;
+
+  return filter;
+}
+
 folly::Expected<std::optional<Parameter>, ErrorCode>
 MoQFrameParser::parseVariableParam(
     folly::io::Cursor& cursor,
@@ -769,6 +886,8 @@ MoQFrameParser::parseVariableParam(
       folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN);
   const auto subscriptionFilterKey =
       folly::to_underlying(TrackRequestParamKey::SUBSCRIPTION_FILTER);
+  const auto trackFilterKey =
+      folly::to_underlying(TrackRequestParamKey::TRACK_FILTER);
   if (key == authKey) {
     auto res = decodeVarint(cursor, length);
     if (!res) {
@@ -816,6 +935,28 @@ MoQFrameParser::parseVariableParam(
     }
     length -= lenRes->first;
     p.asSubscriptionFilter = res.value();
+  } else if (key == trackFilterKey) {
+    // TRACK_FILTER (key=0x29, odd = length-prefixed)
+    // NOTE: TRACK_FILTER is an active proposal, not yet landed
+    // in the core specification.
+    auto lenRes = quic::follyutils::decodeQuicInteger(cursor, length);
+    if (!lenRes) {
+      XLOG(DBG4) << "parseVariableParam: UNDERFLOW on trackFilter length";
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    length -= lenRes->second;
+    auto filterLen = lenRes->first;
+    if (filterLen > length || !cursor.canAdvance(filterLen)) {
+      XLOG(DBG4) << "parseVariableParam: UNDERFLOW on trackFilter data";
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    size_t filterSize = filterLen;
+    auto res = parseTrackFilter(cursor, filterSize);
+    if (!res) {
+      return folly::makeUnexpected(res.error());
+    }
+    length -= lenRes->first;
+    p.asTrackFilter = res.value();
   }
 
   else {
@@ -970,6 +1111,12 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseSetupParams(
       param.emplace(*key, value.value());
     }
 
+    if (getDraftMajorVersion(version) >= 18 &&
+        (*key == folly::to_underlying(SetupKey::HOP_ID) ||
+         *key == folly::to_underlying(SetupKey::RELAY_COST)) &&
+        params.hasParam(*key)) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
     if (params.insertParam(std::move(*param)).hasError()) {
       XLOG(ERR) << "parseSetupParams: rejected setup option at index=" << i
                 << ", key=" << *key;
@@ -1739,6 +1886,16 @@ std::optional<SubscriptionFilter> MoQFrameParser::extractSubscriptionFilter(
   return std::nullopt;
 }
 
+std::optional<TrackFilter> MoQFrameParser::extractTrackFilter(
+    const std::vector<Parameter>& requestSpecificParams) const noexcept {
+  for (const auto& param : requestSpecificParams) {
+    if (param.key == folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
+      return param.asTrackFilter;
+    }
+  }
+  return std::nullopt;
+}
+
 folly::Expected<SubscribeRequest, ErrorCode>
 MoQFrameParser::parseSubscribeRequest(
     folly::io::Cursor& cursor,
@@ -1882,6 +2039,13 @@ folly::Expected<RequestUpdate, ErrorCode> MoQFrameParser::parseRequestUpdate(
       requestSpecificParams);
   if (!res2) {
     return folly::makeUnexpected(res2.error());
+  }
+  if (!validClusterAdvertisement(
+          requestUpdate.params,
+          *version_,
+          hasExtension(SetupExtension::RelayHops),
+          true)) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   handleRequestSpecificParams(requestUpdate, requestSpecificParams);
   // TRACK_NAMESPACE_PREFIX carries a Track Namespace tuple, so a malformed
@@ -2355,6 +2519,12 @@ MoQFrameParser::parsePublishNamespace(folly::io::Cursor& cursor, size_t length)
     return folly::makeUnexpected(res2.error());
   }
   if (length > 0) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+  if (!validClusterAdvertisement(
+          publishNamespace.params,
+          *version_,
+          hasExtension(SetupExtension::RelayHops))) {
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   return publishNamespace;
@@ -3015,6 +3185,28 @@ folly::Expected<Namespace, ErrorCode> MoQFrameParser::parseNamespace(
   ns.trackNamespaceSuffix = TrackNamespace(std::move(res.value()));
 
   if (length > 0) {
+    if (!hasExtension(SetupExtension::RelayHops)) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
+    auto numParams = decodeVarint(cursor, length);
+    if (!numParams) {
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    length -= numParams->second;
+    std::vector<Parameter> requestSpecificParams;
+    auto paramsResult = parseTrackRequestParams(
+        cursor, length, numParams->first, ns.params, requestSpecificParams);
+    if (!paramsResult) {
+      return folly::makeUnexpected(paramsResult.error());
+    }
+  } else if (hasExtension(SetupExtension::RelayHops)) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+  if (length > 0) {
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+  if (hasExtension(SetupExtension::RelayHops) &&
+      !validClusterAdvertisement(ns.params, *version_)) {
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   return ns;
@@ -3634,12 +3826,17 @@ std::string MoQFrameWriter::encodeTokenValue(
 }
 
 bool includeSetupParam(uint64_t version, SetupKey key) {
+  // Cluster setup parameters are defined for draft 18+.
+  if (getDraftMajorVersion(version) < 18 &&
+      (key == SetupKey::HOP_ID || key == SetupKey::RELAY_COST)) {
+    return false;
+  }
   // Draft 18 removed this param in favor of QUIC stream limits.
   if (key == SetupKey::MAX_REQUEST_ID && useBidiRequestStreams(version)) {
     return false;
   }
-  // Draft 18+ delivers requests on independent bidi streams, so we don't use
-  // auth token aliasing there -- it relies on request ordering.
+  // Draft 18+ disables auth token aliasing, which relies on request ordering.
+
   if (key == SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE &&
       useBidiRequestStreams(version)) {
     return false;
@@ -3647,7 +3844,8 @@ bool includeSetupParam(uint64_t version, SetupKey key) {
   return key == SetupKey::MAX_REQUEST_ID || key == SetupKey::PATH ||
       key == SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE ||
       key == SetupKey::AUTHORIZATION_TOKEN || key == SetupKey::AUTHORITY ||
-      key == SetupKey::MOQT_IMPLEMENTATION;
+      key == SetupKey::MOQT_IMPLEMENTATION || key == SetupKey::HOP_ID ||
+      key == SetupKey::RELAY_COST;
 }
 
 WriteResult writeSetup(
@@ -4077,6 +4275,21 @@ void MoQFrameWriter::writeV18ParamValue(
           writeBuf.append(tmpBuf.move());
           size += tmpSize;
         }
+      } else if (
+          param.key ==
+          folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
+        // TRACK_FILTER (0x29) is a fork-local length-prefixed param; its value
+        // lives in asTrackFilter, not asString. Mirror the draft-16 path in
+        // writeParamValue so the v18 wire form round-trips (see
+        // parseTrackFilter via parseV18ParamValue -> parseVariableParam).
+        folly::IOBufQueue tmpBuf{folly::IOBufQueue::cacheChainLength()};
+        size_t tmpSize = 0;
+        writeTrackFilter(tmpBuf, param.asTrackFilter, tmpSize, error);
+        if (!error) {
+          writeVarint(writeBuf, tmpSize, size, error);
+          writeBuf.append(tmpBuf.move());
+          size += tmpSize;
+        }
       } else {
         writeFixedString(writeBuf, param.asString, size, error);
       }
@@ -4092,6 +4305,8 @@ void MoQFrameWriter::writeParamValue(
     bool& error) const noexcept {
   const auto subscriptionFilterKey =
       folly::to_underlying(TrackRequestParamKey::SUBSCRIPTION_FILTER);
+  const auto trackFilterKey =
+      folly::to_underlying(TrackRequestParamKey::TRACK_FILTER);
   const auto largestObjectKey =
       folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT);
   const auto expiresKey = folly::to_underlying(TrackRequestParamKey::EXPIRES);
@@ -4109,6 +4324,17 @@ void MoQFrameWriter::writeParamValue(
     folly::IOBufQueue tmpBuf{folly::IOBufQueue::cacheChainLength()};
     size_t tmpSize = 0;
     writeSubscriptionFilter(tmpBuf, param.asSubscriptionFilter, tmpSize, error);
+    if (!error) {
+      writeVarint(writeBuf, tmpSize, size, error);
+      writeBuf.append(tmpBuf.move());
+      size += tmpSize;
+    }
+  } else if (param.key == trackFilterKey) {
+    // Track filter key is odd (0x29), so it needs a length prefix.
+    // Write to a temporary buffer to compute the length first.
+    folly::IOBufQueue tmpBuf{folly::IOBufQueue::cacheChainLength()};
+    size_t tmpSize = 0;
+    writeTrackFilter(tmpBuf, param.asTrackFilter, tmpSize, error);
     if (!error) {
       writeVarint(writeBuf, tmpSize, size, error);
       writeBuf.append(tmpBuf.move());
@@ -4194,6 +4420,17 @@ void MoQFrameWriter::writeSubscriptionFilter(
       error = true;
     }
   }
+}
+
+void writeTrackFilter(
+    folly::IOBufQueue& writeBuf,
+    const TrackFilter& filter,
+    size_t& size,
+    bool& error) noexcept {
+  // Write propertyType
+  writeVarint(writeBuf, filter.propertyType, size, error);
+  // Write maxSelected (N)
+  writeVarint(writeBuf, filter.maxSelected, size, error);
 }
 
 WriteResult MoQFrameWriter::writeDatagramObject(
@@ -4611,6 +4848,13 @@ WriteResult MoQFrameWriter::writeRequestUpdate(
     const RequestUpdate& update) const noexcept {
   XCHECK(version_.has_value())
       << "Version needs to be set to write request update";
+  if (!validClusterAdvertisement(
+          update.params,
+          *version_,
+          hasExtension(SetupExtension::RelayHops),
+          true)) {
+    return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
+  }
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::SUBSCRIBE_UPDATE, error);
@@ -4890,6 +5134,12 @@ WriteResult MoQFrameWriter::writePublishNamespace(
     const PublishNamespace& publishNamespace) const noexcept {
   XCHECK(version_.has_value())
       << "Version needs to be set to write publishNamespace";
+  if (!validClusterAdvertisement(
+          publishNamespace.params,
+          *version_,
+          hasExtension(SetupExtension::RelayHops))) {
+    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
+  }
   size_t size = 0;
   bool error = false;
   auto sizePtr =
@@ -5192,10 +5442,17 @@ WriteResult MoQFrameWriter::writeNamespace(
     folly::IOBufQueue& writeBuf,
     const Namespace& ns) const noexcept {
   XCHECK(version_.has_value()) << "Version needs to be set to write namespace";
+  if (hasExtension(SetupExtension::RelayHops) &&
+      !validClusterAdvertisement(ns.params, *version_)) {
+    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
+  }
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::NAMESPACE, error);
   writeTrackNamespace(writeBuf, ns.trackNamespaceSuffix, size, error);
+  if (hasExtension(SetupExtension::RelayHops)) {
+    writeTrackRequestParams(writeBuf, ns.params, {}, size, error);
+  }
   writeSize(sizePtr, size, error, *version_);
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
