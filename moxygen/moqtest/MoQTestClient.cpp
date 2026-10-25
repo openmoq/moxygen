@@ -18,8 +18,7 @@ DEFINE_int32(transaction_timeout, 1000, "transaction timeout in ms");
 const int kDefaultRequestId = 0;
 const std::string kDefaultTrackName = "test";
 const GroupOrder kDefaultGroupOrder = GroupOrder::OldestFirst;
-const LocationType kDefaultLocationType = LocationType::NextGroupStart;
-const uint64_t kDefaultEndGroup = 10;
+const LocationFilter kDefaultLocationFilter = LocationFilter::relativeStart(0);
 
 MoQTestClient::MoQTestClient(
     PrivateTag,
@@ -180,8 +179,7 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::subscribe(
 
   sub.fullTrackName = ftn;
   sub.groupOrder = kDefaultGroupOrder;
-  sub.locType = kDefaultLocationType;
-  sub.endGroup = kDefaultEndGroup;
+  sub.filter = kDefaultLocationFilter;
 
   // Add delivery timeout parameter if configured
   if (params.deliveryTimeout > 0) {
@@ -240,8 +238,7 @@ Subscriber::PublishResult MoQTestClient::publish(
   ok.forward = true;
   ok.subscriberPriority = kDefaultPriority;
   ok.groupOrder = GroupOrder::Default;
-  ok.locType = LocationType::AbsoluteStart;
-  ok.start = AbsoluteLocation(0, 0);
+  ok.filter = LocationFilter::absoluteStart({0, 0});
 
   return Subscriber::PublishConsumerAndReplyTask{
       subReceiver_,
@@ -475,7 +472,7 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::join(
   sub.groupOrder = kDefaultGroupOrder;
   // The backfill ends on the object the subscription starts after, so the two
   // halves only meet with no gap if the subscription starts at Largest.
-  sub.locType = LocationType::LargestObject;
+  sub.filter = LocationFilter::nextObject();
 
   if (params.deliveryTimeout > 0) {
     sub.params.insertParam(
@@ -495,69 +492,57 @@ folly::coro::Task<moxygen::TrackNamespace> MoQTestClient::join(
   startReceiving(fetchState_, ReceivingType::FETCH, /*seeded=*/false);
   joinWindowPending_ = groupsToValidate_ > 0;
 
-  auto res = co_await moqClient_->moqSession_->join(
-      sub,
-      subReceiver_,
-      joiningStart,
-      kDefaultPriority,
-      kDefaultGroupOrder,
-      {},
-      fetchReceiver_,
-      relative ? FetchType::RELATIVE_JOINING : FetchType::ABSOLUTE_JOINING);
+  // The backfill counts back from the current group, one nearer than a
+  // Location Filter's relative start.
+  FillParameters fill;
+  fill.locationFilter = relative
+      ? LocationFilter::relativeStart(joiningStart + 1)
+      : LocationFilter::absoluteStart({joiningStart, 0});
+  sub.fill = fill;
+  // Each run requests one fill, checked by the verifying fetch receiver.
+  subReceiver_->setFillReceiverFactory(
+      [this](RequestID) -> std::shared_ptr<FetchConsumer> {
+        return fetchReceiver_;
+      });
 
-  if (res.subscribeResult.hasError()) {
+  auto res = co_await moqClient_->moqSession_->subscribe(sub, subReceiver_);
+
+  if (res.hasError()) {
     XLOG(ERR)
         << "MoQTest verification result: FAILURE! Reason: Error Subscribing to receiver. "
-        << "Error code: "
-        << static_cast<uint64_t>(res.subscribeResult.error().errorCode)
-        << ", Reason: " << res.subscribeResult.error().reasonPhrase;
+        << "Error code: " << static_cast<uint64_t>(res.error().errorCode)
+        << ", Reason: " << res.error().reasonPhrase;
     co_yield folly::coro::co_error(
-        std::runtime_error(res.subscribeResult.error().reasonPhrase));
+        std::runtime_error(res.error().reasonPhrase));
   }
-  subHandle_ = res.subscribeResult.value();
+  subHandle_ = res.value();
 
-  if (res.fetchResult.hasError()) {
-    // A subscription with no Largest gives the join nothing to anchor to, and
-    // covers the track from its start anyway.  The publisher reports that with
-    // more than one error code, so key off the anchor.
-    if (subHandle_->subscribeOk().largest) {
-      XLOG(ERR)
-          << "MoQTest verification result: FAILURE! Reason: Error Fetching to receiver. "
-          << "Error code: "
-          << static_cast<uint64_t>(res.fetchResult.error().errorCode)
-          << ", Reason: " << res.fetchResult.error().reasonPhrase;
-      co_yield folly::coro::co_error(
-          std::runtime_error(res.fetchResult.error().reasonPhrase));
-    }
-    XLOG(INFO) << "MoQTest: joining FETCH backfills nothing, subscription "
-               << "covers the whole track";
+  // Without Largest Object the subscription covers the whole track, so no
+  // fill opens.
+  const auto& largest = subHandle_->subscribeOk().largest;
+  if (!largest) {
+    XLOG(INFO) << "MoQTest: backfill covers nothing, subscription covers the "
+               << "whole track";
     fetchState_ = ReceiveState{};
+    // An empty fill gets only the reset at subscription end, which is the
+    // expected close.
+    fetchState_.done = true;
     subState_.seeded = true;
   } else {
-    fetchHandle_ = res.fetchResult.value();
-    const auto& largest = subHandle_->subscribeOk().largest;
-    if (!largest) {
-      recordSemanticsFailure(
-          "Joining FETCH accepted for a subscription with no Largest");
-    } else {
-      const uint64_t startGroup = joiningStartGroup(joinStart, *largest);
-      validateJoiningFetchOk(
-          fetchHandle_->fetchOk(), params, *largest, startGroup);
-      if (groupsToValidate_) {
-        openGroupsWindow(startGroup, std::chrono::milliseconds(0));
-      }
-      trimExpectedBefore(startGroup);
-      if (fetchState_.endOfGroupOmitted) {
-        // The backfill stops at Largest, so a group the two halves split
-        // still gets its marker from the subscription.
-        trimExpectedEndOfGroupMarkers(startGroup, *largest);
-      }
-      fetchHalfLastGroup_ = largest->group;
-      // Where the two halves met, so a caller can tell the join landed
-      // mid-track.
-      XLOG(INFO) << "MoQTest: joining FETCH backfills groups " << startGroup
-                 << ".." << largest->group;
+    const uint64_t startGroup = joiningStartGroup(joinStart, *largest);
+    if (groupsToValidate_) {
+      openGroupsWindow(startGroup, std::chrono::milliseconds(0));
     }
+    trimExpectedBefore(startGroup);
+    if (fetchState_.endOfGroupOmitted) {
+      // The backfill stops at Largest, so a group the two halves split still
+      // gets its marker from the subscription.
+      trimExpectedEndOfGroupMarkers(startGroup, *largest);
+    }
+    fetchHalfLastGroup_ = largest->group;
+    // Logged so that a caller can tell the join landed mid-track.
+    XLOG(INFO) << "MoQTest: backfill covers groups " << startGroup << ".."
+               << largest->group;
   }
 
   // Armed after the trim, so the backfilled prefix does not schedule deadlines
@@ -793,9 +778,9 @@ void MoQTestClient::cancelDeadlines() {
   requestDeadline_.cancelTimerCallback();
 }
 
-// A joining FETCH backfills up to where the subscription picks up, so a group
-// at or below that boundary arrives on the FETCH half, which is reliable even
-// when the track's preference is datagram.
+// A fill covers groups up to where the subscription picks up, so a group at or
+// below that boundary arrives on the fill stream, which is reliable even when
+// the track's preference is datagram.
 ForwardingPreference MoQTestClient::deadlineForwardingPreference(
     uint64_t group) const {
   const bool viaFetch = fetchState_.active &&
@@ -1320,27 +1305,6 @@ void MoQTestClient::trimExpectedEndOfGroupMarkers(
   for (uint64_t group = first; AbsoluteLocation{group, marker} <= last;
        group += params_.groupIncrement) {
     expectedObjects_.erase({group, marker});
-  }
-}
-
-void MoQTestClient::validateJoiningFetchOk(
-    const FetchOk& ok,
-    const MoQTestParameters& params,
-    const AbsoluteLocation& largest,
-    uint64_t startGroup) {
-  const StandaloneFetch range(
-      AbsoluteLocation{startGroup, 0},
-      AbsoluteLocation{largest.group, largest.object + 1});
-  auto expectedEnd = fetchEndLocation(params, range);
-  if (ok.endLocation != expectedEnd) {
-    recordSemanticsFailure(
-        folly::to<std::string>(
-            "Joining FETCH_OK End Location Mismatch: Actual=",
-            folly::to<std::string>(
-                ok.endLocation.group, ":", ok.endLocation.object),
-            "  Expected=",
-            folly::to<std::string>(
-                expectedEnd.group, ":", expectedEnd.object)));
   }
 }
 

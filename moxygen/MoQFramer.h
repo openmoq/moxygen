@@ -451,7 +451,16 @@ class MoQFrameParser {
       ObjectHeader& objectHeader,
       bool allowImmutable = true) const noexcept;
 
-  std::optional<SubscriptionFilter> extractSubscriptionFilter(
+  // Tail of parseFetch, shared by the draft-20 and legacy field layouts.
+  folly::Expected<Fetch, ErrorCode> parseFetchParams(
+      folly::io::Cursor& cursor,
+      size_t length,
+      Fetch fetch) const noexcept;
+
+  std::optional<FillParameters> extractFillParameters(
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
+  std::optional<LocationFilter> extractLocationFilter(
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
   void handleRequestSpecificParams(
@@ -509,6 +518,18 @@ class MoQFrameParser {
       size_t& length) const noexcept;
 
   folly::Expected<SubscriptionFilter, ErrorCode> parseSubscriptionFilter(
+      folly::io::Cursor& cursor,
+      size_t& length) const noexcept;
+
+  // Draft 20+. A nested parameter block with its own allowlist and its own
+  // duplicate scope, so a type may appear both here and in the message.
+  folly::Expected<FillParameters, ErrorCode> parseFillParameters(
+      folly::io::Cursor& cursor,
+      size_t& length) const noexcept;
+
+  // Draft 20+. `length` is the parameter value length; every byte of it must
+  // be consumed by the optional fields, of which there are at most four.
+  folly::Expected<LocationFilter, ErrorCode> parseLocationFilter(
       folly::io::Cursor& cursor,
       size_t& length) const noexcept;
 
@@ -923,6 +944,18 @@ class MoQFrameWriter {
   void writeSubscriptionFilter(
       folly::IOBufQueue& writeBuf,
       const SubscriptionFilter& filter,
+      size_t& size,
+      bool& error) const noexcept;
+
+  void writeFillParameters(
+      folly::IOBufQueue& writeBuf,
+      const FillParameters& fill,
+      size_t& size,
+      bool& error) const noexcept;
+
+  void writeLocationFilter(
+      folly::IOBufQueue& writeBuf,
+      const LocationFilter& filter,
       size_t& size,
       bool& error) const noexcept;
 

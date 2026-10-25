@@ -1508,7 +1508,7 @@ TEST_P(MoQFramerTest, ParseTrackStatus) {
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
   TrackStatus ts =
       TrackStatus::make(FullTrackName({TrackNamespace({"hello"}), "world"}));
-  ts.locType = LocationType::LargestObject;
+  ts.filter = LocationFilter::nextObject();
   ts.params.insertParam(Parameter(
       folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
       writer_.encodeTokenValue(0, "stampolli")));
@@ -1598,9 +1598,8 @@ TEST(MoQFramerDraft16Test, TrackStatusOmitsDeliveryFieldsOnWrite) {
     trackStatusWithDelivery.priority = 7;
     trackStatusWithDelivery.groupOrder = GroupOrder::NewestFirst;
     trackStatusWithDelivery.forward = false;
-    trackStatusWithDelivery.locType = LocationType::AbsoluteRange;
-    trackStatusWithDelivery.start = AbsoluteLocation{1, 0};
-    trackStatusWithDelivery.endGroup = 2;
+    trackStatusWithDelivery.filter =
+        LocationFilter::range(AbsoluteLocation{1, 0}, uint64_t(2));
 
     folly::IOBufQueue expected{folly::IOBufQueue::cacheChainLength()};
     folly::IOBufQueue actual{folly::IOBufQueue::cacheChainLength()};
@@ -1741,9 +1740,8 @@ static size_t writeSubscribeRequestWithAuthToken(
       kDefaultPriority,
       GroupOrder::OldestFirst,
       true,
-      LocationType::LargestObject,
-      std::nullopt,
-      0};
+      LocationFilter::nextObject(),
+      std::nullopt};
 
   auto encodedToken =
       encodeToken(writer, aliasType, alias, tokenType, tokenValue);
@@ -1987,8 +1985,7 @@ TEST_P(MoQFramerTest, SubscribeUpdateWithSubscribeReqIDSerialization) {
   SubscribeUpdate subscribeUpdate;
   subscribeUpdate.requestID = RequestID(123);
   subscribeUpdate.existingRequestID = RequestID(456);
-  subscribeUpdate.start = AbsoluteLocation{10, 20};
-  subscribeUpdate.endGroup = 30;
+  subscribeUpdate.filter = LocationFilter::range({10, 20}, {30, 0});
   subscribeUpdate.priority = 5;
   subscribeUpdate.forward = true;
 
@@ -2016,9 +2013,10 @@ TEST_P(MoQFramerTest, SubscribeUpdateWithSubscribeReqIDSerialization) {
     EXPECT_EQ(parseResult->existingRequestID.value, 456);
   }
 
-  EXPECT_EQ(parseResult->start->group, 10);
-  EXPECT_EQ(parseResult->start->object, 20);
-  EXPECT_EQ(parseResult->endGroup, 30);
+  ASSERT_TRUE(parseResult->filter.has_value());
+  EXPECT_EQ(
+      parseResult->filter->absoluteStartLocation(), (AbsoluteLocation{10, 20}));
+  EXPECT_EQ(parseResult->filter->legacyEndGroup(), 30);
   EXPECT_EQ(parseResult->priority, 5);
   EXPECT_TRUE(parseResult->forward.has_value());
   EXPECT_EQ(*parseResult->forward, true);
@@ -2037,8 +2035,8 @@ TEST(MoQFramerTest, SubscribeUpdateForwardUnset) {
   SubscribeUpdate subscribeUpdate;
   subscribeUpdate.requestID = RequestID(123);
   subscribeUpdate.existingRequestID = RequestID(456);
-  subscribeUpdate.start = AbsoluteLocation{0, 0};
-  subscribeUpdate.endGroup = 0; // Open-ended subscription
+  // Open-ended subscription
+  subscribeUpdate.filter = LocationFilter::absoluteStart({0, 0});
   subscribeUpdate.priority = kDefaultPriority;
   // forward field intentionally left unset (std::nullopt)
 
@@ -2062,9 +2060,9 @@ TEST(MoQFramerTest, SubscribeUpdateForwardUnset) {
 
   EXPECT_EQ(parseResult->requestID.value, 123);
   EXPECT_EQ(parseResult->existingRequestID.value, 456);
-  EXPECT_EQ(parseResult->start->group, 0);
-  EXPECT_EQ(parseResult->start->object, 0);
-  EXPECT_EQ(parseResult->endGroup, 0);
+  ASSERT_TRUE(parseResult->filter.has_value());
+  EXPECT_EQ(parseResult->filter->absoluteStartLocation(), kLocationMin);
+  EXPECT_TRUE(parseResult->filter->isOpenEnded());
   // An explicit priority (even the default) is serialized and round-trips.
   EXPECT_EQ(parseResult->priority, kDefaultPriority);
   // Verify forward field is NOT set (preserves existing state)
@@ -2236,12 +2234,7 @@ TEST_P(MoQFramerTest, SubscribeRequestEncodeDecode) {
   EXPECT_EQ(parseRes->priority, req.priority);
   EXPECT_EQ(parseRes->groupOrder, req.groupOrder);
   EXPECT_EQ(parseRes->forward, req.forward);
-  EXPECT_EQ(parseRes->locType, req.locType);
-  ASSERT_TRUE(parseRes->start.has_value());
-  ASSERT_TRUE(req.start.has_value());
-  EXPECT_EQ(parseRes->start->group, req.start->group);
-  EXPECT_EQ(parseRes->start->object, req.start->object);
-  EXPECT_EQ(parseRes->endGroup, req.endGroup);
+  EXPECT_EQ(parseRes->filter, req.filter);
   EXPECT_EQ(parseRes->params.size(), req.params.size());
 }
 
@@ -2273,8 +2266,7 @@ TEST_P(MoQFramerTest, ParseSubscriptionFilterLargestGroup) {
   EXPECT_TRUE(parseRes.hasValue());
 
   // Check that parsed SubscribeRequest matches the original
-  EXPECT_EQ(parseRes->locType, LocationType::LargestGroup);
-  EXPECT_FALSE(parseRes->start.has_value());
+  EXPECT_EQ(parseRes->filter, LocationFilter::relativeStart(1));
 }
 
 namespace {
@@ -2332,11 +2324,7 @@ TEST(MoQFramerSubscriptionFilter, EndGroupDeltaV18) {
   auto frameLen = cursor.readBE<uint16_t>();
   auto parseRes = parser.parseSubscribeRequest(cursor, frameLen);
   ASSERT_TRUE(parseRes.hasValue());
-  EXPECT_EQ(parseRes->locType, LocationType::AbsoluteRange);
-  ASSERT_TRUE(parseRes->start.has_value());
-  EXPECT_EQ(parseRes->start->group, kStart.group);
-  EXPECT_EQ(parseRes->start->object, kStart.object);
-  EXPECT_EQ(parseRes->endGroup, kEndGroup);
+  EXPECT_EQ(parseRes->filter, LocationFilter::range(kStart, kEndGroup));
 
   // The v17 and v18 frames must differ only by the EndGroup byte: v17 carries
   // the absolute value while v18 carries the delta.
@@ -2355,6 +2343,373 @@ TEST(MoQFramerSubscriptionFilter, EndGroupDeltaV18) {
   ASSERT_EQ(diffCount, 1u);
   EXPECT_EQ(static_cast<uint8_t>(v17Str[diffIdx]), kEndGroup);
   EXPECT_EQ(static_cast<uint8_t>(v18Str[diffIdx]), kDelta);
+}
+
+// The draft 18 End Group is inclusive, so a range through group 0 goes on the
+// wire as End Group 0 and does not reach into group 1.
+TEST(MoQFramerSubscriptionFilter, EndGroupZeroV18) {
+  const auto filter = LocationFilter::range(AbsoluteLocation{0, 0}, 0);
+  EXPECT_EQ(toSubscriptionFilter(filter).endGroup, 0);
+
+  auto bytes = writeAbsoluteRangeSubscribe(kVersionDraft18, {0, 0}, 0);
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft18);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+  folly::io::Cursor cursor(bytes.get());
+  ASSERT_TRUE(quic::follyutils::decodeQuicInteger(cursor).has_value());
+  auto parsed = parser.parseSubscribeRequest(cursor, cursor.readBE<uint16_t>());
+  ASSERT_TRUE(parsed.hasValue());
+  EXPECT_EQ(parsed->filter, filter);
+  EXPECT_EQ(parsed->filter.resolve(std::nullopt, false).end.group, 0);
+}
+
+// A REQUEST_UPDATE range keeps its end group across every legacy encoding.
+TEST(MoQFramerSubscriptionFilter, RequestUpdateEndGroupRoundTripLegacy) {
+  const auto filter = LocationFilter::range(AbsoluteLocation{5, 0}, 7);
+  for (auto version : {kVersionDraft16, kVersionDraft18}) {
+    SCOPED_TRACE(version);
+    MoQFrameWriter writer;
+    writer.initializeVersion(version);
+    MoQFrameParser parser;
+    parser.initializeVersion(version);
+    MoQTokenCache tokenCache;
+    parser.setTokenCache(&tokenCache);
+
+    SubscribeUpdate update;
+    update.requestID = RequestID(2);
+    update.existingRequestID = RequestID(1);
+    update.filter = filter;
+    update.priority = kDefaultPriority;
+    update.forward = true;
+    folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+    ASSERT_TRUE(writer.writeSubscribeUpdate(writeBuf, update).hasValue());
+
+    auto buffer = writeBuf.move();
+    folly::io::Cursor cursor(buffer.get());
+    ASSERT_TRUE(quic::follyutils::decodeQuicInteger(cursor).has_value());
+    auto parsed = parser.parseRequestUpdate(cursor, cursor.readBE<uint16_t>());
+    ASSERT_TRUE(parsed.hasValue());
+    EXPECT_EQ(parsed->filter, filter);
+  }
+}
+
+// Every Location Filter form must survive a draft-20 SUBSCRIBE round trip.
+TEST(MoQFramerLocationFilter, SubscribeRoundTripV20) {
+  const std::vector<LocationFilter> filters{
+      LocationFilter::none(),
+      LocationFilter::relativeStart(0),
+      LocationFilter::relativeStart(1),
+      LocationFilter::relativeStart(7),
+      LocationFilter::nextObject(),
+      LocationFilter::absoluteStart({10, 20}),
+      LocationFilter::range({10, 20}, 30),
+      LocationFilter::range({10, 20}, {30, 4})};
+
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft20);
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft20);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+
+  for (const auto& filter : filters) {
+    SCOPED_TRACE(filter.describe());
+    auto req = SubscribeRequest::make(
+        FullTrackName{TrackNamespace({"ns"}), "track"},
+        kDefaultPriority,
+        GroupOrder::Default,
+        /*forward=*/true,
+        filter);
+
+    folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+    ASSERT_TRUE(writer.writeSubscribeRequest(buf, req).hasValue());
+    auto bytes = buf.move();
+
+    folly::io::Cursor cursor(bytes.get());
+    auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+    ASSERT_TRUE(frameType.has_value());
+    ASSERT_EQ(frameType->first, folly::to_underlying(FrameType::SUBSCRIBE));
+    auto frameLen = cursor.readBE<uint16_t>();
+    auto parseRes = parser.parseSubscribeRequest(cursor, frameLen);
+    ASSERT_TRUE(parseRes.hasValue());
+    EXPECT_EQ(parseRes->filter, filter);
+  }
+}
+
+namespace {
+// A draft 20 SUBSCRIBE with one request-specific parameter, whose raw value
+// is supplied verbatim.
+std::unique_ptr<folly::IOBuf> subscribeWithRawParam(
+    TrackRequestParamKey key,
+    const std::string& value) {
+  folly::IOBufQueue body{folly::IOBufQueue::cacheChainLength()};
+  writeVarintTo(body, 7); // Request ID
+  writeVarintTo(body, 1); // Track Namespace, one element
+  writeVarintTo(body, 2);
+  body.append(folly::IOBuf::copyBuffer("ns"));
+  writeVarintTo(body, 5); // Track Name
+  body.append(folly::IOBuf::copyBuffer("track"));
+  writeVarintTo(body, 1); // one parameter
+  // The first key is a delta from zero, so it goes out as its own value.
+  writeVarintTo(body, folly::to_underlying(key));
+  writeVarintTo(body, value.size());
+  body.append(folly::IOBuf::copyBuffer(value));
+  return body.move();
+}
+
+ErrorCode parseSubscribeBodyError(const std::unique_ptr<folly::IOBuf>& bytes) {
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft20);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+  folly::io::Cursor cursor(bytes.get());
+  auto res =
+      parser.parseSubscribeRequest(cursor, bytes->computeChainDataLength());
+  EXPECT_TRUE(res.hasError());
+  return res.hasError() ? res.error() : ErrorCode::NO_ERROR;
+}
+} // namespace
+
+// The nested block has its own allowlist, narrower than the message's.
+TEST(MoQFramerFillParameters, DisallowedNestedTypeIsAViolation) {
+  // FORWARD is a legal SUBSCRIBE parameter but has no meaning inside a fill.
+  const std::string nested(
+      1,
+      static_cast<char>(folly::to_underlying(TrackRequestParamKey::FORWARD)));
+  EXPECT_EQ(
+      parseSubscribeBodyError(
+          subscribeWithRawParam(TrackRequestParamKey::FILL_PARAMETERS, nested)),
+      ErrorCode::PROTOCOL_VIOLATION);
+}
+
+// Range Filters are rejected inside FILL_PARAMETERS, as at the top level,
+// until moxygen implements them.
+TEST(MoQFramerFillParameters, RangeFilterIsAViolation) {
+  // Type 0x25 (a Range Filter) with an empty value.
+  const std::string nested("\x25\x00", 2);
+  EXPECT_EQ(
+      parseSubscribeBodyError(
+          subscribeWithRawParam(TrackRequestParamKey::FILL_PARAMETERS, nested)),
+      ErrorCode::PROTOCOL_VIOLATION);
+}
+
+// A Location Filter has at most four fields.
+TEST(MoQFramerLocationFilter, MoreThanFourFieldsIsAViolation) {
+  EXPECT_EQ(
+      parseSubscribeBodyError(subscribeWithRawParam(
+          TrackRequestParamKey::LOCATION_FILTER,
+          std::string("\x01\x02\x03\x04\x05", 5))),
+      ErrorCode::PROTOCOL_VIOLATION);
+}
+
+// The parameter length is known up front, so a field that runs past it is
+// malformed rather than a signal to wait for more bytes.
+TEST(MoQFramerLocationFilter, FieldCrossingParamLengthIsAViolation) {
+  // 0x80 opens a two byte varint with only one byte left in the parameter.
+  EXPECT_EQ(
+      parseSubscribeBodyError(subscribeWithRawParam(
+          TrackRequestParamKey::LOCATION_FILTER, std::string("\x01\x80", 2))),
+      ErrorCode::PROTOCOL_VIOLATION);
+}
+
+namespace {
+std::unique_ptr<folly::IOBuf> writeFillSubscribe(
+    MoQFrameWriter& writer,
+    const FillParameters& fill,
+    LocationFilter filter = LocationFilter::nextObject()) {
+  auto req = SubscribeRequest::make(
+      FullTrackName{TrackNamespace({"ns"}), "track"},
+      kDefaultPriority,
+      GroupOrder::Default,
+      /*forward=*/true,
+      filter);
+  req.fill = fill;
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  EXPECT_TRUE(writer.writeSubscribeRequest(buf, req).hasValue());
+  return buf.move();
+}
+
+folly::Expected<SubscribeRequest, ErrorCode> parseSubscribeFrame(
+    MoQFrameParser& parser,
+    const std::unique_ptr<folly::IOBuf>& bytes) {
+  folly::io::Cursor cursor(bytes.get());
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_TRUE(frameType.has_value());
+  auto frameLen = cursor.readBE<uint16_t>();
+  return parser.parseSubscribeRequest(cursor, frameLen);
+}
+} // namespace
+
+TEST(MoQFramerFillParameters, SubscribeRoundTripV20) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft20);
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft20);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+
+  const std::vector<FillParameters> fills{
+      // Presence alone requests a fill; every member may be absent.
+      FillParameters{},
+      FillParameters{LocationFilter::relativeStart(3), {}, {}, {}},
+      FillParameters{LocationFilter::none(), {}, {}, {}},
+      FillParameters{
+          LocationFilter::range({1, 2}, {3, 4}),
+          uint8_t{7},
+          GroupOrder::NewestFirst,
+          std::chrono::milliseconds(250)},
+      FillParameters{{}, uint8_t{200}, {}, {}},
+      FillParameters{{}, {}, GroupOrder::OldestFirst, {}},
+      FillParameters{{}, {}, {}, std::chrono::milliseconds(0)}};
+
+  for (const auto& fill : fills) {
+    auto bytes = writeFillSubscribe(writer, fill);
+    auto parseRes = parseSubscribeFrame(parser, bytes);
+    ASSERT_TRUE(parseRes.hasValue());
+    ASSERT_TRUE(parseRes->fill.has_value());
+    EXPECT_EQ(*parseRes->fill, fill);
+  }
+}
+
+// A Default group order goes out as an omitted GROUP_ORDER, which still parses.
+TEST(MoQFramerFillParameters, DefaultGroupOrderIsOmitted) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft20);
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft20);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+
+  auto bytes = writeFillSubscribe(
+      writer, FillParameters{{}, {}, GroupOrder::Default, {}});
+  auto parseRes = parseSubscribeFrame(parser, bytes);
+  ASSERT_TRUE(parseRes.hasValue());
+  ASSERT_TRUE(parseRes->fill.has_value());
+  EXPECT_EQ(*parseRes->fill, FillParameters{});
+}
+
+// A type may appear both in the message and inside FILL_PARAMETERS.
+TEST(MoQFramerFillParameters, NestedAndOuterFilterAreIndependent) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft20);
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft20);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+
+  FillParameters fill;
+  fill.locationFilter = LocationFilter::relativeStart(4);
+  auto bytes =
+      writeFillSubscribe(writer, fill, LocationFilter::absoluteStart({9, 9}));
+
+  auto parseRes = parseSubscribeFrame(parser, bytes);
+  ASSERT_TRUE(parseRes.hasValue());
+  EXPECT_EQ(parseRes->filter, LocationFilter::absoluteStart({9, 9}));
+  ASSERT_TRUE(parseRes->fill.has_value());
+  EXPECT_EQ(parseRes->fill->locationFilter, LocationFilter::relativeStart(4));
+}
+
+// A subscription without FILL_PARAMETERS does not request a fill.
+TEST(MoQFramerFillParameters, AbsentWhenNotRequested) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft20);
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft20);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+
+  auto req =
+      SubscribeRequest::make(FullTrackName{TrackNamespace({"ns"}), "track"});
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  ASSERT_TRUE(writer.writeSubscribeRequest(buf, req).hasValue());
+  auto bytes = buf.move();
+
+  auto parseRes = parseSubscribeFrame(parser, bytes);
+  ASSERT_TRUE(parseRes.hasValue());
+  EXPECT_FALSE(parseRes->fill.has_value());
+}
+
+// FILL_PARAMETERS below draft 20 is a protocol violation.
+TEST(MoQFramerFillParameters, RejectedBelowV20) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft20);
+  FillParameters fill;
+  fill.locationFilter = LocationFilter::relativeStart(1);
+  auto bytes = writeFillSubscribe(writer, fill);
+
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft18);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+
+  folly::io::Cursor cursor(bytes.get());
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  auto frameLen = cursor.readBE<uint16_t>();
+  auto parseRes = parser.parseSubscribeRequest(cursor, frameLen);
+  ASSERT_TRUE(parseRes.hasError());
+  EXPECT_EQ(parseRes.error(), ErrorCode::PROTOCOL_VIOLATION);
+}
+
+// FILL_PARAMETERS on any message but SUBSCRIBE or REQUEST_UPDATE is a
+// protocol violation.
+TEST(MoQFramerLocationFilter, FillParametersOnFetchIsAViolation) {
+  folly::IOBufQueue body{folly::IOBufQueue::cacheChainLength()};
+  writeVarintTo(body, 7); // Request ID
+  writeVarintTo(body, 1); // Track Namespace, one element
+  writeVarintTo(body, 2);
+  body.append(folly::IOBuf::copyBuffer("ns"));
+  writeVarintTo(body, 5); // Track Name
+  body.append(folly::IOBuf::copyBuffer("track"));
+  writeVarintTo(body, 1); // one parameter
+  writeVarintTo(
+      body, folly::to_underlying(TrackRequestParamKey::FILL_PARAMETERS));
+  writeVarintTo(body, 0); // empty FILL_PARAMETERS value
+
+  auto bytes = body.move();
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft20);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+
+  folly::io::Cursor cursor(bytes.get());
+  auto res = parser.parseFetch(cursor, bytes->computeChainDataLength());
+  ASSERT_TRUE(res.hasError());
+  EXPECT_EQ(res.error(), ErrorCode::PROTOCOL_VIOLATION);
+}
+
+// Draft 20 carries the FETCH range in LOCATION_FILTER.
+TEST(MoQFramerLocationFilter, StandaloneFetchRangeRoundTripV20) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft20);
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft20);
+  MoQTokenCache tokenCache;
+  parser.setTokenCache(&tokenCache);
+
+  Fetch fetch(
+      RequestID(1),
+      FullTrackName{TrackNamespace({"ns"}), "track"},
+      AbsoluteLocation{7, 1},
+      AbsoluteLocation{10, 5});
+
+  folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};
+  ASSERT_TRUE(writer.writeFetch(buf, fetch).hasValue());
+  auto bytes = buf.move();
+
+  folly::io::Cursor cursor(bytes.get());
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  ASSERT_TRUE(frameType.has_value());
+  ASSERT_EQ(frameType->first, folly::to_underlying(FrameType::FETCH));
+  auto frameLen = cursor.readBE<uint16_t>();
+  auto parseRes = parser.parseFetch(cursor, frameLen);
+  ASSERT_TRUE(parseRes.hasValue());
+
+  auto [standalone, joining] = fetchType(*parseRes);
+  ASSERT_NE(standalone, nullptr);
+  EXPECT_EQ(standalone->start, (AbsoluteLocation{7, 1}));
+  EXPECT_EQ(standalone->end, (AbsoluteLocation{10, 5}));
 }
 
 // Regression: pre-v18 drafts must continue to treat EndGroup as absolute.
@@ -2376,7 +2731,7 @@ TEST(MoQFramerSubscriptionFilter, EndGroupAbsoluteV17Roundtrip) {
   auto frameLen = cursor.readBE<uint16_t>();
   auto parseRes = parser.parseSubscribeRequest(cursor, frameLen);
   ASSERT_TRUE(parseRes.hasValue());
-  EXPECT_EQ(parseRes->endGroup, kEndGroup);
+  EXPECT_EQ(parseRes->filter.legacyEndGroup(), kEndGroup);
 }
 
 // A v18 peer that sends an EndGroup delta whose absolute value would exceed
@@ -2407,12 +2762,12 @@ TEST(MoQFramerSubscriptionFilter, EndGroupDeltaOverflowRejectedV18) {
 INSTANTIATE_TEST_SUITE_P(
     MoQFramerTest,
     MoQFramerTest,
-    ::testing::Values(kVersionDraft16, kVersionDraft18));
+    ::testing::Values(kVersionDraft16, kVersionDraft18, kVersionDraft20));
 
 INSTANTIATE_TEST_SUITE_P(
     MoQFramerAuthTest,
     MoQFramerAuthTest,
-    ::testing::Values(kVersionDraft16, kVersionDraft18));
+    ::testing::Values(kVersionDraft16, kVersionDraft18, kVersionDraft20));
 
 TEST(MoQFramerTestUtils, DraftMajorVersion) {
   EXPECT_EQ(getDraftMajorVersion(0xff080001), 0x8);
@@ -2462,11 +2817,18 @@ TEST(MoQFramerTestUtils, GetAlpnFromVersion) {
 }
 
 TEST(MoQFramerTestUtils, GetMoqtProtocols) {
-  // Empty = all supported versions
+  // Empty = all supported versions. Draft 20 trails the others because it is
+  // still partial, and never claims the standard ALPN for the same reason.
   auto all = getMoqtProtocols("", true);
-  EXPECT_EQ(all.size(), 2);
+  EXPECT_EQ(all.size(), 3);
   EXPECT_EQ(all[0], "moqt-18");
   EXPECT_EQ(all[1], "moqt-16");
+  EXPECT_EQ(all[2], kAlpnMoqtDraft20Latest);
+
+  auto meta20 = getMoqtProtocols("20");
+  EXPECT_EQ(meta20.size(), 1);
+  EXPECT_EQ(meta20[0], kAlpnMoqtDraft20Latest);
+  EXPECT_EQ(getMoqtProtocols("20", true), meta20);
 
   // Single version
   auto just16 = getMoqtProtocols("16", true);
@@ -2492,10 +2854,12 @@ TEST(MoQFramerTestUtils, GetDefaultMoqtProtocols) {
       getDefaultMoqtProtocols(true),
       (std::vector<std::string>{
           std::string(kAlpnMoqtDraft18Latest),
-          std::string(kAlpnMoqtDraft16Latest)}));
+          std::string(kAlpnMoqtDraft16Latest),
+          std::string(kAlpnMoqtDraft20Latest)}));
   EXPECT_EQ(
       getDefaultMoqtProtocols(true, /*useStandard=*/true),
-      (std::vector<std::string>{"moqt-18", "moqt-16"}));
+      (std::vector<std::string>{
+          "moqt-18", "moqt-16", std::string(kAlpnMoqtDraft20Latest)}));
 }
 
 // Test class for immutable extensions feature
@@ -3972,7 +4336,7 @@ TEST_P(MoQFramerV16PlusTest, PublishOkDefaultGroupOrder) {
   publishOk.subscriberPriority = 128;
   publishOk.groupOrder =
       GroupOrder::Default; // Writer won't write GROUP_ORDER param
-  publishOk.locType = LocationType::LargestObject;
+  publishOk.filter = LocationFilter::nextObject();
 
   auto parsed = roundTripPublishOk(
       writer_,
@@ -3992,7 +4356,7 @@ TEST_P(MoQFramerV16PlusTest, PublishOkExplicitGroupOrder) {
   publishOk.subscriberPriority = 128;
   publishOk.groupOrder =
       GroupOrder::OldestFirst; // Non-default, will be written
-  publishOk.locType = LocationType::LargestObject;
+  publishOk.filter = LocationFilter::nextObject();
 
   auto parsed = roundTripPublishOk(
       writer_,
@@ -5179,7 +5543,7 @@ TEST(TrackFilterTest, DefaultConstructor) {
 INSTANTIATE_TEST_SUITE_P(
     MoQFramerV16PlusTest,
     MoQFramerV16PlusTest,
-    ::testing::Values(kVersionDraft16, kVersionDraft18));
+    ::testing::Values(kVersionDraft16, kVersionDraft18, kVersionDraft20));
 
 // ===========================================================================
 // Draft 18+ tests: SUBSCRIBE_NAMESPACE / SUBSCRIBE_TRACKS split
@@ -5334,9 +5698,7 @@ TEST_F(MoQFramerV18Test, PublishOkUsesRequestOkWireType) {
   publishOk.forward = false;
   publishOk.subscriberPriority = 42;
   publishOk.groupOrder = GroupOrder::NewestFirst;
-  publishOk.locType = LocationType::AbsoluteRange;
-  publishOk.start = AbsoluteLocation{3, 4};
-  publishOk.endGroup = 9;
+  publishOk.filter = LocationFilter::range({3, 4}, 9);
   publishOk.params.setMajorVersion(majorVersion);
   ASSERT_TRUE(
       publishOk.params
@@ -5421,9 +5783,7 @@ TEST_F(MoQFramerV18Test, PublishOkUsesRequestOkWireType) {
   EXPECT_EQ(parsedPublishOk.forward, publishOk.forward);
   EXPECT_EQ(parsedPublishOk.subscriberPriority, publishOk.subscriberPriority);
   EXPECT_EQ(parsedPublishOk.groupOrder, publishOk.groupOrder);
-  EXPECT_EQ(parsedPublishOk.locType, publishOk.locType);
-  EXPECT_EQ(parsedPublishOk.start, publishOk.start);
-  EXPECT_EQ(parsedPublishOk.endGroup, publishOk.endGroup);
+  EXPECT_EQ(parsedPublishOk.filter, publishOk.filter);
   EXPECT_EQ(
       getFirstIntParam(
           parsedPublishOk.params, TrackRequestParamKey::NEW_GROUP_REQUEST),
@@ -5467,9 +5827,7 @@ TEST(MoQFramerV22Test, PublishOkCarriesOnlyExpires) {
   publishOk.forward = false;
   publishOk.subscriberPriority = 42;
   publishOk.groupOrder = GroupOrder::NewestFirst;
-  publishOk.locType = LocationType::AbsoluteRange;
-  publishOk.start = AbsoluteLocation{3, 4};
-  publishOk.endGroup = 9;
+  publishOk.filter = LocationFilter::range(AbsoluteLocation{3, 4}, uint64_t(9));
   publishOk.params.setMajorVersion(18);
   ASSERT_TRUE(
       publishOk.params
@@ -7121,9 +7479,8 @@ TEST_F(ParameterValidationFlowTest, ParseParamsIgnoresInvalidParam) {
       kDefaultPriority,
       GroupOrder::Default,
       true,
-      LocationType::LargestGroup,
-      std::nullopt,
-      0};
+      LocationFilter::relativeStart(1),
+      std::nullopt};
 
   // Add valid param using insertParam
   reqWithInvalidParam.params.insertParam(Parameter(
@@ -7284,7 +7641,7 @@ folly::Expected<SubscribeRequest, ErrorCode> roundtripSubscribeWithRendezvous(
   SubscribeRequest req;
   req.requestID = RequestID(1);
   req.fullTrackName = FullTrackName({TrackNamespace({"ns"}), "track"});
-  req.locType = LocationType::LargestObject;
+  req.filter = LocationFilter::nextObject();
   // Insert key 0x04 directly so the test exercises the parser path that
   // distinguishes RENDEZVOUS_TIMEOUT from MAX_CACHE_DURATION by version.
   req.params.setMajorVersion(getDraftMajorVersion(version));

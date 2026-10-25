@@ -6,6 +6,7 @@
 
 #include "moxygen/test/MoQSessionTestCommon.h"
 
+#include "moxygen/FillFetch.h"
 #include "moxygen/MoQTrackProperties.h"
 
 using namespace moxygen;
@@ -68,9 +69,21 @@ SubscribeRequest getSubscribe(const FullTrackName& ftn) {
       0,
       GroupOrder::OldestFirst,
       true,
-      LocationType::LargestObject,
-      std::nullopt,
-      0};
+      LocationFilter::nextObject()};
+}
+
+SubscribeRequest subscribeWithFill(
+    const FullTrackName& ftn,
+    uint64_t joiningStart,
+    std::optional<uint8_t> fillPriority) {
+  auto sub = getSubscribe(ftn);
+  FillParameters fill;
+  // A joining FETCH counts back from the current group, one nearer than a
+  // Location Filter's relative start.
+  fill.locationFilter = LocationFilter::relativeStart(joiningStart + 1);
+  fill.subscriberPriority = fillPriority;
+  sub.fill = fill;
+  return sub;
 }
 
 PublishDone getTrackEndedPublishDone(RequestID id) {
@@ -82,8 +95,7 @@ TrackStatus getTrackStatus() {
       .requestID = RequestID(0),
       .fullTrackName = kTestTrackName,
       .groupOrder = GroupOrder::Default,
-      .locType = LocationType::LargestObject,
-      .endGroup = 0};
+      .filter = LocationFilter::nextObject()};
 }
 
 moxygen::SubscribeNamespace getSubscribeNamespace() {
@@ -477,8 +489,7 @@ folly::coro::Task<void> MoQSessionTest::publishRequestUpdateRoundTrip(
   SubscribeUpdate subscribeUpdate{
       RequestID(0),
       RequestID(0),
-      AbsoluteLocation{0, 0},
-      10,
+      LocationFilter::range({0, 0}, {10, 0}),
       kDefaultPriority + 1,
       true};
 
@@ -507,9 +518,45 @@ void MoQSessionTest::expectFetch(
     EXPECT_CALL(*serverPublisherStatsCallback_, onFetchSuccess())
         .RetiresOnSaturation();
   }
+  expectFillFetch(lambda);
+}
+
+void MoQSessionTest::expectFillFetch(
+    const std::function<TaskFetchResult(Fetch, std::shared_ptr<FetchConsumer>)>&
+        lambda) {
   EXPECT_CALL(*serverPublisher, fetch(_, _))
       .WillOnce(lambda)
       .RetiresOnSaturation();
+}
+
+void MoQSessionTest::expectBeginFill() {
+  EXPECT_CALL(*subscribeCallback_, beginFill(testing::_))
+      .WillOnce(
+          testing::Return(
+              folly::Expected<std::shared_ptr<FetchConsumer>, MoQPublishError>(
+                  fetchCallback_)));
+}
+
+void MoQSessionTest::serveFill(
+    RequestID requestID,
+    const std::optional<FillParameters>& fill,
+    std::shared_ptr<TrackConsumer> pub,
+    std::optional<AbsoluteLocation> largest) {
+  if (!fill) {
+    return;
+  }
+  auto fetch = makeFillFetch(
+      kTestTrackName,
+      requestID,
+      LocationFilter::nextObject(),
+      *fill,
+      largest,
+      kDefaultPriority,
+      GroupOrder::OldestFirst,
+      TrackRequestParameters{FrameType::SUBSCRIBE});
+  if (fetch) {
+    serveFillFromFetch(serverPublisher, std::move(pub), std::move(*fetch));
+  }
 }
 
 void MoQSessionTest::expectFetchSuccess() {
@@ -690,5 +737,10 @@ INSTANTIATE_TEST_SUITE_P(
     PreDraft18Test,
     PreDraft18Test,
     testing::ValuesIn(getPreDraft18VersionParams()));
+
+INSTANTIATE_TEST_SUITE_P(
+    Draft20Test,
+    Draft20Test,
+    testing::Values(VersionParams{{kVersionDraft20}, kVersionDraft20}));
 
 }} // namespace moxygen::test

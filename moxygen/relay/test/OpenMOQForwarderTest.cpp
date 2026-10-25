@@ -88,12 +88,10 @@ class OpenMOQForwarderTest : public ::testing::Test {
       MoQForwarder& forwarder,
       std::shared_ptr<MoQSession> session,
       std::shared_ptr<TrackConsumer> consumer,
-      RequestID requestID = RequestID(0),
-      LocationType locType = LocationType::LargestObject) {
+      RequestID requestID = RequestID(0)) {
     SubscribeRequest sub;
     sub.fullTrackName = forwarder.fullTrackName();
     sub.requestID = requestID;
-    sub.locType = locType;
     return forwarder.addSubscriber(
         session->sessionId(), sub, std::move(consumer));
   }
@@ -575,7 +573,7 @@ TEST_F(
 
   RequestUpdate validUpdate;
   validUpdate.requestID = RequestID(1);
-  validUpdate.endGroup = 10;
+  validUpdate.filter = LocationFilter::range(kLocationMin, 10);
   auto res1 = folly::coro::blockingWait(handle->requestUpdate(validUpdate));
   EXPECT_TRUE(res1.hasValue());
 
@@ -583,8 +581,7 @@ TEST_F(
   // no session, so the close call must not crash.
   RequestUpdate invalidUpdate;
   invalidUpdate.requestID = RequestID(2);
-  invalidUpdate.start = AbsoluteLocation{20, 0};
-  invalidUpdate.endGroup = 3;
+  invalidUpdate.filter = LocationFilter::range(AbsoluteLocation{20, 0}, 3);
   auto res2 = folly::coro::blockingWait(handle->requestUpdate(invalidUpdate));
   EXPECT_FALSE(res2.hasValue());
 }

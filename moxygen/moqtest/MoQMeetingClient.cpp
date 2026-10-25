@@ -498,7 +498,7 @@ Subscriber::PublishResult Participant::publish(
   ok.forward = true;
   ok.subscriberPriority = kDefaultPriority;
   ok.groupOrder = GroupOrder::OldestFirst;
-  ok.locType = LocationType::LargestObject;
+  ok.filter = LocationFilter::nextObject();
   if (cfg_.deliveryTimeoutMs > 0) {
     ok.params.insertParam(
         {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),

@@ -31,11 +31,18 @@ DEFINE_int32(transaction_timeout, 120, "Transaction timeout (s)");
 DEFINE_int32(
     join_start,
     0,
-    "Joining start, only used if either jrfetch or jafetch is true");
+    "Where the backfill starts, used with fill, jrfetch or jafetch. With "
+    "jafetch it is an absolute group; otherwise it counts groups back from "
+    "the current one.");
 DEFINE_bool(quic_transport, false, "Use raw QUIC transport");
 DEFINE_bool(fetch, false, "Use fetch rather than subscribe");
-DEFINE_bool(jrfetch, false, "Joining relative fetch");
-DEFINE_bool(jafetch, false, "Joining absolute fetch");
+DEFINE_bool(jrfetch, false, "Backfill relative to the current group");
+DEFINE_bool(
+    fill,
+    false,
+    "Backfill join_start groups. Version-neutral spelling of jrfetch: a "
+    "joining FETCH below draft 20, a fill fetch stream from draft 20 on.");
+DEFINE_bool(jafetch, false, "Backfill from an absolute group");
 DEFINE_bool(forward, true, "Forward flag for subscriptions");
 DEFINE_bool(
     publish,
@@ -75,41 +82,28 @@ DEFINE_bool(
 namespace {
 using namespace moxygen;
 
-struct SubParams {
-  LocationType locType;
-  std::optional<AbsoluteLocation> start;
-  uint64_t endGroup;
-};
-
-SubParams flags2params() {
-  SubParams result;
+LocationFilter flags2filter() {
   std::string soStr(FLAGS_so);
   if (FLAGS_sg.empty()) {
-    if (soStr.empty()) {
-      result.locType = LocationType::LargestObject;
-      return result;
-    } else {
+    if (!soStr.empty()) {
       XLOG(ERR) << "Invalid: sg blank, so=" << soStr;
       exit(1);
     }
-  } else if (soStr.empty()) {
+    return LocationFilter::nextObject();
+  }
+  if (soStr.empty()) {
     soStr = std::string("0");
   }
-  if (FLAGS_jafetch || FLAGS_jrfetch) {
+  if (FLAGS_jafetch || FLAGS_jrfetch || FLAGS_fill) {
     XLOG(ERR) << "Joining fetch requires empty sg";
     exit(1);
   }
-  result.start.emplace(
+  AbsoluteLocation start(
       folly::to<uint64_t>(FLAGS_sg), folly::to<uint64_t>(soStr));
   if (FLAGS_eg.empty()) {
-    result.locType = LocationType::AbsoluteStart;
-    return result;
-  } else {
-    result.locType = LocationType::AbsoluteRange;
-    result.endGroup = folly::to<uint64_t>(FLAGS_eg);
-    return result;
+    return LocationFilter::absoluteStart(start);
   }
-  return result;
+  return LocationFilter::range(start, {folly::to<uint64_t>(FLAGS_eg), 0});
 }
 
 void addRendezvousTimeoutParamIfSupported(
@@ -232,8 +226,7 @@ class MoQTextClient : public Subscriber,
     publishOk.forward = true;
     publishOk.subscriberPriority = kDefaultPriority;
     publishOk.groupOrder = moxygen::GroupOrder::Default;
-    publishOk.locType = moxygen::LocationType::AbsoluteStart;
-    publishOk.start = moxygen::AbsoluteLocation(0, 0);
+    publishOk.filter = moxygen::LocationFilter::absoluteStart({0, 0});
 
     if (handle) {
       subHandles_.push_back(handle);
@@ -292,30 +285,27 @@ class MoQTextClient : public Subscriber,
       addRendezvousTimeoutParamIfSupported(
           sub, moqClient_.getSession()->getNegotiatedVersion());
 
-      Publisher::SubscribeResult track;
-      if (FLAGS_jafetch || FLAGS_jrfetch) {
-        FetchType fetchType = FLAGS_jafetch ? FetchType::ABSOLUTE_JOINING
-                                            : FetchType::RELATIVE_JOINING;
-
-        // Call join() for joining fetch
-        fetchTextReceiver_ = std::make_shared<ObjectReceiver>(
-            ObjectReceiver::FETCH, fetchTextHandler_);
-        auto joinResult = co_await moqClient_.getSession()->join(
-            sub,
-            subTextReceiver_,
-            FLAGS_join_start,
-            sub.priority,
-            sub.groupOrder,
-            {},
-            fetchTextReceiver_,
-            fetchType);
-        track = joinResult.subscribeResult;
-      } else {
-        track =
-            co_await moqClient_.getSession()->subscribe(sub, subTextReceiver_);
+      if (FLAGS_jafetch || FLAGS_jrfetch || FLAGS_fill) {
+        // --jafetch counts from a group ID, the others from the current
+        // group, which is one nearer than a Location Filter's relative start.
+        const auto joinStart = static_cast<uint64_t>(FLAGS_join_start);
+        FillParameters fill;
+        fill.locationFilter = FLAGS_jafetch
+            ? LocationFilter::absoluteStart({joinStart, 0})
+            : LocationFilter::relativeStart(joinStart + 1);
+        sub.fill = fill;
+        subTextReceiver_->setFillReceiverFactory([this](RequestID) {
+          fetchTextReceiver_ = std::make_shared<ObjectReceiver>(
+              ObjectReceiver::FETCH, fetchTextHandler_);
+          return fetchTextReceiver_;
+        });
       }
+      Publisher::SubscribeResult track =
+          co_await moqClient_.getSession()->subscribe(sub, subTextReceiver_);
       bool needFetch = false;
-      AbsoluteLocation fetchEnd{sub.endGroup + 1, 0};
+      const auto subStart = sub.filter.absoluteStartLocation();
+      const auto subEndGroup = sub.filter.legacyEndGroup();
+      AbsoluteLocation fetchEnd{subEndGroup.value_or(0) + 1, 0};
       if (track.hasValue()) {
         subscription_ = std::move(track.value());
         auto requestID = subscription_->subscribeOk().requestID;
@@ -325,18 +315,15 @@ class MoQTextClient : public Subscriber,
           XLOG(INFO) << "Largest={" << largest->group << ", " << largest->object
                      << "}";
         }
-        if ((sub.locType == LocationType::AbsoluteStart ||
-             sub.locType == LocationType::AbsoluteRange) &&
-            subscription_ && subscription_->subscribeOk().largest &&
-            *sub.start < *subscription_->subscribeOk().largest) {
+        if (subStart && subscription_ && subscription_->subscribeOk().largest &&
+            *subStart < *subscription_->subscribeOk().largest) {
           XLOG(INFO) << "Start before largest, need FETCH";
           needFetch = true;
           fetchEnd = AbsoluteLocation{
               subscription_->subscribeOk().largest->group,
               subscription_->subscribeOk().largest->object + 1};
-          if (sub.locType == LocationType::AbsoluteRange &&
-              fetchEnd.group >= sub.endGroup) {
-            fetchEnd.group = sub.endGroup + 1;
+          if (subEndGroup && fetchEnd.group >= *subEndGroup) {
+            fetchEnd.group = *subEndGroup + 1;
             fetchEnd.object = 0;
             subscription_->unsubscribe();
             subscription_.reset();
@@ -360,7 +347,7 @@ class MoQTextClient : public Subscriber,
             Fetch(
                 RequestID(0),
                 sub.fullTrackName,
-                *sub.start,
+                subStart.value_or(kLocationMin),
                 fetchEnd,
                 sub.priority,
                 sub.groupOrder),
@@ -451,10 +438,10 @@ int main(int argc, char* argv[]) {
   if (!url.isValid() || !url.hasHost()) {
     XLOG(ERR) << "Invalid url: " << FLAGS_connect_url;
   }
-  int sumFetchCount =
-      int(FLAGS_jafetch) + int(FLAGS_jrfetch) + int(FLAGS_fetch);
+  int sumFetchCount = int(FLAGS_jafetch) + int(FLAGS_jrfetch) +
+      int(FLAGS_fill) + int(FLAGS_fetch);
   XCHECK(sumFetchCount <= 1)
-      << "Can specify at most one of jafetch or jrfetch or fetch";
+      << "Can specify at most one of jafetch or jrfetch or fill or fetch";
   TrackNamespace ns =
       TrackNamespace(FLAGS_track_namespace, FLAGS_track_namespace_delimiter);
   std::shared_ptr<MoQFollyExecutorImpl> moqEvb =
@@ -500,7 +487,7 @@ int main(int argc, char* argv[]) {
     }
   });
 
-  auto subParams = flags2params();
+  auto subFilter = flags2filter();
   std::vector<Parameter> params{};
   if (FLAGS_delivery_timeout > 0) {
     params.emplace_back(
@@ -515,9 +502,7 @@ int main(int argc, char* argv[]) {
               0,
               GroupOrder::OldestFirst,
               FLAGS_forward,
-              subParams.locType,
-              subParams.start,
-              subParams.endGroup,
+              subFilter,
               params)))
       .start()
       .via(&eventBase)

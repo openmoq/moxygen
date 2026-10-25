@@ -10,6 +10,7 @@
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
 #include <folly/futures/ThreadWheelTimekeeper.h>
 #include <folly/io/async/EventBaseManager.h>
+#include <moxygen/FillFetch.h>
 #include <moxygen/MoQLocation.h>
 #include <moxygen/MoQQmuxServer.h>
 #include <moxygen/MoQServer.h>
@@ -76,7 +77,8 @@ static const Extensions kExtensions{
 };
 
 // DatePublisher - Publisher logic with no server dependencies
-class DatePublisher : public Publisher {
+class DatePublisher : public Publisher,
+                      public std::enable_shared_from_this<DatePublisher> {
  public:
   enum class Mode { STREAM_PER_GROUP, STREAM_PER_OBJECT, DATAGRAM };
 
@@ -89,6 +91,9 @@ class DatePublisher : public Publisher {
         deliveryTimeout_(deliveryTimeout),
         forwarder_(dateTrackName()) {
     forwarder_.setLargest(nowLocation());
+    auto cb = std::make_shared<FillCallback>();
+    cb->publisher = this;
+    forwarder_.setCallback(std::move(cb));
   }
 
   folly::coro::Task<PublishRequest> callPublish(
@@ -204,8 +209,8 @@ class DatePublisher : public Publisher {
               "unexpected subscribe"});
     }
     auto largest = *forwarder_.largest();
-    if (subReq.locType == LocationType::AbsoluteRange &&
-        subReq.endGroup < largest.group) {
+    auto subEndGroup = subReq.filter.legacyEndGroup();
+    if (subEndGroup && *subEndGroup < largest.group) {
       co_return folly::makeUnexpected(
           SubscribeError{
               subReq.requestID,
@@ -222,6 +227,9 @@ class DatePublisher : public Publisher {
 
     auto subscriber =
         forwarder_.addSubscriber(reqCtx.sessionId, subReq, std::move(consumer));
+    if (subscriber && subReq.fill) {
+      subscriber->requestFill(subReq.requestID, *subReq.fill);
+    }
     co_return subscriber;
   }
 
@@ -504,6 +512,22 @@ class DatePublisher : public Publisher {
   FullTrackName dateTrackName() const {
     return FullTrackName({TrackNamespace({ns_}), "date"});
   }
+
+  // Serves fills from this publisher's own fetch(). The publisher owns the
+  // forwarder that owns this callback, so the pointer outlives it.
+  struct FillCallback : public MoQForwarder::Callback {
+    DatePublisher* publisher{nullptr};
+
+    void onEmpty(MoQForwarder*) override {}
+
+    void fillRequested(
+        MoQForwarder* /*forwarder*/,
+        std::shared_ptr<TrackConsumer> consumer,
+        Fetch fetch) override {
+      serveFillFromFetch(
+          publisher->shared_from_this(), std::move(consumer), std::move(fetch));
+    }
+  };
 
   Mode mode_{Mode::STREAM_PER_GROUP};
   std::string ns_;

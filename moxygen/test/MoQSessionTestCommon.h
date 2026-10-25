@@ -102,9 +102,7 @@ inline Subscriber::PublishResult makePublishOkResult(
       true, // forward
       128,  // subscriber priority
       GroupOrder::Default,
-      LocationType::LargestObject,
-      std::nullopt,                    // start
-      std::make_optional(uint64_t(0)), // endGroup
+      LocationFilter::nextObject(),
   };
 
   // Create the reply task that returns the PublishOk
@@ -120,6 +118,13 @@ inline Subscriber::PublishResult makePublishOkResult(
 Fetch getFetch(AbsoluteLocation start, AbsoluteLocation end);
 
 SubscribeRequest getSubscribe(const FullTrackName& ftn);
+
+// A SUBSCRIBE asking for a fill that covers joiningStart groups back from the
+// current group.
+SubscribeRequest subscribeWithFill(
+    const FullTrackName& ftn,
+    uint64_t joiningStart,
+    std::optional<uint8_t> fillPriority = std::nullopt);
 
 PublishDone getTrackEndedPublishDone(RequestID id);
 
@@ -206,6 +211,22 @@ class MoQSessionTest : public testing::TestWithParam<VersionParams>,
       std::optional<FetchErrorCode> error = std::nullopt);
 
   void expectFetchSuccess();
+
+  // The fetch that serves a fill, which records no fetch outcome stat.
+  void expectFillFetch(
+      const std::function<
+          TaskFetchResult(Fetch, std::shared_ptr<FetchConsumer>)>& lambda);
+
+  // Routes the subscription's fill fetch stream to fetchCallback_.
+  void expectBeginFill();
+
+  // Serves a fill on kTestTrackName the way a publisher does, from
+  // serverPublisher's own fetch(). Does nothing if `fill` is empty.
+  void serveFill(
+      RequestID requestID,
+      const std::optional<FillParameters>& fill,
+      std::shared_ptr<TrackConsumer> pub,
+      std::optional<AbsoluteLocation> largest);
 
   using TaskSubscribeResult = folly::coro::Task<Publisher::SubscribeResult>;
 
@@ -307,5 +328,8 @@ class Draft22Test : public MoQSessionTest {};
 // MAX_REQUEST_ID / REQUESTS_BLOCKED request-ID flow control, which was
 // removed in draft 18 in favor of QUIC bidi stream limits.
 class PreDraft18Test : public MoQSessionTest {};
+
+// Parameterized to draft 20+ only.
+class Draft20Test : public MoQSessionTest {};
 
 }} // namespace moxygen::test

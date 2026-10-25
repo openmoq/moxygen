@@ -114,7 +114,7 @@ class MoQRelayTest : public ::testing::Test {
     SubscribeRequest sub;
     sub.fullTrackName = trackName;
     sub.requestID = requestID;
-    sub.locType = LocationType::LargestObject;
+    sub.filter = LocationFilter::nextObject();
     std::shared_ptr<SubscriptionHandle> handle{nullptr};
     withSessionContext(session, [&]() {
       auto task = relay_->subscribe(std::move(sub), consumer);
@@ -382,9 +382,7 @@ class MoQRelayTest : public ::testing::Test {
                   /*forward=*/pub.forward,
                   /*priority=*/128,
                   GroupOrder::Default,
-                  LocationType::LargestObject,
-                  /*start=*/kLocationMin,
-                  /*endGroup=*/std::make_optional(uint64_t(0))};
+                  LocationFilter::nextObject()};
               return Subscriber::PublishConsumerAndReplyTask{
                   createMockConsumer(),
                   folly::coro::makeTask<
@@ -433,7 +431,7 @@ class MoQRelayTest : public ::testing::Test {
     SubscribeRequest sub;
     sub.fullTrackName = ftn;
     sub.requestID = RequestID(1);
-    sub.locType = LocationType::LargestObject;
+    sub.filter = LocationFilter::nextObject();
     auto consumer = createMockConsumer();
     withSessionContext(subscriber, [&]() {
       auto res = folly::coro::blockingWait(
@@ -1032,9 +1030,7 @@ TEST_F(MoQRelayTest, SubscribeNamespaceDoesntAddDrainingPublish) {
                                       /*forward=*/true,
                                       /*subscriberPriority=*/0,
                                       /*groupOrder=*/GroupOrder::OldestFirst,
-                                      /*locType=*/LocationType::LargestObject,
-                                      /*start=*/std::nullopt,
-                                      /*endGroup=*/std::nullopt};
+                                      LocationFilter::nextObject()};
                 }()});
       });
 
@@ -1119,7 +1115,7 @@ TEST_F(MoQRelayTest, SubscribeEmptyNamespaceRejectedPreV18) {
   SubscribeRequest sub;
   sub.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
   sub.requestID = RequestID(0);
-  sub.locType = LocationType::LargestObject;
+  sub.filter = LocationFilter::nextObject();
   auto consumer = createMockConsumer();
 
   withSessionContext(session, [&]() {
@@ -1141,7 +1137,7 @@ TEST_F(MoQRelayTest, SubscribeEmptyNamespaceAcceptedV18) {
   SubscribeRequest sub;
   sub.fullTrackName = FullTrackName{TrackNamespace{{}}, "track1"};
   sub.requestID = RequestID(0);
-  sub.locType = LocationType::LargestObject;
+  sub.filter = LocationFilter::nextObject();
   auto consumer = createMockConsumer();
 
   withSessionContext(session, [&]() {
@@ -1338,9 +1334,7 @@ TEST_F(MoQRelayTest, PublishExtensionsForwardedToSubscribers) {
                       true,
                       0,
                       GroupOrder::OldestFirst,
-                      LocationType::LargestObject,
-                      std::nullopt,
-                      std::nullopt};
+                      LocationFilter::nextObject()};
                 }()});
       });
 
@@ -1428,9 +1422,7 @@ TEST_F(MoQRelayTest, PublishExtensionsForwardedToLateJoiners) {
                       true,
                       0,
                       GroupOrder::OldestFirst,
-                      LocationType::LargestObject,
-                      std::nullopt,
-                      std::nullopt};
+                      LocationFilter::nextObject()};
                 }()});
       });
 
@@ -1470,9 +1462,7 @@ TEST_F(MoQRelayTest, PublishExtensionsForwardedToLateJoiners) {
                       true,
                       0,
                       GroupOrder::OldestFirst,
-                      LocationType::LargestObject,
-                      std::nullopt,
-                      std::nullopt};
+                      LocationFilter::nextObject()};
                 }()});
       });
 
@@ -1483,6 +1473,102 @@ TEST_F(MoQRelayTest, PublishExtensionsForwardedToLateJoiners) {
   EXPECT_EQ(
       receivedExtensions.getIntExtension(kDeliveryTimeoutExtensionType), 3000);
   EXPECT_EQ(receivedExtensions.getIntExtension(0xCAFE'0000), 99);
+
+  removeSession(publisherSession);
+  removeSession(subscriber1);
+  removeSession(subscriber2);
+}
+
+namespace {
+// A second subscriber whose range ends before the forwarder's Largest Object.
+// Only subscribers that join an existing subscription reach the range check.
+SubscribeRequest pastRangeSubscribe(RequestID requestID) {
+  SubscribeRequest sub;
+  sub.fullTrackName = kTestTrackName;
+  sub.requestID = requestID;
+  sub.filter = LocationFilter::range(AbsoluteLocation{1, 0}, 10);
+  return sub;
+}
+} // namespace
+
+// Refusing a past range refuses the fill that would have retrieved it.
+TEST_F(MoQRelayTest, PastRangeSubscriptionAcceptedAtDraft20) {
+  auto publisherSession = createMockSession();
+  auto subscriber1 = createMockSession();
+  auto subscriber2 = createMockSession();
+  ON_CALL(*subscriber2, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft20)));
+
+  doPublishNamespace(publisherSession, kTestNamespace);
+
+  SubscribeOk upstreamOk;
+  upstreamOk.requestID = RequestID(1);
+  upstreamOk.trackAlias = TrackAlias(1);
+  upstreamOk.groupOrder = GroupOrder::OldestFirst;
+  upstreamOk.largest = AbsoluteLocation{50, 0};
+  EXPECT_CALL(*publisherSession, subscribe(_, _))
+      .WillOnce([upstreamOk](const auto&, auto) {
+        auto handle =
+            std::make_shared<NiceMock<MockSubscriptionHandle>>(upstreamOk);
+        return folly::coro::makeTask<Publisher::SubscribeResult>(
+            folly::
+                Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>(
+                    handle));
+      });
+
+  auto handle1 = subscribeToTrack(
+      subscriber1, kTestTrackName, createMockConsumer(), RequestID(1));
+  ASSERT_NE(handle1, nullptr);
+
+  auto consumer2 = createMockConsumer();
+  withSessionContext(subscriber2, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->subscribe(pastRangeSubscribe(RequestID(2)), consumer2),
+        exec_.get());
+    ASSERT_TRUE(res.hasValue());
+    getOrCreateMockState(subscriber2)->subscribeHandles.push_back(*res);
+  });
+
+  removeSession(publisherSession);
+  removeSession(subscriber1);
+  removeSession(subscriber2);
+}
+
+// The drafts below 20 still refuse the same request.
+TEST_F(MoQRelayTest, PastRangeSubscriptionRefusedBeforeDraft20) {
+  auto publisherSession = createMockSession();
+  auto subscriber1 = createMockSession();
+  auto subscriber2 = createMockSession();
+
+  doPublishNamespace(publisherSession, kTestNamespace);
+
+  SubscribeOk upstreamOk;
+  upstreamOk.requestID = RequestID(1);
+  upstreamOk.trackAlias = TrackAlias(1);
+  upstreamOk.groupOrder = GroupOrder::OldestFirst;
+  upstreamOk.largest = AbsoluteLocation{50, 0};
+  EXPECT_CALL(*publisherSession, subscribe(_, _))
+      .WillOnce([upstreamOk](const auto&, auto) {
+        auto handle =
+            std::make_shared<NiceMock<MockSubscriptionHandle>>(upstreamOk);
+        return folly::coro::makeTask<Publisher::SubscribeResult>(
+            folly::
+                Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>(
+                    handle));
+      });
+
+  auto handle1 = subscribeToTrack(
+      subscriber1, kTestTrackName, createMockConsumer(), RequestID(1));
+  ASSERT_NE(handle1, nullptr);
+
+  auto consumer2 = createMockConsumer();
+  withSessionContext(subscriber2, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->subscribe(pastRangeSubscribe(RequestID(2)), consumer2),
+        exec_.get());
+    ASSERT_FALSE(res.hasValue());
+    EXPECT_EQ(res.error().errorCode, SubscribeErrorCode::INVALID_RANGE);
+  });
 
   removeSession(publisherSession);
   removeSession(subscriber1);
@@ -1573,9 +1659,9 @@ TEST_F(MoQRelayTest, RelaySubscribePreservesFirstSubscriberRequest) {
   sub.fullTrackName = kTestTrackName;
   sub.requestID = RequestID(1);
   sub.groupOrder = GroupOrder::NewestFirst;
-  sub.locType = LocationType::AbsoluteRange;
-  sub.start = AbsoluteLocation{4, 0};
-  sub.endGroup = 9;
+  sub.filter = LocationFilter::range({4, 0}, {9, 0});
+  // The upstream subscription is shared, so the fill stays off it.
+  sub.fill = FillParameters{LocationFilter::relativeStart(3), {}, {}, {}};
 
   auto consumer = createMockConsumer();
   std::shared_ptr<SubscriptionHandle> handle{nullptr};
@@ -1589,13 +1675,183 @@ TEST_F(MoQRelayTest, RelaySubscribePreservesFirstSubscriberRequest) {
   getOrCreateMockState(subscriberSession)->subscribeHandles.push_back(handle);
 
   EXPECT_EQ(upstreamReq.groupOrder, GroupOrder::Default);
-  EXPECT_EQ(upstreamReq.locType, LocationType::LargestObject);
+  EXPECT_EQ(upstreamReq.filter, LocationFilter::nextObject());
+  EXPECT_FALSE(upstreamReq.fill.has_value());
 
   EXPECT_EQ(handle->subscribeOk().groupOrder, GroupOrder::NewestFirst);
   auto* subscriber = dynamic_cast<MoQForwarder::Subscriber*>(handle.get());
   ASSERT_NE(subscriber, nullptr);
   EXPECT_EQ(subscriber->range.start, (AbsoluteLocation{4, 0}));
   EXPECT_EQ(subscriber->range.end, (AbsoluteLocation{9, 0}));
+
+  removeSession(publisherSession);
+  removeSession(subscriberSession);
+}
+
+// The forwarder applies a REQUEST_UPDATE's filter and serves its fill, resolved
+// against the forwarder's Largest Object, under the update's request ID.
+TEST_F(MoQRelayTest, ForwarderRequestUpdateServesFill) {
+  auto publisherSession = createMockSession();
+  auto subscriberSession = createMockSession();
+
+  doPublishNamespace(publisherSession, kTestNamespace);
+
+  SubscribeOk upstreamOk;
+  upstreamOk.requestID = RequestID(1);
+  upstreamOk.trackAlias = TrackAlias(1);
+  upstreamOk.groupOrder = GroupOrder::OldestFirst;
+  upstreamOk.largest = AbsoluteLocation{50, 0};
+  EXPECT_CALL(*publisherSession, subscribe(_, _))
+      .WillOnce([upstreamOk](const auto&, auto) {
+        auto handle =
+            std::make_shared<NiceMock<MockSubscriptionHandle>>(upstreamOk);
+        return folly::coro::makeTask<Publisher::SubscribeResult>(
+            folly::
+                Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>(
+                    handle));
+      });
+
+  auto consumer = createMockConsumer();
+  SubscribeRequest sub;
+  sub.fullTrackName = kTestTrackName;
+  sub.requestID = RequestID(1);
+  sub.filter = LocationFilter::nextObject();
+  sub.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
+      AuthToken{0, "subscription-secret", true}));
+  std::shared_ptr<SubscriptionHandle> handle;
+  withSessionContext(subscriberSession, [&]() {
+    auto res = folly::coro::blockingWait(
+        relay_->subscribe(std::move(sub), consumer), exec_.get());
+    ASSERT_TRUE(res.hasValue());
+    handle = std::move(res.value());
+  });
+  getOrCreateMockState(subscriberSession)->subscribeHandles.push_back(handle);
+  auto* subscriber = dynamic_cast<MoQForwarder::Subscriber*>(handle.get());
+  ASSERT_NE(subscriber, nullptr);
+
+  auto fill = std::make_shared<NiceMock<MockFetchConsumer>>();
+  EXPECT_CALL(*consumer, beginFill(RequestID(2)))
+      .WillOnce(Return(
+          folly::Expected<std::shared_ptr<FetchConsumer>, MoQPublishError>(
+              fill)));
+  Fetch upstreamFetch;
+  EXPECT_CALL(*publisherSession, fetch(_, _))
+      .WillOnce([&upstreamFetch](Fetch fetch, std::shared_ptr<FetchConsumer>) {
+        upstreamFetch = std::move(fetch);
+        return folly::coro::makeTask<Publisher::FetchResult>(
+            std::make_shared<NiceMock<MockFetchHandle>>(FetchOk{
+                RequestID(2),
+                GroupOrder::OldestFirst,
+                0,
+                AbsoluteLocation{50, 0},
+                Extensions{}}));
+      });
+
+  RequestUpdate update;
+  update.requestID = RequestID(2);
+  update.existingRequestID = RequestID(1);
+  update.filter = LocationFilter::range(AbsoluteLocation{40, 0}, 60);
+  update.fill = FillParameters{LocationFilter::relativeStart(3), {}, {}, {}};
+
+  withSessionContext(subscriberSession, [&]() {
+    auto res = folly::coro::blockingWait(
+        subscriber->requestUpdate(std::move(update)), exec_.get());
+    ASSERT_TRUE(res.hasValue());
+  });
+  exec_->drive();
+
+  // The filter runs through the last object of group 60.
+  EXPECT_EQ(subscriber->range.start, (AbsoluteLocation{40, 0}));
+  EXPECT_EQ(subscriber->range.end, (AbsoluteLocation{60, kEightByteLimit}));
+
+  // Three groups back from the next group after Largest {50,0}, with the
+  // subscription's authorization.
+  auto* standalone = std::get_if<StandaloneFetch>(&upstreamFetch.args);
+  ASSERT_NE(standalone, nullptr);
+  EXPECT_EQ(standalone->start, (AbsoluteLocation{48, 0}));
+  EXPECT_EQ(upstreamFetch.requestID, RequestID(2));
+  ASSERT_EQ(upstreamFetch.params.size(), 1);
+  EXPECT_EQ(
+      upstreamFetch.params.at(0).asAuthToken.tokenValue, "subscription-secret");
+
+  removeSession(publisherSession);
+  removeSession(subscriberSession);
+}
+
+// A subscriber that resumes with a fill gets the groups published while it was
+// paused: the fill resolves against the track's Largest, not the pause point.
+TEST_F(MoQRelayTest, ResumeFillCoversThePausedRange) {
+  auto publisherSession = createMockSession();
+  auto subscriberSession = createMockSession();
+
+  doPublishNamespace(publisherSession, kTestNamespace);
+  auto publishConsumer = doPublish(publisherSession, kTestTrackName);
+  auto consumer = createMockConsumer();
+  auto handle = subscribeToTrack(
+      subscriberSession, kTestTrackName, consumer, RequestID(1));
+  ASSERT_NE(handle, nullptr);
+  EXPECT_CALL(*consumer, objectStream(_, _, _))
+      .WillOnce(Return(folly::makeExpected<MoQPublishError>(folly::unit)));
+  ASSERT_TRUE(publishConsumer
+                  ->objectStream(
+                      ObjectHeader(50, 0, 0, 0, uint64_t(1)),
+                      folly::IOBuf::copyBuffer("a"))
+                  .hasValue());
+
+  RequestUpdate pause;
+  pause.requestID = RequestID(2);
+  pause.existingRequestID = RequestID(1);
+  pause.forward = false;
+  withSessionContext(subscriberSession, [&]() {
+    EXPECT_TRUE(
+        folly::coro::blockingWait(
+            handle->requestUpdate(std::move(pause)), exec_.get())
+            .hasValue());
+  });
+
+  ASSERT_TRUE(publishConsumer
+                  ->objectStream(
+                      ObjectHeader(55, 0, 0, 0, uint64_t(1)),
+                      folly::IOBuf::copyBuffer("b"))
+                  .hasValue());
+
+  auto fill = std::make_shared<NiceMock<MockFetchConsumer>>();
+  EXPECT_CALL(*consumer, beginFill(RequestID(3)))
+      .WillOnce(Return(
+          folly::Expected<std::shared_ptr<FetchConsumer>, MoQPublishError>(
+              fill)));
+  Fetch upstreamFetch;
+  EXPECT_CALL(*publisherSession, fetch(_, _))
+      .WillOnce([&upstreamFetch](Fetch fetch, std::shared_ptr<FetchConsumer>) {
+        upstreamFetch = std::move(fetch);
+        return folly::coro::makeTask<Publisher::FetchResult>(
+            std::make_shared<NiceMock<MockFetchHandle>>(FetchOk{
+                RequestID(3),
+                GroupOrder::OldestFirst,
+                0,
+                AbsoluteLocation{55, 0},
+                Extensions{}}));
+      });
+
+  RequestUpdate resume;
+  resume.requestID = RequestID(3);
+  resume.existingRequestID = RequestID(1);
+  resume.forward = true;
+  resume.fill = FillParameters{LocationFilter::relativeStart(6), {}, {}, {}};
+  withSessionContext(subscriberSession, [&]() {
+    EXPECT_TRUE(
+        folly::coro::blockingWait(
+            handle->requestUpdate(std::move(resume)), exec_.get())
+            .hasValue());
+  });
+  exec_->drive();
+
+  // Six groups back from the group after Largest {55,0}.
+  auto* standalone = std::get_if<StandaloneFetch>(&upstreamFetch.args);
+  ASSERT_NE(standalone, nullptr);
+  EXPECT_EQ(standalone->start, (AbsoluteLocation{50, 0}));
+  EXPECT_EQ(standalone->end.group, 55);
 
   removeSession(publisherSession);
   removeSession(subscriberSession);
@@ -1840,7 +2096,7 @@ TEST_F(MoQRelayTest, RelaySubscribeLateJoinerNGRForwardedUpstream) {
   SubscribeRequest sub2;
   sub2.fullTrackName = kTestTrackName;
   sub2.requestID = RequestID(2);
-  sub2.locType = LocationType::LargestObject;
+  sub2.filter = LocationFilter::nextObject();
   sub2.params.insertParam(Parameter(
       folly::to_underlying(TrackRequestParamKey::NEW_GROUP_REQUEST),
       uint64_t(8)));
@@ -1961,13 +2217,11 @@ TEST_F(MoQRelayTest, SubscriberOnPublishOkPostprocessing) {
   // Test 1: Range update from PublishOk
   // Create a PublishOk with specific start/end locations
   PublishOk pubOk1{
-      RequestID(1),                // requestID
-      true,                        // forward
-      0,                           // subscriberPriority
-      GroupOrder::OldestFirst,     // groupOrder
-      LocationType::AbsoluteStart, // locType
-      AbsoluteLocation{5, 0},      // start
-      uint64_t(15),                // endGroup
+      RequestID(1),            // requestID
+      true,                    // forward
+      0,                       // subscriberPriority
+      GroupOrder::OldestFirst, // groupOrder
+      LocationFilter::absoluteStart({5, 0}),
       TrackRequestParameters(FrameType::PUBLISH_OK)};
 
   // Apply the postprocessing
@@ -1983,9 +2237,7 @@ TEST_F(MoQRelayTest, SubscriberOnPublishOkPostprocessing) {
       false, // forward = false
       0,
       GroupOrder::OldestFirst,
-      LocationType::AbsoluteStart,
-      AbsoluteLocation{5, 0},
-      uint64_t(15),
+      LocationFilter::absoluteStart({5, 0}),
       TrackRequestParameters(FrameType::PUBLISH_OK)};
   subscriber->onPublishOk(pubOk2);
   EXPECT_FALSE(subscriber->shouldForward)
@@ -1997,9 +2249,7 @@ TEST_F(MoQRelayTest, SubscriberOnPublishOkPostprocessing) {
       true, // forward = true
       0,
       GroupOrder::OldestFirst,
-      LocationType::AbsoluteStart,
-      AbsoluteLocation{5, 0},
-      uint64_t(15),
+      LocationFilter::absoluteStart({5, 0}),
       TrackRequestParameters(FrameType::PUBLISH_OK)};
   subscriber->onPublishOk(pubOk3);
   EXPECT_TRUE(subscriber->shouldForward)
@@ -2024,9 +2274,7 @@ TEST_F(MoQRelayTest, SubscriberOnPublishOkPostprocessing) {
       true,
       0,
       GroupOrder::OldestFirst,
-      LocationType::AbsoluteStart,
-      AbsoluteLocation{10, 0},
-      std::nullopt,
+      LocationFilter::absoluteStart({10, 0}),
       std::move(ngrParams)};
 
   // onPublishOk should fire the NGR callback for group 20
@@ -2743,9 +2991,7 @@ TEST_F(MoQRelayTest, OnPublishOkUpdatesForwardingCount) {
       /*forward=*/false,
       0,
       GroupOrder::OldestFirst,
-      LocationType::AbsoluteStart,
-      AbsoluteLocation{0, 0},
-      std::nullopt,
+      LocationFilter::absoluteStart({0, 0}),
       TrackRequestParameters(FrameType::PUBLISH_OK)};
   subscriber->onPublishOk(pubOkFalse);
 
@@ -2763,9 +3009,7 @@ TEST_F(MoQRelayTest, OnPublishOkUpdatesForwardingCount) {
       /*forward=*/true,
       0,
       GroupOrder::OldestFirst,
-      LocationType::AbsoluteStart,
-      AbsoluteLocation{0, 0},
-      std::nullopt,
+      LocationFilter::absoluteStart({0, 0}),
       TrackRequestParameters(FrameType::PUBLISH_OK)};
   subscriber->onPublishOk(pubOkTrue);
 
@@ -2855,7 +3099,7 @@ TEST_F(MoQRelayTest, SubscribeSecondForwardingSubscriberSingleRequestUpdate) {
     SubscribeRequest sub;
     sub.fullTrackName = kTestTrackName;
     sub.requestID = RequestID(1);
-    sub.locType = LocationType::LargestObject;
+    sub.filter = LocationFilter::nextObject();
     sub.forward = false;
     withSessionContext(s1, [&]() {
       auto res = folly::coro::blockingWait(
@@ -2884,7 +3128,7 @@ TEST_F(MoQRelayTest, SubscribeSecondForwardingSubscriberSingleRequestUpdate) {
     SubscribeRequest sub;
     sub.fullTrackName = kTestTrackName;
     sub.requestID = RequestID(2);
-    sub.locType = LocationType::LargestObject;
+    sub.filter = LocationFilter::nextObject();
     sub.forward = true;
     withSessionContext(s2, [&]() {
       auto res = folly::coro::blockingWait(

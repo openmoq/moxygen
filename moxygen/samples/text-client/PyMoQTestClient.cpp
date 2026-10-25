@@ -136,25 +136,16 @@ const char* requestErrorCodeToString(RequestErrorCode code) {
   }
 }
 
-// Helper struct to parse location params (similar to flags2params in C++)
-struct SubParams {
-  LocationType locType{};
-  std::optional<AbsoluteLocation> start;
-  uint64_t endGroup{};
-};
-
-SubParams parseLocationParams(const MoQClientOptions& options) {
-  SubParams result;
+LocationFilter parseLocationFilter(const MoQClientOptions& options) {
   std::string soStr = options.so;
 
   if (options.sg.empty()) {
-    if (soStr.empty()) {
-      result.locType = LocationType::LargestObject;
-      return result;
-    } else {
+    if (!soStr.empty()) {
       throw MoQClientError(-1, "Invalid: sg blank, so=" + soStr);
     }
-  } else if (soStr.empty()) {
+    return LocationFilter::nextObject();
+  }
+  if (soStr.empty()) {
     soStr = "0";
   }
 
@@ -162,17 +153,12 @@ SubParams parseLocationParams(const MoQClientOptions& options) {
     throw MoQClientError(-1, "Joining fetch requires empty sg");
   }
 
-  result.start.emplace(
+  AbsoluteLocation start(
       folly::to<uint64_t>(options.sg), folly::to<uint64_t>(soStr));
-
   if (options.eg.empty()) {
-    result.locType = LocationType::AbsoluteStart;
-    return result;
-  } else {
-    result.locType = LocationType::AbsoluteRange;
-    result.endGroup = folly::to<uint64_t>(options.eg);
-    return result;
+    return LocationFilter::absoluteStart(start);
   }
+  return LocationFilter::range(start, {folly::to<uint64_t>(options.eg), 0});
 }
 
 // Simple handler for Python binding
@@ -274,8 +260,7 @@ class PyMoQSubscriber : public Subscriber,
     publishOk.forward = true;
     publishOk.subscriberPriority = kDefaultPriority;
     publishOk.groupOrder = moxygen::GroupOrder::Default;
-    publishOk.locType = moxygen::LocationType::AbsoluteStart;
-    publishOk.start = moxygen::AbsoluteLocation(0, 0);
+    publishOk.filter = moxygen::LocationFilter::absoluteStart({0, 0});
 
     if (handle) {
       subHandles_.push_back(handle);
@@ -336,25 +321,25 @@ class PyMoQSubscriber : public Subscriber,
 
         co_await handler_->baton;
       } else if (options_.jafetch || options_.jrfetch) {
-        // Joining fetch mode
-        FetchType fetchType = options_.jafetch ? FetchType::ABSOLUTE_JOINING
-                                               : FetchType::RELATIVE_JOINING;
-        auto fetchReceiver = std::make_shared<ObjectReceiver>(
-            ObjectReceiver::FETCH, std::make_shared<PyObjectHandler>(true));
+        // Fill mode. jafetch counts from a group ID, jrfetch from the current
+        // group, which is one nearer than a Location Filter's relative start.
+        const auto joinStart = static_cast<uint64_t>(options_.joinStart);
+        FillParameters fill;
+        fill.locationFilter = options_.jafetch
+            ? LocationFilter::absoluteStart({joinStart, 0})
+            : LocationFilter::relativeStart(joinStart + 1);
+        sub.fill = fill;
+        subReceiver_->setFillReceiverFactory([](RequestID) {
+          return std::make_shared<ObjectReceiver>(
+              ObjectReceiver::FETCH, std::make_shared<PyObjectHandler>(true));
+        });
 
-        auto joinResult = co_await moqClient_.getSession()->join(
-            sub,
-            subReceiver_,
-            options_.joinStart,
-            sub.priority,
-            sub.groupOrder,
-            {},
-            fetchReceiver,
-            fetchType);
+        auto subscribeResult =
+            co_await moqClient_.getSession()->subscribe(sub, subReceiver_);
 
-        if (joinResult.subscribeResult.hasError()) {
-          auto& error = joinResult.subscribeResult.error();
-          std::cerr << "Join/Subscribe failed with error:" << std::endl;
+        if (subscribeResult.hasError()) {
+          auto& error = subscribeResult.error();
+          std::cerr << "Subscribe with fill failed with error:" << std::endl;
           std::cerr << "  - Error Code: "
                     << folly::to_underlying(error.errorCode) << std::endl;
           std::cerr << "  - Reason: " << error.reasonPhrase << std::endl;
@@ -365,16 +350,18 @@ class PyMoQSubscriber : public Subscriber,
         co_await handler_->baton;
       } else if (options_.fetch) {
         // Pure fetch mode
-        if (!sub.start.has_value()) {
+        auto subStart = sub.filter.absoluteStartLocation();
+        if (!subStart.has_value()) {
           std::cerr << "Fetch requires start location" << std::endl;
           moqClient_.shutdown();
           co_return -1;
         }
-        AbsoluteLocation fetchEnd{sub.endGroup + 1, 0};
+        AbsoluteLocation fetchEnd{
+            sub.filter.legacyEndGroup().value_or(0) + 1, 0};
         auto fetchReq = Fetch(
             RequestID(0),
             sub.fullTrackName,
-            *sub.start,
+            *subStart,
             fetchEnd,
             sub.priority,
             sub.groupOrder);
@@ -471,19 +458,15 @@ class PyMoQTestClient {
       }
 
       // Parse location params
-      SubParams subParams;
+      LocationFilter subFilter;
       bool isFetch = options_.fetch || options_.jafetch || options_.jrfetch;
-      if (isFetch && !options_.sg.empty()) {
-        subParams = parseLocationParams(options_);
+      if (!options_.sg.empty()) {
+        subFilter = parseLocationFilter(options_);
       } else if (isFetch) {
         // Default fetch params
-        subParams.locType = LocationType::AbsoluteRange;
-        subParams.start.emplace(AbsoluteLocation(0, 0));
-        subParams.endGroup = 1;
-      } else if (!options_.sg.empty()) {
-        subParams = parseLocationParams(options_);
+        subFilter = LocationFilter::range(AbsoluteLocation{0, 0}, {1, 0});
       } else {
-        subParams.locType = LocationType::LargestObject;
+        subFilter = LocationFilter::nextObject();
       }
 
       TrackNamespace ns = TrackNamespace(
@@ -516,9 +499,7 @@ class PyMoQTestClient {
           kDefaultPriority,
           GroupOrder::OldestFirst,
           options_.forward,
-          subParams.locType,
-          subParams.start,
-          subParams.endGroup,
+          subFilter,
           params);
 
       // Use shared_ptr for result to avoid reference capture issues

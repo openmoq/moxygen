@@ -45,6 +45,7 @@ if [ $# -eq 0 ]; then
     echo "         $0 http://localhost:9999 16 Q   # raw QUIC"
     echo "         $0 http://localhost:9999 16 X   # QMUX-on-TCP"
     echo "         $0 http://localhost:9999 16,18"
+    echo "         $0 http://localhost:9999 20     # fill fetch, not joining FETCH"
     exit 1
 fi
 
@@ -218,7 +219,7 @@ run_join_test() {
     # join would have started a fresh one and validated it without ever
     # backfilling, so check which range the two halves actually met on.
     local backfill
-    backfill=$(echo "$output" | grep -o "joining FETCH backfills.*" | tail -1) || true
+    backfill=$(echo "$output" | grep -o "backfill covers.*" | tail -1) || true
     if [ -z "$reason" ]; then
         if [ "$expect" = "backfill" ] && ! echo "$backfill" | grep -q "groups"; then
             reason="Join backfilled nothing, so it did not land mid-track"
@@ -897,6 +898,9 @@ set_section "10" "Joining FETCH"
 # A joining FETCH backfills what ran before the subscription started, so the
 # two together cover the track.  Every test but the last runs against a track
 # a background subscriber is already holding open.
+#
+# From draft 20 the same flags produce a fill fetch stream instead.  These
+# cases check the backfill the client reports, so they cover either wire form.
 
 # 16 groups of 6 objects at 50ms is a little under five seconds of track, so
 # it is still running when the join lands a second and a half in.

@@ -6,6 +6,7 @@
 
 #include "moxygen/relay/MoQRelay.h"
 #include <folly/logging/xlog.h>
+#include "moxygen/FillFetch.h"
 #include "moxygen/MoQFilters.h"
 #include "moxygen/MoQFramer.h"
 #include "moxygen/MoQTrackProperties.h"
@@ -28,8 +29,7 @@ folly::coro::Task<void> MoQRelay::doSubscribeUpdate(
   auto updateRes = co_await handle->requestUpdate(
       {RequestID(0),
        handle->subscribeOk().requestID,
-       kLocationMin,
-       kLocationMax.group,
+       LocationFilter::range(kLocationMin, {kLocationMax.group, 0}),
        kDefaultPriority,
        /*forward=*/forward});
   if (updateRes.hasError()) {
@@ -525,9 +525,7 @@ Subscriber::PublishResult MoQRelay::publish(
           /*forward=*/(nSubscribers > 0),
           kDefaultPriority,
           pub.groupOrder,
-          LocationType::AbsoluteRange,
-          kLocationMin,
-          kLocationMax.group}),
+          LocationFilter::range(kLocationMin, {kLocationMax.group, 0})}),
       /*consumerReady=*/true};
 }
 
@@ -1581,14 +1579,20 @@ MoQRelay::subscribeToExistingRelaySubscription(
     }
   }
   auto& forwarder = subscriptionIt->second.forwarder;
-  if (forwarder->largest() && subReq.locType == LocationType::AbsoluteRange &&
-      subReq.endGroup < forwarder->largest()->group) {
-    co_return folly::makeUnexpected(
-        SubscribeError{
-            subReq.requestID,
-            SubscribeErrorCode::INVALID_RANGE,
-            "Range in the past, use FETCH"});
-    // start may be in the past, it will get adjusted forward to largest
+  // Draft 20 accepts a filter entirely before Largest Object. Older drafts
+  // refuse it, but only for a subscriber joining an existing subscription.
+  // TODO: retire the asymmetry along with the drafts that need it.
+  if (!useFillFetch(downstreamSession->getNegotiatedVersion().value_or(0))) {
+    auto subEndGroup = subReq.filter.legacyEndGroup();
+    if (forwarder->largest() && subEndGroup &&
+        *subEndGroup < forwarder->largest()->group) {
+      co_return folly::makeUnexpected(
+          SubscribeError{
+              subReq.requestID,
+              SubscribeErrorCode::INVALID_RANGE,
+              "Range in the past, use FETCH"});
+      // start may be in the past, it will get adjusted forward to largest
+    }
   }
   auto subscriber = forwarder->addSubscriber(
       downstreamSession->sessionId(), subReq, std::move(consumer));
@@ -1603,6 +1607,9 @@ MoQRelay::subscribeToExistingRelaySubscription(
   }
   XLOG(DBG4) << "added subscriber for ftn=" << subReq.fullTrackName;
   forwarder->tryProcessNewGroupRequest(subReq.params);
+  if (subReq.fill) {
+    subscriber->requestFill(subReq.requestID, *subReq.fill);
+  }
   co_return subscriber;
 }
 
@@ -1632,9 +1639,14 @@ MoQRelay::subscribeToFirstRelaySubscription(
   auto upstreamSubReq = subReq;
   upstreamSubReq.priority = kDefaultUpstreamPriority;
   upstreamSubReq.groupOrder = GroupOrder::Default;
-  // We only subscribe upstream with LargestObject. This is to satisfy other
+  // We only subscribe upstream from the Next Object. This is to satisfy other
   // subscribers that join with narrower filters
-  upstreamSubReq.locType = LocationType::LargestObject;
+  upstreamSubReq.filter = LocationFilter::nextObject();
+  // The shared upstream subscription does not request a fill either;
+  // downstream fills come from the cache and an upstream FETCH.
+  // TODO: carry the first subscriber's FILL_PARAMETERS upstream once the
+  // cache can take in an upstream fill.
+  upstreamSubReq.fill.reset();
   auto forwarder =
       std::make_shared<MoQForwarder>(subReq.fullTrackName, std::nullopt);
   forwarder->setCallback(shared_from_this());
@@ -1712,6 +1724,10 @@ MoQRelay::subscribeToFirstRelaySubscription(
   // Record NGR as outstanding (no fire — it rides the outgoing SUBSCRIBE).
   forwarder->tryProcessNewGroupRequest(subReq.params, /*fire=*/false);
   rsub.promise.setValue(folly::unit);
+  // Only now is upstream's Largest known, to both the forwarder and the cache.
+  if (subReq.fill) {
+    subscriber->requestFill(subReq.requestID, *subReq.fill);
+  }
   co_return subscriber;
 }
 
@@ -1730,6 +1746,13 @@ folly::coro::Task<Publisher::FetchResult> MoQRelay::fetch(
   }
 
   auto [standalone, joining] = fetchType(fetch);
+  if (joining && useFillFetch(session->getNegotiatedVersion().value_or(0))) {
+    // Only a locally built request can reach here at draft 20.
+    co_return folly::makeUnexpected(FetchError(
+        {fetch.requestID,
+         FetchErrorCode::NOT_SUPPORTED,
+         "Joining FETCH retired, use a fill"}));
+  }
   if (joining) {
     auto subscriptionIt = subscriptions_.find(fetch.fullTrackName);
     if (subscriptionIt == subscriptions_.end()) {
@@ -1739,7 +1762,24 @@ folly::coro::Task<Publisher::FetchResult> MoQRelay::fetch(
           {fetch.requestID,
            FetchErrorCode::DOES_NOT_EXIST,
            "No subscription for joining fetch"}));
-    } else if (subscriptionIt->second.promise.isFulfilled()) {
+    }
+    const auto& upstream = subscriptionIt->second.upstream;
+    // A draft 20 upstream refuses Joining FETCH, so resolve the join here once
+    // the subscribe completes.
+    if (!subscriptionIt->second.promise.isFulfilled() && upstream &&
+        useFillFetch(upstream->getNegotiatedVersion().value_or(0))) {
+      auto ready = co_await folly::coro::co_awaitTry(
+          subscriptionIt->second.promise.getFuture());
+      subscriptionIt = subscriptions_.find(fetch.fullTrackName);
+      if (ready.hasException() || subscriptionIt == subscriptions_.end() ||
+          !subscriptionIt->second.promise.isFulfilled()) {
+        co_return folly::makeUnexpected(FetchError(
+            {fetch.requestID,
+             FetchErrorCode::INVALID_JOINING_REQUEST_ID,
+             "Joined subscription failed"}));
+      }
+    }
+    if (subscriptionIt->second.promise.isFulfilled()) {
       auto res = subscriptionIt->second.forwarder->resolveJoiningFetch(
           session->sessionId(), *joining);
       if (res.hasError()) {
@@ -1921,6 +1961,14 @@ void MoQRelay::newGroupRequested(MoQForwarder* forwarder, uint64_t group) {
   auto handle = subscription.handle;
   co_withExecutor(exec, doNewGroupRequestUpdate(std::move(handle), group))
       .start();
+}
+
+// Serves the fill through MoQRelay::fetch: from the cache, else upstream.
+void MoQRelay::fillRequested(
+    MoQForwarder* /*forwarder*/,
+    std::shared_ptr<TrackConsumer> consumer,
+    Fetch fetch) {
+  serveFillFromFetch(shared_from_this(), std::move(consumer), std::move(fetch));
 }
 
 } // namespace moxygen

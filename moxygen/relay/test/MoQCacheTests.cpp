@@ -620,6 +620,93 @@ CO_TEST_F(MoQCacheTest, TestFetchMissUpstreamError) {
   EXPECT_TRUE(res.hasError());
 }
 
+namespace {
+// The shape of a fill's fetch: a range behind Largest Object, with the
+// subscription's authorization.
+Fetch getFillFetch(AbsoluteLocation start, AbsoluteLocation end) {
+  auto fetch = getFetch(start, end);
+  fetch.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
+      AuthToken{0, "secret", true}));
+  return fetch;
+}
+} // namespace
+
+// A fill over a range the cache has never seen goes upstream in full.
+CO_TEST_F(MoQCacheTest, TestFillColdCacheGoesUpstream) {
+  expectUpstreamFetch({2, 0}, {4, 10}, 0, AbsoluteLocation{9, 0});
+  auto res = co_await cache_.fetch(
+      getFillFetch({2, 0}, {4, 10}), trackingConsumer_, upstream_);
+  EXPECT_TRUE(res.hasValue());
+  expectFetchObjects({2, 0}, {4, 10}, true, 10, 1, 1, true);
+  serveCacheRangeFromUpstream({2, 0}, {4, 10}, 10, 1, 1, true);
+}
+
+// A repeated fill is served entirely from the cache.
+CO_TEST_F(MoQCacheTest, TestFillWarmCacheServesWithoutUpstream) {
+  populateCacheRange({2, 0}, {4, 10}, 10, 1, 1, true);
+  EXPECT_CALL(*upstream_, fetch(_, _)).Times(0);
+  expectFetchObjects({2, 0}, {4, 10}, false, 10, 1, 1, true);
+  auto res = co_await cache_.fetch(
+      getFillFetch({2, 0}, {4, 10}), trackingConsumer_, upstream_);
+  EXPECT_TRUE(res.hasValue());
+}
+
+// A fill reaching further back than the cache fetches only the gap upstream.
+CO_TEST_F(MoQCacheTest, TestFillPartialRangeFetchesOnlyTheGap) {
+  populateCacheRange({3, 5}, {4, 10}, 10, 1, 1, true);
+  expectFetchObjects({2, 0}, {4, 10}, false, 10, 1, 1, true);
+  expectUpstreamFetch({2, 0}, {3, 5}, 0, AbsoluteLocation{4, 10});
+  auto res = co_await cache_.fetch(
+      getFillFetch({2, 0}, {4, 10}), trackingConsumer_, upstream_);
+  EXPECT_TRUE(res.hasValue());
+  co_await folly::coro::co_reschedule_on_current_executor;
+  serveCacheRangeFromUpstream({2, 0}, {3, 5}, 10, 1, 1, true);
+}
+
+// On a cold cache, a failure returns a FetchError, which the session turns
+// into the fill's reset.
+CO_TEST_F(MoQCacheTest, TestFillColdCacheUpstreamErrorOpensNoStream) {
+  expectUpstreamFetch(
+      FetchError{0, FetchErrorCode::DOES_NOT_EXIST, "no track"});
+  EXPECT_CALL(*consumer_, reset(_)).Times(0);
+  auto res = co_await cache_.fetch(
+      getFillFetch({2, 0}, {4, 10}), trackingConsumer_, upstream_);
+  EXPECT_TRUE(res.hasError());
+}
+
+// The cache's mark can trail the forwarder's Largest Object, so a fill opened
+// against the forwarder can narrow to an empty stream.
+// TODO: resolve the stream and the range against one Largest Object.
+CO_TEST_F(MoQCacheTest, TestFillAboveLaggingCacheMarkNarrowsToEmpty) {
+  // A live writeback keeps the answer on the cache's own mark.
+  auto writeback = cache_.getSubscribeWriteback(kTestTrackName, trackConsumer_);
+  populateCacheRange({2, 0}, {2, 5});
+  EXPECT_CALL(*upstream_, fetch(_, _)).Times(0);
+  // Only the FIN.
+  EXPECT_CALL(*consumer_, object(_, _, _, _, _, _, _)).Times(0);
+  EXPECT_CALL(*consumer_, endOfFetch())
+      .WillOnce(Return(folly::makeExpected<MoQPublishError>(folly::unit)));
+
+  auto res = co_await cache_.fetch(
+      getFillFetch({4, 0}, {4, 10}), trackingConsumer_, upstream_);
+  CO_ASSERT_TRUE(res.hasValue());
+  // Narrowed to the start: the whole fill range is past what the cache holds.
+  EXPECT_EQ(res.value()->fetchOk().endLocation, (AbsoluteLocation{4, 0}));
+}
+
+// After the cached head is sent, a failure on the tail resets the stream.
+CO_TEST_F(MoQCacheTest, TestFillPartialRangeUpstreamErrorResetsStream) {
+  populateCacheRange({2, 0}, {2, 1});
+  expectUpstreamFetch(
+      FetchError{0, FetchErrorCode::DOES_NOT_EXIST, "no track"});
+  expectFetchObjects({2, 0}, {2, 1}, false);
+  EXPECT_CALL(*consumer_, reset(_));
+  auto res = co_await cache_.fetch(
+      getFillFetch({2, 0}, {4, 10}), trackingConsumer_, upstream_);
+  EXPECT_TRUE(res.hasError());
+}
+
 CO_TEST_F(MoQCacheTest, TestFetchMissTailUpstreamError) {
   // Test case for fetch with complete cache miss when no track is present
   populateCacheRange({0, 0}, {0, 1});

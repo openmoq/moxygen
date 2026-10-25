@@ -472,6 +472,163 @@ struct AbsoluteLocation {
 constexpr AbsoluteLocation kLocationMin;
 constexpr AbsoluteLocation kLocationMax{kEightByteLimit, kEightByteLimit};
 
+struct SubscribeRange {
+  AbsoluteLocation start;
+  AbsoluteLocation end; // inclusive
+};
+
+// Draft-20 Location Filter. How many optional varints are present on the wire
+// decides which fields they are, so the count is part of the value.
+class LocationFilter {
+ public:
+  static constexpr uint8_t kMaxFields = 4;
+
+  LocationFilter() = default;
+
+  static LocationFilter none() {
+    return LocationFilter{};
+  }
+
+  // N groups back from the Next Group: 0 is the next group, 1 the current one.
+  static LocationFilter relativeStart(uint64_t groupsBack) {
+    return LocationFilter{1, {groupsBack, 0}, {}};
+  }
+
+  static LocationFilter nextObject() {
+    return LocationFilter{2, kLocationMin, {}};
+  }
+
+  // An open-ended filter starting at {0,0} is unfiltered; encoding it as two
+  // zero fields would instead mean Next Object.
+  static LocationFilter absoluteStart(AbsoluteLocation start) {
+    if (start == kLocationMin) {
+      return none();
+    }
+    return LocationFilter{2, start, {}};
+  }
+
+  // Through the last Object of endGroup, inclusive.
+  static LocationFilter range(AbsoluteLocation start, uint64_t endGroup) {
+    return LocationFilter{3, start, {endGroup, 0}};
+  }
+
+  // Through end, inclusive.
+  static LocationFilter range(AbsoluteLocation start, AbsoluteLocation end) {
+    return LocationFilter{4, start, end};
+  }
+
+  // The draft < 20 inclusive End Group, or nullopt if open-ended. An end at a
+  // specific Object rounds up to the end of that Group.
+  std::optional<uint64_t> legacyEndGroup() const {
+    if (isOpenEnded()) {
+      return std::nullopt;
+    }
+    return end_.group;
+  }
+
+  bool isOpenEnded() const {
+    return fieldCount_ < 3;
+  }
+
+  // Whether the start depends on Largest Object, which is not available at
+  // parse time. Resolving one without a largest yields {0,0}.
+  bool needsLargest() const {
+    return fieldCount_ == 1 || isNextObjectForm();
+  }
+
+  // Groups back from the Next Group, for the relative form only.
+  std::optional<uint64_t> relativeStartGroupsBack() const {
+    return fieldCount_ == 1 ? std::optional<uint64_t>(start_.group)
+                            : std::nullopt;
+  }
+
+  // The Start Location as written, for the callers that must not resolve it
+  // against Largest Object. The relative forms have none until resolved.
+  std::optional<AbsoluteLocation> absoluteStartLocation() const {
+    if (fieldCount_ == 0) {
+      return kLocationMin;
+    }
+    if (fieldCount_ == 1 || isNextObjectForm()) {
+      return std::nullopt;
+    }
+    return start_;
+  }
+
+  bool operator==(const LocationFilter& other) const {
+    return fieldCount_ == other.fieldCount_ && start_ == other.start_ &&
+        end_ == other.end_;
+  }
+
+  // Applies the Location Filter table. An omitted end is Largest Object for a
+  // fetch and open for a subscription.
+  SubscribeRange resolve(std::optional<AbsoluteLocation> largest, bool isFetch)
+      const;
+
+  // The half-open [start, end) a FETCH covers, the form StandaloneFetch uses.
+  std::pair<AbsoluteLocation, AbsoluteLocation> fetchRange(
+      std::optional<AbsoluteLocation> largest) const;
+
+  std::string describe() const;
+
+  friend std::ostream& operator<<(
+      std::ostream& os,
+      const LocationFilter& filter) {
+    os << filter.describe();
+    return os;
+  }
+
+  // Wire form, for the framer. The end group goes out delta encoded, which
+  // cannot represent an end before the start.
+  uint8_t fieldCount() const {
+    return endBeforeStart() ? kMaxFields : fieldCount_;
+  }
+  std::array<uint64_t, kMaxFields> fields() const {
+    // The wire forms do not encode an empty range, so an end before the start
+    // becomes the single start object, in the four field form.
+    if (endBeforeStart()) {
+      return {start_.group, start_.object, 0, start_.object};
+    }
+    return {
+        start_.group, start_.object, end_.group - start_.group, end_.object};
+  }
+
+  // Rejects the forms the draft calls a PROTOCOL_VIOLATION: more than four
+  // fields, or an EndGroup that overflows.
+  static folly::Expected<LocationFilter, ErrorCode> fromFields(
+      const std::array<uint64_t, kMaxFields>& fields,
+      uint8_t count);
+
+ private:
+  LocationFilter(
+      uint8_t fieldCount,
+      AbsoluteLocation start,
+      AbsoluteLocation end)
+      : fieldCount_(fieldCount), start_(start), end_(end) {}
+
+  // Two zero fields, which the draft defines as the Next Object.
+  bool isNextObjectForm() const {
+    return fieldCount_ == 2 && start_ == kLocationMin;
+  }
+
+  // Only an earlier end group counts, since the unsigned delta cannot carry
+  // it. An inverted end object goes on the wire for the peer to reject.
+  bool endBeforeStart() const {
+    return fieldCount_ >= 3 && end_.group < start_.group;
+  }
+
+  static uint64_t saturatingAdd(uint64_t a, uint64_t b) {
+    return (b > kEightByteLimit - a) ? kEightByteLimit : a + b;
+  }
+
+  uint8_t fieldCount_{0}; // 0..kMaxFields
+  // For the relative form, start_.group is a count of groups back rather than
+  // a group ID.
+  AbsoluteLocation start_;
+  // Absolute, not the delta the wire carries: drafts below 20 can send an end
+  // group behind the start, and the endpoint has to see that to reject it.
+  AbsoluteLocation end_;
+};
+
 enum class LocationType : uint8_t {
   NextGroupStart = 1,
   LargestObject = 2,
@@ -495,6 +652,35 @@ struct SubscriptionFilter {
       : filterType(ft), location(loc), endGroup(std::move(eg)) {}
 };
 
+// Lossless out of the legacy form. Back into it, a relative start more than
+// one group back and an end that falls mid-group both have to approximate.
+SubscriptionFilter toSubscriptionFilter(const LocationFilter& filter);
+LocationFilter fromSubscriptionFilter(const SubscriptionFilter& filter);
+
+enum class GroupOrder : uint8_t {
+  Default = 0x0,
+  OldestFirst = 0x1,
+  NewestFirst = 0x2
+};
+
+// Draft-20 FILL_PARAMETERS, which requests a fill fetch stream. Each member
+// overrides the subscription's value for that stream only.
+struct FillParameters {
+  // Absent means the fill covers the subscription's own range; a zero-length
+  // filter on the wire means the whole track up to Largest Object.
+  std::optional<LocationFilter> locationFilter;
+  std::optional<uint8_t> subscriberPriority;
+  std::optional<GroupOrder> groupOrder;
+  // Carried through but not enforced yet.
+  std::optional<std::chrono::milliseconds> fillTimeout;
+
+  bool operator==(const FillParameters& other) const {
+    return locationFilter == other.locationFilter &&
+        subscriberPriority == other.subscriberPriority &&
+        groupOrder == other.groupOrder && fillTimeout == other.fillTimeout;
+  }
+};
+
 // TRACK_FILTER parameter for SUBSCRIBE_NAMESPACE (0x29)
 // Used to filter tracks based on a property value, selecting the top N tracks.
 struct TrackFilter {
@@ -510,14 +696,15 @@ struct TrackFilter {
 };
 
 // TODO: Consider refactoring to std::variant<std::string, uint64_t,
-// AuthToken, SubscriptionFilter, TrackFilter, AbsoluteLocation> to
+// AuthToken, LocationFilter, FillParameters, TrackFilter, AbsoluteLocation> to
 // reduce memory footprint and clarify semantics.
 struct Parameter {
   uint64_t key = 0;
   std::string asString;
   uint64_t asUint64 = 0;
   AuthToken asAuthToken;
-  SubscriptionFilter asSubscriptionFilter;
+  LocationFilter asLocationFilter;
+  FillParameters asFillParameters;
   TrackFilter asTrackFilter;
   std::optional<AbsoluteLocation> largestObject;
 
@@ -529,7 +716,8 @@ struct Parameter {
         asString(str),
         asUint64(0),
         asAuthToken(),
-        asSubscriptionFilter(),
+        asLocationFilter(),
+        asFillParameters(),
         asTrackFilter(),
         largestObject() {}
 
@@ -539,7 +727,8 @@ struct Parameter {
         asString(),
         asUint64(uint64),
         asAuthToken(),
-        asSubscriptionFilter(),
+        asLocationFilter(),
+        asFillParameters(),
         asTrackFilter(),
         largestObject() {}
 
@@ -549,17 +738,30 @@ struct Parameter {
         asString(),
         asUint64(0),
         asAuthToken(token),
-        asSubscriptionFilter(),
+        asLocationFilter(),
+        asFillParameters(),
         asTrackFilter(),
         largestObject() {}
 
-  // SubscriptionFilter parameter
-  Parameter(uint64_t keyIn, const SubscriptionFilter& filter)
+  // FillParameters parameter
+  Parameter(uint64_t keyIn, const FillParameters& fill)
       : key(keyIn),
         asString(),
         asUint64(0),
         asAuthToken(),
-        asSubscriptionFilter(filter),
+        asLocationFilter(),
+        asFillParameters(fill),
+        asTrackFilter(),
+        largestObject() {}
+
+  // LocationFilter parameter
+  Parameter(uint64_t keyIn, const LocationFilter& filter)
+      : key(keyIn),
+        asString(),
+        asUint64(0),
+        asAuthToken(),
+        asLocationFilter(filter),
+        asFillParameters(),
         asTrackFilter(),
         largestObject() {}
 
@@ -569,7 +771,8 @@ struct Parameter {
         asString(),
         asUint64(0),
         asAuthToken(),
-        asSubscriptionFilter(),
+        asLocationFilter(),
+        asFillParameters(),
         asTrackFilter(filter),
         largestObject() {}
 
@@ -579,7 +782,8 @@ struct Parameter {
         asString(),
         asUint64(0),
         asAuthToken(),
-        asSubscriptionFilter(),
+        asLocationFilter(),
+        asFillParameters(),
         asTrackFilter(),
         largestObject(loc) {}
 
@@ -603,9 +807,13 @@ enum class TrackRequestParamKey : uint64_t {
   RENDEZVOUS_TIMEOUT = 4,
   PUBLISHER_PRIORITY = 0x0E,
   SUBSCRIBER_PRIORITY = 0x20,
+  // Key 0x21: SUBSCRIPTION_FILTER for drafts < 20, LOCATION_FILTER for
+  // drafts >= 20.
   SUBSCRIPTION_FILTER = 0x21,
+  LOCATION_FILTER = 0x21,
   EXPIRES = 8,
   GROUP_ORDER = 0x22,
+  FILL_PARAMETERS = 0x23, // draft 20+
   LARGEST_OBJECT = 0x9,
   FILL_TIMEOUT = 0x0A,
   FORWARD = 0x10,
@@ -1238,19 +1446,23 @@ struct FullTrackName {
   };
 };
 
-enum class GroupOrder : uint8_t {
-  Default = 0x0,
-  OldestFirst = 0x1,
-  NewestFirst = 0x2
-};
-
 struct SubscribeRequest {
   static SubscribeRequest make(
       const FullTrackName& fullTrackName,
       uint8_t priority = kDefaultPriority,
       GroupOrder groupOrder = GroupOrder::Default,
       bool forward = true,
-      LocationType locType = LocationType::LargestGroup,
+      LocationFilter filter = LocationFilter::relativeStart(1),
+      const std::vector<Parameter>& inputParams = {});
+
+  // Deprecated: build a LocationFilter instead. Kept so existing callers
+  // keep compiling, and goes away once they migrate.
+  static SubscribeRequest make(
+      const FullTrackName& fullTrackName,
+      uint8_t priority,
+      GroupOrder groupOrder,
+      bool forward,
+      LocationType locType,
       std::optional<AbsoluteLocation> start = std::nullopt,
       uint64_t endGroup = 0,
       const std::vector<Parameter>& inputParams = {});
@@ -1260,9 +1472,8 @@ struct SubscribeRequest {
   uint8_t priority{kDefaultPriority};
   GroupOrder groupOrder{GroupOrder::Default};
   bool forward{true};
-  LocationType locType{LocationType::LargestObject};
-  std::optional<AbsoluteLocation> start;
-  uint64_t endGroup{0};
+  LocationFilter filter{LocationFilter::nextObject()};
+  std::optional<FillParameters> fill; // draft 20+
   TrackRequestParameters params{FrameType::SUBSCRIBE};
   bool includeProperties{true};
 };
@@ -1270,12 +1481,13 @@ struct SubscribeRequest {
 struct RequestUpdate {
   RequestID requestID;
   RequestID existingRequestID;
-  std::optional<AbsoluteLocation> start;
-  std::optional<uint64_t> endGroup;
+  // Absent leaves the subscription's filter alone.
+  std::optional<LocationFilter> filter;
   std::optional<uint8_t> priority;
   // Optional forward field. When absent, existing forward state is
   // preserved.
   std::optional<bool> forward;
+  std::optional<FillParameters> fill; // draft 20+
   TrackRequestParameters params{FrameType::SUBSCRIBE_UPDATE};
 };
 
@@ -1322,9 +1534,7 @@ struct PublishOk {
   bool forward{true};
   uint8_t subscriberPriority{kDefaultPriority};
   GroupOrder groupOrder{GroupOrder::OldestFirst};
-  LocationType locType{LocationType::LargestObject};
-  std::optional<AbsoluteLocation> start;
-  std::optional<uint64_t> endGroup;
+  LocationFilter filter{LocationFilter::nextObject()};
   TrackRequestParameters params{FrameType::PUBLISH_OK};
 };
 
@@ -1391,6 +1601,9 @@ struct StandaloneFetch {
   AbsoluteLocation end;
 };
 
+// The Location Filter covering a half-open [start, end) fetch range.
+LocationFilter toLocationFilter(const StandaloneFetch& range);
+
 struct JoiningFetch {
   JoiningFetch(
       std::optional<RequestID> jsid,
@@ -1442,6 +1655,9 @@ struct Fetch {
   uint8_t priority{kDefaultPriority};
   GroupOrder groupOrder{GroupOrder::Default};
   TrackRequestParameters params{FrameType::FETCH};
+  // Draft 20+ carries the range in LOCATION_FILTER. `args` holds it resolved,
+  // so code below the framer reads the range from `args` at every draft.
+  LocationFilter filter{LocationFilter::none()};
   std::variant<StandaloneFetch, JoiningFetch> args;
   bool includeProperties{true};
 };
