@@ -73,6 +73,8 @@ use identical dependency versions.
 | `BUILD_MOQTEST` | `ON` | Build the moqtest client, server and perf executables |
 | `BUILD_SHARED_LIBS` | `OFF` | Build shared libraries (discouraged) |
 | `BUILD_PICOQUIC` | `OFF` | Build with picoquic transport support |
+| `MOXYGEN_USE_HABERDASHERY` | `OFF` | Use haberdashery for QUIC AES-128-GCM packet protection (x86_64 and aarch64 Linux) |
+| `HABERDASHERY_REV` | pinned commit | haberdashery revision fetched when `MOXYGEN_USE_HABERDASHERY` is on |
 
 ## Build Caching
 
@@ -111,6 +113,7 @@ Available override variables:
 - `FETCHCONTENT_SOURCE_DIR_WANGLE`
 - `FETCHCONTENT_SOURCE_DIR_MVFST`
 - `FETCHCONTENT_SOURCE_DIR_PROXYGEN`
+- `FETCHCONTENT_SOURCE_DIR_HABERDASHERY`
 
 **Note:** When using local sources, you're responsible for ensuring version
 compatibility between dependencies.

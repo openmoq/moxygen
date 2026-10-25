@@ -1626,6 +1626,7 @@ class MoQSession : public Subscriber,
   // this runs before any frame that an extension could alter is sent or
   // parsed.
   void onSetupParams(SetupParameters params, bool local);
+  void markSetupComplete();
   void pruneBufferedSubgroups(TrackAlias alias);
   void scheduleGoawayTimeout(uint64_t timeoutMs);
   void cancelGoawayTimeout();
@@ -1675,6 +1676,8 @@ class MoQSession : public Subscriber,
   folly::coro::Promise<Setup> setupPromise_;
   folly::coro::Future<Setup> setupFuture_;
   bool setupComplete_{false};
+  using SetupWaiters = folly::F14FastMap<uint64_t, folly::coro::Promise<void>>;
+  std::shared_ptr<SetupWaiters> setupWaiters_;
   bool peerControlStreamReceived_{false};
   struct BufferedUniStream {
     ReadHandleRef readHandle;
