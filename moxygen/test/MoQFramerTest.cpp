@@ -5521,6 +5521,69 @@ TEST_P(MoQFramerV16PlusTest, TrackFilterLargeValues) {
   EXPECT_EQ(parsedParam.asTrackFilter.maxSelected, 15);
 }
 
+namespace {
+std::string writeSubscribeNamespaceWithTrackFilter(
+    const MoQFrameWriter& writer,
+    TrackFilter trackFilter) {
+  SubscribeNamespace subscribeNamespace;
+  subscribeNamespace.requestID = RequestID(1);
+  subscribeNamespace.trackNamespacePrefix =
+      TrackNamespace(std::vector<std::string>{"ns"});
+  subscribeNamespace.forward = true;
+  subscribeNamespace.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::TRACK_FILTER), trackFilter));
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  EXPECT_TRUE(
+      writer.writeSubscribeNamespace(writeBuf, subscribeNamespace).hasValue());
+  return writeBuf.move()->moveToFbString().toStdString();
+}
+} // namespace
+
+TEST_P(MoQFramerV16PlusTest, TrackFilterUsesNegotiatedVarint) {
+  // 100 and 70 take one byte as MoQ varints and two as QUIC varints.
+  auto wire = writeSubscribeNamespaceWithTrackFilter(writer_, {100, 70});
+
+  folly::IOBufQueue fields{folly::IOBufQueue::cacheChainLength()};
+  size_t fieldsSize = 0;
+  bool error = false;
+  writer_.writeVarint(fields, 100, fieldsSize, error);
+  writer_.writeVarint(fields, 70, fieldsSize, error);
+  folly::IOBufQueue value{folly::IOBufQueue::cacheChainLength()};
+  size_t valueSize = 0;
+  writer_.writeVarint(value, fieldsSize, valueSize, error);
+  value.append(fields.move());
+  ASSERT_FALSE(error);
+  EXPECT_NE(
+      wire.find(value.move()->moveToFbString().toStdString()),
+      std::string::npos);
+
+  auto buf = folly::IOBuf::copyBuffer(wire);
+  folly::io::Cursor cursor(buf.get());
+  ASSERT_TRUE(decodeMoQVarint(cursor).has_value());
+  auto parseResult =
+      parser_.parseSubscribeNamespace(cursor, frameLength(cursor));
+  ASSERT_TRUE(parseResult.hasValue());
+  ASSERT_EQ(parseResult->params.size(), 1);
+  EXPECT_EQ(parseResult->params.at(0).asTrackFilter, (TrackFilter{100, 70}));
+}
+
+TEST_P(MoQFramerV16PlusTest, TrackFilterTrailingBytesRejected) {
+  auto wire = writeSubscribeNamespaceWithTrackFilter(writer_, {0x10, 5});
+
+  // Declare one more byte than the two fields use, and grow the frame to match.
+  auto pos = wire.find(std::string("\x02\x10\x05", 3));
+  ASSERT_NE(pos, std::string::npos);
+  wire[pos] = 3;
+  wire.insert(pos + 3, 1, '\0');
+  auto buf = folly::IOBuf::copyBuffer(wire);
+  folly::io::Cursor cursor(buf.get());
+  ASSERT_TRUE(decodeMoQVarint(cursor).has_value());
+  auto frameLen = frameLength(cursor, /*checkAdvance=*/false) + 1;
+
+  auto parseResult = parser_.parseSubscribeNamespace(cursor, frameLen);
+  EXPECT_FALSE(parseResult.hasValue());
+}
+
 // Test TrackFilter struct equality operator
 TEST(TrackFilterTest, Equality) {
   TrackFilter a{0x10, 5};

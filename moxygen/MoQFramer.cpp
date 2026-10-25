@@ -511,12 +511,6 @@ bool datagramTypeEndOfGroup(uint64_t version, DatagramType datagramType);
 
 void writeSize(uint16_t* sizePtr, size_t size, bool& error, uint64_t versionIn);
 
-void writeTrackFilter(
-    folly::IOBufQueue& writeBuf,
-    const TrackFilter& filter,
-    size_t& size,
-    bool& error) noexcept;
-
 bool includeSetupParam(uint64_t version, SetupKey key);
 
 bool isPaddingStreamType(uint64_t version, uint64_t streamType) {
@@ -957,13 +951,13 @@ folly::Expected<FillParameters, ErrorCode> MoQFrameParser::parseFillParameters(
   return fill;
 }
 
-folly::Expected<TrackFilter, ErrorCode> parseTrackFilter(
+folly::Expected<TrackFilter, ErrorCode> MoQFrameParser::parseTrackFilter(
     folly::io::Cursor& cursor,
-    size_t& length) noexcept {
+    size_t& length) const noexcept {
   TrackFilter filter;
 
   // Parse propertyType
-  auto propertyType = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto propertyType = decodeVarint(cursor, length);
   if (!propertyType) {
     XLOG(DBG4) << "parseTrackFilter: UNDERFLOW on propertyType";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -972,7 +966,7 @@ folly::Expected<TrackFilter, ErrorCode> parseTrackFilter(
   filter.propertyType = propertyType->first;
 
   // Parse maxSelected (N)
-  auto maxSelected = quic::follyutils::decodeQuicInteger(cursor, length);
+  auto maxSelected = decodeVarint(cursor, length);
   if (!maxSelected) {
     XLOG(DBG4) << "parseTrackFilter: UNDERFLOW on maxSelected";
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1064,7 +1058,7 @@ MoQFrameParser::parseVariableParam(
     // TRACK_FILTER (key=0x29, odd = length-prefixed)
     // NOTE: TRACK_FILTER is an active proposal, not yet landed
     // in the core specification.
-    auto lenRes = quic::follyutils::decodeQuicInteger(cursor, length);
+    auto lenRes = decodeVarint(cursor, length);
     if (!lenRes) {
       XLOG(DBG4) << "parseVariableParam: UNDERFLOW on trackFilter length";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
@@ -1080,7 +1074,12 @@ MoQFrameParser::parseVariableParam(
     if (!res) {
       return folly::makeUnexpected(res.error());
     }
-    length -= lenRes->first;
+    if (filterSize > 0) {
+      XLOG(DBG4) << "parseVariableParam: track filter did not consume"
+                 << " all declared bytes, remaining=" << filterSize;
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
+    length -= filterLen;
     p.asTrackFilter = res.value();
   }
 
@@ -4640,11 +4639,11 @@ void MoQFrameWriter::writeFillParameters(
   }
 }
 
-void writeTrackFilter(
+void MoQFrameWriter::writeTrackFilter(
     folly::IOBufQueue& writeBuf,
     const TrackFilter& filter,
     size_t& size,
-    bool& error) noexcept {
+    bool& error) const noexcept {
   // Write propertyType
   writeVarint(writeBuf, filter.propertyType, size, error);
   // Write maxSelected (N)

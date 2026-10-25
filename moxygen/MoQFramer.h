@@ -521,6 +521,10 @@ class MoQFrameParser {
       folly::io::Cursor& cursor,
       size_t& length) const noexcept;
 
+  folly::Expected<TrackFilter, ErrorCode> parseTrackFilter(
+      folly::io::Cursor& cursor,
+      size_t& length) const noexcept;
+
   // Draft 20+. A nested parameter block with its own allowlist and its own
   // duplicate scope, so a type may appear both here and in the message.
   folly::Expected<FillParameters, ErrorCode> parseFillParameters(
@@ -944,6 +948,12 @@ class MoQFrameWriter {
   void writeSubscriptionFilter(
       folly::IOBufQueue& writeBuf,
       const SubscriptionFilter& filter,
+      size_t& size,
+      bool& error) const noexcept;
+
+  void writeTrackFilter(
+      folly::IOBufQueue& writeBuf,
+      const TrackFilter& filter,
       size_t& size,
       bool& error) const noexcept;
 
