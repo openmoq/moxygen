@@ -3310,6 +3310,7 @@ void MoQSession::close(
   if (closed_) {
     return;
   }
+  auto keepAlive = weak_from_this().lock();
   closeResult_ = CloseResult{error, wtError};
   closed_ = true;
   if (closeCallback_) {
@@ -3458,6 +3459,18 @@ void MoQSession::initPeerMaxRequestID(const Parameters& peerParams) {
   }
 }
 
+void MoQSession::markSetupComplete() {
+  setupComplete_ = true;
+  if (!setupWaiters_) {
+    return;
+  }
+  auto waiters = std::exchange(setupWaiters_, nullptr);
+  auto pending = std::exchange(*waiters, {});
+  for (auto& [_, promise] : pending) {
+    promise.setValue();
+  }
+}
+
 folly::coro::Task<Setup> MoQSession::awaitPeerSetup() {
   XLOG(DBG1) << __func__ << " sess=" << this;
   auto deletedToken = cancellationSource_.getToken();
@@ -3476,7 +3489,7 @@ folly::coro::Task<Setup> MoQSession::awaitPeerSetup() {
               << folly::exceptionStr(serverSetup.exception());
     co_yield folly::coro::co_error(serverSetup.exception());
   }
-  setupComplete_ = true;
+  markSetupComplete();
   auto negotiatedVersion = *getNegotiatedVersion();
   XLOG(DBG1) << "Negotiated Version=0x" << std::hex << negotiatedVersion
              << std::dec << " (draft-"
@@ -3629,7 +3642,7 @@ void MoQSession::onClientSetup(Setup clientSetup) {
     // MAX_REQUEST_ID is no longer derived from setup params in draft-18+; the
     // QUIC bidi stream limit governs request flow control instead.
     setupPromise_.setValue(clientSetup);
-    setupComplete_ = true;
+    markSetupComplete();
     replayBufferedUniStreams();
   } else {
     auto res = sendSetup(std::move(*serverSetup));
@@ -3637,7 +3650,7 @@ void MoQSession::onClientSetup(Setup clientSetup) {
       close(SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED);
       return;
     }
-    setupComplete_ = true;
+    markSetupComplete();
   }
 }
 
@@ -7969,6 +7982,24 @@ folly::coro::Task<void> MoQSession::bidiStreamDemuxer(
   if (token.isCancellationRequested()) {
     co_return;
   }
+  if (!setupComplete_ && useUniControlStreams(*negotiatedVersion_)) {
+    if (!setupWaiters_) {
+      setupWaiters_ = std::make_shared<SetupWaiters>();
+    }
+    auto waiters = setupWaiters_;
+    const auto id = readHandle.id();
+    auto [promise, future] = folly::coro::makePromiseContract<void>();
+    waiters->emplace(id, std::move(promise));
+    auto removeWaiter = folly::makeGuard([waiters, id] { waiters->erase(id); });
+    auto ready = co_await co_awaitTry(
+        folly::coro::co_withCancellation(token, std::move(future)));
+    if (token.isCancellationRequested() || ready.hasException()) {
+      co_return;
+    }
+    if (!setupComplete_ || closed_) {
+      co_return;
+    }
+  }
   std::optional<FrameType> frameType = std::nullopt;
 
   folly::IOBufQueue readBuf{folly::IOBufQueue::cacheChainLength()};
@@ -8750,7 +8781,7 @@ void MoQSession::setMaxConcurrentRequests(uint64_t maxConcurrent) {
 
 void MoQSession::setVersion(uint64_t version) {
   negotiatedVersion_ = version;
-  setupComplete_ = true;
+  markSetupComplete();
 }
 
 void MoQSession::setMoqSettings(MoQSettings settings) {
