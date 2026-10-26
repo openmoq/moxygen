@@ -79,8 +79,15 @@ if(MOXYGEN_SANITIZER)
     add_link_options(${_san_flags})
 endif()
 
+# haberdashery only has assembly for x86_64 and aarch64 Linux.
+set(_haberdashery_default OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|aarch64|arm64)$")
+    set(_haberdashery_default ON)
+endif()
 option(MOXYGEN_USE_HABERDASHERY
-    "Use haberdashery for QUIC AES-128-GCM packet protection (Linux only)" OFF)
+    "Use haberdashery for QUIC AES-128-GCM packet protection (Linux only)"
+    ${_haberdashery_default})
 # haberdashery is not in github_hashes, so its revision is pinned here.
 set(HABERDASHERY_REV "13b6e1d445cb70ef7c448b98ea14954a8ca40b63"
     CACHE STRING "haberdashery git revision")
