@@ -11,6 +11,7 @@
 #include "moxygen/mlog/FileMLogger.h"
 #include "moxygen/mlog/FileMLoggerFactory.h"
 #include "moxygen/moqtest/MoQTestServer.h"
+#include "moxygen/moqtest/Utils.h"
 #include "moxygen/samples/util/Utils.h"
 #include "moxygen/util/SignalHandler.h"
 
@@ -24,6 +25,10 @@ DEFINE_int32(port, 9999, "Port to listen on");
 DEFINE_bool(log, false, "Log to mlog file");
 DEFINE_string(mlog_path, kDefaultServerFilePath, "Path to mlog file.");
 DEFINE_string(relay_url, "", "Relay server URL to connect to");
+DEFINE_string(
+    ns_prefix,
+    "",
+    "Namespace tuples before moq-test-00, '/'-separated");
 DEFINE_int32(relay_connect_timeout, 1000, "Relay connect timeout (ms)");
 DEFINE_int32(
     relay_transaction_timeout,
@@ -114,7 +119,8 @@ int main(int argc, char** argv) {
             FLAGS_relay_url,
             FLAGS_relay_connect_timeout,
             FLAGS_relay_transaction_timeout,
-            transportType)) {
+            transportType,
+            moxygen::parseNsPrefix(FLAGS_ns_prefix))) {
       XLOG(ERR) << "Failed to start relay client";
       return 1;
     }
