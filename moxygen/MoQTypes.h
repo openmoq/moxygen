@@ -825,6 +825,8 @@ enum class TrackRequestParamKey : uint64_t {
   ROUTE_COST = 0x40B58,
 };
 
+bool isPublishSubscriptionParameter(TrackRequestParamKey key);
+
 inline bool isRendezvousTimeoutParam(uint64_t key, uint64_t majorVersion) {
   return key ==
       static_cast<uint64_t>(TrackRequestParamKey::RENDEZVOUS_TIMEOUT) &&
