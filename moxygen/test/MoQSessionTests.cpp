@@ -4,12 +4,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <folly/coro/Timeout.h>
 #include <folly/logging/xlog.h>
 #include <proxygen/lib/http/webtransport/test/FakeSharedWebTransport.h>
 #include <quic/client/QuicClientTransport.h>
 #include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/common/udpsocket/FollyQuicAsyncUDPSocket.h>
 #include <quic/fizz/client/handshake/FizzClientQuicHandshakeContext.h>
+#include "moxygen/MoQServerBase.h"
 #include "moxygen/test/MoQSessionTestCommon.h"
 
 #include <quic/api/test/MockQuicSocket.h>
@@ -585,6 +587,45 @@ CO_TEST_P_X(DisabledTokenCacheTest, SetupRegistrationsRemainUncached) {
   co_await closeCallback.closed;
   EXPECT_TRUE(receivedSetup_);
   EXPECT_EQ(closeCallback.errorCode, SessionCloseErrorCode::PROTOCOL_VIOLATION);
+}
+
+using MoQControlCallbackExceptionTest = MoQSessionTest;
+INSTANTIATE_TEST_SUITE_P(
+    MoQControlCallbackExceptionTest,
+    MoQControlCallbackExceptionTest,
+    testing::ValuesIn(getSupportedVersionParams()));
+
+CO_TEST_P_X(MoQControlCallbackExceptionTest, GoawayHandlerThrowClosesSession) {
+  co_await setupMoQSession();
+  // An open subscription keeps the draining server from closing first.
+  auto keepAliveConsumer =
+      std::make_shared<testing::NiceMock<MockTrackConsumer>>();
+  ON_CALL(*keepAliveConsumer, setTrackAlias(_))
+      .WillByDefault(
+          testing::Return(
+              folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
+  ON_CALL(*keepAliveConsumer, publishDone(_))
+      .WillByDefault(
+          testing::Return(
+              folly::Expected<folly::Unit, MoQPublishError>(folly::unit)));
+  expectSubscribe(
+      [](SubscribeRequest sub, auto /* pub */) -> TaskSubscribeResult {
+        co_return makeSubscribeOkResult(sub);
+      },
+      MoQControlCodec::Direction::CLIENT);
+  auto keepAlive = co_await serverSession_->subscribe(
+      getSubscribe(kTestTrackName), keepAliveConsumer);
+  CO_ASSERT_TRUE(!keepAlive.hasError());
+
+  RecordingSessionCloseCallback closeCallback;
+  clientSession_->setSessionCloseCallback(&closeCallback);
+  EXPECT_CALL(*clientPublisher, goaway(_))
+      .WillOnce(testing::Throw(std::runtime_error("handler failed")));
+
+  serverSession_->goaway(Goaway{});
+  co_await closeCallback.closed;
+
+  EXPECT_EQ(closeCallback.errorCode, SessionCloseErrorCode::INTERNAL_ERROR);
 }
 
 // === AUTHORITY / PATH tests ===
@@ -2402,6 +2443,39 @@ class NullWebTransportHandler : public proxygen::WebTransportHandler {
   void onSessionDrain() noexcept override {}
 };
 
+namespace {
+class SetupTimeoutServer : public MoQServerBase {
+ public:
+  SetupTimeoutServer() : MoQServerBase("/test") {}
+  void onNewSession(std::shared_ptr<MoQSession> /*session*/) override {}
+  void start(const folly::SocketAddress& /*addr*/) override {}
+  void stop() override {}
+  using MoQServerBase::handleClientSession;
+};
+} // namespace
+
+CO_TEST_P_X(MoQUniControlTest, ServerClosesSessionWithoutClientSetup) {
+  // The client never starts and reads none of the server's streams.
+  NullWebTransportHandler nullHandler;
+  serverWt_->setPeerHandler(&nullHandler);
+  // serverWt_ outlives nullHandler and calls back into it on session end.
+  auto peerHandlerGuard =
+      folly::makeGuard([this] { serverWt_->setPeerHandler(nullptr); });
+  MoQSettings moqSettings;
+  moqSettings.setupTimeout = std::chrono::milliseconds(50);
+  serverSession_->setMoqSettings(moqSettings);
+
+  // handleClientSession keeps the server alive until the session ends.
+  auto server = std::make_shared<SetupTimeoutServer>();
+  co_withExecutor(&eventBase_, server->handleClientSession(serverSession_))
+      .start();
+  for (int i = 0; i < 40 && !serverWt_->isSessionClosed(); ++i) {
+    co_await folly::coro::sleep(std::chrono::milliseconds(50));
+  }
+  EXPECT_TRUE(serverWt_->isSessionClosed());
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQUniControlTest, UniControlSetupStreamFinBeforeSetup) {
   // A peer that packs SETUP and the FIN into one write finishes its control
   // stream before the session can hand it to the control read loop. The
@@ -2556,6 +2630,57 @@ CO_TEST_P_X(MoQUniControlTest, BidiSetupRejectedInUniControlMode) {
     co_await folly::coro::co_reschedule_on_current_executor;
   }
   EXPECT_TRUE(serverWt_->isSessionClosed());
+}
+
+CO_TEST_P_X(MoQUniControlTest, BidiRequestBeforeClientSetupWaitsForSetup) {
+  // A SUBSCRIBE that arrives before CLIENT_SETUP waits for it. Servers install
+  // their handlers while processing CLIENT_SETUP.
+  // The client side is raw frames and reads none of the server's streams.
+  NullWebTransportHandler nullHandler;
+  serverWt_->setPeerHandler(&nullHandler);
+  // serverWt_ outlives nullHandler and calls back into it on session end.
+  auto peerHandlerGuard =
+      folly::makeGuard([this] { serverWt_->setPeerHandler(nullptr); });
+  serverSession_->start();
+  serverSession_->sendSetup(moxygen::Setup{});
+
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft18);
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  auto bidi = clientWt_->createBidiStream();
+  EXPECT_TRUE(bidi.hasValue());
+  if (!bidi.hasValue()) {
+    co_return;
+  }
+  EXPECT_TRUE(
+      writer.writeSubscribeRequest(writeBuf, getSubscribe(kTestTrackName))
+          .hasValue());
+  bidi->writeHandle->writeStreamData(writeBuf.move(), false, nullptr);
+  for (int i = 0; i < 10; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+
+  // Stands in for the server's validateAuthority during SETUP.
+  serverSession_->setPublishHandler(serverPublisher);
+  auto [subscribedPromise, subscribed] =
+      folly::coro::makePromiseContract<void>();
+  EXPECT_CALL(*serverPublisher, subscribe(_, _))
+      .WillOnce([&](auto sub, auto /*pub*/) -> TaskSubscribeResult {
+        subscribedPromise.setValue();
+        co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+      });
+
+  auto* controlWh =
+      CHECK_NOTNULL(clientWt_->createUniStream().value_or(nullptr));
+  writeClientSetup(
+      writeBuf, getClientSetup(initialMaxRequestID_), kVersionDraft18);
+  controlWh->writeStreamData(writeBuf.move(), false, nullptr);
+  // Time out if the publisher never sees the request.
+  auto reached = co_await folly::coro::co_awaitTry(
+      folly::coro::timeout(std::move(subscribed), std::chrono::seconds(1)));
+  EXPECT_FALSE(reached.hasException());
+
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
 CO_TEST_P_X(MoQUniControlTest, BidiRequestStreamFinWithFirstFrame) {
