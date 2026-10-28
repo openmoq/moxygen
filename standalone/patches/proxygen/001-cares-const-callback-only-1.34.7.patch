@@ -1,0 +1,15 @@
+c-ares 1.34.7 made ares_callback's buffer const; 1.34.8 reverted it
+(c-ares #1245). Only 1.34.7 has the const signature, so gate on it
+exactly rather than >=.
+
+--- a/proxygen/lib/dns/CAresResolver.h
++++ b/proxygen/lib/dns/CAresResolver.h
+@@ -24,7 +24,7 @@
+ #include "proxygen/lib/dns/DNSResolver.h"
+ 
+ namespace proxygen {
+-#if ARES_VERSION >= 0x012207
++#if ARES_VERSION == 0x012207
+ using AresCallbackBuffer = const unsigned char;
+ #else
+ using AresCallbackBuffer = unsigned char;

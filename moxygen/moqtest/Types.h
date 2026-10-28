@@ -8,6 +8,8 @@
 
 #include <folly/Expected.h>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace moxygen {
 
@@ -54,6 +56,9 @@ struct MoQTestParameters {
   // Client-side parameter (not part of track namespace)
   uint64_t datagramDropPercentage =
       kDefaultDatagramDropPercentage; // Allowed datagram drop percentage
+
+  // Tuples ahead of Tuple Field 0, to keep publishers apart behind one relay.
+  std::vector<std::string> nsPrefix;
 
   uint64_t lastObjectInTrack = this->objectsPerGroup +
       this->sendEndOfGroupMarkers; // Tuple Field 5 (Out of Order to Ensure
