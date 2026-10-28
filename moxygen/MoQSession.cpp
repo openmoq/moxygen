@@ -9,6 +9,7 @@
 #include <folly/concurrency/ProcessLocalUniqueId.h>
 #include <folly/coro/Baton.h>
 #include <folly/coro/Collect.h>
+#include <folly/coro/DetachOnCancel.h>
 #include <folly/coro/FutureUtil.h>
 #include <folly/coro/SharedPromise.h>
 #include <quic/common/CircularDeque.h>
@@ -775,7 +776,18 @@ StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
       writeBuf_.move(), finStream, deliveryCallback);
   if (writeRes.hasValue()) {
     if (finStream) {
+      // The stream is done, so there is nothing left to pace and no write
+      // handle to await on.  Report success even if the transport is blocked.
       onStreamComplete();
+      return folly::unit;
+    }
+    // For FETCH, propagate transport flow control signal.  The data was
+    // written; BLOCKED tells the publisher to await readiness before the next
+    // write.
+    if (streamType_ == StreamType::FETCH_HEADER &&
+        *writeRes == proxygen::WebTransport::FCState::BLOCKED) {
+      return folly::makeUnexpected(
+          MoQPublishError(MoQPublishError::BLOCKED, "Transport blocked"));
     }
     return folly::unit;
   }
@@ -4656,8 +4668,7 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
           std::move(initialPayload),
           std::move(extensions));
     }
-    return res ? MoQCodec::ParseResult::CONTINUE
-               : MoQCodec::ParseResult::ERROR_TERMINATE;
+    return toParseResult(res);
   }
 
   MoQCodec::ParseResult onObjectPayload(Payload payload, bool objectComplete)
@@ -4684,7 +4695,7 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
         std::move(payload),
         finStream);
     if (!res) {
-      return MoQCodec::ParseResult::ERROR_TERMINATE;
+      return toParseResult(res);
     }
     if (objectComplete != (res.value() == ObjectPublishStatus::DONE)) {
       XLOG(ERR) << "objectPayload status does not match the stream framing,"
@@ -4704,11 +4715,6 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     if (isCancelled()) {
       return MoQCodec::ParseResult::ERROR_TERMINATE;
     }
-    auto toParseResult =
-        [](const folly::Expected<folly::Unit, MoQPublishError>& r) {
-          return r ? MoQCodec::ParseResult::CONTINUE
-                   : MoQCodec::ParseResult::ERROR_TERMINATE;
-        };
     // Handle subscription/fetch consumers
     switch (status) {
       case ObjectStatus::END_OF_GROUP:
@@ -4803,7 +4809,41 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     logger_ = logger;
   }
 
+  bool hasFetchState() const {
+    return fetchState_ != nullptr;
+  }
+
+  // Returns a SemiFuture that completes when the fetch consumer is ready
+  // to accept more data. Used by the read loop to co_await after BLOCKED.
+  folly::SemiFuture<uint64_t> getFetchBlockedTask() const {
+    auto fetchConsumer =
+        fetchState_ ? fetchState_->getFetchCallback() : nullptr;
+    if (!fetchConsumer) {
+      return folly::makeSemiFuture<uint64_t>(folly::OperationCancelled());
+    }
+    auto awaitRes = fetchConsumer->awaitReadyToConsume();
+    if (awaitRes.hasError()) {
+      return folly::makeSemiFuture<uint64_t>(
+          std::runtime_error(awaitRes.error().describe()));
+    }
+    return std::move(awaitRes.value());
+  }
+
  private:
+  // BLOCKED from a fetch consumer is backpressure, not failure: the read loop
+  // pauses on it and resumes when the consumer is ready.  A subgroup consumer
+  // has no such signal, so BLOCKED there is still fatal.
+  template <typename T>
+  MoQCodec::ParseResult toParseResult(
+      const folly::Expected<T, MoQPublishError>& res) const {
+    if (res) {
+      return MoQCodec::ParseResult::CONTINUE;
+    }
+    return (fetchState_ && res.error().code == MoQPublishError::BLOCKED)
+        ? MoQCodec::ParseResult::BLOCKED
+        : MoQCodec::ParseResult::ERROR_TERMINATE;
+  }
+
   bool isCancelled() const {
     if (fetchState_) {
       return !fetchState_->getFetchCallback();
@@ -5006,39 +5046,58 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
         fetchState->noteDataActivity();
       }
 
-      // Handle BLOCKED state (subgroup alias not yet known)
+      // Handle BLOCKED state
       if (result == MoQCodec::ParseResult::BLOCKED) {
-        XLOG(DBG4) << "Parser returned BLOCKED, waiting for signal id=" << id;
-        // Heap allocated so that a stream that does not block only costs the
-        // frame a pointer.  The destructor unlinks it however this loop exits.
-        auto waiter = std::make_unique<AliasWaiter>(*this, deferredAlias);
-        bufferedSubgroups_[deferredAlias].push_back(*waiter);
-        // Merged token for baton waits (session + readHandle)
-        auto batonWaitToken = folly::cancellation_token_merge(
+        auto mergedToken = folly::cancellation_token_merge(
             cancellationSource_.getToken(), readHandle.cancelToken());
-        auto waitRes = co_await co_awaitTry(co_withCancellation(
-            batonWaitToken,
-            waiter->baton.wait(moqSettings_.unknownAliasTimeout)));
-        if (waitRes.hasException()) {
-          XLOG(ERR) << "Timed out waiting for subscription state id=" << id
-                    << " sess=" << this;
-          break;
+        if (dcb.hasFetchState()) {
+          XLOG(DBG4) << "Fetch consumer BLOCKED, awaiting readiness id=" << id;
+          auto awaitRes = co_await co_awaitTry(
+              folly::coro::co_withCancellation(
+                  mergedToken,
+                  folly::coro::detachOnCancel(
+                      dcb.getFetchBlockedTask().via(exec_.get()))));
+          if (awaitRes.hasException()) {
+            const bool cancelled =
+                awaitRes.hasException<folly::OperationCancelled>();
+            XLOG_IF(ERR, !cancelled)
+                << "Fetch await failed: "
+                << folly::exceptionStr(awaitRes.exception()) << " id=" << id
+                << " sess=" << this;
+            XLOG_IF(DBG4, cancelled)
+                << "Fetch await cancelled id=" << id << " sess=" << this;
+            break;
+          }
+          result = MoQCodec::ParseResult::CONTINUE;
+        } else {
+          XLOG(DBG4) << "Parser returned BLOCKED, waiting for signal id=" << id;
+          // Heap allocated so that a stream that does not block only costs the
+          // frame a pointer.  The destructor unlinks it however this loop
+          // exits.
+          auto waiter = std::make_unique<AliasWaiter>(*this, deferredAlias);
+          bufferedSubgroups_[deferredAlias].push_back(*waiter);
+          auto waitRes = co_await co_awaitTry(co_withCancellation(
+              mergedToken,
+              waiter->baton.wait(moqSettings_.unknownAliasTimeout)));
+          if (waitRes.hasException()) {
+            XLOG(ERR) << "Timed out waiting for subscription state id=" << id
+                      << " sess=" << this;
+            break;
+          }
+          result = dcb.onSubgroup(
+              deferredAlias,
+              deferredGroup,
+              deferredSubgroup,
+              deferredPriority,
+              deferredOptions);
+          if (result == MoQCodec::ParseResult::BLOCKED) {
+            // state was deleted (unsubscribe)
+            result = MoQCodec::ParseResult::ERROR_TERMINATE;
+          }
         }
-        result = dcb.onSubgroup(
-            deferredAlias,
-            deferredGroup,
-            deferredSubgroup,
-            deferredPriority,
-            deferredOptions);
-
         if (result == MoQCodec::ParseResult::CONTINUE) {
-          // codec may have buffered excess ingress — next iteration drains it
           codecBlocked = true;
           continue;
-        }
-        if (result == MoQCodec::ParseResult::BLOCKED) {
-          // state was deleted (unsubscribe)
-          result = MoQCodec::ParseResult::ERROR_TERMINATE;
         }
       }
     } catch (const std::exception& ex) {
@@ -5812,6 +5871,12 @@ class MoQSession::ReceiverSubscriptionHandle
 
     if (!session->requestUpdate(requestUpdate, control_)) {
       session->pendingRequests_.erase(requestUpdate.requestID);
+      if (requestUpdate.fill) {
+        auto fillIt = session->fetches_.find(requestUpdate.requestID);
+        if (fillIt != session->fetches_.end()) {
+          fillIt->second->fillNeverOpened(session.get());
+        }
+      }
       co_return folly::makeUnexpected(
           RequestError{
               requestUpdate.requestID,
@@ -7934,9 +7999,10 @@ bool MoQSession::requestUpdate(
     }
   }
 
-  auto* wh = control ? control->writeHandle() : nullptr;
-  if (wh) {
-    if (control->readLoopExited()) {
+  if (control) {
+    // The write handle is null after a local FIN or a peer STOP_SENDING.
+    auto* wh = control->writeHandle();
+    if (!wh || control->readLoopExited()) {
       XLOG(ERR) << "Request stream closed, REQUEST_UPDATE not sent sess="
                 << this;
       return false;

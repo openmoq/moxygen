@@ -2065,6 +2065,9 @@ CO_TEST_P_X(MoQSessionTest, RequestUpdateAfterPublishDone) {
 // A subscriber's REQUEST_UPDATE that is never sent must fail at once. Waiting
 // for a reply that cannot arrive holds the handle and the session forever.
 CO_TEST_P_X(MoQSessionTest, SubscriberRequestUpdateAfterPublishDoneFails) {
+  if (getDraftMajorVersion(getServerSelectedVersion()) < 15) {
+    co_return;
+  }
   co_await setupMoQSession();
   std::shared_ptr<TrackConsumer> trackConsumer = nullptr;
   expectPublishDone();
@@ -2082,22 +2085,45 @@ CO_TEST_P_X(MoQSessionTest, SubscriberRequestUpdateAfterPublishDoneFails) {
   }
   auto subscribeHandle = res.value();
 
+  // Hold back the subgroup stream so that the subscription outlives the
+  // PUBLISH_DONE and the request stream's FIN.
+  serverWt_->setDeferNewStreamData(true);
+  auto subgroup = trackConsumer->beginSubgroup(0, 0, 0);
+  serverWt_->setDeferNewStreamData(false);
+  CO_ASSERT_TRUE(subgroup.hasValue());
   trackConsumer->publishDone(
       getTrackEndedPublishDone(subscribeRequest.requestID));
-  co_await publishDone_;
+  co_await rescheduleN(3);
 
   EXPECT_CALL(*clientSubscriberStatsCallback_, onRequestUpdate());
   RequestUpdate update;
   update.forward = false;
+  bool fillReset = false;
+  const bool withFill = getDraftMajorVersion(getServerSelectedVersion()) >= 20;
+  if (withFill) {
+    EXPECT_CALL(*subscribeCallback_, beginFill(_)).WillOnce([&](RequestID) {
+      return folly::Expected<std::shared_ptr<FetchConsumer>, MoQPublishError>(
+          fetchCallback_);
+    });
+    EXPECT_CALL(*fetchCallback_, reset(ResetStreamErrorCode::CANCELLED))
+        .WillOnce([&] { fillReset = true; });
+    update.fill =
+        FillParameters{LocationFilter::absoluteStart({0, 0}), {}, {}, {}};
+  }
   auto result = co_await folly::coro::timeout(
       subscribeHandle->requestUpdate(std::move(update)),
       std::chrono::seconds(1));
   EXPECT_TRUE(result.hasError());
+  // The fill ends with the update, not with its subscription.
+  EXPECT_EQ(fillReset, withFill);
 
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
 CO_TEST_P_X(MoQSessionTest, SubscriberRequestUpdateAfterCloseFails) {
+  if (getDraftMajorVersion(getServerSelectedVersion()) < 15) {
+    co_return;
+  }
   co_await setupMoQSession();
   EXPECT_CALL(*subscribeCallback_, publishDone(_))
       .WillOnce(testing::Return(folly::unit));
