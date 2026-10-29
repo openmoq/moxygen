@@ -5,14 +5,13 @@
  */
 
 #include <folly/coro/BlockingWait.h>
-#include <folly/io/async/AsyncSignalHandler.h>
-#include <csignal>
 #include <limits>
 #include "folly/init/Init.h"
 #include "folly/io/async/ScopedEventBaseThread.h"
 #include "moxygen/mlog/FileMLogger.h"
 #include "moxygen/moqtest/MoQTestClient.h"
 #include "moxygen/samples/util/Utils.h"
+#include "moxygen/util/SignalHandler.h"
 
 namespace {
 
@@ -57,6 +56,10 @@ bool parseInt64Flag(
 } // namespace
 
 DEFINE_string(url, "http://localhost:9999", "URL to connect to");
+DEFINE_string(
+    ns_prefix,
+    "",
+    "Namespace tuples before moq-test-00, '/'-separated");
 DEFINE_int64(forwarding_preference, 0, "Forwarding preference");
 DEFINE_uint64(start_group, moxygen::kDefaultStart, "Start group for MoQParams");
 DEFINE_uint64(
@@ -114,10 +117,12 @@ DEFINE_string(
 DEFINE_string(
     request,
     "subscribe",
-    "Request Type: must be one of \"subscribe\", \"fetch\" or \"publish\". "
+    "Request Type: must be one of \"subscribe\", \"fetch\", \"publish\" or "
+    "\"subscribe_tracks\". "
     "\"publish\" asks the relay for the track via SUBSCRIBE_TRACKS and "
     "PUBLISHes it on a second session to the same endpoint. It requires a "
-    "relay, and only works when the whole namespace is specified.");
+    "relay, and only works when the whole namespace is specified. "
+    "\"subscribe_tracks\" receives the track from another publisher.");
 DEFINE_string(
     join_start,
     "",
@@ -132,6 +137,12 @@ DEFINE_bool(
     "Backfill from --join_start, which defaults to the start of the track. "
     "The same thing --join_start asks for on its own, under the name the "
     "other samples use.");
+DEFINE_uint64(
+    groups,
+    0,
+    "Validate this many groups after the first one received (with "
+    "--join_start, from the backfill's first group), then unsubscribe. 0 = the "
+    "whole track.");
 DEFINE_string(
     publish_order,
     "subscribe_first",
@@ -211,12 +222,25 @@ int main(int argc, char** argv) {
     XLOG(ERR) << "--join_start=" << FLAGS_join_start << " is out of range";
     return 1;
   }
+  if (FLAGS_groups && FLAGS_request != "subscribe" &&
+      FLAGS_request != "subscribe_tracks") {
+    XLOG(ERR) << "--groups only applies with --request=subscribe or "
+                 "subscribe_tracks";
+    return 1;
+  }
+  if (FLAGS_groups &&
+      moxygen::ForwardingPreference(FLAGS_forwarding_preference) ==
+          moxygen::ForwardingPreference::DATAGRAM) {
+    XLOG(ERR) << "--groups does not support datagram forwarding";
+    return 1;
+  }
 
   folly::EventBase evb;
   XLOG(INFO) << "Starting MoQTestClient";
 
   // Initialize Client with url and moq params
   moxygen::MoQTestParameters defaultMoqParams;
+  defaultMoqParams.nsPrefix = moxygen::parseNsPrefix(FLAGS_ns_prefix);
   defaultMoqParams.forwardingPreference =
       moxygen::ForwardingPreference(FLAGS_forwarding_preference);
   defaultMoqParams.startGroup = FLAGS_start_group;
@@ -258,6 +282,7 @@ int main(int argc, char** argv) {
   auto url = proxygen::URL(FLAGS_url);
   std::shared_ptr<moxygen::MoQTestClient> client =
       moxygen::MoQTestClient::create(&evb, url, transportType);
+  client->setGroupsToValidate(FLAGS_groups);
 
   std::shared_ptr<moxygen::MLogger> logger;
   if (FLAGS_log) {
@@ -268,27 +293,8 @@ int main(int argc, char** argv) {
 
   // Drain on SIGINT/SIGTERM. We don't terminate the loop here: draining closes
   // the session, which flushes CONNECTION_CLOSE and lets evb.loop() return.
-  class SigHandler : public folly::AsyncSignalHandler {
-   public:
-    SigHandler(folly::EventBase* evb, std::shared_ptr<moxygen::MoQTestClient> c)
-        : folly::AsyncSignalHandler(evb), client_(std::move(c)) {
-      registerSignalHandler(SIGINT);
-      registerSignalHandler(SIGTERM);
-    }
-    void signalReceived(int) noexcept override {
-      client_->shutdown();
-      unreg();
-    }
-
-    void unreg() {
-      unregisterSignalHandler(SIGINT);
-      unregisterSignalHandler(SIGTERM);
-    }
-
-   private:
-    std::shared_ptr<moxygen::MoQTestClient> client_;
-  };
-  SigHandler sigHandler(&evb, client);
+  moxygen::SignalHandler sigHandler(
+      &evb, [&client](int) { client->shutdown(); }, /*terminateLoop=*/false);
 
   try {
     // Connect Client to Server
@@ -303,7 +309,7 @@ int main(int argc, char** argv) {
     // the loop alive.
     auto onComplete = [&sigHandler, &client](auto&&) {
       client->shutdown();
-      sigHandler.unreg();
+      sigHandler.unregister();
     };
     if (FLAGS_request == "subscribe" && joinStart) {
       XLOG(INFO) << "Joining from group " << *joinStart << " at "
@@ -331,6 +337,13 @@ int main(int argc, char** argv) {
       folly::coro::co_withExecutor(
           &evb,
           client->publishTrack(defaultMoqParams, FLAGS_versions, publishOrder))
+          .start()
+          .via(&evb)
+          .thenTry(onComplete);
+    } else if (FLAGS_request == "subscribe_tracks") {
+      XLOG(INFO) << "Awaiting PUBLISH from " << url.getHostAndPort();
+      folly::coro::co_withExecutor(
+          &evb, client->receivePublish(defaultMoqParams))
           .start()
           .via(&evb)
           .thenTry(onComplete);
