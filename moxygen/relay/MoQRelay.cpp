@@ -52,7 +52,8 @@ namespace moxygen {
 // - forwardChanged: forwarding subscriber count changed
 folly::coro::Task<void> MoQRelay::doSubscribeUpdate(
     std::shared_ptr<Publisher::SubscriptionHandle> handle,
-    bool forward) {
+    bool forward,
+    MoQForwarder::LargestPromise largest) {
   auto updateRes = co_await handle->requestUpdate(
       {RequestID(0),
        handle->subscribeOk().requestID,
@@ -61,6 +62,14 @@ folly::coro::Task<void> MoQRelay::doSubscribeUpdate(
        /*forward=*/forward});
   if (updateRes.hasError()) {
     XLOG(ERR) << "requestUpdate failed: " << updateRes.error().reasonPhrase;
+    co_return;
+  }
+  for (const auto& param : updateRes->requestSpecificParams) {
+    if (param.key ==
+        folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT)) {
+      largest.complete(param.largestObject);
+      break;
+    }
   }
 }
 
@@ -1999,7 +2008,10 @@ void MoQRelay::onEmpty(MoQForwarder* forwarder) {
   }
 }
 
-void MoQRelay::forwardChanged(MoQForwarder* forwarder) {
+void MoQRelay::forwardChanged(
+    MoQForwarder* forwarder,
+    bool /*forward*/,
+    MoQForwarder::LargestPromise largest) {
   auto subscriptionIt = subscriptions_.find(forwarder->fullTrackName());
   if (subscriptionIt == subscriptions_.end()) {
     return;
@@ -2023,7 +2035,8 @@ void MoQRelay::forwardChanged(MoQForwarder* forwarder) {
       exec,
       doSubscribeUpdate(
           subscription.handle,
-          /*forward=*/forwarder->numForwardingSubscribers() > 0))
+          /*forward=*/forwarder->numForwardingSubscribers() > 0,
+          std::move(largest)))
       .start();
 }
 

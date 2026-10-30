@@ -11,6 +11,7 @@
 
 #include <folly/Executor.h>
 #include <folly/container/F14Set.h>
+#include <folly/futures/SharedPromise.h>
 #include <folly/hash/Hash.h>
 
 namespace moxygen {
@@ -59,8 +60,44 @@ class MoQForwarder : public TrackConsumer {
   void setLargest(AbsoluteLocation largest);
 
   std::optional<AbsoluteLocation> largest() {
+    applyFulfilledLargest();
     return largest_;
   }
+
+  // The source's Largest Object once it forwards again. Resuming subscribers
+  // wait until complete(). Destroying it completes it empty. complete() can
+  // run on any thread. Waiters resume on their own executor.
+  class LargestPromise {
+   public:
+    using State = folly::SharedPromise<std::optional<AbsoluteLocation>>;
+
+    // Empty: complete() does nothing.
+    LargestPromise() = default;
+    explicit LargestPromise(std::shared_ptr<State> state)
+        : state_(std::move(state)) {}
+    LargestPromise(LargestPromise&&) noexcept = default;
+    LargestPromise& operator=(LargestPromise&& other) noexcept {
+      if (this != &other) {
+        complete(std::nullopt);
+        state_ = std::move(other.state_);
+      }
+      return *this;
+    }
+    LargestPromise(const LargestPromise&) = delete;
+    LargestPromise& operator=(const LargestPromise&) = delete;
+    ~LargestPromise() {
+      complete(std::nullopt);
+    }
+
+    void complete(std::optional<AbsoluteLocation> largest) {
+      if (auto state = std::exchange(state_, nullptr)) {
+        state->setValue(largest);
+      }
+    }
+
+   private:
+    std::shared_ptr<State> state_;
+  };
 
   class Callback {
    public:
@@ -75,6 +112,14 @@ class MoQForwarder : public TrackConsumer {
       forwardChanged(fwd);
     }
     virtual void forwardChanged(MoQForwarder*) {}
+    // The forwarder calls this overload. largest is empty when forward is
+    // false. The default destroys it, so subscribers do not wait.
+    virtual void forwardChanged(
+        MoQForwarder* fwd,
+        bool forward,
+        LargestPromise /*largest*/) {
+      forwardChanged(fwd, forward);
+    }
     // This fires whenever an unseen NGR is received
     virtual void newGroupRequested(MoQForwarder*, uint64_t /*group*/) {}
     // Serve `fetch` into consumer->beginFill(fetch.requestID).
@@ -85,6 +130,10 @@ class MoQForwarder : public TrackConsumer {
   };
 
   void setCallback(std::shared_ptr<Callback> callback);
+
+  // Ready when every pending LargestPromise completes, after which largest()
+  // includes their values. Empty when no promise is pending.
+  std::optional<folly::SemiFuture<folly::Unit>> largestReady();
 
   struct SubgroupIdentifier {
     uint64_t group;
@@ -117,6 +166,8 @@ class MoQForwarder : public TrackConsumer {
     // Deprecated: setExtensions now internally resolves group order
     void setPublisherGroupOrder(GroupOrder pubGroupOrder);
 
+    // Sets the Largest that SUBSCRIBE_OK reports, and resolves a Next Object or
+    // relative start against it again. Once per subscription, before the OK.
     void updateLargest(AbsoluteLocation largest);
 
     // Deprecated: track properties are now carried in extensions
@@ -158,7 +209,7 @@ class MoQForwarder : public TrackConsumer {
     RequestID requestID;
     SubscribeRange range;
     // What a fill inherits from the subscription.
-    LocationFilter filter{LocationFilter::nextObject()};
+    LocationFilter filter{LocationFilter::none()};
     uint8_t priority{kDefaultPriority};
     TrackRequestParameters params{FrameType::SUBSCRIBE};
     std::shared_ptr<TrackConsumer> trackConsumer;
@@ -191,6 +242,9 @@ class MoQForwarder : public TrackConsumer {
     // firing forwardChanged when the count crosses zero or after a refusal.
     // Shared by onPublishOk and requestUpdate.
     void updateForwardState(bool newForward);
+
+    // Resolves a Next Object or relative start against `largest`.
+    void resolveStart(std::optional<AbsoluteLocation> largest);
   };
 
   using SubscriberMap = folly::
@@ -481,6 +535,10 @@ class MoQForwarder : public TrackConsumer {
   // fires onEmpty callback if so
   void checkAndFireOnEmpty();
 
+  void fireForwardChanged(bool forward);
+
+  void applyFulfilledLargest();
+
   // onEmpty may destroy this forwarder, so a live OnEmptyGuard defers it until
   // iteration unwinds; the outermost guard re-checks emptiness and fires once.
   // Only onEmpty is deferred; another callback that frees us still dangles.
@@ -532,6 +590,8 @@ class MoQForwarder : public TrackConsumer {
       subgroups_;
   GroupOrder groupOrder_{GroupOrder::OldestFirst};
   std::optional<AbsoluteLocation> largest_;
+  // Removed once applied to largest_.
+  std::vector<std::shared_ptr<LargestPromise::State>> pendingLargest_;
   Extensions extensions_;
   // The NEW_GROUP_REQUEST value most recently forwarded upstream; cleared when
   // the upstream Largest Group advances (indicating the request was fulfilled).
