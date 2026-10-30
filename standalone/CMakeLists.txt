@@ -208,6 +208,9 @@ endif()
 
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
+# Other deps' include dirs can hold headers from a different OpenSSL.
+include_directories(BEFORE SYSTEM ${OPENSSL_INCLUDE_DIR})
+
 # Default (BUNDLE_DEPS_STATIC_SYSLIBS=OFF): prefer .so for these libs so
 # folly-targets.cmake hardcodes .so paths. Consumers' own find_package(Glog)
 # then resolve to the same .so — no dual-linkage under ASAN.
