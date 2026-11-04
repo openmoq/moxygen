@@ -53,6 +53,18 @@ maintainer unblocks them; subsequent runs are automatic.
 At least one approving review from a collaborator is required. Review
 on GitHub or [Reviewable](https://reviewable.io/reviews/openmoq/moxygen).
 
+Gemini reviews a PR when it is opened or marked ready for review. To ask
+for another review, add the `gemini-review` label; it is removed when the
+review starts. A review with no comments above LOW also approves the
+reviewed commit, and that approval counts toward the required one.
+
+To ask Gemini a question, start a PR comment or a review-thread reply
+with `/gemini` and your question, then add the label. If any such
+questions are still unanswered, Gemini answers them in place of a
+review. It answers people with write access, on PRs from branches in
+this repository; other contributors can ask a maintainer to pass a
+question on.
+
 **Admin override** (`gh pr merge --admin`) is for:
 
 - CI/infrastructure repairs blocked by branch protection itself.
