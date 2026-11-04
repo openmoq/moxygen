@@ -2158,6 +2158,747 @@ CO_TEST_P_X(MoQBidiSetupGateTest, VersionTestSeamDoesNotWait) {
   serverSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
+// === Async admission (validateAuthorityAsync) ===
+
+// The check suspends on admissionGate_ unless admissionInline_ is set, then
+// returns admissionResult_ or throws. Every test posts the gate before it
+// ends, since a suspended check holds the session.
+class MoQAsyncAdmissionTest : public MoQBidiSetupGateTest {
+ public:
+  folly::coro::Task<folly::Expected<folly::Unit, SessionCloseErrorCode>>
+  validateAuthorityAsync(moxygen::Setup, uint64_t, std::shared_ptr<MoQSession>)
+      override {
+    ++admissionCalls_;
+    if (!admissionInline_) {
+      co_await admissionGate_;
+    }
+    if (admissionThrows_) {
+      throw std::runtime_error("admission check failed");
+    }
+    co_return admissionResult_;
+  }
+
+  void TearDown() override {
+    admissionGate_.post();
+    MoQBidiSetupGateTest::TearDown();
+  }
+
+ protected:
+  // Pre draft 18: the client's bidi control stream, written by hand so the
+  // test decides what shares a read with CLIENT_SETUP. response is the
+  // handle the server writes to.
+  struct RawControlStream {
+    std::shared_ptr<proxygen::test::FakeStreamHandle> request;
+    std::shared_ptr<proxygen::test::FakeStreamHandle> response;
+  };
+
+  RawControlStream openRawControlStream() {
+    serverSession_->setPublishHandler(serverPublisher);
+    serverSession_->setSubscribeHandler(serverSubscriber);
+    serverSession_->start();
+    auto bidi = clientWt_->createBidiStream().value();
+    const auto streamId = bidi.writeHandle->getID();
+    return {
+        clientWt_->writeHandles.at(streamId),
+        clientWt_->readHandles.at(streamId)};
+  }
+
+  void writeClientSetupFrame(folly::IOBufQueue& bytes) {
+    EXPECT_TRUE(writeClientSetup(
+                    bytes,
+                    getClientSetup(initialMaxRequestID_),
+                    getServerSelectedVersion())
+                    .hasValue());
+  }
+
+  void writeSubscribeFrame(folly::IOBufQueue& bytes) {
+    MoQFrameWriter writer;
+    writer.initializeVersion(getServerSelectedVersion());
+    EXPECT_TRUE(
+        writer.writeSubscribeRequest(bytes, getSubscribe(kTestTrackName))
+            .hasValue());
+  }
+
+  void writeRaw(
+      const RawControlStream& stream,
+      folly::IOBufQueue& bytes,
+      bool fin = false) {
+    EXPECT_TRUE(
+        stream.request->writeStreamData(bytes.move(), fin, nullptr).hasValue());
+  }
+
+  // CLIENT_SETUP and SUBSCRIBE in one read.
+  RawControlStream openRawControlStreamWithPipelinedSubscribe(bool fin) {
+    auto stream = openRawControlStream();
+    folly::IOBufQueue bytes{folly::IOBufQueue::cacheChainLength()};
+    writeClientSetupFrame(bytes);
+    writeSubscribeFrame(bytes);
+    writeRaw(stream, bytes, fin);
+    return stream;
+  }
+
+  // The server's publisher answers the pipelined SUBSCRIBE with SUBSCRIBE_OK.
+  // Not expectSubscribe(): that also expects client-side stats, and no client
+  // session reads the raw stream.
+  void expectRawSubscribe(size_t& dispatched) {
+    EXPECT_CALL(*serverPublisher, subscribe(_, _))
+        .WillRepeatedly(
+            [&dispatched](auto sub, auto pub) -> TaskSubscribeResult {
+              ++dispatched;
+              pub->setTrackAlias(TrackAlias(sub.requestID.value));
+              auto handle = makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+              EXPECT_CALL(*handle, unsubscribe()).Times(testing::AnyNumber());
+              co_return handle;
+            });
+  }
+
+  struct ServerReplies : MoQControlCodec::ControlCallback {
+    void onServerSetup(moxygen::Setup setup) override {
+      serverSetup = std::move(setup);
+    }
+    void onSubscribeOk(SubscribeOk ok) override {
+      subscribeOks.push_back(std::move(ok));
+    }
+    void onConnectionError(ErrorCode error) override {
+      parseError = error;
+    }
+    std::optional<moxygen::Setup> serverSetup;
+    std::vector<SubscribeOk> subscribeOks;
+    std::optional<ErrorCode> parseError;
+  };
+
+  ServerReplies parseServerReplies(const RawControlStream& stream) {
+    ServerReplies replies;
+    MoQControlCodec codec(MoQControlCodec::Direction::CLIENT, &replies);
+    codec.initializeVersion(getServerSelectedVersion());
+    codec.onIngress(stream.response->buf_.move(), false);
+    EXPECT_FALSE(replies.parseError.has_value());
+    return replies;
+  }
+
+  std::unique_ptr<folly::IOBuf> datagramBytes(
+      TrackAlias alias,
+      size_t payloadLength = 4) {
+    MoQFrameWriter writer;
+    writer.initializeVersion(getServerSelectedVersion());
+    folly::IOBufQueue bytes{folly::IOBufQueue::cacheChainLength()};
+    ObjectHeader header(0, 0, 0, std::nullopt, payloadLength);
+    EXPECT_TRUE(
+        writer
+            .writeDatagramObject(
+                bytes,
+                alias,
+                header,
+                folly::IOBuf::copyBuffer(std::string(payloadLength, 'd')))
+            .hasValue());
+    return bytes.move();
+  }
+
+  // Runs clientSession_->setup() in the background, so the test can act
+  // while admission is pending. Draft 18+: the client completes its setup on
+  // the proactive SERVER_SETUP, before admission, so pending admission is
+  // observed on the server's awaitPeerSetup() instead.
+  struct SetupProgress {
+    folly::coro::Baton clientDone;
+    folly::Try<moxygen::Setup> clientResult;
+    folly::coro::Baton serverDone;
+    folly::Try<moxygen::Setup> serverResult;
+    bool uniControl{false};
+
+    bool admitted() const {
+      return uniControl ? serverDone.ready() : clientDone.ready();
+    }
+  };
+
+  std::unique_ptr<SetupProgress> startClientSetup() {
+    auto progress = std::make_unique<SetupProgress>();
+    progress->uniControl = useUniControlStreams(getServerSelectedVersion());
+    clientSession_->setPublishHandler(clientPublisher);
+    clientSession_->setSubscribeHandler(clientSubscriber);
+    clientSession_->start();
+    serverSession_->setPublishHandler(serverPublisher);
+    serverSession_->setSubscribeHandler(serverSubscriber);
+    serverSession_->start();
+    auto* raw = progress.get();
+    if (progress->uniControl) {
+      moxygen::Setup serverSetupMsg;
+      serverSetupMsg.params.insertParam(SetupParameter{
+          folly::to_underlying(SetupKey::MAX_REQUEST_ID),
+          initialMaxRequestID_});
+      EXPECT_TRUE(
+          serverSession_->sendSetup(std::move(serverSetupMsg)).hasValue());
+      co_withExecutor(MoQExecutor_.get(), serverSession_->awaitPeerSetup())
+          .start([raw](folly::Try<moxygen::Setup>&& result) {
+            raw->serverResult = std::move(result);
+            raw->serverDone.post();
+          });
+    } else {
+      raw->serverDone.post();
+    }
+    co_withExecutor(
+        MoQExecutor_.get(),
+        clientSession_->setup(getClientSetup(initialMaxRequestID_)))
+        .start([raw](folly::Try<moxygen::Setup>&& result) {
+          raw->clientResult = std::move(result);
+          raw->clientDone.post();
+        });
+    return progress;
+  }
+
+  folly::coro::Task<void> awaitSetupProgress(SetupProgress& progress) {
+    co_await progress.clientDone;
+    co_await progress.serverDone;
+  }
+
+  folly::coro::Baton admissionGate_;
+  bool admissionInline_{false};
+  bool admissionThrows_{false};
+  folly::Expected<folly::Unit, SessionCloseErrorCode> admissionResult_{
+      folly::unit};
+  size_t admissionCalls_{0};
+};
+
+class MoQAsyncAdmissionLegacyTest : public MoQAsyncAdmissionTest {};
+class MoQAsyncAdmissionDraft18Test : public MoQAsyncAdmissionTest {};
+
+INSTANTIATE_TEST_SUITE_P(
+    MoQAsyncAdmissionTest,
+    MoQAsyncAdmissionTest,
+    testing::ValuesIn(getSupportedVersionParams()));
+
+INSTANTIATE_TEST_SUITE_P(
+    MoQAsyncAdmissionLegacyTest,
+    MoQAsyncAdmissionLegacyTest,
+    testing::Values(VersionParams{{kVersionDraft16}, kVersionDraft16}));
+
+INSTANTIATE_TEST_SUITE_P(
+    MoQAsyncAdmissionDraft18Test,
+    MoQAsyncAdmissionDraft18Test,
+    testing::Values(VersionParams{{kVersionDraft18}, kVersionDraft18}));
+
+CO_TEST_P_X(MoQAsyncAdmissionTest, SetupWaitsForAcceptance) {
+  auto progress = startClientSetup();
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+  EXPECT_FALSE(progress->admitted());
+
+  admissionGate_.post();
+  co_await awaitSetupProgress(*progress);
+  EXPECT_TRUE(progress->clientResult.hasValue());
+  if (progress->uniControl) {
+    EXPECT_TRUE(progress->serverResult.hasValue());
+  }
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionTest, AsyncRejectionClosesWithCode) {
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  admissionResult_ = folly::makeUnexpected(SessionCloseErrorCode::UNAUTHORIZED);
+  auto progress = startClientSetup();
+  co_await rescheduleN(10);
+  EXPECT_FALSE(callback.closed.ready());
+  EXPECT_FALSE(progress->admitted());
+
+  admissionGate_.post();
+  co_await callback.closed;
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::UNAUTHORIZED);
+  EXPECT_TRUE(serverWt_->isSessionClosed());
+  co_await awaitSetupProgress(*progress);
+  if (progress->uniControl) {
+    EXPECT_TRUE(progress->serverResult.hasException());
+  } else {
+    EXPECT_TRUE(progress->clientResult.hasException());
+  }
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionTest, ExceptionClosesInternalError) {
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  admissionThrows_ = true;
+  auto progress = startClientSetup();
+  co_await rescheduleN(10);
+  EXPECT_FALSE(callback.closed.ready());
+  EXPECT_FALSE(progress->admitted());
+
+  admissionGate_.post();
+  co_await callback.closed;
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::INTERNAL_ERROR);
+  co_await awaitSetupProgress(*progress);
+  if (progress->uniControl) {
+    EXPECT_TRUE(progress->serverResult.hasException());
+  } else {
+    EXPECT_TRUE(progress->clientResult.hasException());
+  }
+}
+
+// Datagrams that arrive after CLIENT_SETUP are held, then replayed on
+// acceptance: once the server subscribes and the alias is known, the held
+// datagram reaches the consumer.
+CO_TEST_P_X(MoQAsyncAdmissionLegacyTest, DatagramHeldAndReplayed) {
+  auto progress = startClientSetup();
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+
+  // The server's first request takes id 1; the client publisher answers with
+  // that id as the alias.
+  const TrackAlias alias(1);
+  EXPECT_TRUE(clientWt_->sendDatagram(datagramBytes(alias)).hasValue());
+  co_await rescheduleN(5);
+  EXPECT_FALSE(serverWt_->isSessionClosed());
+
+  admissionGate_.post();
+  co_await awaitSetupProgress(*progress);
+  CO_ASSERT_TRUE(progress->clientResult.hasValue());
+
+  expectSubscribe(
+      [](auto sub, auto /* pub */) -> TaskSubscribeResult {
+        auto handle = makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+        EXPECT_CALL(*handle, unsubscribe()).Times(testing::AnyNumber());
+        co_return handle;
+      },
+      MoQControlCodec::Direction::CLIENT);
+  folly::coro::Baton delivered;
+  EXPECT_CALL(*subscribeCallback_, datagram(_, _, _))
+      .WillOnce([&](const ObjectHeader& header, auto, auto) {
+        EXPECT_EQ(header.id, 0);
+        delivered.post();
+        return folly::Expected<folly::Unit, MoQPublishError>(folly::unit);
+      });
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
+      .WillOnce(testing::Return(folly::unit));
+  auto res = co_await serverSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  // Not CO_ASSERT_FALSE: folly's version omits the negation.
+  CO_ASSERT_TRUE(res.hasValue());
+  co_await delivered;
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+  co_await rescheduleN(2);
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionTest, DatagramCountBoundCloses) {
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  MoQSettings settings;
+  settings.maxPendingAdmissionDatagrams = 2;
+  serverSession_->setMoqSettings(settings);
+  auto progress = startClientSetup();
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+
+  EXPECT_TRUE(clientWt_->sendDatagram(datagramBytes(TrackAlias(1))).hasValue());
+  EXPECT_TRUE(clientWt_->sendDatagram(datagramBytes(TrackAlias(1))).hasValue());
+  EXPECT_FALSE(callback.closed.ready());
+  EXPECT_TRUE(clientWt_->sendDatagram(datagramBytes(TrackAlias(1))).hasValue());
+  co_await callback.closed;
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::PROTOCOL_VIOLATION);
+  admissionGate_.post();
+  co_await awaitSetupProgress(*progress);
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionTest, DatagramByteBoundCloses) {
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  MoQSettings settings;
+  settings.maxPendingAdmissionDatagramBytes = 64;
+  serverSession_->setMoqSettings(settings);
+  auto progress = startClientSetup();
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+
+  EXPECT_TRUE(
+      clientWt_->sendDatagram(datagramBytes(TrackAlias(1), 40)).hasValue());
+  EXPECT_FALSE(callback.closed.ready());
+  EXPECT_TRUE(
+      clientWt_->sendDatagram(datagramBytes(TrackAlias(1), 40)).hasValue());
+  co_await callback.closed;
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::PROTOCOL_VIOLATION);
+  admissionGate_.post();
+  co_await awaitSetupProgress(*progress);
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionTest, DatagramBeforeClientSetupCloses) {
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  serverSession_->start();
+  EXPECT_TRUE(clientWt_->sendDatagram(datagramBytes(TrackAlias(1))).hasValue());
+  co_await callback.closed;
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::PROTOCOL_VIOLATION);
+  EXPECT_EQ(admissionCalls_, 0);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionLegacyTest, HeldRequestDispatchedAfterAcceptance) {
+  size_t dispatched = 0;
+  expectRawSubscribe(dispatched);
+  auto stream = openRawControlStreamWithPipelinedSubscribe(/*fin=*/false);
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+  EXPECT_EQ(dispatched, 0);
+  // No SERVER_SETUP before acceptance.
+  EXPECT_EQ(stream.response->dataWritten_, 0);
+
+  admissionGate_.post();
+  co_await rescheduleN(10);
+  EXPECT_EQ(dispatched, 1);
+  auto replies = parseServerReplies(stream);
+  EXPECT_TRUE(replies.serverSetup.has_value());
+  CO_ASSERT_EQ(replies.subscribeOks.size(), 1);
+  EXPECT_EQ(replies.subscribeOks[0].requestID, RequestID(0));
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// A frame cut short is an error only once the FIN is seen, so the close
+// after acceptance proves the FIN that arrived with CLIENT_SETUP was replayed.
+CO_TEST_P_X(MoQAsyncAdmissionLegacyTest, FinWhileBlockedIsReplayed) {
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  EXPECT_CALL(*serverPublisher, subscribe(_, _)).Times(0);
+  auto stream = openRawControlStream();
+  folly::IOBufQueue bytes{folly::IOBufQueue::cacheChainLength()};
+  writeClientSetupFrame(bytes);
+  writeSubscribeFrame(bytes);
+  auto truncated = bytes.move();
+  truncated->coalesce();
+  truncated->trimEnd(1);
+  bytes.append(std::move(truncated));
+  writeRaw(stream, bytes, /*fin=*/true);
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+  EXPECT_FALSE(callback.closed.ready());
+
+  admissionGate_.post();
+  co_await rescheduleN(10);
+  EXPECT_TRUE(callback.closed.ready());
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::PROTOCOL_VIOLATION);
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionLegacyTest, InlineRejectionDropsSameReadRequest) {
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  admissionInline_ = true;
+  admissionResult_ = folly::makeUnexpected(SessionCloseErrorCode::UNAUTHORIZED);
+  EXPECT_CALL(*serverPublisher, subscribe(_, _)).Times(0);
+  auto stream = openRawControlStreamWithPipelinedSubscribe(/*fin=*/false);
+  co_await callback.closed;
+  co_await rescheduleN(5);
+  EXPECT_EQ(admissionCalls_, 1);
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::UNAUTHORIZED);
+  EXPECT_EQ(stream.response->dataWritten_, 0);
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionLegacyTest, AsyncRejectionDropsHeldRequest) {
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  admissionResult_ = folly::makeUnexpected(SessionCloseErrorCode::UNAUTHORIZED);
+  EXPECT_CALL(*serverPublisher, subscribe(_, _)).Times(0);
+  auto stream = openRawControlStreamWithPipelinedSubscribe(/*fin=*/false);
+  co_await rescheduleN(10);
+  EXPECT_FALSE(callback.closed.ready());
+
+  admissionGate_.post();
+  co_await callback.closed;
+  co_await rescheduleN(5);
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::UNAUTHORIZED);
+  EXPECT_EQ(stream.response->dataWritten_, 0);
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionLegacyTest, DrainDuringPendingAdmissionCloses) {
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  EXPECT_CALL(*serverPublisher, subscribe(_, _)).Times(0);
+  auto stream = openRawControlStreamWithPipelinedSubscribe(/*fin=*/false);
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+
+  serverSession_->drain();
+  co_await callback.closed;
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::NO_ERROR);
+  // A late acceptance changes nothing.
+  admissionGate_.post();
+  co_await rescheduleN(10);
+  EXPECT_EQ(stream.response->dataWritten_, 0);
+}
+
+CO_TEST_P_X(
+    MoQAsyncAdmissionLegacyTest,
+    InlineAcceptanceDispatchesSameReadRequest) {
+  admissionInline_ = true;
+  size_t dispatched = 0;
+  expectRawSubscribe(dispatched);
+  auto stream = openRawControlStreamWithPipelinedSubscribe(/*fin=*/false);
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+  EXPECT_EQ(dispatched, 1);
+  auto replies = parseServerReplies(stream);
+  EXPECT_TRUE(replies.serverSetup.has_value());
+  EXPECT_EQ(replies.subscribeOks.size(), 1);
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionLegacyTest, GoawayDuringPendingAdmissionCloses) {
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  EXPECT_CALL(*serverPublisher, subscribe(_, _)).Times(0);
+  auto stream = openRawControlStreamWithPipelinedSubscribe(/*fin=*/false);
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+
+  serverSession_->goaway(Goaway{});
+  co_await callback.closed;
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::NO_ERROR);
+  // Neither GOAWAY nor SERVER_SETUP went out.
+  EXPECT_EQ(stream.response->dataWritten_, 0);
+  admissionGate_.post();
+}
+
+CO_TEST_P_X(
+    MoQAsyncAdmissionLegacyTest,
+    UniStreamDuringPendingAdmissionCloses) {
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  EXPECT_CALL(*serverPublisher, subscribe(_, _)).Times(0);
+  auto stream = openRawControlStreamWithPipelinedSubscribe(/*fin=*/false);
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+
+  EXPECT_TRUE(clientWt_->createUniStream().hasValue());
+  co_await callback.closed;
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::PROTOCOL_VIOLATION);
+  admissionGate_.post();
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionLegacyTest, DuplicateControlStreamCloses) {
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  auto first = openRawControlStreamWithPipelinedSubscribe(/*fin=*/false);
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+
+  auto second = clientWt_->createBidiStream().value();
+  folly::IOBufQueue bytes{folly::IOBufQueue::cacheChainLength()};
+  writeClientSetupFrame(bytes);
+  EXPECT_TRUE(second.writeHandle->writeStreamData(bytes.move(), false, nullptr)
+                  .hasValue());
+  co_await callback.closed;
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::PROTOCOL_VIOLATION);
+  admissionGate_.post();
+}
+
+CO_TEST_P_X(
+    MoQAsyncAdmissionDraft18Test,
+    ParkedRequestStreamsDispatchedAfterAcceptance) {
+  prepareServerSetup();
+  std::vector<RequestID> dispatched;
+  EXPECT_CALL(*serverSubscriber, publish(_, _))
+      .Times(3)
+      .WillRepeatedly([&](const PublishRequest& request, auto) {
+        dispatched.push_back(request.requestID);
+        return makePublishOkResult(request);
+      });
+  auto before = publishBeforeSetup(0);
+  sendClientSetup();
+  auto after = publishBeforeSetup(1);
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+  EXPECT_TRUE(dispatched.empty());
+  expectUnread(before);
+  expectUnread(after);
+
+  admissionGate_.post();
+  auto late = publishBeforeSetup(2);
+  co_await clientSession_->awaitPeerSetup();
+  co_await expectPublishReply(before);
+  co_await expectPublishReply(after);
+  co_await expectPublishReply(late);
+  EXPECT_THAT(
+      dispatched,
+      testing::UnorderedElementsAre(RequestID(0), RequestID(2), RequestID(4)));
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionDraft18Test, CloseDuringPendingAdmission) {
+  prepareServerSetup();
+  EXPECT_CALL(*serverSubscriber, publish(_, _)).Times(0);
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  sendClientSetup();
+  auto first = publishBeforeSetup(0);
+  auto second = publishBeforeSetup(1);
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+  expectUnread(first);
+  expectUnread(second);
+
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+  co_await callback.closed;
+  co_await rescheduleN(5);
+  EXPECT_GT(first.request->stopSendingCount_, 0);
+  EXPECT_GT(second.request->stopSendingCount_, 0);
+  EXPECT_TRUE(clientWt_->openLocalBidiStreams().empty());
+  // A late acceptance changes nothing.
+  admissionGate_.post();
+  co_await rescheduleN(10);
+  expectUnread(first);
+  expectUnread(second);
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionDraft18Test, ParkedRequestStreamBoundCloses) {
+  prepareServerSetup();
+  MoQSettings settings;
+  settings.maxPendingAdmissionRequestStreams = 2;
+  serverSession_->setMoqSettings(settings);
+  EXPECT_CALL(*serverSubscriber, publish(_, _)).Times(0);
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  sendClientSetup();
+  auto first = publishBeforeSetup(0);
+  auto second = publishBeforeSetup(1);
+  co_await rescheduleN(10);
+  EXPECT_FALSE(callback.closed.ready());
+
+  auto third = publishBeforeSetup(2);
+  co_await callback.closed;
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::PROTOCOL_VIOLATION);
+  expectUnread(first);
+  expectUnread(second);
+  expectUnread(third);
+  admissionGate_.post();
+}
+
+CO_TEST_P_X(MoQAsyncAdmissionDraft18Test, DrainDuringPendingAdmissionCloses) {
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  auto progress = startClientSetup();
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+
+  serverSession_->drain();
+  co_await callback.closed;
+  EXPECT_EQ(callback.errorCode, SessionCloseErrorCode::NO_ERROR);
+  admissionGate_.post();
+  co_await awaitSetupProgress(*progress);
+  EXPECT_TRUE(progress->serverResult.hasException());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// A data uni stream that arrives while admission is pending sits in the
+// pre-setup buffer, then replays on acceptance.
+CO_TEST_P_X(MoQAsyncAdmissionDraft18Test, DataUniStreamHeldAndReplayed) {
+  MoQSettings settings;
+  settings.unknownAliasTimeout = std::chrono::milliseconds(50);
+  serverSession_->setMoqSettings(settings);
+  auto progress = startClientSetup();
+  co_await progress->clientDone;
+  co_await rescheduleN(10);
+  EXPECT_EQ(admissionCalls_, 1);
+
+  // The server's first request takes id 1; the client publisher answers with
+  // that id as the alias.
+  auto dataWh = CHECK_NOTNULL(clientWt_->createUniStream().value_or(nullptr));
+  folly::IOBufQueue dataBuf{folly::IOBufQueue::cacheChainLength()};
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft18);
+  ObjectHeader objHeader(0, 0, 0, 0, ObjectStatus::NORMAL);
+  objHeader.length = 5;
+  writer.writeSubgroupHeader(
+      dataBuf,
+      TrackAlias(1),
+      objHeader,
+      SubgroupOptions{.hasExtensions = true});
+  writer.writeStreamObject(
+      dataBuf,
+      getSubgroupStreamType(
+          kVersionDraft18, SubgroupIDFormat::Present, true, false),
+      objHeader,
+      makeBuf(5));
+  dataWh->writeStreamData(dataBuf.move(), false, nullptr);
+  co_await rescheduleN(5);
+  EXPECT_FALSE(serverWt_->isSessionClosed());
+  // Dispatched early, the stream would wait out unknownAliasTimeout here and
+  // be dropped before the subscription exists.
+  co_await folly::coro::sleep(std::chrono::milliseconds(150));
+
+  admissionGate_.post();
+  co_await awaitSetupProgress(*progress);
+  CO_ASSERT_TRUE(progress->serverResult.hasValue());
+
+  expectSubscribe(
+      [](auto sub, auto /* pub */) -> TaskSubscribeResult {
+        auto handle = makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+        EXPECT_CALL(*handle, unsubscribe()).Times(testing::AnyNumber());
+        co_return handle;
+      },
+      MoQControlCodec::Direction::CLIENT);
+  auto sgConsumer =
+      std::make_shared<testing::StrictMock<MockSubgroupConsumer>>();
+  folly::coro::Baton delivered;
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, _, _))
+      .WillOnce(testing::Return(sgConsumer));
+  EXPECT_CALL(*sgConsumer, object(0, HasChainDataLengthOf(5), _, _))
+      .WillOnce([&](auto, auto, const auto&, auto) {
+        delivered.post();
+        return folly::unit;
+      });
+  EXPECT_CALL(*sgConsumer, reset(_)).Times(testing::AnyNumber());
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
+      .Times(testing::AnyNumber())
+      .WillRepeatedly(testing::Return(folly::unit));
+  auto res = co_await serverSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  CO_ASSERT_TRUE(res.hasValue());
+  co_await delivered;
+  res.value()->unsubscribe();
+  dataWh->writeStreamData(nullptr, true, nullptr);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+  co_await rescheduleN(2);
+}
+
+// MoQServerBase awaits the peer setup with setupTimeout. The timeout covers
+// the arrival of CLIENT_SETUP, not the admission check.
+CO_TEST_P_X(MoQAsyncAdmissionDraft18Test, ServerSetupTimeoutExcludesAdmission) {
+  MoQSettings settings;
+  settings.setupTimeout = std::chrono::milliseconds(50);
+  serverSession_->setMoqSettings(settings);
+  prepareServerSetup();
+  folly::coro::Baton serverSetupDone;
+  folly::Try<moxygen::Setup> serverSetupResult;
+  co_withExecutor(MoQExecutor_.get(), serverSession_->awaitPeerSetup())
+      .start([&](folly::Try<moxygen::Setup>&& result) {
+        serverSetupResult = std::move(result);
+        serverSetupDone.post();
+      });
+  sendClientSetup();
+  co_await folly::coro::sleep(std::chrono::milliseconds(150));
+  EXPECT_EQ(admissionCalls_, 1);
+  EXPECT_FALSE(serverSetupDone.ready());
+
+  admissionGate_.post();
+  co_await serverSetupDone;
+  EXPECT_TRUE(serverSetupResult.hasValue());
+  co_await clientSession_->awaitPeerSetup();
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(
+    MoQAsyncAdmissionDraft18Test,
+    ServerSetupTimeoutStillCoversArrival) {
+  MoQSettings settings;
+  settings.setupTimeout = std::chrono::milliseconds(50);
+  serverSession_->setMoqSettings(settings);
+  prepareServerSetup();
+  RecordingSessionCloseCallback callback;
+  serverSession_->setSessionCloseCallback(&callback);
+  auto result =
+      co_await folly::coro::co_awaitTry(serverSession_->awaitPeerSetup());
+  EXPECT_TRUE(result.hasException());
+  co_await callback.closed;
+  EXPECT_EQ(
+      callback.errorCode, SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED);
+  EXPECT_EQ(admissionCalls_, 0);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 // A subscription ends with PUBLISH_DONE or an unsubscribe. Session close does
 // not send PUBLISH_DONE, so the publisher's handle has to be unsubscribed.
 CO_TEST_P_X(MoQSessionTest, SessionCloseUnsubscribesPublisherHandle) {

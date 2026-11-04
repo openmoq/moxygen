@@ -66,6 +66,16 @@ struct MoQSettings {
   // Joining FETCHes held while their subscription is unseen or pending.
   size_t maxDeferredJoiningFetches{16};
   bool acceptRequestUpdatesAfterReceivedGoaway{false};
+  // Holds while validateAuthorityAsync is pending; exceeding one closes the
+  // session with PROTOCOL_VIOLATION. Not a memory ceiling: parked stream
+  // bytes stay in the transport, the control stream suffix in the codec.
+
+  // Draft 18+ request bidi streams parked until setup completes, including
+  // those that arrive before CLIENT_SETUP.
+  size_t maxPendingAdmissionRequestStreams{100};
+  // Datagrams received after CLIENT_SETUP, kept raw.
+  size_t maxPendingAdmissionDatagrams{64};
+  size_t maxPendingAdmissionDatagramBytes{64 * 1024};
 };
 
 class ReplyContext;
@@ -236,6 +246,29 @@ class MoQSession : public Subscriber,
         const Setup& clientSetup,
         uint64_t negotiatedVersion,
         std::shared_ptr<MoQSession> session) = 0;
+
+    // Admission check.
+    // - Started inline on the session executor from CLIENT_SETUP handling.
+    //   A check that never suspends leaves the wire unchanged.
+    // - Setup stays incomplete until it resolves. Before draft 18,
+    //   SERVER_SETUP waits for acceptance.
+    // - Peer traffic meanwhile is held, see MoQSettings::maxPendingAdmission*.
+    // - An error closes the session with that code, an exception with
+    //   INTERNAL_ERROR. Session close cancels the task.
+    // - The task holds the session, not this callback: the callback must
+    //   outlive it, or the task must finish promptly on cancellation.
+    // - Before draft 18, issue no requests on the session until setup
+    //   completes: they would precede SERVER_SETUP on the wire.
+    // - No deadline: the implementation bounds its own wait.
+    virtual folly::coro::Task<
+        folly::Expected<folly::Unit, SessionCloseErrorCode>>
+    validateAuthorityAsync(
+        Setup clientSetup,
+        uint64_t negotiatedVersion,
+        std::shared_ptr<MoQSession> session) {
+      co_return validateAuthority(
+          clientSetup, negotiatedVersion, std::move(session));
+    }
   };
 
   class MoQSessionCloseCallback {
@@ -1676,6 +1709,8 @@ class MoQSession : public Subscriber,
   // parsed.
   void onSetupParams(SetupParameters params, bool local);
   void markSetupComplete();
+  void onAdmissionResult(
+      folly::Try<folly::Expected<folly::Unit, SessionCloseErrorCode>> result);
   void pruneBufferedSubgroups(TrackAlias alias);
   void scheduleGoawayTimeout(uint64_t timeoutMs);
   void cancelGoawayTimeout();
@@ -1724,6 +1759,22 @@ class MoQSession : public Subscriber,
 
   folly::coro::Promise<Setup> setupPromise_;
   folly::coro::Future<Setup> setupFuture_;
+  // Server only. Fulfilled once CLIENT_SETUP is parsed and the version
+  // settled, before admission; awaitPeerSetup() applies setupTimeout to this.
+  folly::coro::Promise<void> clientSetupPromise_;
+  folly::coro::Future<void> clientSetupFuture_;
+  // Server only, from CLIENT_SETUP until the admission result.
+  struct PendingAdmission {
+    Setup clientSetup;
+    // Pre draft 18: sent on acceptance.
+    Setup serverSetup;
+    std::vector<std::unique_ptr<folly::IOBuf>> datagrams;
+    size_t datagramBytes{0};
+  };
+  std::optional<PendingAdmission> pendingAdmission_;
+  // Signalled on acceptance. The control read loop waits on it after the
+  // codec blocks behind CLIENT_SETUP.
+  TimedBaton admitted_;
   bool setupComplete_{false};
   using SetupWaiters = folly::F14FastMap<uint64_t, folly::coro::Promise<void>>;
   std::shared_ptr<SetupWaiters> setupWaiters_;

@@ -3103,6 +3103,8 @@ MoQSession::MoQSession(
   receiveTokenCache_.setMaxSize(
       authTokenCacheEnabled_ ? kMaxReceiveTokenCacheSize : 0);
   controlCodec_->setTokenCache(&receiveTokenCache_);
+  std::tie(clientSetupPromise_, clientSetupFuture_) =
+      folly::coro::makePromiseContract<void>();
 }
 
 MoQSession::~MoQSession() {
@@ -3191,6 +3193,11 @@ void MoQSession::cleanup() {
     source.requestCancellation();
   }
   bufferedDatagrams_.clear();
+  pendingAdmission_.reset();
+  if (auto waiters = std::exchange(setupWaiters_, nullptr)) {
+    // Parked request streams wake on the broken promise, or on cancellation.
+    waiters->clear();
+  }
   // Break any shared_ptr cycle between the session and its handlers.  A
   // handler that holds a shared_ptr<MoQSession> back to this session would
   // otherwise keep both objects alive indefinitely once all external
@@ -3316,6 +3323,12 @@ void MoQSession::drain() {
 void MoQSession::goaway(Goaway goaway) {
   if (!draining_) {
     if (!moqFrameWriter_.getVersion().has_value()) {
+      close(SessionCloseErrorCode::NO_ERROR);
+      return;
+    }
+    if (pendingAdmission_ && !useUniControlStreams(*negotiatedVersion_)) {
+      // SERVER_SETUP is not out yet, so GOAWAY cannot precede it. Nothing is
+      // admitted, so there is nothing to migrate either.
       close(SessionCloseErrorCode::NO_ERROR);
       return;
     }
@@ -3715,18 +3728,37 @@ folly::coro::Task<Setup> MoQSession::awaitPeerSetup() {
   auto deletedToken = cancellationSource_.getToken();
   auto token = co_await folly::coro::co_current_cancellation_token;
   auto mergeToken = folly::cancellation_token_merge(deletedToken, token);
-  auto serverSetup = co_await co_awaitTry(co_withCancellation(
-      mergeToken,
-      folly::coro::timeout(
-          std::move(setupFuture_), moqSettings_.setupTimeout)));
+  folly::Try<Setup> peerSetup;
+  if (dir_ == MoQControlCodec::Direction::SERVER) {
+    // setupTimeout covers the wait for CLIENT_SETUP only. The admission that
+    // follows has no deadline in the session.
+    auto arrived = co_await co_awaitTry(co_withCancellation(
+        mergeToken,
+        folly::coro::timeout(
+            std::move(clientSetupFuture_), moqSettings_.setupTimeout)));
+    if (mergeToken.isCancellationRequested()) {
+      co_yield folly::coro::co_stopped_may_throw;
+    }
+    if (arrived.hasException()) {
+      close(SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED);
+      XLOG(ERR) << "Setup Failed: " << folly::exceptionStr(arrived.exception());
+      co_yield folly::coro::co_error(arrived.exception());
+    }
+    peerSetup = co_await co_awaitTry(
+        co_withCancellation(mergeToken, std::move(setupFuture_)));
+  } else {
+    peerSetup = co_await co_awaitTry(co_withCancellation(
+        mergeToken,
+        folly::coro::timeout(
+            std::move(setupFuture_), moqSettings_.setupTimeout)));
+  }
   if (mergeToken.isCancellationRequested()) {
     co_yield folly::coro::co_stopped_may_throw;
   }
-  if (serverSetup.hasException()) {
+  if (peerSetup.hasException()) {
     close(SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED);
-    XLOG(ERR) << "Setup Failed: "
-              << folly::exceptionStr(serverSetup.exception());
-    co_yield folly::coro::co_error(serverSetup.exception());
+    XLOG(ERR) << "Setup Failed: " << folly::exceptionStr(peerSetup.exception());
+    co_yield folly::coro::co_error(peerSetup.exception());
   }
   markSetupComplete();
   auto negotiatedVersion = *getNegotiatedVersion();
@@ -3736,7 +3768,7 @@ folly::coro::Task<Setup> MoQSession::awaitPeerSetup() {
 
   replayBufferedUniStreams();
 
-  co_return *serverSetup;
+  co_return *peerSetup;
 }
 
 void MoQSession::onServerSetup(Setup serverSetup) {
@@ -3801,6 +3833,11 @@ void MoQSession::onClientSetup(Setup clientSetup) {
                << " sess=" << this;
   }
 
+  // Nothing pipelined behind CLIENT_SETUP is parsed until admission accepts.
+  // Every close() below leaves the codec blocked, so a request in the same
+  // read never reaches a handler of a closed session.
+  controlCodec_->block();
+
   initPeerMaxRequestID(clientSetup.params);
   auto peerAuthCacheSize = getMaxAuthTokenCacheSizeIfPresent(
       clientSetup.params, negotiatedVersion_.value_or(kVersionDraft16));
@@ -3855,42 +3892,94 @@ void MoQSession::onClientSetup(Setup clientSetup) {
   // version-dependent.
   onSetupParams(clientSetup.params, /*local=*/false);
 
-  // Validate authority with the negotiated version
-  auto authorityValidation = serverSetupCallback_->validateAuthority(
-      clientSetup, *getNegotiatedVersion(), shared_from_this());
-  if (!authorityValidation.hasValue()) {
-    SessionCloseErrorCode errorCode = authorityValidation.error();
+  const auto negotiatedVersion = *getNegotiatedVersion();
+  XLOG(DBG1) << "Negotiated Version=0x" << std::hex << negotiatedVersion
+             << std::dec << " (draft-"
+             << getDraftMajorVersion(negotiatedVersion) << ")";
+  clientSetupPromise_.setValue();
+
+  pendingAdmission_.emplace(
+      PendingAdmission{clientSetup, std::move(*serverSetup), {}, 0});
+  // A check that never suspends runs onAdmissionResult before this returns.
+  // Weak: the task's own session argument is the only reference it holds.
+  co_withExecutor(
+      exec_.get(),
+      serverSetupCallback_->validateAuthorityAsync(
+          std::move(clientSetup), negotiatedVersion, shared_from_this()))
+      .startInlineUnsafe(
+          [weakSelf = weak_from_this()](
+              folly::Try<folly::Expected<folly::Unit, SessionCloseErrorCode>>&&
+                  result) {
+            auto self = weakSelf.lock();
+            if (!self) {
+              return;
+            }
+            // startInlineUnsafe would call back again with the exception, and
+            // pendingAdmission_ is gone by then.
+            try {
+              self->onAdmissionResult(std::move(result));
+            } catch (const std::exception& ex) {
+              XLOG(ERR) << "Admission completion failed sess=" << self.get()
+                        << " ex=" << folly::exceptionStr(ex);
+              self->close(SessionCloseErrorCode::INTERNAL_ERROR);
+            }
+          },
+          cancellationSource_.getToken());
+}
+
+void MoQSession::onAdmissionResult(
+    folly::Try<folly::Expected<folly::Unit, SessionCloseErrorCode>> result) {
+  if (closed_ || !pendingAdmission_) {
+    // Closed while the check was pending; cancellation lands here too.
+    return;
+  }
+  if (result.hasException()) {
+    XLOG(ERR) << "Admission check failed sess=" << this
+              << " ex=" << folly::exceptionStr(result.exception());
+    close(SessionCloseErrorCode::INTERNAL_ERROR);
+    return;
+  }
+  if (result->hasError()) {
+    SessionCloseErrorCode errorCode = result->error();
     XLOG(ERR) << "Authority validation failed sess=" << this
               << " errorCode=" << static_cast<uint64_t>(errorCode);
     close(errorCode);
     return;
   }
 
-  {
-    auto negotiatedVersion = *getNegotiatedVersion();
-    XLOG(DBG1) << "Negotiated Version=0x" << std::hex << negotiatedVersion
-               << std::dec << " (draft-"
-               << getDraftMajorVersion(negotiatedVersion) << ")";
-  }
-
-  bool isUniControl = useUniControlStreams(*getNegotiatedVersion());
-
-  if (isUniControl) {
+  auto pending = std::move(*pendingAdmission_);
+  pendingAdmission_.reset();
+  if (useUniControlStreams(*getNegotiatedVersion())) {
     // SERVER_SETUP was already sent proactively in start(). Fulfill the
     // setup promise so a server-side awaitPeerSetup() can return.
     // MAX_REQUEST_ID is no longer derived from setup params in draft-18+; the
     // QUIC bidi stream limit governs request flow control instead.
-    setupPromise_.setValue(clientSetup);
+    setupPromise_.setValue(std::move(pending.clientSetup));
     markSetupComplete();
     replayBufferedUniStreams();
   } else {
-    auto res = sendSetup(std::move(*serverSetup));
+    auto res = sendSetup(std::move(pending.serverSetup));
     if (res.hasError()) {
       close(SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED);
       return;
     }
     markSetupComplete();
   }
+  // Through the normal path, so an alias the held control frames have not
+  // established yet lands in bufferedDatagrams_ under its own bounds.
+  for (auto& datagram : pending.datagrams) {
+    if (closed_) {
+      return;
+    }
+    onDatagram(std::move(datagram));
+  }
+  if (closed_) {
+    return;
+  }
+  // Inline completion: the codec's running onIngress carries on with the
+  // frames behind CLIENT_SETUP. Async completion: the read loop resumes it.
+  controlCodec_->unblock();
+  admitted_.signal();
 }
 
 std::unique_ptr<MoQControlCodec> MoQSession::makeBidiCodec(
@@ -4019,27 +4108,44 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
   // Seeded so a handed-over FIN still reaches the close handling below.
   bool fin = initialData.fin;
 
-  // Frame callbacks, including application handlers, run inside onIngress. An
+  // Frame callbacks, including application handlers, run inside the codec. An
   // exception from one closes this session, not the process.
-  auto onIngress = [&](std::unique_ptr<folly::IOBuf> data, bool eom) {
+  auto guarded = [&](auto&& parse) {
     auto guard = shared_from_this();
     try {
-      controlCodec->onIngress(std::move(data), eom);
+      return parse();
     } catch (const std::exception& ex) {
       XLOG(ERR) << "exception thrown from onIngress ex="
                 << folly::exceptionStr(ex) << " sess=" << this;
       close(SessionCloseErrorCode::INTERNAL_ERROR);
+      return MoQCodec::ParseResult::ERROR_TERMINATE;
     }
+  };
+  auto token = co_await folly::coro::co_current_cancellation_token;
+  // BLOCKED: admission is pending. No transport reads until it accepts, so
+  // flow control throttles the peer. Rejection closes, cancelling the wait.
+  auto ingest = [&](std::unique_ptr<folly::IOBuf> data,
+                    bool eom) -> folly::coro::Task<void> {
+    auto res =
+        guarded([&] { return controlCodec->onIngress(std::move(data), eom); });
+    if (res != MoQCodec::ParseResult::BLOCKED) {
+      co_return;
+    }
+    auto admitted =
+        co_await co_awaitTry(co_withCancellation(token, admitted_.wait()));
+    if (token.isCancellationRequested() || admitted.hasException()) {
+      co_return;
+    }
+    guarded([&] { return controlCodec->resume(); });
   };
 
   // Process any pre-buffered data first
   if (initialData.data || fin) {
-    onIngress(std::move(initialData.data), fin);
+    co_await ingest(std::move(initialData.data), fin);
   }
 
   bool exceptionalExit = false;
   std::optional<ResetStreamErrorCode> peerTerminationError;
-  auto token = co_await folly::coro::co_current_cancellation_token;
   while (auto* handle = readHandle.get()) {
     if (token.isCancellationRequested()) {
       break;
@@ -4062,7 +4168,7 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
     }
     if (!token.isCancellationRequested() &&
         (streamData->data || streamData->fin)) {
-      onIngress(std::move(streamData->data), streamData->fin);
+      co_await ingest(std::move(streamData->data), streamData->fin);
     }
     fin = streamData->fin;
     if (fin) {
@@ -8494,12 +8600,16 @@ void MoQSession::handleClientSetup(
     ReadHandleRef readHandle,
     proxygen::WebTransport::StreamWriteHandle* writeHandle,
     proxygen::WebTransport::StreamData initialData) noexcept {
-  // TODO: prevent second control stream?
   if (dir_ == MoQControlCodec::Direction::CLIENT) {
     XLOG(ERR) << "Received bidi stream on client, kill it sess=" << this;
     writeHandle->resetStream(/*error=*/0);
     readHandle.stopSending(/*error=*/0);
+  } else if (peerControlStreamReceived_) {
+    // A second reader would share the control codec, and its admission wait.
+    XLOG(ERR) << "Duplicate control stream sess=" << this;
+    close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
   } else {
+    peerControlStreamReceived_ = true;
     if (logger_) {
       logger_->logStreamTypeSet(
           readHandle.id(), MOQTStreamType::CONTROL, Owner::REMOTE);
@@ -8612,6 +8722,11 @@ folly::coro::Task<void> MoQSession::bidiStreamDemuxer(
       setupWaiters_ = std::make_shared<SetupWaiters>();
     }
     auto waiters = setupWaiters_;
+    if (waiters->size() >= moqSettings_.maxPendingAdmissionRequestStreams) {
+      XLOG(ERR) << "Too many request streams before setup sess=" << this;
+      close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+      co_return;
+    }
     const auto id = readHandle.id();
     auto [promise, future] = folly::coro::makePromiseContract<void>();
     waiters->emplace(id, std::move(promise));
@@ -8721,8 +8836,24 @@ folly::coro::Task<void> MoQSession::bidiStreamDemuxer(
 void MoQSession::onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept {
   XLOG(DBG1) << __func__ << " sess=" << this;
   if (!setupComplete_) {
-    XLOG(ERR) << "Datagram before setup complete sess=" << this;
-    close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+    if (!pendingAdmission_) {
+      XLOG(ERR) << "Datagram before setup complete sess=" << this;
+      close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+      return;
+    }
+    // Held raw until admission accepts, then replayed through this function.
+    auto& pending = *pendingAdmission_;
+    const size_t length = datagram ? datagram->computeChainDataLength() : 0;
+    const auto maxBytes = moqSettings_.maxPendingAdmissionDatagramBytes;
+    if (pending.datagrams.size() >= moqSettings_.maxPendingAdmissionDatagrams ||
+        pending.datagramBytes > maxBytes ||
+        length > maxBytes - pending.datagramBytes) {
+      XLOG(ERR) << "Too many datagrams before admission sess=" << this;
+      close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+      return;
+    }
+    pending.datagramBytes += length;
+    pending.datagrams.push_back(std::move(datagram));
     return;
   }
   folly::IOBufQueue readBuf{folly::IOBufQueue::cacheChainLength()};
