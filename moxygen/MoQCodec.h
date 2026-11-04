@@ -125,8 +125,29 @@ class MoQControlCodec : public MoQCodec {
     callback_ = callback;
   }
 
-  // If ParseResult::BLOCKED is returned, must call onIngress again to restart
+  // Returns BLOCKED only after block(): the frame being delivered is the last
+  // one parsed, later bytes stay in the codec, and a FIN is kept for resume().
   ParseResult onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) override;
+
+  // Stops parsing once the frame being delivered has been handled. Callable
+  // from inside a callback. While blocked, onIngress only buffers.
+  void block() {
+    blocked_ = true;
+  }
+
+  // Lifts block() without parsing. From inside a callback this lets the
+  // running onIngress continue with the bytes after the current frame.
+  void unblock() {
+    blocked_ = false;
+  }
+
+  // Lifts block() and parses the retained bytes and FIN. Not callable from
+  // inside a callback: that would re-enter onIngress.
+  ParseResult resume();
+
+  bool isBlocked() const {
+    return blocked_;
+  }
 
  public:
   // Draft 18+: REQUEST_OK / REQUEST_ERROR carry no on-wire requestID; codec
@@ -225,6 +246,11 @@ class MoQControlCodec : public MoQCodec {
   bool seenSetup_{false};
 
  private:
+  bool blocked_{false};
+  // A FIN seen while blocked, replayed by the next unblocked onIngress.
+  bool pendingEom_{false};
+  bool inIngress_{false};
+
   // State-machine helpers called from onIngress().
   folly::Expected<folly::Unit, ErrorCode> parseFrameHeaderType(
       folly::io::Cursor& cursor,

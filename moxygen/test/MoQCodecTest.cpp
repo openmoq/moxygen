@@ -694,6 +694,135 @@ TEST_P(MoQCodecTest, ServerGetsServerSetup) {
   serverControlCodec_.onIngress(serverSetup->clone(), false);
 }
 
+// block()/resume(): the server codec is fed CLIENT_SETUP and blocks from the
+// onClientSetup callback. GOAWAY stands in for anything pipelined behind it.
+class MoQCodecBlockTest : public MoQCodecTest {
+ protected:
+  void writeClientSetupFrame() {
+    moxygen::Setup setup;
+    setup.params.insertParam(
+        Parameter(folly::to_underlying(SetupKey::PATH), "/foo"));
+    EXPECT_TRUE(writeClientSetup(writeBuf_, setup, GetParam()).hasValue());
+  }
+
+  void writeGoawayFrame() {
+    EXPECT_TRUE(moqFrameWriter_.writeGoaway(writeBuf_, Goaway{}).hasValue());
+  }
+
+  void blockOnClientSetup() {
+    EXPECT_CALL(serverControlCodecCallback_, onClientSetup(_))
+        .WillOnce(
+            [this](const moxygen::Setup&) { serverControlCodec_.block(); });
+  }
+
+  folly::IOBufQueue writeBuf_{folly::IOBufQueue::cacheChainLength()};
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    MoQCodecBlockTest,
+    MoQCodecBlockTest,
+    ::testing::Values(kVersionDraft16));
+
+TEST_P(MoQCodecBlockTest, BlockHoldsFramesAfterSetup) {
+  writeClientSetupFrame();
+  writeGoawayFrame();
+  blockOnClientSetup();
+  EXPECT_CALL(serverControlCodecCallback_, onGoaway(_)).Times(0);
+  EXPECT_EQ(
+      serverControlCodec_.onIngress(writeBuf_.move(), false),
+      MoQCodec::ParseResult::BLOCKED);
+  EXPECT_TRUE(serverControlCodec_.isBlocked());
+
+  // Bytes arriving while blocked are kept, not parsed.
+  writeGoawayFrame();
+  EXPECT_EQ(
+      serverControlCodec_.onIngress(writeBuf_.move(), false),
+      MoQCodec::ParseResult::BLOCKED);
+  testing::Mock::VerifyAndClearExpectations(&serverControlCodecCallback_);
+
+  EXPECT_CALL(serverControlCodecCallback_, onGoaway(_)).Times(2);
+  EXPECT_CALL(serverControlCodecCallback_, onConnectionError(_)).Times(0);
+  EXPECT_EQ(serverControlCodec_.resume(), MoQCodec::ParseResult::CONTINUE);
+  EXPECT_FALSE(serverControlCodec_.isBlocked());
+}
+
+TEST_P(MoQCodecBlockTest, BlockWithEmptySuffix) {
+  writeClientSetupFrame();
+  blockOnClientSetup();
+  EXPECT_EQ(
+      serverControlCodec_.onIngress(writeBuf_.move(), false),
+      MoQCodec::ParseResult::BLOCKED);
+  EXPECT_EQ(serverControlCodec_.resume(), MoQCodec::ParseResult::CONTINUE);
+
+  writeGoawayFrame();
+  EXPECT_CALL(serverControlCodecCallback_, onGoaway(_));
+  EXPECT_EQ(
+      serverControlCodec_.onIngress(writeBuf_.move(), false),
+      MoQCodec::ParseResult::CONTINUE);
+}
+
+TEST_P(MoQCodecBlockTest, UnblockInsideCallbackContinues) {
+  writeClientSetupFrame();
+  writeGoawayFrame();
+  EXPECT_CALL(serverControlCodecCallback_, onClientSetup(_))
+      .WillOnce([this](const moxygen::Setup&) {
+        serverControlCodec_.block();
+        serverControlCodec_.unblock();
+      });
+  EXPECT_CALL(serverControlCodecCallback_, onGoaway(_));
+  EXPECT_EQ(
+      serverControlCodec_.onIngress(writeBuf_.move(), false),
+      MoQCodec::ParseResult::CONTINUE);
+  EXPECT_FALSE(serverControlCodec_.isBlocked());
+}
+
+// A truncated frame is only an error once the FIN is seen, so an error on
+// resume() proves the FIN of the blocked read was replayed.
+TEST_P(MoQCodecBlockTest, ResumeReplaysFinOfBlockedRead) {
+  writeClientSetupFrame();
+  writeGoawayFrame();
+  auto bytes = writeBuf_.move();
+  bytes->coalesce();
+  bytes->trimEnd(1);
+  blockOnClientSetup();
+  EXPECT_CALL(serverControlCodecCallback_, onConnectionError(_)).Times(0);
+  EXPECT_EQ(
+      serverControlCodec_.onIngress(std::move(bytes), true),
+      MoQCodec::ParseResult::BLOCKED);
+  testing::Mock::VerifyAndClearExpectations(&serverControlCodecCallback_);
+
+  EXPECT_CALL(serverControlCodecCallback_, onGoaway(_)).Times(0);
+  EXPECT_CALL(
+      serverControlCodecCallback_,
+      onConnectionError(ErrorCode::PARSE_UNDERFLOW));
+  EXPECT_EQ(
+      serverControlCodec_.resume(), MoQCodec::ParseResult::ERROR_TERMINATE);
+}
+
+TEST_P(MoQCodecBlockTest, ResumeReplaysFinSeenWhileBlocked) {
+  writeClientSetupFrame();
+  writeGoawayFrame();
+  auto bytes = writeBuf_.move();
+  bytes->coalesce();
+  bytes->trimEnd(1);
+  blockOnClientSetup();
+  EXPECT_CALL(serverControlCodecCallback_, onConnectionError(_)).Times(0);
+  EXPECT_EQ(
+      serverControlCodec_.onIngress(std::move(bytes), false),
+      MoQCodec::ParseResult::BLOCKED);
+  EXPECT_EQ(
+      serverControlCodec_.onIngress(nullptr, true),
+      MoQCodec::ParseResult::BLOCKED);
+  testing::Mock::VerifyAndClearExpectations(&serverControlCodecCallback_);
+
+  EXPECT_CALL(serverControlCodecCallback_, onGoaway(_)).Times(0);
+  EXPECT_CALL(
+      serverControlCodecCallback_,
+      onConnectionError(ErrorCode::PARSE_UNDERFLOW));
+  EXPECT_EQ(
+      serverControlCodec_.resume(), MoQCodec::ParseResult::ERROR_TERMINATE);
+}
+
 // Test for codec fix: stream with only subgroup header and EOF
 // This tests the fix where a stream with only a STREAM_HEADER_SG_EXT and EOF
 // should only call onSubgroup and onEndOfStream, NOT fall through to

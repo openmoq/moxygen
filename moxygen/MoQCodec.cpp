@@ -6,6 +6,7 @@
 
 #include "moxygen/MoQCodec.h"
 
+#include <folly/ScopeGuard.h>
 #include <folly/logging/xlog.h>
 
 #include <iomanip>
@@ -58,13 +59,27 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrameLength(
   return folly::unit;
 }
 
+MoQCodec::ParseResult MoQControlCodec::resume() {
+  XCHECK(!inIngress_) << "resume() from inside a codec callback";
+  blocked_ = false;
+  return onIngress(nullptr, false);
+}
+
 MoQCodec::ParseResult MoQControlCodec::onIngress(
     std::unique_ptr<folly::IOBuf> data,
     bool eom) {
   onIngressStart(std::move(data));
+  if (blocked_) {
+    pendingEom_ = pendingEom_ || eom;
+    return ParseResult::BLOCKED;
+  }
+  eom = eom || std::exchange(pendingEom_, false);
+  inIngress_ = true;
+  auto ingressGuard = folly::makeGuard([this] { inIngress_ = false; });
   size_t remainingLength = ingress_.chainLength();
   folly::io::Cursor cursor(ingress_.front());
-  while (!connError_ && remainingLength > 0) {
+  // A callback may block() mid-buffer: parsing stops after its frame.
+  while (!connError_ && !blocked_ && remainingLength > 0) {
     switch (parseState_) {
       case ParseState::FRAME_HEADER_TYPE: {
         auto res = parseFrameHeaderType(cursor, remainingLength);
@@ -104,6 +119,12 @@ MoQCodec::ParseResult MoQControlCodec::onIngress(
         break;
       }
     }
+  }
+  if (blocked_ && !connError_) {
+    // Keep the unparsed suffix for resume(). onIngressEnd would discard it.
+    ingress_.trimStart(ingress_.chainLength() - remainingLength);
+    pendingEom_ = pendingEom_ || eom;
+    return ParseResult::BLOCKED;
   }
   onIngressEnd(remainingLength, eom, callback_);
 
