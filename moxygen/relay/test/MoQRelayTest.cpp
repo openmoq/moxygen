@@ -3153,6 +3153,58 @@ TEST_F(MoQRelayTest, SubscribeSecondForwardingSubscriberSingleRequestUpdate) {
   }
 }
 
+// A subscriber that resumes a paused PUBLISH gets the Largest Object from the
+// publisher's REQUEST_UPDATE_OK in its own REQUEST_UPDATE_OK.
+TEST_F(MoQRelayTest, ResumeReportsLargestFromUpstreamRequestUpdateOk) {
+  auto pubSession = createMockSession();
+  doPublishNamespace(pubSession, kTestNamespace);
+  auto mockHandle = makePublishHandle();
+  RequestOk upstreamOk;
+  upstreamOk.requestSpecificParams.emplace_back(
+      folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT),
+      AbsoluteLocation{5, 0});
+  ON_CALL(*mockHandle, requestUpdateResult())
+      .WillByDefault(Return(folly::makeExpected<RequestError>(upstreamOk)));
+  doPublishWithHandle(pubSession, kTestTrackName, mockHandle);
+
+  auto sub = createMockSession();
+  setupPublishSucceeds(sub);
+  std::shared_ptr<Publisher::SubscriptionHandle> handle;
+  {
+    SubscribeRequest subReq;
+    subReq.fullTrackName = kTestTrackName;
+    subReq.requestID = RequestID(1);
+    subReq.filter = LocationFilter::nextObject();
+    subReq.forward = false;
+    withSessionContext(sub, [&]() {
+      auto res = folly::coro::blockingWait(
+          relay_->subscribe(std::move(subReq), createMockConsumer()),
+          exec_.get());
+      ASSERT_TRUE(res.hasValue());
+      handle = *res;
+      getOrCreateMockState(sub)->subscribeHandles.push_back(handle);
+    });
+  }
+  ASSERT_NE(handle, nullptr);
+
+  RequestUpdate resume;
+  resume.requestID = RequestID(2);
+  resume.existingRequestID = RequestID(1);
+  resume.forward = true;
+  auto ok =
+      folly::coro::blockingWait(handle->requestUpdate(resume), exec_.get());
+  ASSERT_TRUE(ok.hasValue());
+  ASSERT_EQ(ok->requestSpecificParams.size(), 1);
+  EXPECT_EQ(
+      ok->requestSpecificParams[0].largestObject, (AbsoluteLocation{5, 0}));
+
+  removeSession(sub);
+  removeSession(pubSession);
+  for (int i = 0; i < 3; i++) {
+    exec_->drive();
+  }
+}
+
 // ============================================================================
 // Draft 18+: SUBSCRIBE_TRACKS tests
 // ============================================================================

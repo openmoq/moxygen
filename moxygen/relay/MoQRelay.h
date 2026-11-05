@@ -290,7 +290,10 @@ class MoQRelay : public Publisher,
       std::shared_ptr<MoQSession> upstreamSession);
 
   void onEmpty(MoQForwarder* forwarder) override;
-  void forwardChanged(MoQForwarder* forwarder) override;
+  void forwardChanged(
+      MoQForwarder* forwarder,
+      bool forward,
+      MoQForwarder::LargestPromise largest) override;
   void newGroupRequested(MoQForwarder* forwarder, uint64_t group) override;
   void fillRequested(
       MoQForwarder* forwarder,
@@ -347,7 +350,8 @@ class MoQRelay : public Publisher,
 
   folly::coro::Task<void> doSubscribeUpdate(
       std::shared_ptr<Publisher::SubscriptionHandle> handle,
-      bool forward);
+      bool forward,
+      MoQForwarder::LargestPromise largest = {});
 
   folly::coro::Task<void> doNewGroupRequestUpdate(
       std::shared_ptr<Publisher::SubscriptionHandle> handle,
