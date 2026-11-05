@@ -72,7 +72,8 @@ use identical dependency versions.
 | `BUILD_TESTS` | `ON` | Build test executables |
 | `BUILD_MOQTEST` | `ON` | Build the moqtest client, server and perf executables |
 | `BUILD_SHARED_LIBS` | `OFF` | Build shared libraries (discouraged) |
-| `MOXYGEN_USE_HABERDASHERY` | `OFF` | Use haberdashery for QUIC AES-128-GCM packet protection (x86_64 and aarch64 Linux) |
+| `BUILD_PICOQUIC` | `OFF` | Build with picoquic transport support |
+| `MOXYGEN_USE_HABERDASHERY` | `ON` on x86_64/aarch64 Linux, else `OFF` | Use haberdashery for QUIC AES-128-GCM packet protection (x86_64 and aarch64 Linux) |
 | `HABERDASHERY_REV` | pinned commit | haberdashery revision fetched when `MOXYGEN_USE_HABERDASHERY` is on |
 
 ## Build Caching
