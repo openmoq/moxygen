@@ -32,8 +32,8 @@ with upstream workflow files:
   to `main` using the standalone CMake build. Publishes as rolling
   `snapshot-latest` pre-release.
 - `omoq-verify.yml` — Standalone build CI for PRs to `main`.
-- `omoq-gemini-review.yml` — Gemini review when a PR opens or gets the
-  `gemini-review` label; answers `/gemini` questions.
+- `omoq-gemini-review.yml` — Gemini review, or answers to `/gemini`
+  questions, when the `gemini-review` label is added to a PR.
 
 ## Scripts
 

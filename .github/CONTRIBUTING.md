@@ -53,9 +53,9 @@ maintainer unblocks them; subsequent runs are automatic.
 At least one approving review from a collaborator is required. Review
 on GitHub or [Reviewable](https://reviewable.io/reviews/openmoq/moxygen).
 
-Gemini reviews a PR when it is opened or marked ready for review. To ask
-for another review, add the `gemini-review` label; it is removed when the
-review starts. A review with no comments above LOW also approves the
+Gemini reviews a PR only when someone adds the `gemini-review` label.
+The label is removed when the review starts, so add it again for another
+review. A review with no comments above LOW also approves the
 reviewed commit, and that approval counts toward the required one.
 
 To ask Gemini a question, start a PR comment or a review-thread reply
