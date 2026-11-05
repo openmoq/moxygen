@@ -24,16 +24,26 @@ for the full design.
 OpenMOQ workflows live on `main` and are prefixed `omoq-` to avoid collisions
 with upstream workflow files:
 
-- `omoq-upstream-sync.yml` — Daily upstream sync: mirrors upstream to `upstream`,
-  creates merge PR to `main`, auto-merges on CI pass.
-- `omoq-auto-merge-sync.yml` — Merges sync PRs after CI passes (triggered by
-  `verify` workflow completion on `sync/*` branches).
-- `omoq-publish-artifacts.yml` — Builds per-platform artifact bundles on merge
-  to `main` using the standalone CMake build. Publishes as rolling
-  `snapshot-latest` pre-release.
-- `omoq-verify.yml` — Standalone build CI for PRs to `main`.
-- `omoq-gemini-review.yml` — Gemini review, or answers to `/gemini`
-  questions, when the `gemini-review` label is added to a PR.
+- `omoq-upstream-sync.yml` (`upstream sync`) — Daily: opens a `sync/<sha>`
+  PR to `main` for the newest upstream commit with green CI, one at a time.
+- `omoq-picoquic-sync.yml` (`picoquic sync`) — Daily: opens a
+  `sync-picoquic/<sha>` PR when the openmoq/picoquic pin in
+  `build/deps/github_hashes/openmoq/picoquic-rev.txt` falls behind.
+- `omoq-auto-merge-sync.yml` (`sync auto-merge`) — Merges a sync PR when
+  `ci pr` passes on its branch; notifies Slack and email when it fails.
+- `omoq-ci-pr.yml` (`ci pr`) — Standalone build and tests for PRs to `main`:
+  linux, macos and asan debug.
+- `omoq-gemini-review.yml` (`🔎 Gemini Review`) — Gemini review, or answers
+  to `/gemini` questions, when the `gemini-review` label is added to a PR.
+- `omoq-ci-main.yml` (`ci main`) — On push to `main` or `release/**`: build
+  and test, publish per-platform tarballs as a `snapshot-<sha12>`
+  pre-release, and move the rolling `snapshot-latest` alias.
+- `omoq-version-release.yml` (`version release`) — Manual: tags a versioned
+  release with portable Linux tarballs plus the snapshot's platform tarballs.
+- `omoq-dev-build.yml` (`dev build (manual)`) — Manual: snapshot-equivalent
+  tarballs from any branch, as workflow artifacts.
+- `omoq-pr-cache-cleanup.yml` (`pr cache cleanup`) — Deletes a PR's caches
+  when it closes.
 
 ## Scripts
 
