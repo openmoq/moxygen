@@ -64,19 +64,20 @@ reviews:
 
     - path: "moxygen/**/*.{h,cpp}"
       instructions: |
-        Wire behavior must match the MOQT drafts moxygen supports: draft-14,
-        draft-16 and draft-18. kSupportedVersions in moxygen/MoQVersions.h
-        still lists draft-15, but its removal is planned, so a change does not
-        need to preserve or add draft-15 behavior.
+        Wire behavior must match the MOQT drafts in kSupportedVersions
+        (moxygen/MoQVersions.h): draft-16, draft-18 and draft-20. Draft-20 is
+        only partly implemented, under Meta-scoped ALPNs (moqt-20-meta-NN);
+        each wire-breaking step adds a revision and moves
+        kAlpnMoqtDraft20Latest.
         A change to framing, setup parameters, control-message semantics or
         error codes has to state which versions it applies to and stay correct
         on the others. Version-dependent behavior belongs behind the helpers
         in MoQVersions.h rather than ad hoc version comparisons.
 
         Normative texts on the IETF Datatracker:
-        - draft-14: https://www.ietf.org/archive/id/draft-ietf-moq-transport-14.txt
         - draft-16: https://www.ietf.org/archive/id/draft-ietf-moq-transport-16.txt
         - draft-18: https://www.ietf.org/archive/id/draft-ietf-moq-transport-18.txt
+        - draft-20: https://www.ietf.org/archive/id/draft-ietf-moq-transport-20.txt
         - all revisions: https://datatracker.ietf.org/doc/draft-ietf-moq-transport/
 
         The RELAY_HOPS extension (MoQTypes.h) is specified by
