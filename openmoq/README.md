@@ -33,6 +33,8 @@ with upstream workflow files:
   `ci pr` passes on its branch; notifies Slack and email when it fails.
 - `omoq-ci-pr.yml` (`ci pr`) — Standalone build and tests for PRs to `main`:
   linux, macos and asan debug.
+- `omoq-gemini-review.yml` (`🔎 Gemini Review`) — Gemini review, or answers
+  to `/gemini` questions, when the `gemini-review` label is added to a PR.
 - `omoq-ci-main.yml` (`ci main`) — On push to `main` or `release/**`: build
   and test, publish per-platform tarballs as a `snapshot-<sha12>`
   pre-release, and move the rolling `snapshot-latest` alias.
