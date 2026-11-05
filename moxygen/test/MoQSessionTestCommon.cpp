@@ -94,7 +94,7 @@ TrackStatus getTrackStatus() {
   return TrackStatus{
       .requestID = RequestID(0),
       .fullTrackName = kTestTrackName,
-      .groupOrder = GroupOrder::Default,
+      .groupOrder = std::nullopt,
       .filter = LocationFilter::nextObject()};
 }
 
@@ -117,7 +117,7 @@ std::shared_ptr<MockSubscriptionHandle> makePublishHandle() {
       RequestID(0),
       TrackAlias(100),
       std::chrono::milliseconds(0), // expires
-      GroupOrder::Default,          // groupOrder
+      GroupOrder::OldestFirst,      // groupOrder
       std::nullopt,                 // largest
   });
 }
@@ -185,6 +185,8 @@ void MoQSessionTest::SetUp() {
   MoQExecutor_ = std::make_shared<RecordingMoQExecutor>(&eventBase_);
   std::tie(clientWt_, serverWt_) =
       proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
+  clientWt_->setDeliveryExecutor(&eventBase_);
+  serverWt_->setDeliveryExecutor(&eventBase_);
   clientSession_ = std::make_shared<MoQRelaySession>(
       folly::MaybeManagedPtr<proxygen::WebTransport>(clientWt_.get()),
       MoQExecutor_);
@@ -455,7 +457,7 @@ folly::coro::Task<void> MoQSessionTest::publishRequestUpdateRoundTrip(
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100},
       true,
       {}, // extensions
@@ -552,7 +554,6 @@ void MoQSessionTest::serveFill(
       *fill,
       largest,
       kDefaultPriority,
-      GroupOrder::OldestFirst,
       TrackRequestParameters{FrameType::SUBSCRIBE});
   if (fetch) {
     serveFillFromFetch(serverPublisher, std::move(pub), std::move(*fetch));
@@ -712,7 +713,9 @@ folly::coro::Task<void> MoQSessionTest::rescheduleN(int n) {
 INSTANTIATE_TEST_SUITE_P(
     Draft18Test,
     Draft18Test,
-    testing::Values(VersionParams{{kVersionDraft18}, kVersionDraft18}));
+    testing::Values(
+        VersionParams{{kVersionDraft18}, kVersionDraft18},
+        VersionParams{{kVersionDraft22}, kVersionDraft22}));
 
 INSTANTIATE_TEST_SUITE_P(
     Draft22Test,
@@ -737,10 +740,5 @@ INSTANTIATE_TEST_SUITE_P(
     PreDraft18Test,
     PreDraft18Test,
     testing::ValuesIn(getPreDraft18VersionParams()));
-
-INSTANTIATE_TEST_SUITE_P(
-    Draft20Test,
-    Draft20Test,
-    testing::Values(VersionParams{{kVersionDraft20}, kVersionDraft20}));
 
 }} // namespace moxygen::test

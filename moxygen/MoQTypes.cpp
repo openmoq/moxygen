@@ -224,8 +224,8 @@ SubscribeRange LocationFilter::resolve(
     result.start = nextObject;
   } else {
     result.start = start_;
-    // Below draft 20, a start behind Largest moves up to the Next Object.
-    // TODO: skip this at draft 20 once the unfiltered default is settled.
+    // Below draft 22, a start behind Largest moves up to the Next Object.
+    // TODO: skip this at draft 22 once the unfiltered default is settled.
     if (!isFetch && largest && result.start < *largest) {
       result.start = nextObject;
     }
@@ -361,6 +361,17 @@ LocationFilter fromSubscriptionFilter(const SubscriptionFilter& filter) {
       break;
   }
   return LocationFilter::absoluteStart(filter.location.value_or(kLocationMin));
+}
+
+std::optional<GroupOrder> toGroupOrder(uint64_t value) {
+  switch (value) {
+    case folly::to_underlying(GroupOrder::OldestFirst):
+      return GroupOrder::OldestFirst;
+    case folly::to_underlying(GroupOrder::NewestFirst):
+      return GroupOrder::NewestFirst;
+    default:
+      return std::nullopt;
+  }
 }
 
 std::string toString(LocationType loctype) {
@@ -526,9 +537,9 @@ static bool isLegacyPublishOkSubscriptionParameter(TrackRequestParamKey key) {
   }
 }
 
-// v20+ carries the FETCH range in LOCATION_FILTER (0x21) and allows it on
+// v22+ carries the FETCH range in LOCATION_FILTER (0x21) and allows it on
 // PUBLISH, but not on PUBLISH_OK.
-static bool isLocationFilterAllowedV20(FrameType frameType) {
+static bool isLocationFilterAllowedV22(FrameType frameType) {
   switch (frameType) {
     case FrameType::SUBSCRIBE:
     case FrameType::REQUEST_UPDATE:
@@ -590,7 +601,7 @@ const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
         {TrackRequestParamKey::FILL_TIMEOUT, kAllowedFramesForFillTimeout},
         {TrackRequestParamKey::TRACK_NAMESPACE_PREFIX,
          kAllowedFramesForTrackNamespacePrefix},
-        // v20+ FILL_PARAMETERS (0x23): MAY appear in SUBSCRIBE or
+        // v22+ FILL_PARAMETERS (0x23): MAY appear in SUBSCRIBE or
         // REQUEST_UPDATE.
         {TrackRequestParamKey::FILL_PARAMETERS,
          {FrameType::SUBSCRIBE, FrameType::REQUEST_UPDATE}},
@@ -629,20 +640,14 @@ static bool isV18OnlyParamKey(TrackRequestParamKey key) {
   }
 }
 
-static bool isV20OnlyParamKey(TrackRequestParamKey key) {
-  return key == TrackRequestParamKey::FILL_PARAMETERS;
-}
-
 static bool isV22OnlyParamKey(TrackRequestParamKey key) {
-  return key == TrackRequestParamKey::INCLUDE_PROPERTIES;
+  return key == TrackRequestParamKey::FILL_PARAMETERS ||
+      key == TrackRequestParamKey::INCLUDE_PROPERTIES;
 }
 
 bool Parameters::isKnownParamKey(uint64_t key, uint64_t majorVersion) {
   auto typedKey = static_cast<TrackRequestParamKey>(key);
   if (majorVersion < 18 && isV18OnlyParamKey(typedKey)) {
-    return false;
-  }
-  if (majorVersion < 20 && isV20OnlyParamKey(typedKey)) {
     return false;
   }
   if (majorVersion < 22 && isV22OnlyParamKey(typedKey)) {
@@ -717,20 +722,14 @@ bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
     return false;
   }
 
-  if (isV20OnlyParamKey(key) &&
-      (!majorVersion_.has_value() || *majorVersion_ < 20)) {
-    return false;
-  }
-
-  // INCLUDE_PROPERTIES did not exist before draft 22.
   if (isV22OnlyParamKey(key) &&
       (!majorVersion_.has_value() || *majorVersion_ < 22)) {
     return false;
   }
 
   if (key == TrackRequestParamKey::LOCATION_FILTER &&
-      majorVersion_.has_value() && *majorVersion_ >= 20) {
-    return isLocationFilterAllowedV20(frameType_);
+      majorVersion_.has_value() && *majorVersion_ >= 22) {
+    return isLocationFilterAllowedV22(frameType_);
   }
 
   auto it = kParamAllowlist.find(key);
@@ -769,7 +768,7 @@ std::pair<const StandaloneFetch*, const JoiningFetch*> fetchType(
 SubscribeRequest SubscribeRequest::make(
     const FullTrackName& fullTrackName,
     uint8_t priority,
-    GroupOrder groupOrder,
+    std::optional<GroupOrder> groupOrder,
     bool forward,
     LocationFilter filter,
     const std::vector<Parameter>& inputParams) {
@@ -796,7 +795,7 @@ SubscribeRequest SubscribeRequest::make(
 SubscribeRequest SubscribeRequest::make(
     const FullTrackName& fullTrackName,
     uint8_t priority,
-    GroupOrder groupOrder,
+    std::optional<GroupOrder> groupOrder,
     bool forward,
     LocationType locType,
     std::optional<AbsoluteLocation> start,

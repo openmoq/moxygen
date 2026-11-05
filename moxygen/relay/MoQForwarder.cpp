@@ -177,11 +177,29 @@ MoQForwarder::MoQForwarder(
     : fullTrackName_(std::move(ftn)), largest_(std::move(largest)) {}
 
 MoQForwarder::~MoQForwarder() {
+  std::vector<std::pair<std::shared_ptr<TrackConsumer>, RequestID>> waiting;
+  if (pendingPublishDone_) {
+    for (const auto& [_, sub] : subscribers_) {
+      if (sub->trackConsumer) {
+        waiting.emplace_back(sub->trackConsumer, sub->requestID);
+      }
+    }
+  }
   for (auto& [id, subgroupForwarder] : subgroups_) {
     subgroupForwarder->detach();
   }
   for (auto& [_, sub] : subscribers_) {
     sub->detach();
+  }
+  // Subscribers must still learn the track ended if the owner released this
+  // forwarder while a deferred PUBLISH_DONE was pending.
+  for (const auto& [consumer, requestID] : waiting) {
+    consumer->publishDone(
+        PublishDone{
+            requestID,
+            pendingPublishDone_->statusCode,
+            0, // filled in by session
+            pendingPublishDone_->reasonPhrase});
   }
 }
 
@@ -238,6 +256,7 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
       subReq.forward);
   subscriber->filter = subReq.filter;
   subscriber->priority = subReq.priority;
+  subscriber->groupOrder = subReq.groupOrder;
   subscriber->params = subReq.params;
   subscriber->pinned = true;
   // If the session already has a subscriber (e.g. from a prior
@@ -364,7 +383,7 @@ folly::Expected<SubscribeRange, FetchError> MoQForwarder::resolveJoiningFetch(
   auto& largest = *subIt->second->joiningLocation;
   // Not LocationFilter::relativeStart(): that clamps a start before the track
   // to group 0, but a joining FETCH does not.
-  // TODO: fold these together once drafts below 20 are dropped.
+  // TODO: fold these together once drafts below 22 are dropped.
   if (joining.fetchType == FetchType::RELATIVE_JOINING) {
     AbsoluteLocation start{largest};
     start.group -=
@@ -432,6 +451,13 @@ void MoQForwarder::removeSubscriber(
 }
 
 void MoQForwarder::checkAndFireOnEmpty() {
+  if (pendingPublishDone_ && subgroups_.empty()) {
+    OnEmptyGuard guard(this);
+    auto done = std::exchange(pendingPublishDone_, std::nullopt);
+    drainSubscribers(*done);
+    checkAndFireOnEmpty();
+    return;
+  }
   if (subscribers_.size() == passiveCount_) {
     if (subgroups_.empty()) {
       if (deferOnEmptyDepth_ > 0) {
@@ -767,11 +793,24 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::publishDone(
   XLOG(DBG1) << __func__ << " pubDone reason=" << pubDone.reasonPhrase;
   OnEmptyGuard guard(this);
   draining_ = true;
-  if (callback_) {
-    // Signal source termination before draining subscribers, so any owning
-    // registry can release this forwarder (identity-scoped via the pointer).
-    callback_->onPublishDone(this);
+  // Signal source termination before draining subscribers, so any owning
+  // registry can release this forwarder (identity-scoped via the pointer).
+  auto notifySource = [this] {
+    if (callback_) {
+      callback_->onPublishDone(this);
+    }
+  };
+  if (deferPublishDone_ && !subgroups_.empty()) {
+    pendingPublishDone_ = std::move(pubDone);
+    notifySource();
+    return folly::unit;
   }
+  notifySource();
+  drainSubscribers(pubDone);
+  return folly::unit;
+}
+
+void MoQForwarder::drainSubscribers(const PublishDone& pubDone) {
   forEachSubscriber([&](const std::shared_ptr<Subscriber>& sub) {
     drainSubscriber(
         sub->sessionId,
@@ -782,8 +821,6 @@ folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::publishDone(
             pubDone.reasonPhrase},
         "publishDone");
   });
-  // Cleanup/draining operation - succeed even with no subscribers
-  return folly::unit;
 }
 
 void MoQForwarder::addForwardingSubscriber() {
@@ -866,7 +903,7 @@ MoQForwarder::Subscriber::Subscriber(
 void MoQForwarder::Subscriber::setPublisherGroupOrder(
     GroupOrder pubGroupOrder) {
   subscribeOk_->groupOrder =
-      MoQSession::resolveGroupOrder(pubGroupOrder, subscribeOk_->groupOrder);
+      MoQSession::resolveGroupOrder(pubGroupOrder, groupOrder);
 }
 
 void MoQForwarder::Subscriber::updateLargest(AbsoluteLocation largest) {
@@ -878,10 +915,10 @@ void MoQForwarder::Subscriber::updateLargest(AbsoluteLocation largest) {
 
 void MoQForwarder::Subscriber::setExtensions(Extensions extensions) {
   subscribeOk_->extensions = std::move(extensions);
-  auto groupOrder = getPublisherGroupOrder(*subscribeOk_);
-  if (groupOrder) {
+  auto publisherGroupOrder = getPublisherGroupOrder(*subscribeOk_);
+  if (publisherGroupOrder) {
     subscribeOk_->groupOrder =
-        MoQSession::resolveGroupOrder(*groupOrder, subscribeOk_->groupOrder);
+        MoQSession::resolveGroupOrder(*publisherGroupOrder, groupOrder);
   }
 }
 
@@ -934,6 +971,9 @@ void MoQForwarder::Subscriber::onPublishOk(const PublishOk& pubOk) {
   // PUBLISH-served subscriptions carry the real id only after PUBLISH_OK; a
   // later joining fetch matches against it in resolveJoiningFetch.
   requestID = pubOk.requestID;
+  if (!pubOk.params.isParamAllowed(TrackRequestParamKey::FORWARD)) {
+    return;
+  }
   range = toSubscribeRange(pubOk.filter, forwarder->largest());
 
   updateForwardState(pubOk.forward);
@@ -1018,7 +1058,6 @@ void MoQForwarder::Subscriber::requestFill(
       fill,
       forwarder->largest(),
       priority,
-      subscribeOk().groupOrder,
       params);
   if (!fetch) {
     return;

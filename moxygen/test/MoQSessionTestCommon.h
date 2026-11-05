@@ -101,7 +101,7 @@ inline Subscriber::PublishResult makePublishOkResult(
       pub.requestID,
       true, // forward
       128,  // subscriber priority
-      GroupOrder::Default,
+      std::nullopt,
       LocationFilter::nextObject(),
   };
 
@@ -320,16 +320,12 @@ class MoQSessionTest : public testing::TestWithParam<VersionParams>,
 // streams, uni control streams, or other draft-18-introduced behavior.
 class Draft18Test : public MoQSessionTest {};
 
-// Parameterized to draft 22 for behavior introduced in that draft. Draft 22
-// is not advertised in kSupportedVersions yet.
+// Parameterized to draft 22+ only.
 class Draft22Test : public MoQSessionTest {};
 
 // Parameterized to pre-draft-18 versions only. Use for tests that exercise
 // MAX_REQUEST_ID / REQUESTS_BLOCKED request-ID flow control, which was
 // removed in draft 18 in favor of QUIC bidi stream limits.
 class PreDraft18Test : public MoQSessionTest {};
-
-// Parameterized to draft 20+ only.
-class Draft20Test : public MoQSessionTest {};
 
 }} // namespace moxygen::test

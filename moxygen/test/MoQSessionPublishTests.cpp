@@ -25,6 +25,32 @@ CO_TEST_P_X(MoQSessionTest, NoPublishHandler) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
+CO_TEST_P_X(MoQSessionTest, FailedPublishWriteDoesNotReachPeer) {
+  co_await setupMoQSessionForPublish(initialMaxRequestID_);
+  EXPECT_CALL(*serverSubscriber, publish(_, _))
+      .WillOnce([](const PublishRequest& request, auto) {
+        return makePublishOkResult(request);
+      });
+
+  PublishRequest invalid;
+  invalid.fullTrackName = FullTrackName{TrackNamespace{{"test"}}, "invalid"};
+  CO_ASSERT_TRUE(
+      invalid.params.insertParam(Parameter(0xBEEF, std::string("unregistered")))
+          .hasValue());
+  auto failed =
+      clientSession_->publish(std::move(invalid), makePublishHandle());
+  CO_ASSERT_TRUE(failed.hasError());
+
+  PublishRequest valid;
+  valid.fullTrackName = FullTrackName{TrackNamespace{{"test"}}, "valid"};
+  auto result = clientSession_->publish(std::move(valid), makePublishHandle());
+  CO_ASSERT_TRUE(result.hasValue());
+  auto reply = co_await std::move(result->reply);
+  EXPECT_TRUE(reply.hasValue());
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(Draft22Test, PublishOkDoesNotOverrideInitialForwardState) {
   co_await setupMoQSessionForPublish(initialMaxRequestID_);
 
@@ -256,7 +282,7 @@ CO_TEST_P_X(MoQSessionTest, DuplicatePublishRequestID) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(0),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -308,7 +334,7 @@ CO_TEST_P_X(MoQSessionTest, PublishDiagnostic) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -361,7 +387,7 @@ CO_TEST_P_X(MoQSessionTest, PublishTimeout) {
       RequestID(1),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -502,7 +528,7 @@ CO_TEST_P_X(Draft18Test, DeliveredSubgroupsStayUnderBufferLimit) {
                           actualPub.requestID,
                           true,
                           128,
-                          GroupOrder::Default,
+                          std::nullopt,
                           LocationFilter::nextObject()};
                     })};
           });
@@ -538,7 +564,7 @@ CO_TEST_P_X(MoQSessionTest, PublishBasicSuccess) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -577,7 +603,7 @@ CO_TEST_P_X(MoQSessionTest, PublishWithFilterParameters) {
       RequestID(1),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -635,13 +661,15 @@ CO_TEST_P_X(MoQSessionTest, PublishWithFilterParameters) {
   // Verify subscriber filtering parameters are preserved
   const auto& publishOk = replyResult.value();
   EXPECT_TRUE(publishOk.forward);
-  EXPECT_EQ(publishOk.subscriberPriority, 64);
-  EXPECT_EQ(publishOk.groupOrder, GroupOrder::NewestFirst);
-  // PUBLISH_OK does not carry a filter in draft 20, so the publisher sees the
-  // unfiltered default.
-  if (getDraftMajorVersion(getServerSelectedVersion()) >= 20) {
+  // PUBLISH_OK does not carry the subscription parameters in draft 22, so the
+  // publisher gets the defaults.
+  if (getDraftMajorVersion(getServerSelectedVersion()) >= 22) {
+    EXPECT_EQ(publishOk.subscriberPriority, kDefaultPriority);
+    EXPECT_EQ(publishOk.groupOrder, std::nullopt);
     EXPECT_EQ(publishOk.filter, LocationFilter::none());
   } else {
+    EXPECT_EQ(publishOk.subscriberPriority, 64);
+    EXPECT_EQ(publishOk.groupOrder, GroupOrder::NewestFirst);
     EXPECT_EQ(
         publishOk.filter, LocationFilter::range(AbsoluteLocation{50, 25}, 200));
   }
@@ -655,7 +683,7 @@ CO_TEST_P_X(MoQSessionTest, PublishConnectionDropCleanup) {
       RequestID(1),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -731,7 +759,7 @@ CO_TEST_P_X(MoQSessionTest, PublishUnsubscribedBeforeReply) {
           .fullTrackName =
               FullTrackName{TrackNamespace{{"test"}}, "test-track"},
           .trackAlias = TrackAlias(100),
-          .groupOrder = GroupOrder::Default,
+          .groupOrder = GroupOrder::OldestFirst,
           .largest = AbsoluteLocation{0, 100},
           .forward = true},
       makePublishHandle());
@@ -759,7 +787,7 @@ CO_TEST_P_X(MoQSessionTest, PublishHandleCancel) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -818,7 +846,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeUpdateWithDeliveryTimeout) {
         RequestID(0),
         FullTrackName{TrackNamespace{{"test"}}, "test-track"},
         TrackAlias(100),
-        GroupOrder::Default,
+        GroupOrder::OldestFirst,
         AbsoluteLocation{0, 100}, // largest
         true,                     // forward
     };
@@ -885,7 +913,7 @@ CO_TEST_P_X(MoQSessionTest, PublishThenSubscribeUpdate) {
         RequestID(0),
         FullTrackName{TrackNamespace{{"test"}}, "test-track"},
         TrackAlias(100),
-        GroupOrder::Default,
+        GroupOrder::OldestFirst,
         AbsoluteLocation{0, 100}, // largest
         true,                     // forward
     };
@@ -959,7 +987,7 @@ CO_TEST_P_X(Draft18Test, PublishBidiForwardsPublishDone) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100},
       true,
       {}, // extensions
@@ -1016,7 +1044,7 @@ CO_TEST_P_X(Draft18Test, PublishBidiCreateTransportErrorIsInternalError) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100},
       true,
   };
@@ -1050,7 +1078,7 @@ CO_TEST_P_X(Draft18Test, PublishBidiCreateStreamCreationErrorIsInternalError) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100},
       true,
   };
@@ -1081,7 +1109,7 @@ CO_TEST_P_X(MoQSessionTest, PublishDataArrivesBeforePublishOk) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -1127,7 +1155,7 @@ CO_TEST_P_X(MoQSessionTest, PublishDataArrivesBeforePublishOk) {
                               actualPub.requestID,
                               true,
                               128,
-                              GroupOrder::Default,
+                              std::nullopt,
                               LocationFilter::nextObject()};
                         })};
               }));
@@ -1182,7 +1210,7 @@ CO_TEST_P_X(MoQSessionTest, PublishConsumerReadyDeliversDataBeforePublishOk) {
                           actualPub.requestID,
                           true,
                           128,
-                          GroupOrder::Default,
+                          std::nullopt,
                           LocationFilter::nextObject()};
                     }),
                 /*consumerReady=*/true};
@@ -1192,7 +1220,7 @@ CO_TEST_P_X(MoQSessionTest, PublishConsumerReadyDeliversDataBeforePublishOk) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -1260,7 +1288,7 @@ CO_TEST_P_X(MoQSessionTest, PublishConsumerReadyErrorReleasesState) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -1299,7 +1327,7 @@ CO_TEST_P_X(MoQSessionTest, InboundPublish_NoSubscriber_PublishError) {
       RequestID(1),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -1321,7 +1349,7 @@ CO_TEST_P_X(MoQSessionTest, PublishOkRequestIDMappedToInbound) {
       RequestID(7),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -1348,7 +1376,7 @@ CO_TEST_P_X(MoQSessionTest, PublishOkRequestIDMappedToInbound) {
                     RequestID(actualPub.requestID.value + 123),
                     true,
                     128,
-                    GroupOrder::Default,
+                    std::nullopt,
                     LocationFilter::nextObject()};
                 auto replyTask = folly::coro::makeTask<
                     folly::Expected<PublishOk, PublishError>>(std::move(bogus));
@@ -1379,7 +1407,7 @@ CO_TEST_P_X(MoQSessionTest, PublishOkWithDeliveryTimeout) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -1405,7 +1433,7 @@ CO_TEST_P_X(MoQSessionTest, PublishOkWithDeliveryTimeout) {
                     actualPub.requestID,
                     true, // forward
                     128,  // subscriber priority
-                    GroupOrder::Default,
+                    std::nullopt,
                     LocationFilter::nextObject()};
 
                 // Add delivery timeout parameter (3000ms)
@@ -1432,7 +1460,6 @@ CO_TEST_P_X(MoQSessionTest, PublishOkWithDeliveryTimeout) {
   auto replyResult = co_await std::move(result->reply);
   EXPECT_TRUE(replyResult.hasValue());
 
-  EXPECT_GE(replyResult->params.size(), 1);
   bool foundDeliveryTimeout = false;
   for (const auto& param : replyResult->params) {
     if (param.key ==
@@ -1441,7 +1468,10 @@ CO_TEST_P_X(MoQSessionTest, PublishOkWithDeliveryTimeout) {
       EXPECT_GT(param.asUint64, 0);
     }
   }
-  EXPECT_TRUE(foundDeliveryTimeout);
+  // PUBLISH_OK does not carry DELIVERY_TIMEOUT in draft 22.
+  EXPECT_EQ(
+      foundDeliveryTimeout,
+      getDraftMajorVersion(getServerSelectedVersion()) < 22);
 
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
@@ -1452,7 +1482,7 @@ CO_TEST_P_X(MoQSessionTest, PublishOkWithoutDeliveryTimeout) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100}, // largest
       true,                     // forward
   };
@@ -1504,7 +1534,7 @@ CO_TEST_P_X(
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100},
       true,
   };
@@ -1524,11 +1554,7 @@ CO_TEST_P_X(
         ON_CALL(*consumer, publishDone(_))
             .WillByDefault(testing::Return(folly::unit));
         PublishOk ok{
-            p.requestID,
-            true,
-            128,
-            GroupOrder::Default,
-            LocationFilter::nextObject()};
+            p.requestID, true, 128, std::nullopt, LocationFilter::nextObject()};
         ok.params.insertParam(
             {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
              kSubscriberTimeoutMs});
@@ -1568,7 +1594,7 @@ CO_TEST_P_X(MoQSessionTest, DeliveryTimeoutResetCancelsLaterObjects) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100},
       true,
   };
@@ -1586,11 +1612,7 @@ CO_TEST_P_X(MoQSessionTest, DeliveryTimeoutResetCancelsLaterObjects) {
         ON_CALL(*consumer, publishDone(_))
             .WillByDefault(testing::Return(folly::unit));
         PublishOk ok{
-            p.requestID,
-            true,
-            128,
-            GroupOrder::Default,
-            LocationFilter::nextObject()};
+            p.requestID, true, 128, std::nullopt, LocationFilter::nextObject()};
         return Subscriber::PublishConsumerAndReplyTask{
             std::static_pointer_cast<TrackConsumer>(consumer),
             folly::coro::makeTask<folly::Expected<PublishOk, PublishError>>(
@@ -1629,7 +1651,7 @@ CO_TEST_P_X(MoQSessionTest, PublishConsumerObjectStreamAfterSessionClose) {
       RequestID(0),
       FullTrackName{TrackNamespace{{"test"}}, "test-track"},
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100},
       true};
 
@@ -1686,7 +1708,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeDuplicatesPendingPublish) {
       RequestID(0),
       ftn,
       TrackAlias(100),
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       AbsoluteLocation{0, 100},
       true,
   };
@@ -1720,7 +1742,7 @@ CO_TEST_P_X(MoQSessionTest, SubscribeDuplicatesPendingPublish) {
                           actualPub.requestID,
                           true,
                           128,
-                          GroupOrder::Default,
+                          std::nullopt,
                           LocationFilter::nextObject()};
                     })};
           });
@@ -1792,7 +1814,7 @@ CO_TEST_P_X(MoQSessionTest, PublishDuplicatesPendingSubscribe) {
           RequestID(0),
           ftn,
           TrackAlias(100),
-          GroupOrder::Default,
+          GroupOrder::OldestFirst,
           AbsoluteLocation{0, 100},
           true,
       },
@@ -1861,7 +1883,7 @@ CO_TEST_P_X(Draft18Test, PublishAfterSubscribeStreamCloseIsNotDuplicate) {
           RequestID(0),
           ftn,
           TrackAlias(100),
-          GroupOrder::Default,
+          GroupOrder::OldestFirst,
           AbsoluteLocation{0, 100},
           true,
       },
@@ -1924,7 +1946,7 @@ CO_TEST_P_X(MoQSessionTest, NoSubscriptionEndForPublishPendingOkAtClose) {
           RequestID(0),
           FullTrackName{TrackNamespace{{"test"}}, "test-track"},
           TrackAlias(100),
-          GroupOrder::Default,
+          GroupOrder::OldestFirst,
           AbsoluteLocation{0, 100},
           true,
       },
@@ -1981,7 +2003,7 @@ CO_TEST_P_X(Draft18Test, PublishFailsOnPeerStopSendingWithoutReply) {
           RequestID(0),
           FullTrackName{TrackNamespace{{"test"}}, "test-track"},
           TrackAlias(100),
-          GroupOrder::Default,
+          GroupOrder::OldestFirst,
           AbsoluteLocation{0, 100},
           true,
       },

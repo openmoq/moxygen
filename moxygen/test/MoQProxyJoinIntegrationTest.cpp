@@ -272,7 +272,7 @@ class ProxyJoinIntegrationTest : public testing::TestWithParam<uint64_t>,
       std::shared_ptr<TrackConsumer> live,
       std::shared_ptr<FetchConsumer> history,
       uint64_t joiningStart,
-      GroupOrder groupOrder = GroupOrder::Default) {
+      GroupOrder groupOrder = GroupOrder::OldestFirst) {
     return folly::coro::co_withExecutor(
                &eventBase_,
                viewer.client->join(
@@ -346,7 +346,7 @@ std::vector<AbsoluteLocation> historyLocations(
     if (std::sscanf(
             entry.c_str(), "object %" SCNu64 "/%" SCNu64, &group, &object) ==
         2) {
-      locations.push_back({group, object});
+      locations.emplace_back(group, object);
     }
   }
   return locations;
@@ -767,7 +767,7 @@ TEST_P(ProxyJoinIntegrationTest, ReplayOutlivesEvictionUnderBudgetPressure) {
     std::vector<AbsoluteLocation> expected;
     for (uint64_t group = 41; group <= 43; group++) {
       for (uint64_t objectID = 0; objectID < 3; objectID++) {
-        expected.push_back({group, objectID});
+        expected.emplace_back(group, objectID);
       }
     }
     EXPECT_EQ(historyLocations(history->log), expected);
@@ -827,7 +827,7 @@ TEST_P(ProxyJoinIntegrationTest, CancelledJoinStopsOnlyItsOwnReplay) {
   }));
 }
 
-// Draft 20 retires Joining FETCH.
+// Draft 22 retires Joining FETCH.
 static std::vector<uint64_t> joiningFetchVersions() {
   std::vector<uint64_t> versions;
   for (auto version : kSupportedVersions) {

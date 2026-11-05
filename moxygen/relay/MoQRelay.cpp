@@ -64,6 +64,18 @@ folly::coro::Task<void> MoQRelay::doSubscribeUpdate(
   }
 }
 
+folly::coro::Task<void> MoQRelay::doPublishForwardUpdate(
+    std::shared_ptr<Publisher::SubscriptionHandle> handle,
+    bool forward) {
+  RequestUpdate update;
+  update.forward = forward;
+  auto updateRes = co_await handle->requestUpdate(std::move(update));
+  if (updateRes.hasError()) {
+    XLOG(ERR) << "PUBLISH forward update failed: "
+              << updateRes.error().reasonPhrase;
+  }
+}
+
 // Sends a REQUEST_UPDATE that carries only the NEW_GROUP_REQUEST parameter.
 folly::coro::Task<void> MoQRelay::doNewGroupRequestUpdate(
     std::shared_ptr<Publisher::SubscriptionHandle> handle,
@@ -254,7 +266,7 @@ void MoQRelay::NamespaceNode::incrementActiveChildren() {
 }
 
 void MoQRelay::NamespaceNode::decrementActiveChildren() {
-  XCHECK_GT(activeChildCount_, 0);
+  XCHECK_GT(activeChildCount_, 0u);
   activeChildCount_--;
 }
 
@@ -277,7 +289,7 @@ void MoQRelay::NamespaceNode::tryPruneChild(const std::string& childKey) {
   NamespaceNode* current = this;
 
   while (current) {
-    XCHECK_GT(current->activeChildCount_, 0);
+    XCHECK_GT(current->activeChildCount_, 0u);
     current->activeChildCount_--;
 
     // If current still has content or children after decrement, stop walking
@@ -458,6 +470,8 @@ Subscriber::PublishResult MoQRelay::publish(
   }
 
   auto session = MoQSession::getRequestSession();
+  const auto majorVersion =
+      getDraftMajorVersion(*session->getNegotiatedVersion());
   bool wasEmpty = !nodePtr->hasLocalSessions();
 
   auto it = subscriptions_.find(pub.fullTrackName);
@@ -546,14 +560,32 @@ Subscriber::PublishResult MoQRelay::publish(
 
   wakePendingRendezvousForTrack(pub.fullTrackName);
 
+  const bool shouldForward = nSubscribers > 0;
+  PublishOk publishOk;
+  publishOk.requestID = pub.requestID;
+  if (majorVersion >= 22) {
+    if (pub.forward != shouldForward) {
+      auto exec = session->getExecutor();
+      co_withExecutor(exec, doPublishForwardUpdate(rsub.handle, shouldForward))
+          .start([](folly::Try<void>&& result) {
+            if (result.hasException()) {
+              XLOG(ERR) << "PUBLISH forward update failed with exception: "
+                        << result.exception().what();
+            }
+          });
+    }
+  } else {
+    publishOk.forward = shouldForward;
+    publishOk.subscriberPriority = kDefaultPriority;
+    publishOk.groupOrder = pub.groupOrder;
+    publishOk.filter =
+        LocationFilter::range(kLocationMin, {kLocationMax.group, 0});
+  }
+
   return PublishConsumerAndReplyTask{
       filter, // Return filter, not forwarder directly
-      folly::coro::makeTask<folly::Expected<PublishOk, PublishError>>(PublishOk{
-          pub.requestID,
-          /*forward=*/(nSubscribers > 0),
-          kDefaultPriority,
-          pub.groupOrder,
-          LocationFilter::range(kLocationMin, {kLocationMax.group, 0})}),
+      folly::coro::makeTask<folly::Expected<PublishOk, PublishError>>(
+          std::move(publishOk)),
       /*consumerReady=*/true};
 }
 
@@ -627,8 +659,6 @@ folly::coro::Task<void> MoQRelay::publishToSession(
   XLOG(DBG1) << "Publish OK sess=" << session.get();
   auto& pubOk = pubResult.value().value();
 
-  // Process the PUBLISH_OK response - updates range, forward flag, and
-  // handles NEW_GROUP_REQUEST forwarding via callback
   subscriber->onPublishOk(pubOk);
 }
 
@@ -1663,7 +1693,7 @@ MoQRelay::subscribeToExistingRelaySubscription(
     }
   }
   auto& forwarder = subscriptionIt->second.forwarder;
-  // Draft 20 accepts a filter entirely before Largest Object. Older drafts
+  // Draft 22 accepts a filter entirely before Largest Object. Older drafts
   // refuse it, but only for a subscriber joining an existing subscription.
   // TODO: retire the asymmetry along with the drafts that need it.
   if (!useFillFetch(downstreamSession->getNegotiatedVersion().value_or(0))) {
@@ -1722,7 +1752,7 @@ MoQRelay::subscribeToFirstRelaySubscription(
 
   auto upstreamSubReq = subReq;
   upstreamSubReq.priority = kDefaultUpstreamPriority;
-  upstreamSubReq.groupOrder = GroupOrder::Default;
+  upstreamSubReq.groupOrder.reset();
   // We only subscribe upstream from the Next Object. This is to satisfy other
   // subscribers that join with narrower filters
   upstreamSubReq.filter = LocationFilter::nextObject();
@@ -1831,7 +1861,7 @@ folly::coro::Task<Publisher::FetchResult> MoQRelay::fetch(
 
   auto [standalone, joining] = fetchType(fetch);
   if (joining && useFillFetch(session->getNegotiatedVersion().value_or(0))) {
-    // Only a locally built request can reach here at draft 20.
+    // Only a locally built request can reach here at draft 22.
     co_return folly::makeUnexpected(FetchError(
         {fetch.requestID,
          FetchErrorCode::NOT_SUPPORTED,
@@ -1848,7 +1878,7 @@ folly::coro::Task<Publisher::FetchResult> MoQRelay::fetch(
            "No subscription for joining fetch"}));
     }
     const auto& upstream = subscriptionIt->second.upstream;
-    // A draft 20 upstream refuses Joining FETCH, so resolve the join here once
+    // A draft 22 upstream refuses Joining FETCH, so resolve the join here once
     // the subscribe completes.
     if (!subscriptionIt->second.promise.isFulfilled() && upstream &&
         useFillFetch(upstream->getNegotiatedVersion().value_or(0))) {
@@ -1936,6 +1966,10 @@ folly::coro::Task<Publisher::TrackStatusResult> MoQRelay::trackStatus(
     TrackStatusOk trackStatusOk;
     trackStatusOk.requestID = trackStatus.requestID;
     trackStatusOk.groupOrder = forwarder->groupOrder();
+    trackStatusOk.trackProperties.insertMutableExtension(
+        Extension{
+            kPublisherGroupOrderExtensionType,
+            folly::to_underlying(forwarder->groupOrder())});
     trackStatusOk.largest = forwarder->largest();
 
     XLOG(DBG1) << "Returning local track status for "

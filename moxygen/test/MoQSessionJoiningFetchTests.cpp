@@ -59,7 +59,7 @@ class JoiningFetchTestHelper {
                    std::move(subscribeCallback),
                    /*joiningStart=*/0,
                    /*fetchPri=*/129,
-                   GroupOrder::Default,
+                   GroupOrder::OldestFirst,
                    {},
                    std::move(fetchCallback),
                    FetchType::RELATIVE_JOINING))
@@ -71,7 +71,7 @@ class JoiningFetchTestHelper {
 // answered, and a bound dependency does not inherit the unseen-ID timeout.
 CO_TEST_P_X(MoQSessionTest, JoiningFetchWaitsForSlowSubscription) {
   if (useFillFetch(getServerSelectedVersion())) {
-    // Draft 20 retires Joining FETCH.
+    // Draft 22 retires Joining FETCH.
     co_return;
   }
   serverSession_->setMoqSettings(joiningSettings(20ms));
@@ -118,6 +118,11 @@ CO_TEST_P_X(MoQSessionTest, JoiningFetchWaitsForSlowSubscription) {
 // Draft 18 request streams can deliver the joining FETCH before the SUBSCRIBE
 // it references. The session holds it until that SUBSCRIBE is established.
 CO_TEST_P_X(Draft18Test, JoiningFetchArrivesBeforeItsSubscribe) {
+  if (useFillFetch(getServerSelectedVersion())) {
+    // Draft 22 retires Joining FETCH; FillArrivesBeforeSubscribeOk covers the
+    // same ordering.
+    co_return;
+  }
   co_await setupMoQSession();
   bool subscribeHandled = false;
   expectSubscribe([&](auto sub, auto pub) -> TaskSubscribeResult {
@@ -169,6 +174,10 @@ CO_TEST_P_X(Draft18Test, JoiningFetchArrivesBeforeItsSubscribe) {
 // Once the late SUBSCRIBE binds a deferred FETCH, the unseen-ID timeout no
 // longer applies, however long establishment takes.
 CO_TEST_P_X(Draft18Test, BoundFetchFirstJoinOutlivesTheUnseenTimeout) {
+  if (useFillFetch(getServerSelectedVersion())) {
+    // Draft 22 retires Joining FETCH.
+    co_return;
+  }
   serverSession_->setMoqSettings(joiningSettings(500ms));
   co_await setupMoQSession();
   folly::coro::Baton releaseSubscribe;
@@ -222,6 +231,10 @@ CO_TEST_P_X(Draft18Test, BoundFetchFirstJoinOutlivesTheUnseenTimeout) {
 // A joining FETCH whose SUBSCRIBE never shows up fails after the unseen-ID
 // timeout without reaching the Publisher.
 CO_TEST_P_X(Draft18Test, JoiningFetchForUnseenSubscribeTimesOut) {
+  if (useFillFetch(getServerSelectedVersion())) {
+    // Draft 22 retires Joining FETCH.
+    co_return;
+  }
   serverSession_->setMoqSettings(joiningSettings(20ms));
   co_await setupMoQSession();
   expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
@@ -261,6 +274,11 @@ CO_TEST_P_X(Draft18Test, JoiningFetchForUnseenSubscribeTimesOut) {
 // A joining FETCH held for a PUBLISH reaches the Publisher only after the
 // PUBLISH reply has been delivered, so a relay has recorded the subscription.
 CO_TEST_P_X(Draft18Test, JoiningFetchOnPublishFollowsThePublishReply) {
+  if (useFillFetch(getServerSelectedVersion())) {
+    // Draft 22 retires Joining FETCH; PublishHandleDefersUpdateUntilPublishOk
+    // covers the same ordering.
+    co_return;
+  }
   co_await setupMoQSessionForPublish(initialMaxRequestID_);
   folly::coro::Baton publishReceived;
   auto releasePublishOk = std::make_shared<folly::coro::Baton>();
@@ -283,7 +301,7 @@ CO_TEST_P_X(Draft18Test, JoiningFetchOnPublishFollowsThePublishReply) {
                       co_return PublishOk{
                           .requestID = requestID,
                           .subscriberPriority = 128,
-                          .groupOrder = GroupOrder::Default};
+                          .groupOrder = std::nullopt};
                     }),
                 /*consumerReady=*/true};
           });
@@ -300,7 +318,7 @@ CO_TEST_P_X(Draft18Test, JoiningFetchOnPublishFollowsThePublishReply) {
           .requestID = RequestID(0),
           .fullTrackName = kTestTrackName,
           .trackAlias = TrackAlias(100),
-          .groupOrder = GroupOrder::Default,
+          .groupOrder = GroupOrder::OldestFirst,
           .largest = AbsoluteLocation{0, 100},
           .forward = true},
       makePublishHandle());
@@ -337,7 +355,7 @@ CO_TEST_P_X(Draft18Test, JoiningFetchOnPublishFollowsThePublishReply) {
 // A subscription that fails takes its pending joining FETCH with it.
 CO_TEST_P_X(MoQSessionTest, JoiningFetchFailsWithItsSubscription) {
   if (useFillFetch(getServerSelectedVersion())) {
-    // Draft 20 retires Joining FETCH.
+    // Draft 22 retires Joining FETCH.
     co_return;
   }
   co_await setupMoQSession();
@@ -359,7 +377,7 @@ CO_TEST_P_X(MoQSessionTest, JoiningFetchFailsWithItsSubscription) {
       subscribeCallback_,
       0,
       129,
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       {},
       fetchCallback_,
       FetchType::RELATIVE_JOINING);
@@ -376,7 +394,7 @@ CO_TEST_P_X(MoQSessionTest, JoiningFetchFailsWithItsSubscription) {
 // a held FETCH that is dispatched frees its slot.
 CO_TEST_P_X(MoQSessionTest, DeferredJoiningFetchesAreCapped) {
   if (useFillFetch(getServerSelectedVersion())) {
-    // Draft 20 retires Joining FETCH.
+    // Draft 22 retires Joining FETCH.
     co_return;
   }
   serverSession_->setMoqSettings(joiningSettings(2000ms, /*maxDeferred=*/1));
@@ -449,7 +467,7 @@ CO_TEST_P_X(MoQSessionTest, DeferredJoiningFetchesAreCapped) {
 // FETCH_CANCEL for a held joining FETCH releases its slot for later joins.
 CO_TEST_P_X(MoQSessionTest, CancellingAHeldJoiningFetchFreesItsSlot) {
   if (useFillFetch(getServerSelectedVersion())) {
-    // Draft 20 retires Joining FETCH.
+    // Draft 22 retires Joining FETCH.
     co_return;
   }
   serverSession_->setMoqSettings(joiningSettings(2000ms, /*maxDeferred=*/1));
@@ -506,7 +524,7 @@ CO_TEST_P_X(MoQSessionTest, CancellingAHeldJoiningFetchFreesItsSlot) {
       0,
       FetchType::RELATIVE_JOINING,
       129,
-      GroupOrder::Default);
+      GroupOrder::OldestFirst);
   heldFetch.fullTrackName = kTestTrackName;
   folly::CancellationSource cancelHeld;
   auto held =
@@ -555,7 +573,7 @@ CO_TEST_P_X(PreDraft18Test, JoiningFetchOnNonLargestObjectSubscriptionCloses) {
       subscribeCallback_,
       0,
       129,
-      GroupOrder::Default,
+      GroupOrder::OldestFirst,
       {},
       fetchCallback_,
       FetchType::RELATIVE_JOINING);
@@ -789,9 +807,9 @@ CO_TEST_P_X(MoQSessionTest, FetchReadinessWaitsForStreamCredit) {
 }
 
 // Raw QUIC transports allow a single uni stream credit waiter. FETCHes held
-// for their first stream, including one that abandoned an earlier wait, share
-// one transport waiter. When credit for one stream arrives, the other FETCH
-// waits again and goes out once that stream finishes.
+// for their first stream share one transport waiter. When credit for one
+// stream arrives, the other FETCH waits again and goes out once that stream
+// finishes. A second readiness call while one is pending fails.
 CO_TEST_P_X(MoQSessionTest, ConcurrentFetchesShareOneStreamCreditWaiter) {
   co_await setupMoQSession();
   const auto openUni = serverWt_->openLocalUniStreams().size();
@@ -803,18 +821,22 @@ CO_TEST_P_X(MoQSessionTest, ConcurrentFetchesShareOneStreamCreditWaiter) {
   auto holdThenEnd = [](auto fetchPub,
                         folly::coro::Baton& waiting,
                         folly::coro::Baton& release,
-                        bool abandonFirstWait) -> folly::coro::Task<void> {
+                        bool callTwice) -> folly::coro::Task<void> {
     auto blocked =
         fetchPub->object(0, 0, 0, makeBuf(10), noExtensions(), false);
     EXPECT_TRUE(blocked.hasError());
     if (blocked.hasError()) {
       EXPECT_EQ(blocked.error().code, MoQPublishError::BLOCKED);
     }
-    if (abandonFirstWait) {
-      EXPECT_TRUE(fetchPub->awaitReadyToConsume().hasValue());
-    }
     auto ready = fetchPub->awaitReadyToConsume();
     EXPECT_TRUE(ready.hasValue());
+    if (callTwice) {
+      auto again = fetchPub->awaitReadyToConsume();
+      EXPECT_TRUE(again.hasError());
+      if (again.hasError()) {
+        EXPECT_EQ(again.error().code, MoQPublishError::API_ERROR);
+      }
+    }
     waiting.post();
     if (ready.hasValue()) {
       co_await std::move(ready.value());

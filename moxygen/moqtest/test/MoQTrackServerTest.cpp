@@ -174,7 +174,8 @@ TEST_F(MoQTrackServerTest, ValidateSubscribeWithForwardPreferenceZero) {
     EXPECT_CALL(
         *mockConsumer, beginSubgroup(groupId, 0, testing::_, testing::_))
         .WillRepeatedly(testing::Return(mockSubgroupConsumer));
-    for (int objectId = 0; objectId <= params_.lastObjectInTrack; objectId++) {
+    for (uint64_t objectId = 0; objectId <= params_.lastObjectInTrack;
+         objectId++) {
       // Find Object Size
       auto objectSize = moxygen::getObjectSize(objectId, &params_);
 
@@ -228,7 +229,8 @@ TEST_F(
     EXPECT_CALL(
         *mockConsumer, beginSubgroup(groupId, 0, testing::_, testing::_))
         .WillRepeatedly(testing::Return(mockSubgroupConsumer));
-    for (int objectId = 0; objectId <= params_.lastObjectInTrack; objectId++) {
+    for (uint64_t objectId = 0; objectId <= params_.lastObjectInTrack;
+         objectId++) {
       // Find Object Size
       auto objectSize = moxygen::getObjectSize(objectId, &params_);
 
@@ -293,7 +295,8 @@ TEST_F(MoQTrackServerTest, ValidateSubscribeWithForwardPreferenceOne) {
 
   // Set expectations for beginSubgroup
   for (int groupId = 0; groupId <= 10; groupId++) {
-    for (int objectId = 0; objectId <= params_.lastObjectInTrack; objectId++) {
+    for (uint64_t objectId = 0; objectId <= params_.lastObjectInTrack;
+         objectId++) {
       // Set expectations for beginObject
       auto objectSize = moxygen::getObjectSize(objectId, &params_);
       // Create a mock subgroup consumer
@@ -349,7 +352,8 @@ TEST_F(MoQTrackServerTest, ValidateSubscribeWithForwardPreferenceTwo) {
         *mockConsumer, beginSubgroup(groupId, 1, testing::_, testing::_))
         .WillRepeatedly(testing::Return(mockSubgroupConsumerOne));
 
-    for (int objectId = 0; objectId <= params_.lastObjectInTrack; objectId++) {
+    for (uint64_t objectId = 0; objectId <= params_.lastObjectInTrack;
+         objectId++) {
       auto objectSize = moxygen::getObjectSize(objectId, &params_);
       // Set expectations for beginObject
       if (objectId % 2 == 0) {
@@ -432,7 +436,8 @@ TEST_F(
 
         .WillRepeatedly(testing::Return(mockSubgroupConsumerOne));
 
-    for (int objectId = 0; objectId <= params_.lastObjectInTrack; objectId++) {
+    for (uint64_t objectId = 0; objectId <= params_.lastObjectInTrack;
+         objectId++) {
       auto objectSize = moxygen::getObjectSize(objectId, &params_);
       // Set expectations for beginObject
       if (objectId % 2 == 0) {
@@ -579,7 +584,8 @@ TEST_F(MoQTrackServerTest, ValidateFetchWithForwardPreferenceZero) {
   // Set expectations for beginSubgroup
   for (int groupId = 0; groupId <= 10; groupId++) {
     // Create a mock subgroup consumer
-    for (int objectId = 0; objectId <= params_.lastObjectInTrack; objectId++) {
+    for (uint64_t objectId = 0; objectId <= params_.lastObjectInTrack;
+         objectId++) {
       // Find Object Size
       auto objectSize = moxygen::getObjectSize(objectId, &params_);
 
@@ -643,7 +649,8 @@ TEST_F(
   // Set expectations for beginSubgroup
   for (int groupId = 0; groupId <= 10; groupId++) {
     // Create a mock subgroup consumer
-    for (int objectId = 0; objectId <= params_.lastObjectInTrack; objectId++) {
+    for (uint64_t objectId = 0; objectId <= params_.lastObjectInTrack;
+         objectId++) {
       // Find Object Size
       auto objectSize = moxygen::getObjectSize(objectId, &params_);
 
@@ -719,7 +726,8 @@ TEST_F(MoQTrackServerTest, ValidateFetchWithForwardPreferenceOne) {
   // Set expectations for beginSubgroup
   for (int groupId = 0; groupId <= 10; groupId++) {
     // Create a mock subgroup consumer
-    for (int objectId = 0; objectId <= params_.lastObjectInTrack; objectId++) {
+    for (uint64_t objectId = 0; objectId <= params_.lastObjectInTrack;
+         objectId++) {
       // Find Object Size
       auto objectSize = moxygen::getObjectSize(objectId, &params_);
 
@@ -779,7 +787,8 @@ TEST_F(MoQTrackServerTest, ValidateFetchWithForwardPreferenceTwo) {
   // Set expectations for beginSubgroup
   for (int groupId = 0; groupId <= 10; groupId++) {
     // Create a mock subgroup consumer
-    for (int objectId = 0; objectId <= params_.lastObjectInTrack; objectId++) {
+    for (uint64_t objectId = 0; objectId <= params_.lastObjectInTrack;
+         objectId++) {
       // Find Object Size
       auto objectSize = moxygen::getObjectSize(objectId, &params_);
       int subGroupId = objectId % 2;
@@ -840,7 +849,8 @@ TEST_F(
   // Set expectations for beginSubgroup
   for (int groupId = 0; groupId <= 10; groupId++) {
     // Create a mock subgroup consumer
-    for (int objectId = 0; objectId <= params_.lastObjectInTrack; objectId++) {
+    for (uint64_t objectId = 0; objectId <= params_.lastObjectInTrack;
+         objectId++) {
       // Find Object Size
       auto objectSize = moxygen::getObjectSize(objectId, &params_);
       int subGroupId = (objectId - params_.startObject) % 2;
@@ -907,7 +917,8 @@ TEST_F(MoQTrackServerTest, ValidateFetchWithForwardPreferenceThree) {
   // Build Expect Calls
   for (int groupId = 0; groupId <= 10; groupId++) {
     // Create a mock subgroup consumer
-    for (int objectId = 0; objectId <= params_.lastObjectInTrack; objectId++) {
+    for (uint64_t objectId = 0; objectId <= params_.lastObjectInTrack;
+         objectId++) {
       moxygen::ObjectHeader expectedHeader;
       expectedHeader.group = groupId;
       expectedHeader.id = objectId;
@@ -1978,6 +1989,49 @@ CO_TEST_F(MoQTrackServerTest, CancelAllStopsAnInFlightTrack) {
   co_await folly::coro::sleep(std::chrono::milliseconds(300));
   EXPECT_LE(recorder.groups().size(), groupsAtCancel + 1);
   EXPECT_LT(recorder.groups().size(), 20u);
+}
+
+// Track status tests
+//
+// TRACK_STATUS describes the track the way SUBSCRIBE_OK would, without
+// starting it.
+
+CO_TEST_F(MoQTrackServerTest, TrackStatusMatchesSubscribeOk) {
+  MoQTrackServerTest::CreateDefaultTrackNamespace();
+  track_.trackNamespace[4] = "20";
+  track_.trackNamespace[9] = "50";
+
+  // Nobody has subscribed, so the track is not being generated yet.
+  auto idle = co_await publisher_->trackStatus(MakeSubscribe(1));
+  CO_ASSERT_TRUE(idle.hasValue());
+  EXPECT_EQ(idle->requestID, moxygen::RequestID(1));
+  EXPECT_FALSE(idle->largest.has_value());
+
+  GroupRecorder recorder;
+  auto sub = co_await SubscribeAs(
+      CreateSession(), MakeSubscribe(2), recorder.consumer());
+  CO_ASSERT_TRUE(sub.hasValue());
+  co_await recorder.waitForGroups(2);
+
+  auto live = co_await publisher_->trackStatus(MakeSubscribe(3));
+  const auto lastGroup = recorder.groups().back();
+  publisher_->cancelAll();
+  CO_ASSERT_TRUE(live.hasValue());
+  CO_ASSERT_TRUE(live->largest.has_value());
+  EXPECT_EQ(live->largest->group, lastGroup);
+  EXPECT_EQ(live->groupOrder, sub.value()->subscribeOk().groupOrder);
+  EXPECT_EQ(live->trackProperties, sub.value()->subscribeOk().extensions);
+  EXPECT_EQ(idle->trackProperties, live->trackProperties);
+}
+
+CO_TEST_F(MoQTrackServerTest, TrackStatusRejectsAnInvalidTrack) {
+  MoQTrackServerTest::CreateDefaultTrackNamespace();
+  track_.trackNamespace[0] = "not-moq-test";
+
+  auto res = co_await publisher_->trackStatus(MakeSubscribe(0));
+  CO_ASSERT_TRUE(res.hasError());
+  EXPECT_EQ(
+      res.error().errorCode, moxygen::TrackStatusErrorCode::NOT_SUPPORTED);
 }
 
 // Subgroup header encoding tests

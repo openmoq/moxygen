@@ -303,7 +303,9 @@ INSTANTIATE_TEST_SUITE_P(
     CurrentVersionOnly,
     CurrentVersionOnly,
     testing::Values(
-        VersionParams{{kVersionDraftCurrent}, kVersionDraftCurrent}));
+        VersionParams{{kVersionDraftCurrent}, kVersionDraftCurrent},
+        VersionParams{{kVersionDraft18}, kVersionDraft18},
+        VersionParams{{kVersionDraft22}, kVersionDraft22}));
 namespace {
 class ScopedTestHandler : public Publisher,
                           public Subscriber,
@@ -898,7 +900,7 @@ CO_TEST_P_X(
             RequestID(0),
             FullTrackName{TrackNamespace{{"test"}}, "test-track"},
             TrackAlias(100),
-            GroupOrder::Default,
+            GroupOrder::OldestFirst,
             AbsoluteLocation{0, 100},
             true,
         };
@@ -999,7 +1001,7 @@ CO_TEST_P_X(
             RequestID(0),
             FullTrackName{TrackNamespace{{"test"}}, "test-track"},
             TrackAlias(100),
-            GroupOrder::Default,
+            GroupOrder::OldestFirst,
             AbsoluteLocation{0, 100},
             true,
         };
@@ -1094,7 +1096,9 @@ class Draft18GoawayTimeoutTest : public MoQSessionTest {
 INSTANTIATE_TEST_SUITE_P(
     Draft18GoawayTimeoutTest,
     Draft18GoawayTimeoutTest,
-    testing::Values(VersionParams{{kVersionDraft18}, kVersionDraft18}));
+    testing::Values(
+        VersionParams{{kVersionDraft18}, kVersionDraft18},
+        VersionParams{{kVersionDraft22}, kVersionDraft22}));
 
 CO_TEST_P_X(Draft18GoawayTimeoutTest, TimeoutClosesOpenPeerSubscription) {
   auto subscription = co_await openPeerSubscription();
@@ -1162,6 +1166,41 @@ CO_TEST_P_X(
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
+// Waiting for acks does not push the close past a sooner GOAWAY deadline.
+CO_TEST_P_X(Draft18GoawayTimeoutTest, DrainFlushKeepsSoonerGoawayDeadline) {
+  co_await setupMoQSession();
+  for (auto& [id, stream] : serverWt_->writeHandles) {
+    stream->setImmediateDelivery(false);
+  }
+
+  Goaway goaway;
+  goaway.timeout = 20;
+  serverSession_->goaway(goaway);
+  co_await rescheduleN(5);
+  EXPECT_FALSE(serverSession_->isClosed());
+
+  co_await folly::coro::sleep(std::chrono::milliseconds(100));
+  EXPECT_TRUE(serverSession_->isClosed());
+  EXPECT_EQ(
+      serverSession_->getCloseResult()->error, SessionCloseErrorCode::NO_ERROR);
+}
+
+// A GOAWAY sent with no open requests reaches the peer before the close.
+CO_TEST_P_X(MoQSessionTest, GoawayWithoutRequestsReachesPeer) {
+  co_await setupMoQSession();
+  folly::coro::Baton goawayBaton;
+  EXPECT_CALL(*serverPublisher, goaway(_)).WillOnce([&](auto) {
+    goawayBaton.post();
+  });
+
+  clientSession_->goaway(Goaway{});
+  co_await goawayBaton;
+  co_await rescheduleN(5);
+  EXPECT_TRUE(clientSession_->isClosed());
+  EXPECT_EQ(
+      clientSession_->getCloseResult()->error, SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, Goaway) {
   co_await setupMoQSession();
   expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
@@ -1193,6 +1232,9 @@ CO_TEST_P_X(MoQSessionTest, Goaway) {
   co_await goawayBaton;
 
   subscribeHandler->unsubscribe();
+  // Pre-draft-18, the drain waits for the UNSUBSCRIBE on the control stream.
+  co_await rescheduleN(5);
+  EXPECT_TRUE(clientSession_->isClosed());
 }
 
 CO_TEST_P_X(Draft22Test, GoawayOmitsRequestID) {
@@ -1258,7 +1300,9 @@ class Draft18RequestStreamGoawayTest : public MoQSessionTest {
 INSTANTIATE_TEST_SUITE_P(
     Draft18RequestStreamGoawayTest,
     Draft18RequestStreamGoawayTest,
-    testing::Values(VersionParams{{kVersionDraft18}, kVersionDraft18}));
+    testing::Values(
+        VersionParams{{kVersionDraft18}, kVersionDraft18},
+        VersionParams{{kVersionDraft22}, kVersionDraft22}));
 
 CO_TEST_P_X(
     Draft18RequestStreamGoawayTest,
@@ -1943,7 +1987,7 @@ class MoQBidiSetupGateTest : public MoQSessionTest {
         RequestID(sequence * 2),
         FullTrackName{TrackNamespace{{"setup-gate"}}, std::to_string(sequence)},
         TrackAlias(100 + sequence),
-        GroupOrder::Default,
+        GroupOrder::OldestFirst,
         AbsoluteLocation{0, 100},
         true,
         {}};
@@ -2002,7 +2046,9 @@ class MoQBidiSetupGateTest : public MoQSessionTest {
 INSTANTIATE_TEST_SUITE_P(
     MoQBidiSetupGateTest,
     MoQBidiSetupGateTest,
-    testing::Values(VersionParams{{kVersionDraft18}, kVersionDraft18}));
+    testing::Values(
+        VersionParams{{kVersionDraft18}, kVersionDraft18},
+        VersionParams{{kVersionDraft22}, kVersionDraft22}));
 
 CO_TEST_P_X(MoQBidiSetupGateTest, PublishWaitsForAcceptedSetup) {
   prepareServerSetup();
@@ -2188,7 +2234,9 @@ class MoQUniControlTest : public MoQSessionTest {};
 INSTANTIATE_TEST_SUITE_P(
     MoQUniControlTest,
     MoQUniControlTest,
-    testing::Values(VersionParams{{kVersionDraft18}, kVersionDraft18}));
+    testing::Values(
+        VersionParams{{kVersionDraft18}, kVersionDraft18},
+        VersionParams{{kVersionDraft22}, kVersionDraft22}));
 
 CO_TEST_P_X(MoQUniControlTest, UniControlSetup) {
   co_await setupMoQSession();
@@ -2325,6 +2373,25 @@ CO_TEST_P_X(MoQUniControlTest, UniControlDataStreamBeforeSetup) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
+// The owner releases the session before SETUP arrives on the peer's control
+// stream. The session is freed once SETUP arrives.
+CO_TEST_P_X(MoQUniControlTest, ReleaseBeforePeerSetupFreesTheSession) {
+  clientSession_->start();
+  serverSession_->start();
+  co_await rescheduleN(2);
+
+  std::weak_ptr<MoQSession> weakClient = clientSession_;
+  clientSession_.reset();
+  serverSession_->sendSetup(moxygen::Setup{});
+  co_await rescheduleN(2);
+  EXPECT_TRUE(weakClient.expired());
+
+  // serverWt_ still holds a raw peer pointer to the freed client; drop it so
+  // closing the server doesn't call onSessionEnd() on the dead session.
+  serverWt_->setPeerHandler(nullptr);
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 // The peer resolves the alias and ends the subscription in one batch of control
 // messages, so the waiting read loop wakes to find the state gone again.
 CO_TEST_P_X(MoQUniControlTest, UnknownAliasResolvedThenRemovedAbandonsStream) {
@@ -2438,7 +2505,8 @@ class NullWebTransportHandler : public proxygen::WebTransportHandler {
       proxygen::WebTransport::StreamReadHandle*) noexcept override {}
   void onNewBidiStream(
       proxygen::WebTransport::BidiStreamHandle) noexcept override {}
-  void onDatagram(std::unique_ptr<folly::IOBuf>) noexcept override {}
+  void onDatagrams(
+      std::vector<std::unique_ptr<folly::IOBuf>>) noexcept override {}
   void onSessionEnd(folly::Optional<uint32_t>) noexcept override {}
   void onSessionDrain() noexcept override {}
 };
@@ -2474,6 +2542,57 @@ CO_TEST_P_X(MoQUniControlTest, ServerClosesSessionWithoutClientSetup) {
   }
   EXPECT_TRUE(serverWt_->isSessionClosed());
   serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQUniControlTest, ClientCloseBeforeHandleClientSessionRuns) {
+  auto server = std::make_shared<SetupTimeoutServer>();
+  auto handled =
+      co_withExecutor(&eventBase_, server->handleClientSession(serverSession_))
+          .start();
+  clientWt_->closeSession();
+  co_await std::move(handled);
+  EXPECT_TRUE(serverSession_->isClosed());
+}
+
+CO_TEST_P_X(MoQSessionTest, ControlStreamFailureClosesTheSessionWhenEnabled) {
+  serverWt_->setPeerHandler(nullptr);
+  if (useUniControlStreams(getServerSelectedVersion())) {
+    clientWt_->setMaxLocalUniStreams(0);
+  } else {
+    clientWt_->setNextCreateBidiStreamError(
+        proxygen::WebTransport::ErrorCode::BLOCKED);
+  }
+  MoQSettings moqSettings;
+  moqSettings.closeOnControlStreamFailure = true;
+  clientSession_->setMoqSettings(moqSettings);
+  clientSession_->start();
+  CO_ASSERT_TRUE(clientSession_->getCloseResult().has_value());
+  EXPECT_EQ(
+      clientSession_->getCloseResult()->error,
+      SessionCloseErrorCode::INTERNAL_ERROR);
+
+  auto setup = co_await folly::coro::co_awaitTry(
+      clientSession_->setup(getClientSetup(initialMaxRequestID_)));
+  EXPECT_TRUE(setup.hasException<folly::OperationCancelled>());
+}
+
+CO_TEST_P_X(MoQSessionTest, ControlStreamFailureWaitsForTheSetupTimeout) {
+  serverWt_->setPeerHandler(nullptr);
+  if (useUniControlStreams(getServerSelectedVersion())) {
+    clientWt_->setMaxLocalUniStreams(0);
+  } else {
+    clientWt_->setNextCreateBidiStreamError(
+        proxygen::WebTransport::ErrorCode::BLOCKED);
+  }
+  MoQSettings moqSettings;
+  moqSettings.setupTimeout = std::chrono::milliseconds(100);
+  clientSession_->setMoqSettings(moqSettings);
+  clientSession_->start();
+  EXPECT_FALSE(clientSession_->isClosed());
+
+  auto setup = co_await folly::coro::co_awaitTry(
+      clientSession_->setup(getClientSetup(initialMaxRequestID_)));
+  EXPECT_TRUE(setup.hasException<folly::FutureTimeout>());
 }
 
 CO_TEST_P_X(MoQUniControlTest, UniControlSetupStreamFinBeforeSetup) {
@@ -2676,6 +2795,79 @@ CO_TEST_P_X(MoQUniControlTest, BidiRequestBeforeClientSetupWaitsForSetup) {
       writeBuf, getClientSetup(initialMaxRequestID_), kVersionDraft18);
   controlWh->writeStreamData(writeBuf.move(), false, nullptr);
   // Time out if the publisher never sees the request.
+  auto reached = co_await folly::coro::co_awaitTry(
+      folly::coro::timeout(std::move(subscribed), std::chrono::seconds(1)));
+  EXPECT_FALSE(reached.hasException());
+
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQUniControlTest, NegotiatesParameterBeforeBufferedRequest) {
+  constexpr uint64_t kTestSetupOption = 0x4d;
+  constexpr uint64_t kTestParameter = 0x4f;
+  const std::string kTestValue = "route";
+
+  auto extensions = std::make_shared<MessageParameterExtensions>();
+  extensions->emplace(
+      kTestParameter,
+      MessageParameterExtension{
+          ParameterValueEncoding::LengthPrefixed, {FrameType::SUBSCRIBE}});
+  serverSession_->setMessageParameterNegotiator(
+      [extensions, kTestValue](uint64_t, const auto& local, const auto& peer) {
+        auto hasOption = [&](const auto& params) {
+          return getFirstStringParam(params, kTestSetupOption) == kTestValue;
+        };
+        return hasOption(local) && hasOption(peer)
+            ? *extensions
+            : MessageParameterExtensions{};
+      });
+
+  NullWebTransportHandler nullHandler;
+  serverWt_->setPeerHandler(&nullHandler);
+  auto peerHandlerGuard =
+      folly::makeGuard([this] { serverWt_->setPeerHandler(nullptr); });
+  serverSession_->setPublishHandler(serverPublisher);
+  serverSession_->start();
+  moxygen::Setup serverSetup;
+  serverSetup.params.insertParam(Parameter(kTestSetupOption, kTestValue));
+  serverSession_->sendSetup(std::move(serverSetup));
+
+  auto [subscribedPromise, subscribed] =
+      folly::coro::makePromiseContract<void>();
+  bool sawSubscribe = false;
+  EXPECT_CALL(*serverPublisher, subscribe(_, _))
+      .WillOnce([&](auto sub, auto /*pub*/) -> TaskSubscribeResult {
+        EXPECT_EQ(sub.params.size(), 1);
+        EXPECT_EQ(sub.params.at(0).key, kTestParameter);
+        EXPECT_EQ(sub.params.at(0).asString, kTestValue);
+        sawSubscribe = true;
+        subscribedPromise.setValue();
+        co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+      });
+
+  MoQFrameWriter writer;
+  writer.initializeVersion(getServerSelectedVersion());
+  writer.setMessageParameterExtensions(extensions);
+  auto request = getSubscribe(kTestTrackName);
+  request.params.insertParam(Parameter(kTestParameter, kTestValue));
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  CO_ASSERT_TRUE(writer.writeSubscribeRequest(writeBuf, request).hasValue());
+  auto bidi = clientWt_->createBidiStream();
+  CO_ASSERT_TRUE(bidi.hasValue());
+  bidi->writeHandle->writeStreamData(writeBuf.move(), false, nullptr);
+  for (int i = 0; i < 10; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  EXPECT_FALSE(sawSubscribe);
+
+  moxygen::Setup clientSetup = getClientSetup(initialMaxRequestID_);
+  clientSetup.params.insertParam(Parameter(kTestSetupOption, kTestValue));
+  auto* controlWh =
+      CHECK_NOTNULL(clientWt_->createUniStream().value_or(nullptr));
+  CO_ASSERT_TRUE(
+      writeClientSetup(writeBuf, clientSetup, getServerSelectedVersion())
+          .hasValue());
+  controlWh->writeStreamData(writeBuf.move(), false, nullptr);
   auto reached = co_await folly::coro::co_awaitTry(
       folly::coro::timeout(std::move(subscribed), std::chrono::seconds(1)));
   EXPECT_FALSE(reached.hasException());
@@ -3185,19 +3377,25 @@ CO_TEST_P_X(
   // Get weak_ptr to track session lifetime
   std::weak_ptr<MoQSession> weakClient = clientSession_;
 
-  // The control stream is stream ID 0. We need to:
+  // We need to:
   // 1. Pause data delivery so controlReadLoop blocks on co_await
   // 2. Release the session shared_ptr
   // 3. Deliver data to trigger the coroutine resume
   // 4. Verify it exits gracefully (with our fix) instead of crashing
 
-  // Pause data delivery on the control stream (ID 0)
-  // This ensures controlReadLoop is blocked waiting for data
-  serverWt_->writeHandles[0]->setImmediateDelivery(false);
+  // The server writes control data on the client's bidi stream before draft
+  // 18, and on its own uni stream from draft 18.
+  const uint64_t controlStreamId =
+      useUniControlStreams(getServerSelectedVersion()) ? 3 : 0;
+  auto controlWriteHandle = serverWt_->writeHandles[controlStreamId];
+  CO_ASSERT_NE(controlWriteHandle, nullptr);
+
+  // Pause data delivery so that controlReadLoop blocks waiting for data
+  controlWriteHandle->setImmediateDelivery(false);
 
   // Write some data that will be held in the inflight buffer
   auto data = folly::IOBuf::copyBuffer("test");
-  serverWt_->writeHandles[0]->writeStreamData(std::move(data), false, nullptr);
+  controlWriteHandle->writeStreamData(std::move(data), false, nullptr);
 
   // Now release the client session shared_ptr WITHOUT calling close()
   // This simulates the scenario where all external references are released
@@ -3212,7 +3410,7 @@ CO_TEST_P_X(
   // Before the fix: shared_from_this() would throw bad_weak_ptr
   // After the fix: weak_from_this().lock() returns nullptr, coroutine exits
   // gracefully
-  serverWt_->writeHandles[0]->deliverInflightData();
+  controlWriteHandle->deliverInflightData();
 
   // Drive the event loop to let the coroutine process
   co_await folly::coro::co_reschedule_on_current_executor;
@@ -3232,7 +3430,9 @@ INSTANTIATE_TEST_SUITE_P(
     MoQSessionDeleteFromCallbackTests,
     MoQSessionDeleteFromCallbackTest,
     testing::Values(
-        VersionParams{{kVersionDraftCurrent}, kVersionDraftCurrent}));
+        VersionParams{{kVersionDraftCurrent}, kVersionDraftCurrent},
+        VersionParams{{kVersionDraft18}, kVersionDraft18},
+        VersionParams{{kVersionDraft22}, kVersionDraft22}));
 
 // Demonstrate and verify that cleanup() breaks the shared_ptr cycle between
 // a session and a handler that holds a back-reference to that session.

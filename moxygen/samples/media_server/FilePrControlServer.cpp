@@ -8,12 +8,13 @@
 
 #include <moxygen/samples/media_server/sources/FilePrFaultState.h>
 
+#include <folly/String.h>
 #include <folly/dynamic.h>
 #include <folly/json.h>
 #include <folly/logging/xlog.h>
 
 #include <arpa/inet.h>
-#include <fcntl.h>
+#include <fcntl.h> // IWYU pragma: keep
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>

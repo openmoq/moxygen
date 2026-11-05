@@ -93,11 +93,7 @@ class SimplePublisher : public moxygen::Publisher {
     moxygen::SubscribeOk ok;
     ok.requestID = sub.requestID;
     ok.expires = std::chrono::milliseconds(0);
-    // GroupOrder::Default (0x0) is invalid in SUBSCRIBE_OK wire format.
-    // Use OldestFirst as the resolved value when request has Default.
-    ok.groupOrder = (sub.groupOrder == moxygen::GroupOrder::Default)
-        ? moxygen::GroupOrder::OldestFirst
-        : sub.groupOrder;
+    ok.groupOrder = sub.groupOrder.value_or(moxygen::GroupOrder::OldestFirst);
     ok.largest = std::nullopt;
     co_return std::make_shared<SimpleSubscriptionHandle>(std::move(ok));
   }
@@ -223,7 +219,7 @@ void recordNegotiatedVersion(
 }
 
 // The current group where the negotiated draft has a filter for it (the
-// relative Location Filter, draft 20+), else Next Object. Before draft 20,
+// relative Location Filter, draft 22+), else Next Object. Before draft 22,
 // relativeStart(1) goes out as LargestGroup (250), a filter type those
 // drafts do not define and their relays must reject (draft-18 5.1.2).
 LocationFilter subscribeFilter(const MoQClient& client) {

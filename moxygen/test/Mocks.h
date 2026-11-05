@@ -64,6 +64,10 @@ class MockMoQCodecCallback : public MoQControlCodec::ControlCallback,
   MOCK_METHOD(void, onNamespaceDone, (NamespaceDone nsDone));
   MOCK_METHOD(void, onTrackStatusError, (TrackStatusError trackStatusError));
   MOCK_METHOD(void, onGoaway, (Goaway goaway));
+  MOCK_METHOD(
+      void,
+      onRequestStreamGoaway,
+      (RequestID requestID, Goaway goaway));
   MOCK_METHOD(void, onConnectionError, (ErrorCode error));
 
   MOCK_METHOD(MoQCodec::ParseResult, onFetchHeader, (RequestID));
@@ -241,6 +245,27 @@ class MockSubgroupConsumer : public SubgroupConsumer {
       (folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>),
       awaitReadyToConsume,
       (),
+      (override));
+};
+
+class MockDeliveryCallback : public DeliveryCallback {
+ public:
+  MOCK_METHOD(
+      void,
+      onDelivered,
+      (const std::optional<TrackAlias>&,
+       uint64_t groupId,
+       uint64_t subgroupId,
+       uint64_t objectId),
+      (override));
+
+  MOCK_METHOD(
+      void,
+      onDeliveryCancelled,
+      (const std::optional<TrackAlias>&,
+       uint64_t groupId,
+       uint64_t subgroupId,
+       uint64_t objectId),
       (override));
 };
 

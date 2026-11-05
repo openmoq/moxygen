@@ -79,11 +79,13 @@ class PicoWebTransportBase : public proxygen::WebTransport {
   folly::Expected<folly::SemiFuture<StreamData>, ErrorCode> readStreamData(
       uint64_t id) override;
 
+  using WebTransport::writeStreamData;
   folly::Expected<FCState, ErrorCode> writeStreamData(
       uint64_t id,
       std::unique_ptr<folly::IOBuf> data,
       bool fin,
-      ByteEventCallback* deliveryCallback) override;
+      ByteEventCallback* deliveryCallback,
+      bool checkpoint) override;
 
   folly::Expected<folly::Unit, ErrorCode> resetStream(
       uint64_t streamId,

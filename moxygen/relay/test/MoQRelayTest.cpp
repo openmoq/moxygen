@@ -6,6 +6,7 @@
 
 #include <folly/coro/BlockingWait.h>
 #include <folly/io/async/EventBase.h>
+#include <folly/logging/LoggerDB.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 #include <moxygen/MoQTrackProperties.h>
@@ -15,6 +16,7 @@
 #include <moxygen/test/MockMoQSession.h>
 #include <moxygen/test/Mocks.h>
 #include <moxygen/test/TestUtils.h>
+#include <stdexcept>
 
 using namespace testing;
 
@@ -24,28 +26,29 @@ const TrackNamespace kTestNamespace{{"test", "namespace"}};
 const TrackNamespace kAllowedPrefix{{"test"}};
 const FullTrackName kTestTrackName{kTestNamespace, "track1"};
 
-// TestMoQExecutor that can be driven for tests
-class TestMoQExecutor : public MoQFollyExecutorImpl,
-                        public folly::DrivableExecutor {
+// TestMoQExecutor that can be driven for tests. MoQExecutor is a member so
+// that this class has a single folly::Executor base.
+class TestMoQExecutor : public folly::DrivableExecutor,
+                        public std::enable_shared_from_this<TestMoQExecutor> {
  public:
-  explicit TestMoQExecutor() : MoQFollyExecutorImpl(&evb_) {}
-  ~TestMoQExecutor() override = default;
-
   void add(folly::Func func) override {
-    MoQFollyExecutorImpl::add(std::move(func));
+    moqExecutor_.add(std::move(func));
   }
 
   // Implements DrivableExec::drive
   void drive() override {
-    // Run the event loop until there is nothing left to do
-    // (simulate a "tick" for test event loop)
-    if (auto* evb = getBackingEventBase()) {
-      evb->loopOnce();
-    }
+    evb_.loopOnce();
+  }
+
+  // Shares ownership of this TestMoQExecutor, so that the EventBase stays
+  // alive while the result is held.
+  std::shared_ptr<MoQExecutor> moqExecutor() {
+    return {shared_from_this(), &moqExecutor_};
   }
 
  private:
   folly::EventBase evb_;
+  MoQFollyExecutorImpl moqExecutor_{&evb_};
 };
 
 // Test fixture for MoQRelay tests
@@ -66,7 +69,8 @@ class MoQRelayTest : public ::testing::Test {
 
   // Helper to create a mock session
   std::shared_ptr<MockMoQSession> createMockSession() {
-    auto session = std::make_shared<NiceMock<MockMoQSession>>(exec_);
+    auto session =
+        std::make_shared<NiceMock<MockMoQSession>>(exec_->moqExecutor());
     ON_CALL(*session, getNegotiatedVersion())
         .WillByDefault(Return(std::optional<uint64_t>(kVersionDraftCurrent)));
     auto state = getOrCreateMockState(session);
@@ -80,7 +84,7 @@ class MoQRelayTest : public ::testing::Test {
     ok.requestID = RequestID(0);
     ok.trackAlias = TrackAlias(0);
     ok.expires = std::chrono::milliseconds(0);
-    ok.groupOrder = GroupOrder::Default;
+    ok.groupOrder = GroupOrder::OldestFirst;
     auto handle =
         std::make_shared<NiceMock<MockSubscriptionHandle>>(std::move(ok));
     return handle;
@@ -381,7 +385,7 @@ class MoQRelayTest : public ::testing::Test {
                   pub.requestID,
                   /*forward=*/pub.forward,
                   /*priority=*/128,
-                  GroupOrder::Default,
+                  std::nullopt,
                   LocationFilter::nextObject()};
               return Subscriber::PublishConsumerAndReplyTask{
                   createMockConsumer(),
@@ -396,7 +400,7 @@ class MoQRelayTest : public ::testing::Test {
     ok.requestID = RequestID(0);
     ok.trackAlias = TrackAlias(0);
     ok.expires = std::chrono::milliseconds(0);
-    ok.groupOrder = GroupOrder::Default;
+    ok.groupOrder = GroupOrder::OldestFirst;
     auto handle =
         std::make_shared<NiceMock<MockSubscriptionHandle>>(std::move(ok));
     ON_CALL(*handle, requestUpdateResult())
@@ -417,7 +421,7 @@ class MoQRelayTest : public ::testing::Test {
     upstreamOk.requestID = RequestID(1);
     upstreamOk.trackAlias = TrackAlias(1);
     upstreamOk.expires = std::chrono::milliseconds(0);
-    upstreamOk.groupOrder = GroupOrder::Default;
+    upstreamOk.groupOrder = GroupOrder::OldestFirst;
     EXPECT_CALL(*publisher, subscribe(_, _))
         .WillOnce([upstreamOk](const auto& /*req*/, auto /*consumer*/) {
           auto handle =
@@ -1492,12 +1496,12 @@ SubscribeRequest pastRangeSubscribe(RequestID requestID) {
 } // namespace
 
 // Refusing a past range refuses the fill that would have retrieved it.
-TEST_F(MoQRelayTest, PastRangeSubscriptionAcceptedAtDraft20) {
+TEST_F(MoQRelayTest, PastRangeSubscriptionAcceptedAtDraft22) {
   auto publisherSession = createMockSession();
   auto subscriber1 = createMockSession();
   auto subscriber2 = createMockSession();
   ON_CALL(*subscriber2, getNegotiatedVersion())
-      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft20)));
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft22)));
 
   doPublishNamespace(publisherSession, kTestNamespace);
 
@@ -1534,8 +1538,8 @@ TEST_F(MoQRelayTest, PastRangeSubscriptionAcceptedAtDraft20) {
   removeSession(subscriber2);
 }
 
-// The drafts below 20 still refuse the same request.
-TEST_F(MoQRelayTest, PastRangeSubscriptionRefusedBeforeDraft20) {
+// The drafts below 22 still refuse the same request.
+TEST_F(MoQRelayTest, PastRangeSubscriptionRefusedBeforeDraft22) {
   auto publisherSession = createMockSession();
   auto subscriber1 = createMockSession();
   auto subscriber2 = createMockSession();
@@ -1627,7 +1631,7 @@ TEST_F(MoQRelayTest, RelaySubscribePropagatesDynamicGroupsToAllSubscribers) {
   removeSession(subscriber2);
 }
 
-// Test: the upstream SUBSCRIBE is normalized to Default group order and
+// Test: the upstream SUBSCRIBE omits the group order and starts at
 // LargestObject, but the first downstream subscriber keeps the group order and
 // range it asked for.
 TEST_F(MoQRelayTest, RelaySubscribePreservesFirstSubscriberRequest) {
@@ -1674,7 +1678,7 @@ TEST_F(MoQRelayTest, RelaySubscribePreservesFirstSubscriberRequest) {
   ASSERT_NE(handle, nullptr);
   getOrCreateMockState(subscriberSession)->subscribeHandles.push_back(handle);
 
-  EXPECT_EQ(upstreamReq.groupOrder, GroupOrder::Default);
+  EXPECT_EQ(upstreamReq.groupOrder, std::nullopt);
   EXPECT_EQ(upstreamReq.filter, LocationFilter::nextObject());
   EXPECT_FALSE(upstreamReq.fill.has_value());
 
@@ -2292,6 +2296,78 @@ TEST_F(MoQRelayTest, SubscriberOnPublishOkPostprocessing) {
 
   removeSession(publisherSession);
   removeSession(subscriberSession);
+}
+
+TEST_F(MoQRelayTest, Draft22PublishPausesWithHandleUpdate) {
+  auto publisherSession = createMockSession();
+  ON_CALL(*publisherSession, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft22)));
+
+  PublishRequest publish;
+  publish.fullTrackName = kTestTrackName;
+  publish.forward = true;
+  auto handle = std::static_pointer_cast<MockSubscriptionHandle>(
+      createMockSubscriptionHandle());
+  bool updateSent = false;
+  EXPECT_CALL(*handle, requestUpdateCalled)
+      .WillOnce([&](const RequestUpdate& update) {
+        EXPECT_EQ(update.forward, false);
+        EXPECT_FALSE(update.priority.has_value());
+        EXPECT_FALSE(update.filter.has_value());
+        updateSent = true;
+      });
+  EXPECT_CALL(*handle, requestUpdateResult).WillOnce(Return(RequestOk{}));
+  auto result = withSessionContext(publisherSession, [&] {
+    return relay_->publish(std::move(publish), handle);
+  });
+  ASSERT_TRUE(result.hasValue());
+  exec_->drive();
+  EXPECT_TRUE(updateSent);
+
+  const auto reply =
+      folly::coro::blockingWait(std::move(result->reply), exec_.get());
+  ASSERT_TRUE(reply.hasValue());
+
+  getOrCreateMockState(publisherSession)
+      ->publishConsumers.push_back(std::move(result->consumer));
+  removeSession(publisherSession);
+}
+
+TEST_F(MoQRelayTest, Draft22PublishForwardUpdateLogsException) {
+  auto publisherSession = createMockSession();
+  ON_CALL(*publisherSession, getNegotiatedVersion())
+      .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft22)));
+
+  PublishRequest publish;
+  publish.fullTrackName = kTestTrackName;
+  publish.forward = true;
+  auto handle = std::static_pointer_cast<MockSubscriptionHandle>(
+      createMockSubscriptionHandle());
+  EXPECT_CALL(*handle, requestUpdateCalled(_));
+  EXPECT_CALL(*handle, requestUpdateResult())
+      .WillOnce(Throw(std::runtime_error("forward update failure")));
+  auto result = withSessionContext(publisherSession, [&] {
+    return relay_->publish(std::move(publish), handle);
+  });
+  ASSERT_TRUE(result.hasValue());
+
+  testing::internal::CaptureStderr();
+  exec_->drive();
+  folly::LoggerDB::get().flushAllHandlers();
+  const auto output = testing::internal::GetCapturedStderr();
+  EXPECT_THAT(
+      output,
+      AllOf(
+          HasSubstr("PUBLISH forward update failed with exception:"),
+          HasSubstr("forward update failure")));
+
+  const auto reply =
+      folly::coro::blockingWait(std::move(result->reply), exec_.get());
+  ASSERT_TRUE(reply.hasValue());
+
+  getOrCreateMockState(publisherSession)
+      ->publishConsumers.push_back(std::move(result->consumer));
+  removeSession(publisherSession);
 }
 
 // Test: Duplicate beginSubgroup with active consumers resets them and creates
@@ -3173,7 +3249,8 @@ class MoQRelayTracksTest : public MoQRelayTest {
 
   // Like createMockSession() but reports draft 18 for the negotiated version.
   std::shared_ptr<MockMoQSession> createV18Session() {
-    auto session = std::make_shared<NiceMock<MockMoQSession>>(exec_);
+    auto session =
+        std::make_shared<NiceMock<MockMoQSession>>(exec_->moqExecutor());
     ON_CALL(*session, getNegotiatedVersion())
         .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft18)));
     getOrCreateMockState(session);
@@ -3181,7 +3258,8 @@ class MoQRelayTracksTest : public MoQRelayTest {
   }
 
   std::shared_ptr<MockMoQSession> createV21Session() {
-    auto session = std::make_shared<NiceMock<MockMoQSession>>(exec_);
+    auto session =
+        std::make_shared<NiceMock<MockMoQSession>>(exec_->moqExecutor());
     ON_CALL(*session, getNegotiatedVersion())
         .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft21)));
     getOrCreateMockState(session);
@@ -3189,7 +3267,8 @@ class MoQRelayTracksTest : public MoQRelayTest {
   }
 
   std::shared_ptr<MockMoQSession> createV22Session() {
-    auto session = std::make_shared<NiceMock<MockMoQSession>>(exec_);
+    auto session =
+        std::make_shared<NiceMock<MockMoQSession>>(exec_->moqExecutor());
     ON_CALL(*session, getNegotiatedVersion())
         .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft22)));
     getOrCreateMockState(session);

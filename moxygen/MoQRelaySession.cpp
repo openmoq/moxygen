@@ -629,7 +629,7 @@ MoQRelaySession::sendRequestUpdateOnBidi(
     // Draft 18+: REQUEST_OK / REQUEST_ERROR carry no requestID on the wire; the
     // response codec correlates them FIFO from this queue.
     control->responseIDQueue().push_back(reqUpdate.requestID);
-    writeHandle->writeStreamData(buf.move(), /*fin=*/false, nullptr);
+    control->write(buf.move(), /*fin=*/false);
   } else {
     // Pre-draft-18: ride the shared control stream.
     controlWriteBuf_.append(buf.move());
@@ -828,7 +828,15 @@ MoQRelaySession::publishNamespace(
   pubNs.requestID = getNextRequestID();
 
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
-  moqFrameWriter_.writePublishNamespace(writeBuf, pubNs);
+  auto writeResult = moqFrameWriter_.writePublishNamespace(writeBuf, pubNs);
+  if (!writeResult) {
+    XLOG(ERR) << "writePublishNamespace failed sess=" << this;
+    co_return folly::makeUnexpected(
+        PublishNamespaceError{
+            pubNs.requestID,
+            PublishNamespaceErrorCode::INTERNAL_ERROR,
+            "local write failed"});
+  }
   auto sendResult = sendRequest(
       writeBuf,
       FrameType::REQUEST_OK,
@@ -1941,6 +1949,9 @@ WriteResult SeparateStreamSubNsReply::ok(const SubscribeNamespaceOk& subNsOk) {
   }
   auto res = moqFrameWriter_.writeSubscribeNamespaceOk(
       replyContext_->writeBuf(), subNsOk);
+  if (!res) {
+    return res;
+  }
   replyContext_->flush();
   okSent_ = true;
   flushPendingMessages();

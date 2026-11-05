@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <folly/container/F14Map.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBufQueue.h>
 #include <folly/logging/xlog.h>
@@ -18,6 +19,7 @@
 #include <quic/codec/QuicInteger.h>
 #include <quic/folly_utils/Utils.h>
 
+#include <memory>
 #include <variant>
 
 namespace moxygen {
@@ -26,6 +28,21 @@ namespace moxygen {
 const size_t kMaxFrameHeaderSize = 32;
 
 using WriteResult = folly::Expected<size_t, quic::TransportErrorCode>;
+
+enum class ParameterValueEncoding {
+  Uint8,
+  Varint,
+  Location,
+  LengthPrefixed,
+};
+
+struct MessageParameterExtension {
+  ParameterValueEncoding encoding;
+  std::vector<FrameType> allowedFrames;
+};
+
+using MessageParameterExtensions =
+    folly::F14FastMap<uint64_t, MessageParameterExtension>;
 
 // Test-only free helpers that always operate on QUIC varints (drafts <17
 // behavior). Production code should use MoQFrameWriter::writeVarint /
@@ -385,6 +402,11 @@ class MoQFrameParser {
     tokenCache_ = cache;
   }
 
+  void setMessageParameterExtensions(
+      std::shared_ptr<const MessageParameterExtensions> extensions) {
+    messageParameterExtensions_ = std::move(extensions);
+  }
+
   // Test only
   void reset() {
     previousObjectID_ = std::nullopt;
@@ -451,7 +473,7 @@ class MoQFrameParser {
       ObjectHeader& objectHeader,
       bool allowImmutable = true) const noexcept;
 
-  // Tail of parseFetch, shared by the draft-20 and legacy field layouts.
+  // Tail of parseFetch, shared by the draft-22 and legacy field layouts.
   folly::Expected<Fetch, ErrorCode> parseFetchParams(
       folly::io::Cursor& cursor,
       size_t length,
@@ -487,11 +509,6 @@ class MoQFrameParser {
       Fetch& fetchRequest,
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
-  void handleGroupOrderParam(
-      GroupOrder& groupOrderField,
-      const std::vector<Parameter>& requestSpecificParams,
-      GroupOrder defaultGroupOrder) const noexcept;
-
   void handleSubscriberPriorityParam(
       uint8_t& priorityField,
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
@@ -525,13 +542,13 @@ class MoQFrameParser {
       folly::io::Cursor& cursor,
       size_t& length) const noexcept;
 
-  // Draft 20+. A nested parameter block with its own allowlist and its own
+  // Draft 22+. A nested parameter block with its own allowlist and its own
   // duplicate scope, so a type may appear both here and in the message.
   folly::Expected<FillParameters, ErrorCode> parseFillParameters(
       folly::io::Cursor& cursor,
       size_t& length) const noexcept;
 
-  // Draft 20+. `length` is the parameter value length; every byte of it must
+  // Draft 22+. `length` is the parameter value length; every byte of it must
   // be consumed by the optional fields, of which there are at most four.
   folly::Expected<LocationFilter, ErrorCode> parseLocationFilter(
       folly::io::Cursor& cursor,
@@ -560,7 +577,8 @@ class MoQFrameParser {
       folly::io::Cursor& cursor,
       size_t& length,
       uint64_t version,
-      uint64_t key) const noexcept;
+      uint64_t key,
+      ParameterValueEncoding encoding) const noexcept;
 
   folly::Expected<uint64_t, ErrorCode> parseParamKey(
       folly::io::Cursor& cursor,
@@ -584,6 +602,7 @@ class MoQFrameParser {
   SetupExtensions extensions_;
   mutable MoQTokenCache fallbackTokenCache_;
   MoQTokenCache* tokenCache_{nullptr};
+  std::shared_ptr<const MessageParameterExtensions> messageParameterExtensions_;
   mutable std::optional<uint64_t> previousObjectID_;
   // Context for FETCH object delta encoding
   mutable std::optional<uint64_t> previousFetchGroup_;
@@ -809,6 +828,11 @@ class MoQFrameWriter {
     return version_;
   }
 
+  void setMessageParameterExtensions(
+      std::shared_ptr<const MessageParameterExtensions> extensions) {
+    messageParameterExtensions_ = std::move(extensions);
+  }
+
   void setNegotiatedExtensions(SetupExtensions extensions) noexcept {
     extensions_ = extensions;
   }
@@ -942,6 +966,8 @@ class MoQFrameWriter {
   void writeV18ParamValue(
       folly::IOBufQueue& writeBuf,
       const Parameter& param,
+      ParameterValueEncoding encoding,
+      bool isExtension,
       size_t& size,
       bool& error) const noexcept;
 
@@ -990,6 +1016,7 @@ class MoQFrameWriter {
 
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
+  std::shared_ptr<const MessageParameterExtensions> messageParameterExtensions_;
   SetupExtensions extensions_;
   mutable std::optional<uint64_t> previousObjectID_;
   // Context for FETCH object delta encoding

@@ -41,7 +41,7 @@ DEFINE_bool(
     fill,
     false,
     "Backfill join_start groups. Version-neutral spelling of jrfetch: a "
-    "joining FETCH below draft 20, a fill fetch stream from draft 20 on.");
+    "joining FETCH below draft 22, a fill fetch stream from draft 22 on.");
 DEFINE_bool(jafetch, false, "Backfill from an absolute group");
 DEFINE_bool(forward, true, "Forward flag for subscriptions");
 DEFINE_bool(
@@ -225,7 +225,7 @@ class MoQTextClient : public Subscriber,
     // Default Params for Now
     publishOk.forward = true;
     publishOk.subscriberPriority = kDefaultPriority;
-    publishOk.groupOrder = moxygen::GroupOrder::Default;
+    publishOk.groupOrder = std::nullopt;
     publishOk.filter = moxygen::LocationFilter::absoluteStart({0, 0});
 
     if (handle) {
@@ -350,7 +350,7 @@ class MoQTextClient : public Subscriber,
                 subStart.value_or(kLocationMin),
                 fetchEnd,
                 sub.priority,
-                sub.groupOrder),
+                sub.groupOrder.value_or(GroupOrder::OldestFirst)),
             fetchTextReceiver_);
         if (fetchTrack.hasError()) {
           XLOG(ERR) << "Fetch failed err="

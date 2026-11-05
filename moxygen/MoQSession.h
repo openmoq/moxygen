@@ -23,9 +23,11 @@
 #include <folly/coro/Task.h>
 #include <folly/logging/xlog.h>
 #include <quic/mvfst-config.h>
+#include <moxygen/EgressAckTracker.h>
 #include <moxygen/MoQConsumers.h>
 #include <moxygen/Publisher.h>
 #include <moxygen/Subscriber.h>
+#include <moxygen/UniStreamQueue.h>
 #include <moxygen/stats/MoQStats.h>
 #include <memory>
 #include <optional>
@@ -66,6 +68,12 @@ struct MoQSettings {
   // Joining FETCHes held while their subscription is unseen or pending.
   size_t maxDeferredJoiningFetches{16};
   bool acceptRequestUpdatesAfterReceivedGoaway{false};
+  bool closeOnControlStreamFailure{false};
+  // Subgroups that may wait for peer uni stream credit. beginSubgroup fails
+  // with BLOCKED past this limit.
+  size_t maxPendingUniStreams{64};
+  // Timeout for waiting for acks once a draining session has no open requests
+  std::chrono::milliseconds drainFlushTimeout{std::chrono::seconds(2)};
 };
 
 class ReplyContext;
@@ -285,6 +293,11 @@ class MoQSession : public Subscriber,
 
   void setVersion(uint64_t version);
   void setMoqSettings(MoQSettings settings);
+  using MessageParameterNegotiator = folly::Function<MessageParameterExtensions(
+      uint64_t /* version */,
+      const SetupParameters& /* localParams */,
+      const SetupParameters& /* peerParams */)>;
+  void setMessageParameterNegotiator(MessageParameterNegotiator negotiator);
   // Accessor used by PublisherImpl and others
   const MoQSettings& getMoqSettings() const {
     return moqSettings_;
@@ -389,7 +402,12 @@ class MoQSession : public Subscriber,
   ~MoQSession() override;
 
   void start();
+
+  // Refuses new requests. Once the open requests end, waits up to
+  // MoQSettings::drainFlushTimeout for the peer to ack everything written,
+  // then closes with NO_ERROR.
   void drain();
+
   void close(
       SessionCloseErrorCode error,
       folly::Optional<uint32_t> wtError = folly::none);
@@ -425,7 +443,9 @@ class MoQSession : public Subscriber,
     initializeNegotiatedVersion(version);
   }
 
-  static GroupOrder resolveGroupOrder(GroupOrder pubOrder, GroupOrder subOrder);
+  static GroupOrder resolveGroupOrder(
+      GroupOrder pubOrder,
+      std::optional<GroupOrder> subOrder);
 
   static std::string getMoQTImplementationString();
 
@@ -583,20 +603,23 @@ class MoQSession : public Subscriber,
       return nullptr;
     }
 
-    // See MoQSession::awaitUniStreamCredit.
-    auto awaitUniStreamCredit() {
+    std::optional<uint64_t> requestUniStream(
+        quic::PriorityQueue::Priority priority,
+        UniStreamQueue::Grant grant) {
       if (!session_) {
-        return UniStreamCreditWait{
-            .credit = folly::makeSemiFuture<folly::Unit>(
-                std::runtime_error("session closed"))};
+        return std::nullopt;
       }
-      return session_->awaitUniStreamCredit();
+      return session_->uniStreamQueue_.request(priority, std::move(grant));
     }
 
-    void cancelUniStreamCreditWait(uint64_t waiterId) {
+    void cancelUniStreamRequest(uint64_t id) {
       if (session_) {
-        session_->cancelUniStreamCreditWait(waiterId);
+        session_->uniStreamQueue_.cancel(id);
       }
+    }
+
+    size_t numUniStreamRequests() const {
+      return session_ ? session_->uniStreamQueue_.size() : 0;
     }
 
     uint64_t getVersion() const {
@@ -624,6 +647,10 @@ class MoQSession : public Subscriber,
 
     std::shared_ptr<MoQExecutor> getExecutor() const {
       return session_ ? session_->exec_ : nullptr;
+    }
+
+    std::shared_ptr<EgressAckTracker> getEgressTracker() const {
+      return session_ ? session_->egressTracker_ : nullptr;
     }
 
     quic::TransportInfo getTransportInfo() const {
@@ -820,7 +847,8 @@ class MoQSession : public Subscriber,
   };
   std::optional<BidiStreamConfig> getBidiStreamConfig(FrameType frameType);
 
-  void onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept override;
+  void onDatagrams(
+      std::vector<std::unique_ptr<folly::IOBuf>> datagrams) noexcept override;
   void onSessionEnd(folly::Optional<uint32_t> err) noexcept override;
   void onSessionDrain() noexcept override {
     XLOG(DBG1) << __func__ << " sess=" << this;
@@ -867,7 +895,7 @@ class MoQSession : public Subscriber,
       GroupOrder groupOrder,
       RequestID owningSubscribeID);
 
-  // Serves a subscription's fill below draft 20, as a standalone FETCH for an
+  // Serves a subscription's fill below draft 22, as a standalone FETCH for an
   // absolute range and a Joining FETCH otherwise.
   folly::coro::Task<void> sendFetchForFill(
       RequestID subscribeID,
@@ -987,6 +1015,8 @@ class MoQSession : public Subscriber,
 
  private:
   static const folly::RequestToken& sessionRequestToken();
+
+  void handleDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept;
 
   const SessionId id_{makeSessionId()};
 
@@ -1670,6 +1700,7 @@ class MoQSession : public Subscriber,
 
   // Private implementation methods
   void initializeNegotiatedVersion(uint64_t negotiatedVersion);
+  void negotiateMessageParameters();
   // Records one half of the setup exchange. Once both halves are in, computes
   // the negotiated extensions and pushes them to the framers, which is why
   // this runs before any frame that an extension could alter is sent or
@@ -1681,6 +1712,7 @@ class MoQSession : public Subscriber,
   void cancelGoawayTimeout();
   void onGoawayTimeoutExpired();
   bool hasOpenRequests() const;
+  bool egressIdle() const;
 
   // Private session state
   std::optional<SetupParameters> localSetupParams_;
@@ -1690,7 +1722,7 @@ class MoQSession : public Subscriber,
       pubTracks_;
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingPublishTracks_;
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingSubscribeTracks_;
-  folly::F14FastMap<TrackAlias, std::list<Payload>, TrackAlias::hash>
+  folly::F14FastMap<TrackAlias, std::vector<Payload>, TrackAlias::hash>
       bufferedDatagrams_;
   folly::F14FastMap<
       RequestID,
@@ -1701,18 +1733,14 @@ class MoQSession : public Subscriber,
 
   // QuicWebTransport allows one uni stream credit waiter at a time, so every
   // request on the session shares a single transport wait.
-  struct UniStreamCreditWait {
-    // Zero when credit was already available.
-    uint64_t waiterId{0};
-    folly::SemiFuture<folly::Unit> credit;
-  };
-  UniStreamCreditWait awaitUniStreamCredit();
-  // Drops the waiter; its future fails.
-  void cancelUniStreamCreditWait(uint64_t waiterId);
-  quic::InlineMap<uint64_t, folly::Promise<folly::Unit>, 4>
-      uniStreamCreditWaiters_;
-  uint64_t nextUniStreamCreditWaiter_{1};
+  folly::SemiFuture<folly::Unit> awaitUniStreamCredit();
+  std::vector<folly::Promise<folly::Unit>> uniStreamCreditWaiters_;
   bool waitingForUniStreamCredit_{false};
+  UniStreamQueue uniStreamQueue_{
+      wt_.get(),
+      exec_.get(),
+      [this] { return awaitUniStreamCredit(); },
+      cancellationSource_.getToken()};
   // F14Node: moving an intrusive list head would relink every waiter.
   folly::F14NodeMap<TrackAlias, AliasWaiterList, TrackAlias::hash>
       bufferedSubgroups_;
@@ -1724,6 +1752,9 @@ class MoQSession : public Subscriber,
 
   folly::coro::Promise<Setup> setupPromise_;
   folly::coro::Future<Setup> setupFuture_;
+  std::shared_ptr<MessageParameterExtensions> messageParameterExtensions_{
+      std::make_shared<MessageParameterExtensions>()};
+  MessageParameterNegotiator messageParameterNegotiator_;
   bool setupComplete_{false};
   using SetupWaiters = folly::F14FastMap<uint64_t, folly::coro::Promise<void>>;
   std::shared_ptr<SetupWaiters> setupWaiters_;
@@ -1734,6 +1765,9 @@ class MoQSession : public Subscriber,
   };
   std::vector<BufferedUniStream> bufferedPreSetupUniStreams_;
   bool draining_{false};
+  bool drainFlushing_{false};
+  std::shared_ptr<EgressAckTracker> egressTracker_{
+      std::make_shared<EgressAckTracker>()};
   bool receivedGoaway_{false};
   std::optional<RequestID> receivedGoawayRequestID_;
 

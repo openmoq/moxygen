@@ -170,7 +170,8 @@ PicoWebTransportBase::writeStreamData(
     uint64_t id,
     std::unique_ptr<folly::IOBuf> data,
     bool fin,
-    ByteEventCallback* deliveryCallback) {
+    ByteEventCallback* deliveryCallback,
+    bool checkpoint) {
   size_t dataLen = data ? data->computeChainDataLength() : 0;
   XLOG(DBG5) << "writeStreamData: stream=" << id << " dataLen=" << dataLen
              << " fin=" << fin;
@@ -180,7 +181,8 @@ PicoWebTransportBase::writeStreamData(
     return folly::makeUnexpected(ErrorCode::INVALID_STREAM_ID);
   }
 
-  auto result = handle->writeStreamData(std::move(data), fin, deliveryCallback);
+  auto result = handle->writeStreamData(
+      std::move(data), fin, deliveryCallback, checkpoint);
   if (result.hasValue()) {
     WakeTimeGuard guard(cnx_, updateWakeTimeoutCallback_);
     markStreamActiveImpl(id);
