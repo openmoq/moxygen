@@ -3559,15 +3559,18 @@ INSTANTIATE_TEST_SUITE_P(
 // requested newest first.
 CO_TEST_P_X(Draft22UpdateFillOrderTest, IsAscendingWithoutItsOwnOrder) {
   co_await setupMoQSession();
+  // gcc 12 rejects a scalar initializer list inside a co_await expression.
+  std::vector<uint64_t> publishedGroups{10, 11};
   co_await runUpdateFill(
-      GroupOrder::NewestFirst, std::nullopt, std::vector<uint64_t>{10, 11});
+      GroupOrder::NewestFirst, std::nullopt, std::move(publishedGroups));
   EXPECT_EQ(groups_, (std::vector<uint64_t>{10, 11}));
 }
 
 CO_TEST_P_X(Draft22UpdateFillOrderTest, UsesItsOwnOrder) {
   co_await setupMoQSession();
+  std::vector<uint64_t> publishedGroups{11, 10};
   co_await runUpdateFill(
-      std::nullopt, GroupOrder::NewestFirst, std::vector<uint64_t>{11, 10});
+      std::nullopt, GroupOrder::NewestFirst, std::move(publishedGroups));
   EXPECT_EQ(groups_, (std::vector<uint64_t>{11, 10}));
 }
 
