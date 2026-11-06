@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <unordered_map>
 #include "folly/SocketAddress.h"
 #include "folly/json/dynamic.h"
 #include "folly/json/json.h"
@@ -52,6 +53,8 @@ class MLogger {
   void addStreamTypeSetLog(MOQTStreamTypeSet req);
   void addObjectDatagramCreatedLog(MOQTObjectDatagramCreated req);
   void addObjectDatagramParsedLog(MOQTObjectDatagramParsed req);
+  void addPaddingDatagramCreatedLog(MOQTPaddingDatagramCreated req);
+  void addPaddingDatagramParsedLog(MOQTPaddingDatagramParsed req);
   void addSubgroupHeaderCreatedLog(MOQTSubgroupHeaderCreated req);
   void addSubgroupHeaderParsedLog(MOQTSubgroupHeaderParsed req);
   void addSubgroupObjectCreatedLog(MOQTSubgroupObjectCreated req);
@@ -80,8 +83,29 @@ class MLogger {
       const SubscribeRequest& req,
       const MOQTByteStringType& type = MOQTByteStringType::STRING_VALUE,
       ControlMessageType controlType = ControlMessageType::CREATED);
+  // `fillRangeFilters` contains encoded 0x25-0x28 parameter values. It is a
+  // sidecar until moxygen's FillParameters model carries these draft-20
+  // fields itself.
+  void logSubscribe(
+      const SubscribeRequest& req,
+      const std::vector<Parameter>& fillRangeFilters,
+      const MOQTByteStringType& type = MOQTByteStringType::STRING_VALUE,
+      ControlMessageType controlType = ControlMessageType::CREATED);
   void logSubscribeUpdate(
       const SubscribeUpdate& req,
+      ControlMessageType controlType = ControlMessageType::CREATED);
+  void logSubscribeUpdate(
+      const SubscribeUpdate& req,
+      const std::vector<Parameter>& fillRangeFilters,
+      ControlMessageType controlType = ControlMessageType::CREATED);
+  void logRequestOk(
+      const RequestOk& req,
+      ControlMessageType controlType = ControlMessageType::CREATED);
+  void logRequestError(
+      const RequestError& req,
+      ControlMessageType controlType = ControlMessageType::CREATED);
+  void logPublishStateNotify(
+      const TrackRequestParameters& params,
       ControlMessageType controlType = ControlMessageType::CREATED);
   void logUnsubscribe(
       const Unsubscribe& req,
@@ -109,6 +133,22 @@ class MLogger {
       ControlMessageType controlType = ControlMessageType::CREATED);
   void logSubscribeNamespace(
       const SubscribeNamespace& req,
+      const MOQTByteStringType& type = MOQTByteStringType::STRING_VALUE,
+      ControlMessageType controlType = ControlMessageType::CREATED);
+  void logSubscribeTracks(
+      const SubscribeTracks& req,
+      const MOQTByteStringType& type = MOQTByteStringType::STRING_VALUE,
+      ControlMessageType controlType = ControlMessageType::CREATED);
+  void logNamespace(
+      const Namespace& req,
+      const MOQTByteStringType& type = MOQTByteStringType::STRING_VALUE,
+      ControlMessageType controlType = ControlMessageType::CREATED);
+  void logNamespaceDone(
+      const NamespaceDone& req,
+      const MOQTByteStringType& type = MOQTByteStringType::STRING_VALUE,
+      ControlMessageType controlType = ControlMessageType::CREATED);
+  void logPublishSkipped(
+      const PublishBlocked& req,
       const MOQTByteStringType& type = MOQTByteStringType::STRING_VALUE,
       ControlMessageType controlType = ControlMessageType::CREATED);
   void logUnsubscribeNamespace(
@@ -176,11 +216,15 @@ class MLogger {
   void logObjectDatagramCreated(
       TrackAlias trackAlias,
       const ObjectHeader& header,
-      const Payload& payload);
+      const Payload& payload,
+      bool endOfGroup = false);
   void logObjectDatagramParsed(
       TrackAlias trackAlias,
       const ObjectHeader& header,
-      const Payload& payload);
+      const Payload& payload,
+      bool endOfGroup = false);
+  void logPaddingDatagramCreated(uint64_t paddingLength);
+  void logPaddingDatagramParsed(uint64_t paddingLength);
   void logSubgroupHeaderCreated(
       uint64_t streamId,
       TrackAlias trackAlias,
@@ -189,7 +233,9 @@ class MLogger {
       uint8_t publisherPriority,
       SubgroupIDFormat format,
       bool includeExtensions,
-      bool endOfGroup);
+      bool endOfGroup,
+      bool firstObject = false,
+      bool publisherPriorityPresent = true);
   void logSubgroupHeaderParsed(
       uint64_t streamId,
       TrackAlias trackAlias,
@@ -266,8 +312,18 @@ class MLogger {
       uint64_t streamId,
       const std::optional<uint64_t>& length,
       std::unique_ptr<MOQTBaseControlMessage> message);
-  std::vector<MOQTExtensionHeader> convertExtensionToMoQTExtensionHeaders(
-      std::vector<Extension> extensions);
+  std::vector<MOQTProperty> convertExtensionsToProperties(
+      const Extensions& extensions);
+
+  struct ObjectStreamState {
+    std::optional<uint64_t> group;
+    std::optional<uint64_t> subgroup;
+    std::optional<uint64_t> object;
+    std::optional<uint8_t> priority;
+  };
+
+  std::unordered_map<uint64_t, ObjectStreamState> createdObjectStreamState_;
+  std::unordered_map<uint64_t, ObjectStreamState> parsedObjectStreamState_;
 };
 
 } // namespace moxygen

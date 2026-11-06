@@ -13,7 +13,9 @@
 #include <folly/portability/GTest.h>
 #include <quic/codec/QuicConnectionId.h>
 #include <stdlib.h>
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -59,22 +61,22 @@ constexpr std::array<ObjectEventCase, 6> kObjectEvents{{
      false},
     {ObjectEvent::SUBGROUP_CREATED,
      "moqt:subgroup_object_created",
-     "objectPayload",
+     "object_payload",
      false,
      true},
     {ObjectEvent::SUBGROUP_PARSED,
      "moqt:subgroup_object_parsed",
-     "objectPayload",
+     "object_payload",
      false,
      true},
     {ObjectEvent::FETCH_CREATED,
      "moqt:fetch_object_created",
-     "objectPayload",
+     "object_payload",
      false,
      true},
     {ObjectEvent::FETCH_PARSED,
      "moqt:fetch_object_parsed",
-     "objectPayload",
+     "object_payload",
      false,
      true},
 }};
@@ -128,13 +130,9 @@ void expectEventControls(
   const auto* data = event.get_ptr("data");
   ASSERT_NE(data, nullptr);
   const auto* objectId =
-      data->get_ptr(testCase.datagram ? "object_id" : "objectId");
+      data->get_ptr(testCase.datagram ? "object_id" : "object_id_delta");
   ASSERT_NE(objectId, nullptr);
-  if (testCase.datagram) {
-    EXPECT_EQ(objectId->asInt(), 9);
-  } else {
-    EXPECT_EQ(objectId->asString(), "9");
-  }
+  EXPECT_EQ(objectId->asInt(), 9);
 }
 
 // Datagram events keep a qlog RawInfo holding only the length; the other
@@ -153,7 +151,7 @@ const folly::dynamic* payloadLength(
     const folly::dynamic& data,
     const ObjectEventCase& testCase) {
   if (!testCase.datagram) {
-    return data.get_ptr("objectPayloadLength");
+    return data.get_ptr("object_payload_length");
   }
   const auto* payload = data.get_ptr(testCase.payloadField);
   return payload ? payload->get_ptr("length") : nullptr;
@@ -191,6 +189,17 @@ void appendViolation(
   violations += ":";
   violations += detail;
 }
+
+class InspectableMLogger final : public MLogger {
+ public:
+  InspectableMLogger() : MLogger(VantagePoint::SERVER) {}
+
+  void outputLogs() override {}
+
+  folly::dynamic event(size_t index) {
+    return formatLog(logs_.at(index));
+  }
+};
 
 } // namespace
 
@@ -387,11 +396,7 @@ TEST_F(FileMLoggerTest, ObjectPayloadLengthUsesEntireSuppliedChain) {
     const auto* length = payloadLength(data, testCase);
     if (!length) {
       appendViolation(violations, testCase, "payload length missing");
-    } else if (testCase.datagram) {
-      if (length->asInt() != kExpectedLength) {
-        appendViolation(violations, testCase, "payload length mismatch");
-      }
-    } else if (length->asString() != std::to_string(kExpectedLength)) {
+    } else if (length->asInt() != kExpectedLength) {
       appendViolation(violations, testCase, "payload length mismatch");
     }
   }
@@ -415,7 +420,7 @@ TEST_F(FileMLoggerTest, ObjectsWithoutAPayloadLogZeroLength) {
     const auto event = parseSingleEvent(path);
     expectEventControls(event, testCase);
     const auto* length = payloadLength(event["data"], testCase);
-    if (!length || length->asString() != "0") {
+    if (!length || length->asInt() != 0) {
       appendViolation(violations, testCase, "payload length not zero");
     }
   }
@@ -496,6 +501,274 @@ TEST(MLogTypesTest, NamespaceMessagesLogRequestId) {
   auto obj = unsubscribe.toDynamic();
   EXPECT_EQ(obj["request_id"], 7);
   EXPECT_EQ(obj.count("requestID"), 0);
+}
+
+TEST(MLogTypesTest, LatestTransportEventFieldNames) {
+  MOQTStreamTypeSet streamType;
+  streamType.owner = Owner::REMOTE;
+  streamType.streamId = 7;
+  streamType.streamType = MOQTStreamType::PADDING;
+  auto stream = streamType.toDynamic();
+  EXPECT_EQ(stream["owner"], "remote");
+  EXPECT_EQ(stream["stream_id"], 7);
+  EXPECT_EQ(stream["stream_type"], "padding");
+  EXPECT_EQ(stream.count("streamId"), 0);
+
+  MOQTSubgroupHeaderCreated header;
+  header.streamId = 11;
+  header.trackAlias = 12;
+  header.groupId = 13;
+  header.subgroupIdMode = 2;
+  header.containsEndOfGroup = true;
+  header.propertiesPresent = true;
+  header.firstObject = true;
+  auto subgroup = header.toDynamic();
+  EXPECT_EQ(subgroup["subgroup_id_mode"], 2);
+  EXPECT_EQ(subgroup["properties_present"], true);
+  EXPECT_EQ(subgroup["first_object"], true);
+  EXPECT_EQ(subgroup.count("extensions_present"), 0);
+
+  MOQTFetchObjectCreated fetchObject;
+  fetchObject.streamId = 21;
+  fetchObject.endOfTimedOutRange = true;
+  fetchObject.objectPayloadLength = 34;
+  auto fetch = fetchObject.toDynamic();
+  EXPECT_EQ(fetch["datagram"], false);
+  EXPECT_EQ(fetch["end_of_nonexistent_range"], false);
+  EXPECT_EQ(fetch["end_of_unknown_range"], false);
+  EXPECT_EQ(fetch["end_of_timed_out_range"], true);
+  EXPECT_EQ(fetch["object_payload_length"], 34);
+  EXPECT_EQ(fetch.count("objectStatus"), 0);
+
+  EXPECT_EQ(MOQTPaddingDatagramParsed{55}.toDynamic()["padding_length"], 55);
+}
+
+TEST(MLogTypesTest, FetchGroupDeltaFollowsObservedDirection) {
+  ObjectHeader first(10, 1, 4, 12);
+  ObjectHeader second(7, 1, 5, 12);
+
+  InspectableMLogger created;
+  created.logFetchHeaderCreated(17, 19);
+  created.logFetchObjectCreated(17, first, nullptr);
+  created.logFetchObjectCreated(17, second, nullptr);
+  EXPECT_EQ(created.event(1)["data"]["group_id_delta"], 10);
+  EXPECT_EQ(created.event(2)["data"]["group_id_delta"], 2);
+
+  InspectableMLogger parsed;
+  parsed.logFetchHeaderParsed(17, 19);
+  parsed.logFetchObjectParsed(17, first, nullptr);
+  parsed.logFetchObjectParsed(17, second, nullptr);
+  EXPECT_EQ(parsed.event(1)["data"]["group_id_delta"], 10);
+  EXPECT_EQ(parsed.event(2)["data"]["group_id_delta"], 2);
+}
+
+TEST_F(FileMLoggerTest, LatestSetupAndFillParameterSchemas) {
+  const auto setupPath = (dir_ / "setup.mlog").string();
+  FileMLogger setupLogger(VantagePoint::CLIENT, setupPath);
+  struct Setup setup;
+  ASSERT_TRUE(setup.params
+                  .insertParam(Parameter(
+                      folly::to_underlying(SetupKey::PATH), "/meeting"))
+                  .hasValue());
+  setupLogger.logClientSetup(setup, 20, ControlMessageType::CREATED);
+  setupLogger.outputLogs();
+
+  const auto setupEvent = parseSingleEvent(setupPath);
+  const auto& setupMessage = setupEvent["data"]["message"];
+  EXPECT_EQ(setupMessage["type"], "setup");
+  EXPECT_EQ(setupMessage.count("version"), 0);
+  EXPECT_EQ(setupMessage.count("number_of_parameters"), 0);
+  ASSERT_EQ(setupMessage["setup_options"].size(), 1);
+  EXPECT_EQ(setupMessage["setup_options"][0]["name"], "path");
+  EXPECT_EQ(setupMessage["setup_options"][0]["value"], "/meeting");
+
+  const auto subscribePath = (dir_ / "fill.mlog").string();
+  FileMLogger subscribeLogger(VantagePoint::CLIENT, subscribePath);
+  auto subscribe = SubscribeRequest::make(
+      FullTrackName{TrackNamespace({"room"}), "audio"},
+      42,
+      GroupOrder::NewestFirst,
+      false,
+      LocationFilter::range({7, 8}, {9, 10}));
+  subscribe.requestID = RequestID(11);
+  subscribe.includeProperties = false;
+  subscribe.fill = FillParameters{
+      .locationFilter = LocationFilter::relativeStart(3),
+      .subscriberPriority = 12,
+      .groupOrder = GroupOrder::OldestFirst,
+      .fillTimeout = std::chrono::milliseconds(13)};
+  ASSERT_TRUE(subscribe.params
+                  .insertParam(Parameter(
+                      folly::to_underlying(
+                          TrackRequestParamKey::OBJECT_DELIVERY_TIMEOUT),
+                      14))
+                  .hasValue());
+  subscribeLogger.logSubscribe(subscribe);
+  subscribeLogger.outputLogs();
+
+  const auto subscribeEvent = parseSingleEvent(subscribePath);
+  const auto& message = subscribeEvent["data"]["message"];
+  EXPECT_EQ(message["track_namespace"][0]["value"], "room");
+  EXPECT_EQ(message["track_name"]["value"], "audio");
+  EXPECT_EQ(message.count("subscriber_priority"), 0);
+  EXPECT_EQ(message.count("group_order"), 0);
+  EXPECT_EQ(message.count("filter_type"), 0);
+  const auto& parameters = message["parameters"];
+  EXPECT_EQ(message["number_of_parameters"], parameters.size());
+  std::vector<std::string> names;
+  for (const auto& parameter : parameters) {
+    names.push_back(parameter["name"].asString());
+  }
+  EXPECT_NE(
+      std::find(names.begin(), names.end(), "object_delivery_timeout"),
+      names.end());
+  EXPECT_NE(
+      std::find(names.begin(), names.end(), "location_filter"), names.end());
+  EXPECT_NE(
+      std::find(names.begin(), names.end(), "fill_parameters"), names.end());
+  EXPECT_NE(
+      std::find(names.begin(), names.end(), "subscriber_priority"),
+      names.end());
+  EXPECT_NE(std::find(names.begin(), names.end(), "group_order"), names.end());
+  EXPECT_NE(std::find(names.begin(), names.end(), "forward"), names.end());
+  EXPECT_NE(
+      std::find(names.begin(), names.end(), "include_properties"), names.end());
+}
+
+TEST_F(FileMLoggerTest, LatestRangeFilterParameterSchema) {
+  const auto path = (dir_ / "range_filter.mlog").string();
+  FileMLogger logger(VantagePoint::CLIENT, path);
+  RequestOk ok;
+  ok.requestSpecificParams.emplace_back(
+      0x29,
+      std::string(
+          "\x07\x02\x03\x02\x05\x05",
+          6)); // set 7, property 2, ranges 3-5 and 10-15
+  logger.logRequestOk(ok);
+  logger.outputLogs();
+
+  const auto event = parseSingleEvent(path);
+  const auto& parameter = event["data"]["message"]["parameters"][0];
+  EXPECT_EQ(parameter["name"], "track_property_filter");
+  EXPECT_EQ(parameter["set_id"], 7);
+  EXPECT_EQ(parameter["property_type"], 2);
+  ASSERT_EQ(parameter["ranges"].size(), 2);
+  EXPECT_EQ(parameter["ranges"][0]["start"], 3);
+  EXPECT_EQ(parameter["ranges"][0]["end"], 5);
+  EXPECT_EQ(parameter["ranges"][1]["start"], 10);
+  EXPECT_EQ(parameter["ranges"][1]["end"], 15);
+}
+
+TEST_F(FileMLoggerTest, LatestFillParametersPreserveRangeFilters) {
+  const auto path = (dir_ / "fill_range_filters.mlog").string();
+  FileMLogger logger(VantagePoint::CLIENT, path);
+  auto subscribe =
+      SubscribeRequest::make(FullTrackName{TrackNamespace({"room"}), "audio"});
+  subscribe.fill = FillParameters{.groupOrder = GroupOrder::OldestFirst};
+  std::vector<Parameter> fillRangeFilters = {
+      Parameter(0x25, std::string("\x01\x03\x02", 3)),
+      Parameter(0x25, std::string("\x02\x07", 2)),
+      Parameter(0x26, std::string("\x03\x09\x01", 3)),
+      Parameter(0x27, std::string()),
+      Parameter(0x28, std::string("\x04\x02\x05\x03", 4)),
+  };
+  logger.logSubscribe(subscribe, fillRangeFilters);
+  logger.outputLogs();
+
+  const auto event = parseSingleEvent(path);
+  const auto& parameters = event["data"]["message"]["parameters"];
+  const folly::dynamic* fill = nullptr;
+  for (const auto& parameter : parameters) {
+    if (parameter["name"] == "fill_parameters") {
+      fill = &parameter;
+      break;
+    }
+  }
+  ASSERT_NE(fill, nullptr);
+  const auto& values = (*fill)["value"];
+  ASSERT_EQ(values.size(), 6);
+  EXPECT_EQ(values[0]["name"], "group_order");
+  EXPECT_EQ(values[1]["name"], "subgroup_filter");
+  EXPECT_EQ(values[1]["set_id"], 1);
+  EXPECT_EQ(values[1]["ranges"][0]["start"], 3);
+  EXPECT_EQ(values[1]["ranges"][0]["end"], 5);
+  EXPECT_EQ(values[2]["name"], "subgroup_filter");
+  EXPECT_EQ(values[2]["set_id"], 2);
+  EXPECT_EQ(values[2]["ranges"][0]["start"], 7);
+  EXPECT_EQ(values[2]["ranges"][0].count("end"), 0);
+  EXPECT_EQ(values[3]["name"], "objectid_filter");
+  EXPECT_EQ(values[4]["name"], "priority_filter");
+  EXPECT_EQ(values[4].count("set_id"), 0);
+  EXPECT_EQ(values[5]["name"], "object_property_filter");
+  EXPECT_EQ(values[5]["property_type"], 2);
+
+  InspectableMLogger updateLogger;
+  SubscribeUpdate update;
+  updateLogger.logSubscribeUpdate(
+      update, {Parameter(0x26, std::string("\x05\x0b", 2))});
+  const auto updateEvent = updateLogger.event(0);
+  EXPECT_EQ(
+      updateEvent["data"]["message"]["parameters"][0]["name"],
+      "fill_parameters");
+}
+
+TEST_F(FileMLoggerTest, LatestResponseAndNamespaceControlMessages) {
+  const auto errorPath = (dir_ / "request_error.mlog").string();
+  FileMLogger errorLogger(VantagePoint::SERVER, errorPath);
+  RequestError error;
+  error.requestID = RequestID(17);
+  error.errorCode = RequestErrorCode::REDIRECT;
+  error.reasonPhrase = "moved";
+  error.retryInterval = std::chrono::milliseconds(18);
+  error.redirect = Redirect{
+      "https://new.example/moq",
+      FullTrackName{TrackNamespace({"replacement"}), "video"}};
+  errorLogger.logSubscribeError(error, ControlMessageType::PARSED);
+  errorLogger.outputLogs();
+
+  const auto errorEvent = parseSingleEvent(errorPath);
+  const auto& errorMessage = errorEvent["data"]["message"];
+  EXPECT_EQ(errorMessage["type"], "request_error");
+  EXPECT_EQ(errorMessage["error_code"], static_cast<uint64_t>(error.errorCode));
+  EXPECT_EQ(errorMessage["retry_interval"], 18);
+  EXPECT_EQ(errorMessage["reason_phrase"], "moved");
+  EXPECT_EQ(errorMessage.count("request_id"), 0);
+  EXPECT_EQ(errorMessage["redirect"]["connect_uri"]["length"], 23);
+  EXPECT_EQ(
+      errorMessage["redirect"]["track_namespace"][0]["value"], "replacement");
+
+  const auto okPath = (dir_ / "request_ok.mlog").string();
+  FileMLogger okLogger(VantagePoint::SERVER, okPath);
+  RequestOk ok;
+  ok.requestID = RequestID(19);
+  ok.trackProperties.insertMutableExtension(Extension(2, 20));
+  okLogger.logPublishNamespaceOk(ok, ControlMessageType::PARSED);
+  okLogger.outputLogs();
+
+  const auto okEvent = parseSingleEvent(okPath);
+  const auto& okMessage = okEvent["data"]["message"];
+  EXPECT_EQ(okMessage["type"], "request_ok");
+  EXPECT_EQ(okMessage["number_of_parameters"], 0);
+  EXPECT_EQ(okMessage.count("request_id"), 0);
+  EXPECT_EQ(okMessage["track_properties"][0]["type"], 2);
+  EXPECT_EQ(okMessage["track_properties"][0]["value"], 20);
+
+  MOQTSubscribeTracks subscribeTracks;
+  subscribeTracks.requestId = 21;
+  subscribeTracks.trackNamespacePrefix.emplace_back();
+  subscribeTracks.trackNamespacePrefix[0].type =
+      MOQTByteStringType::VALUE_BYTES;
+  subscribeTracks.trackNamespacePrefix[0].valueBytes =
+      folly::IOBuf::copyBuffer("ab", 2);
+  auto subscribeTracksJson = subscribeTracks.toDynamic();
+  EXPECT_EQ(subscribeTracksJson["type"], "subscribe_tracks");
+  EXPECT_EQ(
+      subscribeTracksJson["track_namespace_prefix"][0]["value_bytes"], "6162");
+
+  MOQTPublishSkipped skipped;
+  skipped.trackName.type = MOQTByteStringType::STRING_VALUE;
+  skipped.trackName.value = "late";
+  EXPECT_EQ(skipped.toDynamic()["type"], "publish_skipped");
 }
 
 } // namespace moxygen

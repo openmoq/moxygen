@@ -30,130 +30,46 @@ enum ControlMessageType : int {
 
 // Data Type Structs
 
-enum MOQTStreamType { CONTROL, SUBGROUP_HEADER, FETCH_HEADER };
+enum MOQTStreamType { CONTROL, SUBGROUP_HEADER, FETCH_HEADER, PADDING };
 
 enum Owner { LOCAL, REMOTE };
 
-struct MOQTExtensionHeader {
-  uint64_t headerType{0};
-  std::optional<uint64_t> headerValue;
-  std::optional<uint64_t> headerLength;
-  std::unique_ptr<folly::IOBuf> payload;
-
-  folly::dynamic toDynamic() const;
-};
-
-// Parameter Types (Section 5.3 of the mLog spec)
-
-struct MOQTAuthorizationTokenParameter {
-  std::string name = "authorization_token";
-  uint64_t aliasType{0};
-  std::optional<uint64_t> tokenAlias;
-  std::optional<uint64_t> tokenType;
-  std::unique_ptr<folly::IOBuf> tokenValue;
-
-  folly::dynamic toDynamic() const;
-};
-
-struct MOQTDeliveryTimeoutParameter {
-  std::string name = "delivery_timeout";
-  uint64_t value{0};
-
-  folly::dynamic toDynamic() const;
-};
-
-struct MOQTMaxCacheDurationParameter {
-  std::string name = "max_cache_duration";
-  uint64_t value{0};
-
-  folly::dynamic toDynamic() const;
-};
-
-struct MOQTUnknownParameter {
-  std::string name = "unknown";
-  uint64_t nameBytes{0};
+struct MOQTRawInfo {
   std::optional<uint64_t> length;
-  std::optional<uint64_t> value;
-  std::unique_ptr<folly::IOBuf> valueBytes;
+  std::optional<uint64_t> payloadLength;
+  std::optional<std::string> data;
 
   folly::dynamic toDynamic() const;
 };
 
-using MOQTParameter = std::variant<
-    MOQTAuthorizationTokenParameter,
-    MOQTDeliveryTimeoutParameter,
-    MOQTMaxCacheDurationParameter,
-    MOQTUnknownParameter>;
+struct MOQTProperty {
+  uint64_t type{0};
+  std::optional<uint64_t> value;
+  std::optional<uint64_t> length;
+  std::optional<MOQTRawInfo> valueBytes;
 
-// Helper to convert variant to dynamic
+  folly::dynamic toDynamic() const;
+};
+
+// Parameters are extensible maps in the mlog schema. Keeping their encoded
+// representation here lets MLogger support both current and unknown types.
+struct MOQTParameter {
+  folly::dynamic fields = folly::dynamic::object;
+
+  MOQTParameter() = default;
+  explicit MOQTParameter(folly::dynamic value) : fields(std::move(value)) {}
+};
+
 folly::dynamic parameterToDynamic(const MOQTParameter& param);
 
-// Setup Parameter Types (Section 5.2 of the mLog spec)
-enum class MOQTAliasType { UNREGISTER, REGISTER, USE_ALIAS, USE_VALUE };
+struct MOQTSetupOption {
+  folly::dynamic fields = folly::dynamic::object;
 
-struct MOQTAuthoritySetupParameter {
-  std::string name = "authority";
-  std::string value;
-
-  folly::dynamic toDynamic() const;
+  MOQTSetupOption() = default;
+  explicit MOQTSetupOption(folly::dynamic value) : fields(std::move(value)) {}
 };
 
-struct MOQTAuthorizationTokenSetupParameter {
-  std::string name = "authorization_token";
-  MOQTAliasType aliasType;
-  std::optional<uint64_t> tokenAlias;
-  std::optional<uint64_t> tokenType;
-  std::unique_ptr<folly::IOBuf> tokenValue;
-
-  folly::dynamic toDynamic() const;
-};
-
-struct MOQTPathSetupParameter {
-  std::string name = "path";
-  std::string value;
-
-  folly::dynamic toDynamic() const;
-};
-
-struct MOQTMaxRequestIdSetupParameter {
-  std::string name = "max_request_id";
-  uint64_t value{0};
-
-  folly::dynamic toDynamic() const;
-};
-
-struct MOQTMaxAuthTokenCacheSizeSetupParameter {
-  std::string name = "max_auth_token_cache_size";
-  uint64_t value{0};
-
-  folly::dynamic toDynamic() const;
-};
-
-struct MOQTImplementationSetupParameter {
-  std::string name = "implementation";
-  std::string value;
-
-  folly::dynamic toDynamic() const;
-};
-
-struct MOQTUnknownSetupParameter {
-  std::string name = "unknown";
-  uint64_t nameBytes{0};
-  std::optional<uint64_t> length;
-  std::optional<uint64_t> value;
-  std::unique_ptr<folly::IOBuf> valueBytes;
-
-  folly::dynamic toDynamic() const;
-};
-
-using MOQTSetupParameter = std::variant<
-    MOQTAuthoritySetupParameter,
-    MOQTAuthorizationTokenSetupParameter,
-    MOQTPathSetupParameter,
-    MOQTMaxRequestIdSetupParameter,
-    MOQTMaxAuthTokenCacheSizeSetupParameter,
-    MOQTImplementationSetupParameter,
-    MOQTUnknownSetupParameter>;
+using MOQTSetupParameter = MOQTSetupOption;
 
 // Helper to convert variant to dynamic
 folly::dynamic setupParameterToDynamic(const MOQTSetupParameter& param);
@@ -171,6 +87,8 @@ struct MOQTByteString {
   MOQTByteString& operator=(MOQTByteString&& other) noexcept = default;
 
   ~MOQTByteString() {}
+
+  folly::dynamic toDynamic() const;
 };
 
 class MOQTBaseControlMessage {
@@ -186,20 +104,18 @@ class MOQTBaseControlMessage {
   virtual ~MOQTBaseControlMessage() {}
 
   // Helper Methods Extended to BaseControlMessage Classes
-  std::vector<std::string> parseTrackNamespace(
+  std::vector<folly::dynamic> parseTrackNamespace(
       const std::vector<MOQTByteString>& trackNamespace) const;
-  std::string parseTrackName(const MOQTByteString& trackName) const;
+  folly::dynamic parseTrackName(const MOQTByteString& trackName) const;
 };
 
 class MOQTSetupMessage : public MOQTBaseControlMessage {
  public:
-  explicit MOQTSetupMessage(const std::string& setupType) {
-    type = setupType;
+  explicit MOQTSetupMessage(const std::string& /*setupType*/ = "setup") {
+    type = "setup";
   }
   folly::dynamic toDynamic() const override;
-  uint64_t version{0};
-  uint64_t numberOfParameters{0};
-  std::vector<MOQTSetupParameter> setupParameters;
+  std::vector<MOQTSetupOption> setupOptions;
 };
 
 // Keep old names as aliases for backward compatibility
@@ -212,10 +128,8 @@ class MOQTGoaway : public MOQTBaseControlMessage {
     type = "goaway";
   }
   folly::dynamic toDynamic() const override;
-  std::optional<uint64_t> length;
-  std::unique_ptr<folly::IOBuf> newSessionUri;
+  MOQTRawInfo newSessionUri;
   uint64_t timeout{0};
-  std::optional<uint64_t> requestId;
 };
 
 struct MOQTLocation {
@@ -223,6 +137,37 @@ struct MOQTLocation {
   uint64_t object{0};
 
   folly::dynamic toDynamic() const;
+};
+
+struct MOQTRedirect {
+  MOQTRawInfo connectUri;
+  std::vector<MOQTByteString> trackNamespace;
+  MOQTByteString trackName;
+
+  folly::dynamic toDynamic() const;
+};
+
+class MOQTRequestOk : public MOQTBaseControlMessage {
+ public:
+  MOQTRequestOk() {
+    type = "request_ok";
+  }
+  folly::dynamic toDynamic() const override;
+  uint64_t numberOfParameters{0};
+  std::vector<MOQTParameter> parameters;
+  std::vector<MOQTProperty> trackProperties;
+};
+
+class MOQTRequestError : public MOQTBaseControlMessage {
+ public:
+  MOQTRequestError() {
+    type = "request_error";
+  }
+  folly::dynamic toDynamic() const override;
+  uint64_t errorCode{0};
+  uint64_t retryInterval{0};
+  std::optional<std::string> reasonPhrase;
+  std::optional<MOQTRedirect> redirect;
 };
 
 class MOQTSubscribe : public MOQTBaseControlMessage {
@@ -247,7 +192,7 @@ class MOQTSubscribe : public MOQTBaseControlMessage {
 class MOQTSubscribeUpdate : public MOQTBaseControlMessage {
  public:
   MOQTSubscribeUpdate() {
-    type = "subscribe_update";
+    type = "request_update";
   }
   folly::dynamic toDynamic() const override;
   uint64_t requestId{0};
@@ -257,6 +202,16 @@ class MOQTSubscribeUpdate : public MOQTBaseControlMessage {
   uint8_t subscriberPriority{};
   uint8_t forward{};
   uint64_t numberOfParameters{};
+  std::vector<MOQTParameter> parameters;
+};
+
+class MOQTPublishStateNotify : public MOQTBaseControlMessage {
+ public:
+  MOQTPublishStateNotify() {
+    type = "publish_state_notify";
+  }
+  folly::dynamic toDynamic() const override;
+  uint64_t numberOfParameters{0};
   std::vector<MOQTParameter> parameters;
 };
 
@@ -292,11 +247,14 @@ class MOQTFetch : public MOQTBaseControlMessage {
   }
   folly::dynamic toDynamic() const override;
   uint64_t requestId{0};
+  std::vector<MOQTByteString> trackNamespace;
+  MOQTByteString trackName;
   uint8_t subscriberPriority{};
   uint8_t groupOrder{};
   std::string fetchType;
   std::optional<MOQTStandaloneFetch> standaloneFetch;
   std::optional<MOQTJoiningFetch> joiningFetch;
+  uint64_t numberOfParameters{0};
   std::vector<MOQTParameter> parameters;
 };
 
@@ -373,6 +331,18 @@ class MOQTSubscribeNamespace : public MOQTBaseControlMessage {
   std::vector<MOQTParameter> parameters;
 };
 
+class MOQTSubscribeTracks : public MOQTBaseControlMessage {
+ public:
+  MOQTSubscribeTracks() {
+    type = "subscribe_tracks";
+  }
+  folly::dynamic toDynamic() const override;
+  uint64_t requestId{0};
+  std::vector<MOQTByteString> trackNamespacePrefix;
+  uint64_t numberOfParameters{0};
+  std::vector<MOQTParameter> parameters;
+};
+
 class MOQTUnsubscribeNamespace : public MOQTBaseControlMessage {
  public:
   MOQTUnsubscribeNamespace() {
@@ -396,6 +366,7 @@ class MOQTSubscribeOk : public MOQTBaseControlMessage {
   std::optional<MOQTLocation> largestLocation;
   uint64_t numberOfParameters{};
   std::vector<MOQTParameter> parameters;
+  std::vector<MOQTProperty> trackProperties;
 };
 
 class MOQTSubscribeError : public MOQTBaseControlMessage {
@@ -422,6 +393,7 @@ class MOQTFetchOk : public MOQTBaseControlMessage {
   MOQTLocation endLocation;
   uint64_t numberOfParameters{};
   std::vector<MOQTParameter> parameters;
+  std::vector<MOQTProperty> trackProperties;
 };
 
 class MOQTFetchError : public MOQTBaseControlMessage {
@@ -470,13 +442,41 @@ class MOQTRequestsBlocked : public MOQTBaseControlMessage {
 class MOQTPublishNamespace : public MOQTBaseControlMessage {
  public:
   MOQTPublishNamespace() {
-    type = "publishNamespace";
+    type = "publish_namespace";
   }
   folly::dynamic toDynamic() const override;
   uint64_t requestId{0};
   std::vector<MOQTByteString> trackNamespace;
   uint64_t numberOfParameters{};
   std::vector<MOQTParameter> parameters;
+};
+
+class MOQTNamespace : public MOQTBaseControlMessage {
+ public:
+  MOQTNamespace() {
+    type = "namespace";
+  }
+  folly::dynamic toDynamic() const override;
+  std::vector<MOQTByteString> trackNamespaceSuffix;
+};
+
+class MOQTNamespaceDone : public MOQTBaseControlMessage {
+ public:
+  MOQTNamespaceDone() {
+    type = "namespace_done";
+  }
+  folly::dynamic toDynamic() const override;
+  std::vector<MOQTByteString> trackNamespaceSuffix;
+};
+
+class MOQTPublishSkipped : public MOQTBaseControlMessage {
+ public:
+  MOQTPublishSkipped() {
+    type = "publish_skipped";
+  }
+  folly::dynamic toDynamic() const override;
+  std::vector<MOQTByteString> trackNamespaceSuffix;
+  MOQTByteString trackName;
 };
 
 class MOQTPublishNamespaceDone : public MOQTBaseControlMessage {
@@ -553,6 +553,7 @@ class MOQTPublish : public MOQTBaseControlMessage {
   uint8_t forward{};
   uint64_t numberOfParameters{};
   std::vector<MOQTParameter> parameters;
+  std::vector<MOQTProperty> trackProperties;
 };
 
 class MOQTPublishOk : public MOQTBaseControlMessage {
@@ -613,11 +614,11 @@ struct MOQTObjectDatagramCreated {
   uint64_t trackAlias{0};
   uint64_t groupId{0};
   std::optional<uint64_t> objectId;
-  uint8_t publisherPriority{0};
-  std::optional<uint64_t> extensionHeadersLength;
-  std::vector<MOQTExtensionHeader> extensionHeaders;
+  std::optional<uint8_t> publisherPriority;
+  std::optional<uint64_t> propertiesLength;
+  std::vector<MOQTProperty> properties;
   std::optional<uint64_t> objectStatus;
-  uint64_t objectPayloadLength{0};
+  std::optional<MOQTRawInfo> objectPayload;
   bool endOfGroup{false};
 
   folly::dynamic toDynamic() const;
@@ -627,11 +628,11 @@ struct MOQTObjectDatagramParsed {
   uint64_t trackAlias{0};
   uint64_t groupId{0};
   std::optional<uint64_t> objectId;
-  uint8_t publisherPriority{0};
-  std::optional<uint64_t> extensionHeadersLength;
-  std::vector<MOQTExtensionHeader> extensionHeaders;
+  std::optional<uint8_t> publisherPriority;
+  std::optional<uint64_t> propertiesLength;
+  std::vector<MOQTProperty> properties;
   std::optional<uint64_t> objectStatus;
-  uint64_t objectPayloadLength{0};
+  std::optional<MOQTRawInfo> objectPayload;
   bool endOfGroup{false};
 
   folly::dynamic toDynamic() const;
@@ -641,10 +642,12 @@ struct MOQTSubgroupHeaderCreated {
   uint64_t streamId{0};
   uint64_t trackAlias{0};
   uint64_t groupId{0};
+  uint8_t subgroupIdMode{0};
   std::optional<uint64_t> subgroupId;
-  uint8_t publisherPriority{0};
+  std::optional<uint8_t> publisherPriority;
   bool containsEndOfGroup{false};
-  bool extensionsPresent{false};
+  bool propertiesPresent{false};
+  bool firstObject{false};
 
   folly::dynamic toDynamic() const;
 };
@@ -653,21 +656,20 @@ struct MOQTSubgroupHeaderParsed {
   uint64_t streamId{0};
   uint64_t trackAlias{0};
   uint64_t groupId{0};
+  uint8_t subgroupIdMode{0};
   std::optional<uint64_t> subgroupId;
-  uint8_t publisherPriority{0};
+  std::optional<uint8_t> publisherPriority;
   bool containsEndOfGroup{false};
-  bool extensionsPresent{false};
+  bool propertiesPresent{false};
+  bool firstObject{false};
 
   folly::dynamic toDynamic() const;
 };
 
 struct MOQTSubgroupObjectCreated {
   uint64_t streamId{0};
-  std::optional<uint64_t> groupId;
-  std::optional<uint64_t> subgroupId;
-  uint64_t objectId{0};
-  uint64_t extensionHeadersLength{0};
-  std::vector<MOQTExtensionHeader> extensionHeaders;
+  uint64_t objectIdDelta{0};
+  std::vector<MOQTProperty> properties;
   uint64_t objectPayloadLength{0};
   std::optional<uint64_t> objectStatus;
 
@@ -676,11 +678,8 @@ struct MOQTSubgroupObjectCreated {
 
 struct MOQTSubgroupObjectParsed {
   uint64_t streamId{0};
-  std::optional<uint64_t> groupId;
-  std::optional<uint64_t> subgroupId;
-  uint64_t objectId{0};
-  uint64_t extensionHeadersLength{0};
-  std::vector<MOQTExtensionHeader> extensionHeaders;
+  uint64_t objectIdDelta{0};
+  std::vector<MOQTProperty> properties;
   uint64_t objectPayloadLength{0};
   std::optional<uint64_t> objectStatus;
 
@@ -690,9 +689,6 @@ struct MOQTSubgroupObjectParsed {
 struct MOQTFetchHeaderCreated {
   uint64_t streamId{0};
   uint64_t requestId{0};
-  // qlog does not define a fill stream type, so this goes in the extension
-  // point.
-  bool isFill{false};
 
   folly::dynamic toDynamic() const;
 };
@@ -700,35 +696,54 @@ struct MOQTFetchHeaderCreated {
 struct MOQTFetchHeaderParsed {
   uint64_t streamId{0};
   uint64_t requestId{0};
-  bool isFill{false};
 
   folly::dynamic toDynamic() const;
 };
 
 struct MOQTFetchObjectCreated {
   uint64_t streamId{0};
-  uint64_t groupId{};
-  uint64_t subgroupId{};
-  uint64_t objectId{0};
-  uint8_t publisherPriority{0};
-  uint64_t extensionHeadersLength{0};
-  std::vector<MOQTExtensionHeader> extensionHeaders;
+  bool datagram{false};
+  bool endOfNonexistentRange{false};
+  bool endOfUnknownRange{false};
+  bool endOfTimedOutRange{false};
+  std::optional<uint8_t> subgroupIdBits;
+  std::optional<uint64_t> groupIdDelta;
+  std::optional<uint64_t> subgroupId;
+  std::optional<uint64_t> objectIdDelta;
+  std::optional<uint8_t> publisherPriority;
+  std::optional<uint64_t> propertiesLength;
+  std::vector<MOQTProperty> properties;
   uint64_t objectPayloadLength{0};
-  std::optional<uint64_t> objectStatus;
 
   folly::dynamic toDynamic() const;
 };
 
 struct MOQTFetchObjectParsed {
   uint64_t streamId{0};
-  uint64_t groupId{};
-  uint64_t subgroupId{};
-  uint64_t objectId{0};
-  uint8_t publisherPriority{0};
-  uint64_t extensionHeadersLength{0};
-  std::vector<MOQTExtensionHeader> extensionHeaders;
+  bool datagram{false};
+  bool endOfNonexistentRange{false};
+  bool endOfUnknownRange{false};
+  bool endOfTimedOutRange{false};
+  std::optional<uint8_t> subgroupIdBits;
+  std::optional<uint64_t> groupIdDelta;
+  std::optional<uint64_t> subgroupId;
+  std::optional<uint64_t> objectIdDelta;
+  std::optional<uint8_t> publisherPriority;
+  std::optional<uint64_t> propertiesLength;
+  std::vector<MOQTProperty> properties;
   uint64_t objectPayloadLength{0};
-  std::optional<uint64_t> objectStatus;
+
+  folly::dynamic toDynamic() const;
+};
+
+struct MOQTPaddingDatagramCreated {
+  uint64_t paddingLength{0};
+
+  folly::dynamic toDynamic() const;
+};
+
+struct MOQTPaddingDatagramParsed {
+  uint64_t paddingLength{0};
 
   folly::dynamic toDynamic() const;
 };

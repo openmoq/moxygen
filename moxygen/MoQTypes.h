@@ -680,7 +680,7 @@ struct FillParameters {
   }
 };
 
-// TRACK_FILTER parameter for SUBSCRIBE_NAMESPACE (0x29)
+// TRACK_FILTER parameter for SUBSCRIBE_NAMESPACE (0x30)
 // Used to filter tracks based on a property value, selecting the top N tracks.
 struct TrackFilter {
   uint64_t propertyType{0}; // Property type to filter on (e.g., audio level)
@@ -816,7 +816,7 @@ enum class TrackRequestParamKey : uint64_t {
   LARGEST_OBJECT = 0x9,
   FILL_TIMEOUT = 0x0A,
   FORWARD = 0x10,
-  TRACK_FILTER = 0x29,
+  TRACK_FILTER = 0x30,
   NEW_GROUP_REQUEST = 0x32,
   TRACK_NAMESPACE_PREFIX = 0x34,
   INCLUDE_PROPERTIES = 0x35,

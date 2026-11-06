@@ -67,7 +67,7 @@ moxygen::ParameterValueEncoding paramEncodingV18(uint64_t key) {
     case K::TRACK_NAMESPACE_PREFIX:
     case K::FILL_PARAMETERS:
     case K::HOP_PATH:
-    // TRACK_FILTER (0x29) is a fork-local active proposal; length-prefixed
+    // TRACK_FILTER (0x30) is a fork-local active proposal; length-prefixed
     // value decoded via parseVariableParam (see parseTrackFilter).
     case K::TRACK_FILTER:
       return E::LengthPrefixed;
@@ -1099,9 +1099,8 @@ MoQFrameParser::parseVariableParam(
       p.asLocationFilter = fromSubscriptionFilter(res.value());
     }
   } else if (key == trackFilterKey) {
-    // TRACK_FILTER (key=0x29, odd = length-prefixed)
-    // NOTE: TRACK_FILTER is an active proposal, not yet landed
-    // in the core specification.
+    // TRACK_FILTER is an active proposal, not yet landed in the core
+    // specification. Its key is even but its value is length-prefixed.
     auto lenRes = decodeVarint(cursor, length);
     if (!lenRes) {
       XLOG(DBG4) << "parseVariableParam: UNDERFLOW on trackFilter length";
@@ -1989,6 +1988,9 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseTrackRequestParams(
           version,
           key,
           extension ? extension->encoding : paramEncodingV18(key));
+    } else if (
+        key == folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
+      res = parseVariableParam(cursor, length, version, key);
     } else if ((key & 0x01) == 0) {
       res = parseIntParam(cursor, length, version, key);
     } else if (
@@ -4473,7 +4475,7 @@ void MoQFrameWriter::writeV18ParamValue(
     case ParameterValueEncoding::LengthPrefixed: {
       if (param.key ==
           folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
-        // TRACK_FILTER (0x29) is a fork-local length-prefixed param; its value
+        // TRACK_FILTER (0x30) is a fork-local length-prefixed param; its value
         // lives in asTrackFilter, not asString. Mirror the draft-16 path in
         // writeParamValue so the v18 wire form round-trips (see
         // parseTrackFilter via parseV18ParamValue -> parseVariableParam).
@@ -4563,7 +4565,7 @@ void MoQFrameWriter::writeParamValue(
       size += tmpSize;
     }
   } else if (param.key == trackFilterKey) {
-    // Track filter key is odd (0x29), so it needs a length prefix.
+    // Track filter key is even, but its value is length-prefixed.
     // Write to a temporary buffer to compute the length first.
     folly::IOBufQueue tmpBuf{folly::IOBufQueue::cacheChainLength()};
     size_t tmpSize = 0;
