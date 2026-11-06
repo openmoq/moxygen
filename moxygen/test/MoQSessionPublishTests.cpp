@@ -1289,6 +1289,75 @@ CO_TEST_P_X(MoQSessionTest, PublishConsumerReadyErrorReleasesState) {
 
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+namespace {
+
+// Rejects one PUBLISH from a suspended reply task with `error`; returns the
+// error the publisher received.
+folly::coro::Task<PublishError> publishRejectedLater(
+    MockSubscriber& serverSubscriber,
+    MoQSession& clientSession,
+    folly::EventBase& eventBase,
+    PublishError error) {
+  folly::coro::Baton allowError;
+  EXPECT_CALL(serverSubscriber, publish(_, _))
+      .WillOnce([&](const PublishRequest& actualPub,
+                    std::shared_ptr<SubscriptionHandle>)
+                    -> Subscriber::PublishResult {
+        return Subscriber::PublishConsumerAndReplyTask{
+            std::make_shared<testing::NiceMock<MockTrackConsumer>>(),
+            folly::coro::co_invoke(
+                [&allowError, error, requestID = actualPub.requestID]() mutable
+                    -> folly::coro::Task<
+                        folly::Expected<PublishOk, PublishError>> {
+                  co_await allowError;
+                  error.requestID = requestID;
+                  co_return folly::makeUnexpected(std::move(error));
+                }),
+            /*consumerReady=*/false};
+      });
+
+  PublishRequest pub{
+      RequestID(0),
+      FullTrackName{TrackNamespace{{"test"}}, "test-track"},
+      TrackAlias(100),
+      GroupOrder::Default,
+      AbsoluteLocation{0, 100}, // largest
+      true,                     // forward
+  };
+  auto result = clientSession.publish(std::move(pub), makePublishHandle());
+  EXPECT_TRUE(result.hasValue());
+  if (!result.hasValue()) {
+    co_return result.error();
+  }
+  auto reply =
+      co_withExecutor(&eventBase, std::move(result.value().reply)).start();
+  for (int i = 0; i < 3; ++i) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+  }
+  allowError.post();
+  auto replyResult = co_await std::move(reply).via(&eventBase);
+  EXPECT_TRUE(replyResult.hasError());
+  if (!replyResult.hasError()) {
+    co_return PublishError{};
+  }
+  co_return replyResult.error();
+}
+
+} // namespace
+
+CO_TEST_P_X(MoQSessionTest, PublishReplyErrorKeepsFields) {
+  co_await setupMoQSessionForPublish(initialMaxRequestID_);
+  PublishError error{
+      RequestID(0), PublishErrorCode::UNAUTHORIZED, "not allowed"};
+  error.retryInterval = std::chrono::milliseconds(1500);
+  auto received = co_await publishRejectedLater(
+      *serverSubscriber, *clientSession_, eventBase_, error);
+  EXPECT_EQ(received.errorCode, PublishErrorCode::UNAUTHORIZED);
+  EXPECT_EQ(received.reasonPhrase, "not allowed");
+  EXPECT_EQ(received.retryInterval, std::chrono::milliseconds(1500));
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, InboundPublish_NoSubscriber_PublishError) {
   co_await setupMoQSessionForPublish(initialMaxRequestID_);
 

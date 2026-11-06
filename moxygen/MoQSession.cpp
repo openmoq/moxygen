@@ -6035,8 +6035,8 @@ folly::coro::Task<void> MoQSession::handlePublish(
     if (publishResult.hasError()) {
       XLOG(DBG1) << "Application publish error err="
                  << publishResult.error().reasonPhrase;
-      publishErr.errorCode = publishResult.error().errorCode;
-      publishErr.reasonPhrase = publishResult.error().reasonPhrase;
+      publishErr = std::move(publishResult.error());
+      publishErr.requestID = requestID;
     } else {
       // Extract the initiator and process reply with co_await
       auto& initiator = publishResult.value();
@@ -6058,7 +6058,8 @@ folly::coro::Task<void> MoQSession::handlePublish(
                   << replyResult.exception().what().toStdString();
         publishErr.reasonPhrase = replyResult.exception().what().toStdString();
       } else if (replyResult->hasError()) {
-        publishErr.reasonPhrase = replyResult->error().reasonPhrase;
+        publishErr = std::move(replyResult->error());
+        publishErr.requestID = requestID;
       } else {
         if (!initiator.consumerReady &&
             !installPublishReceiveState(
