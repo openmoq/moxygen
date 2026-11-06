@@ -36,13 +36,64 @@ void MoQTestFetchHandle::fetchCancel() {
 }
 
 MoQTestPublisher::ObjectPacer MoQTestPublisher::makePacer(
-    const MoQTestParameters& params) {
+    const MoQTestParameters& params,
+    TrackTiming timing) {
   return ObjectPacer(
       std::chrono::milliseconds(params.objectFrequency),
       &timekeeper_,
       params.forwardingPreference == ForwardingPreference::DATAGRAM
           ? &datagramStats_
-          : &subgroupStats_);
+          : &subgroupStats_,
+      std::move(timing));
+}
+
+MoQTestPublisher::TrackTiming MoQTestPublisher::makeTrackTiming(
+    const MoQTestParameters& params) const {
+  TrackTiming timing;
+  if (timestampMode_ == TimestampMode::None) {
+    return timing;
+  }
+  if (timestampMode_ == TimestampMode::Mapping) {
+    auto steadyStart = std::chrono::steady_clock::now();
+    timing.info =
+        scheduleTimestampInfo(params, std::chrono::system_clock::now());
+    if (timing.info) {
+      timing.scheduleStart = steadyStart;
+      return timing;
+    }
+    XLOG(WARN) << "Track schedule can't be mapped, sending explicit timestamps";
+  }
+  timing.info = TrackTimestampInfo::wallClockMicros();
+  return timing;
+}
+
+MoQTestPublisher::ObjectPacer::~ObjectPacer() {
+  if (!timestampInfo_ || !timestampInfo_->mapping || stamped_ == 0) {
+    return;
+  }
+  const double microsPerTick = 1e6 / timestampInfo_->timescale;
+  XLOG(INFO) << "Timestamp corrections: " << corrected_ << "/" << stamped_
+             << " objects, mean "
+             << (corrected_ ? correctionSum_ * microsPerTick / corrected_ : 0)
+             << "us, max " << correctionMax_ * microsPerTick << "us";
+}
+
+void MoQTestPublisher::ObjectPacer::stampSendTime(
+    std::vector<Extension>& extensions,
+    AbsoluteLocation location) {
+  if (!timestampInfo_) {
+    return;
+  }
+  ++stamped_;
+  if (auto correction =
+          appendSendTime(extensions, *timestampInfo_, location)) {
+    const uint64_t magnitude = *correction < 0
+        ? 0 - static_cast<uint64_t>(*correction)
+        : static_cast<uint64_t>(*correction);
+    ++corrected_;
+    correctionSum_ += magnitude;
+    correctionMax_ = std::max(correctionMax_, magnitude);
+  }
 }
 
 folly::coro::Task<void> MoQTestPublisher::ObjectPacer::awaitNextObject() {
@@ -109,9 +160,10 @@ Extensions makeTrackProperties(
 
 std::shared_ptr<MoQForwarder> MoQTestPublisher::makeForwarder(
     const FullTrackName& ftn,
-    uint64_t /*version*/) {
+    uint64_t /*version*/,
+    const TrackTiming& timing) {
   auto forwarder = std::make_shared<MoQForwarder>(ftn);
-  forwarder->setExtensions(makeTrackProperties(timestampInfo_));
+  forwarder->setExtensions(makeTrackProperties(timing.info));
 
   auto cb = std::make_shared<TrackCallback>();
   cb->publisher = shared_from_this();
@@ -160,7 +212,13 @@ folly::coro::Task<Publisher::TrackStatusResult> MoQTestPublisher::trackStatus(
   ok.requestID = trackStatus.requestID;
   auto trackIt = tracks_.find(trackStatus.fullTrackName);
   if (trackIt == tracks_.end()) {
-    ok.trackProperties = makeTrackProperties(timestampInfo_);
+    // A mapping anchors at track start, so only explicit stamping has a
+    // TIMESCALE to advertise before the track exists.
+    std::optional<TrackTimestampInfo> timestampInfo;
+    if (timestampMode_ == TimestampMode::Explicit) {
+      timestampInfo = TrackTimestampInfo::wallClockMicros();
+    }
+    ok.trackProperties = makeTrackProperties(timestampInfo);
     co_return ok;
   }
   const auto& forwarder = trackIt->second.forwarder;
@@ -188,8 +246,14 @@ folly::coro::Task<MoQSession::SubscribeResult> MoQTestPublisher::subscribe(
   const auto reqCtx = MoQSession::getRequestContext();
   auto trackIt = tracks_.find(sub.fullTrackName);
   const bool isNewTrack = (trackIt == tracks_.end());
-  auto forwarder = isNewTrack ? makeForwarder(sub.fullTrackName, reqCtx.version)
-                              : trackIt->second.forwarder;
+  TrackTiming timing;
+  std::shared_ptr<MoQForwarder> forwarder;
+  if (isNewTrack) {
+    timing = makeTrackTiming(res.value());
+    forwarder = makeForwarder(sub.fullTrackName, reqCtx.version, timing);
+  } else {
+    forwarder = trackIt->second.forwarder;
+  }
 
   auto subscriber =
       forwarder->addSubscriber(reqCtx.sessionId, sub, std::move(callback));
@@ -212,6 +276,7 @@ folly::coro::Task<MoQSession::SubscribeResult> MoQTestPublisher::subscribe(
   auto* executor = co_await folly::coro::co_current_executor;
   auto& state = tracks_[sub.fullTrackName];
   state.forwarder = forwarder;
+  state.timing = timing;
   co_withCancellation(
       state.cancelSource.getToken(),
       co_withExecutor(
@@ -220,7 +285,8 @@ folly::coro::Task<MoQSession::SubscribeResult> MoQTestPublisher::subscribe(
               sub.fullTrackName,
               std::move(forwarder),
               res.value(),
-              sub.requestID)))
+              sub.requestID,
+              std::move(timing))))
       .start();
 
   co_return subscriber;
@@ -230,18 +296,20 @@ folly::coro::Task<void> MoQTestPublisher::runTrack(
     FullTrackName ftn,
     std::shared_ptr<MoQForwarder> forwarder,
     MoQTestParameters params,
-    RequestID requestID) {
+    RequestID requestID,
+    TrackTiming timing) {
   auto unregister =
       folly::makeGuard([self = shared_from_this(), ftn, fwd = forwarder.get()] {
         self->retireTrack(ftn, fwd);
       });
-  co_await sendTrackData(params, requestID, forwarder);
+  co_await sendTrackData(params, requestID, forwarder, std::move(timing));
 }
 
 folly::coro::Task<void> MoQTestPublisher::sendTrackData(
     MoQTestParameters params,
     RequestID requestID,
-    std::shared_ptr<TrackConsumer> callback) {
+    std::shared_ptr<TrackConsumer> callback,
+    TrackTiming timing) {
   // Publish Objects in Accordance to params
 
   // Publisher Delivery Timeout (To be implemented later)
@@ -249,23 +317,24 @@ folly::coro::Task<void> MoQTestPublisher::sendTrackData(
   // Switch based on forwarding preference
   switch (params.forwardingPreference) {
     case (ForwardingPreference::ONE_SUBGROUP_PER_GROUP): {
-      co_await sendOneSubgroupPerGroup(params, callback);
+      co_await sendOneSubgroupPerGroup(params, callback, std::move(timing));
       break;
     }
 
     case (ForwardingPreference::ONE_SUBGROUP_PER_OBJECT): {
-      co_await sendOneSubgroupPerObject(params, callback);
+      co_await sendOneSubgroupPerObject(params, callback, std::move(timing));
 
       break;
     }
 
     case (ForwardingPreference::TWO_SUBGROUPS_PER_GROUP): {
-      co_await sendTwoSubgroupsPerGroup(params, callback);
+      co_await sendTwoSubgroupsPerGroup(params, callback, std::move(timing));
       break;
     }
 
     case (ForwardingPreference::DATAGRAM): {
-      co_await MoQTestPublisher::sendDatagram(requestID, params, callback);
+      co_await MoQTestPublisher::sendDatagram(
+          requestID, params, callback, std::move(timing));
       break;
     }
 
@@ -291,9 +360,13 @@ folly::coro::Task<folly::coro::Task<void>> MoQTestPublisher::startPublishTrack(
     RequestID requestID) {
   auto forwarder = std::make_shared<MoQForwarder>(std::move(ftn));
   forwarder->setTrackAlias(TrackAlias(requestID.value));
-  if (timestampInfo_) {
+  auto timing = makeTrackTiming(params);
+  // The peer unpauses an unknown time after PUBLISH, so the pacer starts then.
+  // Every correction on this track also carries that delay.
+  timing.scheduleStart.reset();
+  if (timing.info) {
     Extensions trackProperties;
-    timestampInfo_->addTo(trackProperties);
+    timing.info->addTo(trackProperties);
     forwarder->setExtensions(std::move(trackProperties));
   }
 
@@ -344,14 +417,19 @@ folly::coro::Task<folly::coro::Task<void>> MoQTestPublisher::startPublishTrack(
   subscriber->onPublishOk(pubResult.value().value());
 
   co_return streamPublishedTrack(
-      std::move(published), std::move(forwarder), params, requestID);
+      std::move(published),
+      std::move(forwarder),
+      params,
+      requestID,
+      std::move(timing));
 }
 
 folly::coro::Task<void> MoQTestPublisher::streamPublishedTrack(
     std::shared_ptr<PublishedTrack> published,
     std::shared_ptr<MoQForwarder> forwarder,
     MoQTestParameters params,
-    RequestID requestID) {
+    RequestID requestID,
+    TrackTiming timing) {
   // Drop the registration however this track ends, so a long-lived publisher
   // doesn't accumulate one fulfilled entry per publish.
   auto unregister = folly::makeGuard(
@@ -361,7 +439,9 @@ folly::coro::Task<void> MoQTestPublisher::streamPublishedTrack(
       co_await folly::coro::co_current_cancellation_token,
       published->cancelSource.getToken());
   co_await folly::coro::co_withCancellation(
-      std::move(token), sendTrackData(params, requestID, std::move(forwarder)));
+      std::move(token),
+      sendTrackData(
+          params, requestID, std::move(forwarder), std::move(timing)));
 }
 
 folly::coro::Task<void> MoQTestPublisher::publishTrack(
@@ -376,12 +456,14 @@ folly::coro::Task<void> MoQTestPublisher::publishTrack(
 
 folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerGroup(
     MoQTestParameters params,
-    std::shared_ptr<TrackConsumer> callback) {
+    std::shared_ptr<TrackConsumer> callback,
+    TrackTiming timing) {
   // Iterate through Groups
   auto token = co_await folly::coro::co_current_cancellation_token;
-  auto pacer = makePacer(params);
+  const bool stamped = timing.info.has_value();
+  auto pacer = makePacer(params, std::move(timing));
   const auto subgroupOptions =
-      subgroupOptionsFor(params, 0, timestampInfo_.has_value());
+      subgroupOptionsFor(params, 0, stamped);
   for (uint64_t groupNum = params.startGroup;
        groupNum <= params.lastGroupInTrack;
        groupNum += params.groupIncrement) {
@@ -402,9 +484,8 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerGroup(
       // Add Integer/Variable Extensions if needed
       std::vector<Extension> extensions = getExtensions(
           params.testIntegerExtension,
-          params.testVariableExtension,
-          timestampInfo_,
-          {groupNum, objectId});
+          params.testVariableExtension);
+      pacer.stampSendTime(extensions, {groupNum, objectId});
 
       // If there are send end of group markers and j == lastObjectID, send
       // the end of group
@@ -436,10 +517,12 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerGroup(
 
 folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerObject(
     MoQTestParameters params,
-    std::shared_ptr<TrackConsumer> callback) {
+    std::shared_ptr<TrackConsumer> callback,
+    TrackTiming timing) {
   // Iterate through Objects
   auto token = co_await folly::coro::co_current_cancellation_token;
-  auto pacer = makePacer(params);
+  const bool stamped = timing.info.has_value();
+  auto pacer = makePacer(params, std::move(timing));
   for (uint64_t groupNum = params.startGroup;
        groupNum <= params.lastGroupInTrack;
        groupNum += params.groupIncrement) {
@@ -454,7 +537,7 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerObject(
           groupNum,
           objectId,
           publisherPriorityForGroup(groupNum),
-          subgroupOptionsFor(params, objectId, timestampInfo_.has_value()));
+          subgroupOptionsFor(params, objectId, stamped));
       auto subConsumer = maybeSubConsumer->get();
       // Find Object Size
       int objectSize = moxygen::getObjectSize(objectId, &params);
@@ -462,9 +545,8 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerObject(
       // Add Integer/Variable Extensions if needed
       std::vector<Extension> extensions = getExtensions(
           params.testIntegerExtension,
-          params.testVariableExtension,
-          timestampInfo_,
-          {groupNum, objectId});
+          params.testVariableExtension);
+      pacer.stampSendTime(extensions, {groupNum, objectId});
 
       // If there are send end of group markers and j == lastObjectID, send
       // the end of group
@@ -492,10 +574,12 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerObject(
 
 folly::coro::Task<void> MoQTestPublisher::sendTwoSubgroupsPerGroup(
     MoQTestParameters params,
-    std::shared_ptr<TrackConsumer> callback) {
+    std::shared_ptr<TrackConsumer> callback,
+    TrackTiming timing) {
   // Iterate through Objects
   auto token = co_await folly::coro::co_current_cancellation_token;
-  auto pacer = makePacer(params);
+  const bool stamped = timing.info.has_value();
+  auto pacer = makePacer(params, std::move(timing));
   // Odd number of objects in track means end on subgroupZero
   for (uint64_t groupNum = params.startGroup;
        groupNum <= params.lastGroupInTrack;
@@ -510,7 +594,7 @@ folly::coro::Task<void> MoQTestPublisher::sendTwoSubgroupsPerGroup(
                   groupNum,
                   0,
                   publisherPriorityForGroup(groupNum),
-                  subgroupOptionsFor(params, 0, timestampInfo_.has_value()))
+                  subgroupOptionsFor(params, 0, stamped))
               .value());
     } else {
       subConsumers.push_back(nullptr);
@@ -525,7 +609,7 @@ folly::coro::Task<void> MoQTestPublisher::sendTwoSubgroupsPerGroup(
                   groupNum,
                   1,
                   publisherPriorityForGroup(groupNum),
-                  subgroupOptionsFor(params, 1, timestampInfo_.has_value()))
+                  subgroupOptionsFor(params, 1, stamped))
               .value());
     } else {
       subConsumers.push_back(nullptr);
@@ -543,9 +627,8 @@ folly::coro::Task<void> MoQTestPublisher::sendTwoSubgroupsPerGroup(
       // Add Integer/Variable Extensions if needed
       std::vector<Extension> extensions = getExtensions(
           params.testIntegerExtension,
-          params.testVariableExtension,
-          timestampInfo_,
-          {groupNum, objectId});
+          params.testVariableExtension);
+      pacer.stampSendTime(extensions, {groupNum, objectId});
 
       // If there are send end of group markers and j == lastObjectID, send
       // the end of group
@@ -595,9 +678,10 @@ folly::coro::Task<void> MoQTestPublisher::sendTwoSubgroupsPerGroup(
 folly::coro::Task<void> MoQTestPublisher::sendDatagram(
     RequestID requestID,
     MoQTestParameters params,
-    std::shared_ptr<TrackConsumer> callback) {
+    std::shared_ptr<TrackConsumer> callback,
+    TrackTiming timing) {
   auto token = co_await folly::coro::co_current_cancellation_token;
-  auto pacer = makePacer(params);
+  auto pacer = makePacer(params, std::move(timing));
   const auto lastObject = lastObjectInGroup(params);
   // Iterate through Objects
   for (uint64_t groupNum = params.startGroup;
@@ -638,13 +722,10 @@ folly::coro::Task<void> MoQTestPublisher::sendDatagram(
         objectSize = getObjectSize(objectId, &params);
         objectPayload = makePayload(objectSize);
         // Add Integer/Variable Extensions if needed
-        header.extensions = Extensions(
-            getExtensions(
-                params.testIntegerExtension,
-                params.testVariableExtension,
-                timestampInfo_,
-                {groupNum, objectId}),
-            {});
+        auto extensions = getExtensions(
+            params.testIntegerExtension, params.testVariableExtension);
+        pacer.stampSendTime(extensions, {groupNum, objectId});
+        header.extensions = Extensions(extensions, {});
       }
 
       auto res = callback->datagram(
@@ -749,6 +830,15 @@ folly::coro::Task<MoQSession::FetchResult> MoQTestPublisher::fetch(
     XLOG(INFO) << "Serving " << window.first << ".." << window.last;
   }
 
+  // A live track's FETCH_OK repeats the properties its subscribers got.
+  std::optional<TrackTimestampInfo> timestampInfo;
+  auto trackIt = tracks_.find(fetch.fullTrackName);
+  if (trackIt != tracks_.end()) {
+    timestampInfo = trackIt->second.timing.info;
+  } else if (timestampMode_ != TimestampMode::None) {
+    timestampInfo = TrackTimestampInfo::wallClockMicros();
+  }
+
   auto cancelSource = std::make_shared<folly::CancellationSource>();
   activeFetches_.push_back(cancelSource);
 
@@ -757,7 +847,12 @@ folly::coro::Task<MoQSession::FetchResult> MoQTestPublisher::fetch(
       cancelSource->getToken(),
       co_withExecutor(
           co_await folly::coro::co_current_executor,
-          runFetch(cancelSource, params, window, std::move(fetchCallback))))
+          runFetch(
+              cancelSource,
+              params,
+              window,
+              std::move(fetchCallback),
+              timestampInfo)))
       .start();
 
   FetchOk ok;
@@ -765,8 +860,8 @@ folly::coro::Task<MoQSession::FetchResult> MoQTestPublisher::fetch(
   ok.groupOrder = GroupOrder::OldestFirst;
   ok.endOfTrack = window.endOfTrack ? 1 : 0;
   ok.endLocation = fetchEndLocation(params, *standalone);
-  if (timestampInfo_) {
-    timestampInfo_->addTo(ok.extensions);
+  if (timestampInfo) {
+    timestampInfo->addTo(ok.extensions);
   }
 
   co_return std::make_shared<MoQTestFetchHandle>(ok, std::move(cancelSource));
@@ -776,7 +871,8 @@ folly::coro::Task<void> MoQTestPublisher::runFetch(
     std::shared_ptr<folly::CancellationSource> cancelSource,
     MoQTestParameters params,
     MoQTestFetchWindow window,
-    std::shared_ptr<FetchConsumer> callback) {
+    std::shared_ptr<FetchConsumer> callback,
+    std::optional<TrackTimestampInfo> timestampInfo) {
   // Drop the registration however the fetch ends, so a long-lived publisher
   // doesn't accumulate one entry per completed fetch.  The self-reference keeps
   // the publisher alive for the detached coroutine.  This erase and cancelAll()
@@ -784,13 +880,15 @@ folly::coro::Task<void> MoQTestPublisher::runFetch(
   auto unregister = folly::makeGuard([self = shared_from_this(), cancelSource] {
     std::erase(self->activeFetches_, cancelSource);
   });
-  co_await onFetch(params, window, std::move(callback));
+  co_await onFetch(
+      params, window, std::move(callback), std::move(timestampInfo));
 }
 
 folly::coro::Task<void> MoQTestPublisher::onFetch(
     MoQTestParameters params,
     MoQTestFetchWindow window,
-    std::shared_ptr<FetchConsumer> fetchCallback) {
+    std::shared_ptr<FetchConsumer> fetchCallback,
+    std::optional<TrackTimestampInfo> timestampInfo) {
   if (window.empty()) {
     // FETCH_OK has already gone out, so close the fetch without any objects.
     fetchCallback->endOfFetch();
@@ -799,13 +897,15 @@ folly::coro::Task<void> MoQTestPublisher::onFetch(
 
   // Publisher Delivery Timeout (To be implemented later)
 
-  co_await fetchObjects(params, std::move(fetchCallback), window);
+  co_await fetchObjects(
+      params, std::move(fetchCallback), window, std::move(timestampInfo));
 }
 
 folly::coro::Task<void> MoQTestPublisher::fetchObjects(
     MoQTestParameters params,
     std::shared_ptr<FetchConsumer> callback,
-    MoQTestFetchWindow window) {
+    MoQTestFetchWindow window,
+    std::optional<TrackTimestampInfo> timestampInfo) {
   auto token = co_await folly::coro::co_current_cancellation_token;
   // Object frequency describes how a live track is produced; a FETCH serves
   // what already exists, so it does not pace at all.
@@ -831,9 +931,10 @@ folly::coro::Task<void> MoQTestPublisher::fetchObjects(
       const uint64_t subgroupId = fetchSubgroupID(params, objectId);
       std::vector<Extension> extensions = getExtensions(
           params.testIntegerExtension,
-          params.testVariableExtension,
-          timestampInfo_,
-          {groupNum, objectId});
+          params.testVariableExtension);
+      if (timestampInfo) {
+        appendSendTime(extensions, *timestampInfo, {groupNum, objectId});
+      }
 
       // If there are send end of group markers and j == lastObjectID, send
       // the end of group

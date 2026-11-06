@@ -473,3 +473,75 @@ TEST_F(MoQTrackTest, testPayloadEmbedsOffset) {
   EXPECT_TRUE(moxygen::validatePayload(0, nullptr));
   EXPECT_EQ(moxygen::makePayload(0)->computeChainDataLength(), 0);
 }
+
+TEST_F(MoQTrackTest, ScheduleTimestampsDefaultIncrements) {
+  CreateDefaultMoQTestParameters();
+  params_.lastObjectInTrack = 9;
+  params_.objectFrequency = 50;
+  const auto start = std::chrono::system_clock::time_point(
+      std::chrono::seconds(1767225600));
+  auto info = moxygen::scheduleTimestampInfo(params_, start);
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->timescale, 1'000'000);
+  ASSERT_TRUE(info->mapping.has_value());
+  EXPECT_EQ(info->mapping->objectMultiplier, 50'000);
+  EXPECT_EQ(info->mapping->groupMultiplier, 500'000);
+  EXPECT_EQ(info->toWallClock(info->mapping->timestamp(2, 3).value()),
+            start + std::chrono::milliseconds(23 * 50));
+}
+
+TEST_F(MoQTrackTest, ScheduleTimestampsUnevenIncrements) {
+  // Object IDs 1, 4, 7, 10 every 10ms in Groups 5, 12, 19, ...
+  CreateDefaultMoQTestParameters();
+  params_.startGroup = 5;
+  params_.groupIncrement = 7;
+  params_.startObject = 1;
+  params_.objectIncrement = 3;
+  params_.lastObjectInTrack = 10;
+  params_.objectFrequency = 10;
+  const auto start = std::chrono::system_clock::time_point(
+      std::chrono::seconds(1767225600));
+  auto info = moxygen::scheduleTimestampInfo(params_, start);
+  ASSERT_TRUE(info.has_value());
+  EXPECT_EQ(info->timescale, 21'000'000);
+  uint64_t index = 0;
+  for (uint64_t group = 5; group <= 19; group += 7) {
+    for (uint64_t object = 1; object <= 10; object += 3) {
+      auto timestamp = info->mapping->timestamp(group, object);
+      ASSERT_TRUE(timestamp.hasValue());
+      EXPECT_EQ(info->toWallClock(*timestamp),
+                start + std::chrono::milliseconds(10 * index++));
+    }
+  }
+}
+
+TEST_F(MoQTrackTest, ScheduleTimestampsUnpaced) {
+  CreateDefaultMoQTestParameters();
+  params_.objectFrequency = 0;
+  EXPECT_FALSE(moxygen::scheduleTimestampInfo(
+                   params_, std::chrono::system_clock::now())
+                   .has_value());
+}
+
+TEST_F(MoQTrackTest, AppendSendTime) {
+  std::vector<moxygen::Extension> extensions;
+  EXPECT_EQ(moxygen::appendSendTime(
+                extensions,
+                moxygen::TrackTimestampInfo::wallClockMicros(),
+                {0, 0}),
+            std::nullopt);
+  ASSERT_EQ(extensions.size(), 1);
+  EXPECT_EQ(extensions[0].type, moxygen::kObjectTimestampPropertyType);
+
+  // A track whose schedule started a second ago is behind by at least that.
+  CreateDefaultMoQTestParameters();
+  params_.objectFrequency = 50;
+  auto info = moxygen::scheduleTimestampInfo(
+      params_, std::chrono::system_clock::now() - std::chrono::seconds(1));
+  ASSERT_TRUE(info.has_value());
+  extensions.clear();
+  auto correction = moxygen::appendSendTime(extensions, *info, {0, 0});
+  ASSERT_TRUE(correction.has_value());
+  EXPECT_GE(*correction, 1'000'000);
+  ASSERT_EQ(extensions.size(), 1);
+}
