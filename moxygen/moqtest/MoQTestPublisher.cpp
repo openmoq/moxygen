@@ -94,10 +94,14 @@ namespace {
 // Advertise the priority even-numbered groups are published at, so the
 // subgroup and datagram encodings elide it for those and write it explicitly
 // for the odd ones.
-Extensions makeTrackProperties() {
+Extensions makeTrackProperties(
+    const std::optional<TrackTimestampInfo>& timestampInfo) {
   Extensions trackProperties;
   trackProperties.insertMutableExtension(
       Extension{kPublisherPriorityExtensionType, kMoQTestPublisherPriority});
+  if (timestampInfo) {
+    timestampInfo->addTo(trackProperties);
+  }
   return trackProperties;
 }
 
@@ -107,7 +111,7 @@ std::shared_ptr<MoQForwarder> MoQTestPublisher::makeForwarder(
     const FullTrackName& ftn,
     uint64_t /*version*/) {
   auto forwarder = std::make_shared<MoQForwarder>(ftn);
-  forwarder->setExtensions(makeTrackProperties());
+  forwarder->setExtensions(makeTrackProperties(timestampInfo_));
 
   auto cb = std::make_shared<TrackCallback>();
   cb->publisher = shared_from_this();
@@ -156,7 +160,7 @@ folly::coro::Task<Publisher::TrackStatusResult> MoQTestPublisher::trackStatus(
   ok.requestID = trackStatus.requestID;
   auto trackIt = tracks_.find(trackStatus.fullTrackName);
   if (trackIt == tracks_.end()) {
-    ok.trackProperties = makeTrackProperties();
+    ok.trackProperties = makeTrackProperties(timestampInfo_);
     co_return ok;
   }
   const auto& forwarder = trackIt->second.forwarder;
@@ -287,6 +291,11 @@ folly::coro::Task<folly::coro::Task<void>> MoQTestPublisher::startPublishTrack(
     RequestID requestID) {
   auto forwarder = std::make_shared<MoQForwarder>(std::move(ftn));
   forwarder->setTrackAlias(TrackAlias(requestID.value));
+  if (timestampInfo_) {
+    Extensions trackProperties;
+    timestampInfo_->addTo(trackProperties);
+    forwarder->setExtensions(std::move(trackProperties));
+  }
 
   // The track starts paused and is unpaused once the peer asks for data. When
   // the subscriber registered before we published, PUBLISH_OK already carries
@@ -372,7 +381,7 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerGroup(
   auto token = co_await folly::coro::co_current_cancellation_token;
   auto pacer = makePacer(params);
   const auto subgroupOptions =
-      subgroupOptionsFor(params, 0, includeTimestampExtension_);
+      subgroupOptionsFor(params, 0, timestampInfo_.has_value());
   for (uint64_t groupNum = params.startGroup;
        groupNum <= params.lastGroupInTrack;
        groupNum += params.groupIncrement) {
@@ -394,7 +403,8 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerGroup(
       std::vector<Extension> extensions = getExtensions(
           params.testIntegerExtension,
           params.testVariableExtension,
-          includeTimestampExtension_);
+          timestampInfo_,
+          {groupNum, objectId});
 
       // If there are send end of group markers and j == lastObjectID, send
       // the end of group
@@ -444,7 +454,7 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerObject(
           groupNum,
           objectId,
           publisherPriorityForGroup(groupNum),
-          subgroupOptionsFor(params, objectId, includeTimestampExtension_));
+          subgroupOptionsFor(params, objectId, timestampInfo_.has_value()));
       auto subConsumer = maybeSubConsumer->get();
       // Find Object Size
       int objectSize = moxygen::getObjectSize(objectId, &params);
@@ -453,7 +463,8 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerObject(
       std::vector<Extension> extensions = getExtensions(
           params.testIntegerExtension,
           params.testVariableExtension,
-          includeTimestampExtension_);
+          timestampInfo_,
+          {groupNum, objectId});
 
       // If there are send end of group markers and j == lastObjectID, send
       // the end of group
@@ -499,7 +510,7 @@ folly::coro::Task<void> MoQTestPublisher::sendTwoSubgroupsPerGroup(
                   groupNum,
                   0,
                   publisherPriorityForGroup(groupNum),
-                  subgroupOptionsFor(params, 0, includeTimestampExtension_))
+                  subgroupOptionsFor(params, 0, timestampInfo_.has_value()))
               .value());
     } else {
       subConsumers.push_back(nullptr);
@@ -514,7 +525,7 @@ folly::coro::Task<void> MoQTestPublisher::sendTwoSubgroupsPerGroup(
                   groupNum,
                   1,
                   publisherPriorityForGroup(groupNum),
-                  subgroupOptionsFor(params, 1, includeTimestampExtension_))
+                  subgroupOptionsFor(params, 1, timestampInfo_.has_value()))
               .value());
     } else {
       subConsumers.push_back(nullptr);
@@ -533,7 +544,8 @@ folly::coro::Task<void> MoQTestPublisher::sendTwoSubgroupsPerGroup(
       std::vector<Extension> extensions = getExtensions(
           params.testIntegerExtension,
           params.testVariableExtension,
-          includeTimestampExtension_);
+          timestampInfo_,
+          {groupNum, objectId});
 
       // If there are send end of group markers and j == lastObjectID, send
       // the end of group
@@ -630,7 +642,8 @@ folly::coro::Task<void> MoQTestPublisher::sendDatagram(
             getExtensions(
                 params.testIntegerExtension,
                 params.testVariableExtension,
-                includeTimestampExtension_),
+                timestampInfo_,
+                {groupNum, objectId}),
             {});
       }
 
@@ -752,6 +765,9 @@ folly::coro::Task<MoQSession::FetchResult> MoQTestPublisher::fetch(
   ok.groupOrder = GroupOrder::OldestFirst;
   ok.endOfTrack = window.endOfTrack ? 1 : 0;
   ok.endLocation = fetchEndLocation(params, *standalone);
+  if (timestampInfo_) {
+    timestampInfo_->addTo(ok.extensions);
+  }
 
   co_return std::make_shared<MoQTestFetchHandle>(ok, std::move(cancelSource));
 }
@@ -816,7 +832,8 @@ folly::coro::Task<void> MoQTestPublisher::fetchObjects(
       std::vector<Extension> extensions = getExtensions(
           params.testIntegerExtension,
           params.testVariableExtension,
-          includeTimestampExtension_);
+          timestampInfo_,
+          {groupNum, objectId});
 
       // If there are send end of group markers and j == lastObjectID, send
       // the end of group

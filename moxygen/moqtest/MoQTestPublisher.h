@@ -56,7 +56,11 @@ class MoQTestPublisher : public Publisher,
   };
 
   void setIncludeTimestampExtension(bool include) {
-    includeTimestampExtension_ = include;
+    if (include) {
+      timestampInfo_ = TrackTimestampInfo::wallClockMicros();
+    } else {
+      timestampInfo_.reset();
+    }
   }
 
   const SendStats& datagramStats() const {
@@ -286,7 +290,7 @@ class MoQTestPublisher : public Publisher,
   // Not the global singleton, which can crash if used during teardown, and not
   // a wheel: wheels arm through libevent, whose timeouts are jiffy granular.
   folly::HeapTimekeeper timekeeper_;
-  bool includeTimestampExtension_{false};
+  std::optional<TrackTimestampInfo> timestampInfo_;
   SendStats datagramStats_;
   SendStats subgroupStats_;
 };
