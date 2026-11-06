@@ -6,7 +6,10 @@
 
 #include <folly/coro/BlockingWait.h>
 #include <folly/coro/Sleep.h>
+#include <folly/executors/IOThreadPoolExecutor.h>
+#include <folly/executors/thread_factory/NamedThreadFactory.h>
 #include <folly/futures/ThreadWheelTimekeeper.h>
+#include <folly/io/async/EventBaseManager.h>
 #include <moxygen/FillFetch.h>
 #include <moxygen/MoQLocation.h>
 #include <moxygen/MoQQmuxServer.h>
@@ -409,11 +412,18 @@ class DatePublisher : public Publisher,
     if (minute != currentMinute_) {
       subgroupPub_.reset();
       currentMinute_ = minute;
+      lastSecond_.reset();
     }
     if (forwarder_.empty()) {
       forwarder_.setLargest(nowLocation());
       co_return;
     }
+    // Ticks can repeat a second, or go back after a wall-clock step.
+    // MoQSession rejects an object ID that does not advance.
+    if (lastSecond_ && second <= *lastSecond_) {
+      co_return;
+    }
+    lastSecond_ = second;
     switch (mode_) {
       case Mode::STREAM_PER_GROUP:
         subgroupPub_ = publishDate(subgroupPub_, minute, second);
@@ -525,6 +535,7 @@ class DatePublisher : public Publisher,
   folly::Executor* publisherEvb_{nullptr};
   std::shared_ptr<SubgroupConsumer> subgroupPub_;
   uint64_t currentMinute_{0};
+  std::optional<uint64_t> lastSecond_;
 };
 
 template <typename ServerBase>
@@ -698,9 +709,19 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // Outlives the worker, whose EB runs the session this owns.
+  std::unique_ptr<MoQRelayClient> relayClient;
+
   // DatePublisher state is single-threaded; share one worker EB across stacks.
-  folly::ScopedEventBaseThread worker("MoQDateWorker");
-  std::vector<folly::EventBase*> workerEvbs{worker.getEventBase()};
+  // waitForAll: proxygen detaches this EB's WebTransport CONNECT stream only on
+  // the delivery ack for the EOM that closing the relay session queues.
+  folly::IOThreadPoolExecutor worker(
+      1,
+      std::make_shared<folly::NamedThreadFactory>("MoQDateWorker"),
+      folly::EventBaseManager::get(),
+      folly::IOThreadPoolExecutor::Options().setWaitForAll(true));
+  auto* workerEvb = worker.getEventBase();
+  std::vector<folly::EventBase*> workerEvbs{workerEvb};
   folly::SocketAddress addr("::", FLAGS_port);
   if (quicServer) {
     quicServer->start(addr, workerEvbs);
@@ -711,10 +732,8 @@ int main(int argc, char* argv[]) {
   }
 
   // Create relay client if relay URL is specified
-  std::unique_ptr<MoQRelayClient> relayClient;
   if (!FLAGS_relay_url.empty()) {
-    relayClient =
-        createRelayClient(worker.getEventBase(), publisher, loggerFactory);
+    relayClient = createRelayClient(workerEvb, publisher, loggerFactory);
     if (!relayClient) {
       return 1;
     }
@@ -738,13 +757,16 @@ int main(int argc, char* argv[]) {
       .start();
 
   auto* relayClientPtr = relayClient.get();
-  moxygen::SignalHandler handler(&evb, [&cancelSrc, relayClientPtr](int) {
-    cancelSrc.requestCancellation();
-    if (relayClientPtr) {
-      relayClientPtr->getEventBase()->add(
-          [relayClientPtr] { relayClientPtr->shutdown(); });
-    }
-  });
+  // terminateLoop=false: the loop has to outlive the relay session's close.
+  moxygen::SignalHandler handler(
+      &evb,
+      [&cancelSrc, relayClientPtr, workerEvb](int) {
+        cancelSrc.requestCancellation();
+        if (relayClientPtr) {
+          workerEvb->add([relayClientPtr] { relayClientPtr->shutdown(); });
+        }
+      },
+      /*terminateLoop=*/false);
 
   evb.loop();
   for (auto& server : servers) {
