@@ -1325,6 +1325,36 @@ TEST_P(MoQFramerTest, ParseClientSetupForMaxRequestID) {
   }
 }
 
+TEST_P(MoQFramerTest, SetupWritesExtensionParams) {
+  // Keys moxygen does not define: an even one carries a varint, an odd one
+  // bytes.
+  constexpr uint64_t kEvenKey = 0x7A10;
+  constexpr uint64_t kOddKey = 0x7A11;
+  for (bool isClient : {true, false}) {
+    moxygen::Setup setup;
+    setup.params.insertParam(Parameter(kEvenKey, uint64_t{300}));
+    setup.params.insertParam(Parameter(kOddKey, std::string("ext")));
+
+    folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+    auto written = isClient ? writeClientSetup(writeBuf, setup, GetParam())
+                            : writeServerSetup(writeBuf, setup, GetParam());
+    ASSERT_TRUE(written.hasValue());
+    auto buffer = writeBuf.move();
+    folly::io::Cursor cursor(buffer.get());
+    ASSERT_TRUE(parser_.decodeVarint(cursor).has_value());
+    auto parsed = isClient
+        ? parser_.parseClientSetup(cursor, frameLength(cursor))
+        : parser_.parseServerSetup(cursor, frameLength(cursor));
+    ASSERT_TRUE(parsed.hasValue());
+    const auto* even = parsed->params.getFirstParam(kEvenKey);
+    const auto* odd = parsed->params.getFirstParam(kOddKey);
+    ASSERT_NE(even, nullptr);
+    ASSERT_NE(odd, nullptr);
+    EXPECT_EQ(even->asUint64, 300);
+    EXPECT_EQ(odd->asString, "ext");
+  }
+}
+
 TEST(MoQFramerTest, ParseClientSetupParamUnderflow) {
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
   size_t size = 0;

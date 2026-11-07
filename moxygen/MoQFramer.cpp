@@ -4031,11 +4031,9 @@ bool includeSetupParam(uint64_t version, SetupKey key) {
       useBidiRequestStreams(version)) {
     return false;
   }
-  return key == SetupKey::MAX_REQUEST_ID || key == SetupKey::PATH ||
-      key == SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE ||
-      key == SetupKey::AUTHORIZATION_TOKEN || key == SetupKey::AUTHORITY ||
-      key == SetupKey::MOQT_IMPLEMENTATION || key == SetupKey::HOP_ID ||
-      key == SetupKey::RELAY_COST;
+  // Keys moxygen does not define belong to the application (extensions); the
+  // writer encodes them by key parity, as the parser reads them.
+  return true;
 }
 
 WriteResult writeSetup(
