@@ -140,10 +140,19 @@ folly::coro::Task<void> SubscriberState::subscribe(
     subHandle_ = res.value();
     XLOG(DBG2) << "Subscriber " << id_ << " subscribed successfully";
 
+    const auto& subscribeOk = subHandle_->subscribeOk();
+    auto parsed =
+        TrackTimestampInfo::fromTrackProperties(subscribeOk.extensions);
+    if (parsed.hasError()) {
+      XLOG(ERR) << "Subscriber " << id_ << " got malformed timestamp "
+                << "properties: " << parsed.error().reason;
+    } else if (*parsed && (*parsed)->isWallClock()) {
+      timestampInfo_ = std::move(**parsed);
+    }
+
     // Check if SubscribeOk.largest indicates a track restart
     // Only consider it a restart if more than 2 groups behind (to avoid false
     // positives from timing)
-    const auto& subscribeOk = subHandle_->subscribeOk();
     auto largestSeen = testClient_.getLargestObjectSeen();
     if (largestSeen.has_value()) {
       auto subOkLargest =
@@ -197,14 +206,8 @@ ObjectReceiverCallback::FlowControlState SubscriberState::Callback::onObject(
     return FlowControlState::UNBLOCKED;
   }
   std::optional<uint64_t> latencyMs;
-  if (auto sendTs =
-          objHeader.extensions.getIntExtension(kTimestampExtensionType)) {
-    uint64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-    if (nowMs >= *sendTs) {
-      latencyMs = nowMs - *sendTs;
-    }
+  if (state_->timestampInfo_) {
+    latencyMs = objectLatencyMs(*state_->timestampInfo_, objHeader);
   }
   state_->testClient_.recordObject(
       payload ? payload->computeChainDataLength() : 0, latencyMs);

@@ -27,12 +27,6 @@ namespace {
 constexpr const char* kVideoTrack = "video";
 constexpr const char* kAudioTrack = "audio";
 
-uint64_t nowMs() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
-
 MoQTestParameters videoParams(const MeetingConfig& cfg) {
   MoQTestParameters params;
   params.forwardingPreference = ForwardingPreference::ONE_SUBGROUP_PER_GROUP;
@@ -214,8 +208,15 @@ class Participant : public Subscriber,
 // no-ops.
 class Participant::RxCallback : public ObjectReceiverCallback {
  public:
-  RxCallback(Participant& participant, bool video, bool selfEcho)
-      : participant_(&participant), video_(video), selfEcho_(selfEcho) {}
+  RxCallback(
+      Participant& participant,
+      bool video,
+      bool selfEcho,
+      std::optional<TrackTimestampInfo> timestampInfo)
+      : participant_(&participant),
+        video_(video),
+        selfEcho_(selfEcho),
+        timestampInfo_(std::move(timestampInfo)) {}
 
   void detach() {
     participant_ = nullptr;
@@ -269,6 +270,7 @@ class Participant::RxCallback : public ObjectReceiverCallback {
   bool video_;
   bool selfEcho_;
   bool sawObject_{false};
+  std::optional<TrackTimestampInfo> timestampInfo_;
   std::optional<uint64_t> highestAudioGroup_;
   std::deque<uint64_t> missingAudioGroups_;
   uint64_t badAudio_{0};
@@ -316,12 +318,8 @@ ObjectReceiverCallback::FlowControlState Participant::RxCallback::onObject(
   const auto& cfg = participant_->cfg_;
   uint64_t bytes = payload ? payload->computeChainDataLength() : 0;
   std::optional<uint64_t> latencyMs;
-  if (auto sendTs =
-          header.extensions.getIntExtension(kTimestampExtensionType)) {
-    auto now = nowMs();
-    if (now >= *sendTs) {
-      latencyMs = now - *sendTs;
-    }
+  if (timestampInfo_) {
+    latencyMs = objectLatencyMs(*timestampInfo_, header);
   }
 
   if (video_) {
@@ -486,7 +484,16 @@ Subscriber::PublishResult Participant::publish(
     XLOG_EVERY_MS(WARN, 10000)
         << "Relay echoed a participant's own track back to it: " << ftn;
   }
-  auto callback = std::make_shared<RxCallback>(*this, video, selfEcho);
+  std::optional<TrackTimestampInfo> timestampInfo;
+  auto parsed = TrackTimestampInfo::fromTrackProperties(pub.extensions);
+  if (parsed.hasError()) {
+    XLOG_EVERY_MS(WARN, 10000) << "Malformed timestamp properties on " << ftn
+                               << ": " << parsed.error().reason;
+  } else if (*parsed && (*parsed)->isWallClock()) {
+    timestampInfo = std::move(**parsed);
+  }
+  auto callback = std::make_shared<RxCallback>(
+      *this, video, selfEcho, std::move(timestampInfo));
   auto receiver =
       std::make_shared<ObjectReceiver>(ObjectReceiver::SUBSCRIBE, callback);
   rxTracks_.push_back({callback, std::move(handle)});
