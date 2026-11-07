@@ -35,13 +35,25 @@ convertTrackNamespaceToMoqTestParam(TrackNamespace* track);
 // Splits a '/'-separated --ns_prefix into tuples.
 std::vector<std::string> parseNsPrefix(const std::string& prefix);
 
-// Stamps the Object at `location` with the current wall-clock time when
-// `timestampInfo` is set.
 std::vector<Extension> getExtensions(
     int integerExtensionId,
-    int variableExtensionId,
-    const std::optional<TrackTimestampInfo>& timestampInfo = std::nullopt,
-    AbsoluteLocation location = {});
+    int variableExtensionId);
+
+// Appends the OBJECT_TIMESTAMP for the Object at `location` sent at
+// `sendTime`. Returns the correction when a mapped track sends the Object off
+// its schedule.
+std::optional<int64_t> appendSendTime(
+    std::vector<Extension>& extensions,
+    const TrackTimestampInfo& timestampInfo,
+    AbsoluteLocation location,
+    std::chrono::system_clock::time_point sendTime =
+        std::chrono::system_clock::now());
+
+// Maps each Object to its paced send time on a track that starts at `start`.
+// nullopt when the track is not paced or the values overflow.
+std::optional<TrackTimestampInfo> scheduleTimestampInfo(
+    const MoQTestParameters& params,
+    std::chrono::system_clock::time_point start);
 
 // Milliseconds from the Object's wall-clock timestamp to now. nullopt when the
 // timestamp is missing, malformed, or in the future.
