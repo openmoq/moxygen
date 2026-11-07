@@ -52,6 +52,7 @@ jobs:
             cache_prefix: ci-asan-ubuntu-22.04
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - name: Fix workspace ownership (self-hosted)
         if: ${{ contains(toJSON(matrix.runner), 'self-hosted') }}
@@ -240,6 +241,7 @@ jobs:
 
     name: publish (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     container:
       image: ${{ matrix.container || null }}
       options: ${{ matrix.cache_opts || '' }}

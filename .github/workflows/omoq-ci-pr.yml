@@ -41,6 +41,7 @@ jobs:
     # head.repo.fork is the wrong check — openmoq/moxygen is itself a fork of
     # upstream, so it's always true. Compare full_name to github.repository.
     runs-on: ${{ fromJSON(matrix.self_hosted && github.event.pull_request.head.repo.full_name == github.repository && '["self-hosted","build"]' || format('["{0}"]', matrix.runner)) }}
+    timeout-minutes: 60
     env:
       SELF_HOSTED: ${{ (matrix.self_hosted && github.event.pull_request.head.repo.full_name == github.repository) && 'true' || 'false' }}
     steps:
