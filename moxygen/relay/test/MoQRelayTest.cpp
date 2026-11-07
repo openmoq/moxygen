@@ -1098,6 +1098,287 @@ TEST_F(MoQRelayTest, SubscribeNamespaceDoesntAddDrainingPublish) {
   removeSession(subscriber2);
 }
 
+TEST_F(MoQRelayTest, RepublishWhileSubscriberDrainsAfterPublishDone) {
+  auto publisherSession = createMockSession();
+  auto publisherSession2 = createMockSession();
+  auto subscriber = createMockSession();
+  const FullTrackName ftn{kTestNamespace, "track_stream"};
+
+  doSubscribeNamespace(subscriber, kTestNamespace, /*addToState=*/false);
+  auto mockConsumer = createMockConsumer();
+  EXPECT_CALL(*subscriber, publish(testing::_, testing::_))
+      .WillOnce([mockConsumer](const auto& /*pubReq*/, auto /*subHandle*/) {
+        return Subscriber::PublishResult(
+            Subscriber::PublishConsumerAndReplyTask{
+                mockConsumer,
+                []() -> folly::coro::Task<
+                         folly::Expected<PublishOk, PublishError>> {
+                  co_return PublishOk{/*requestID=*/RequestID(1),
+                                      /*forward=*/true,
+                                      /*subscriberPriority=*/0,
+                                      /*groupOrder=*/GroupOrder::OldestFirst,
+                                      LocationFilter::nextObject()};
+                }()});
+      })
+      .WillOnce([](const auto& /*pubReq*/, auto /*subHandle*/) {
+        return folly::makeUnexpected(PublishError{});
+      });
+  auto sg = std::make_shared<NiceMock<MockSubgroupConsumer>>();
+  ON_CALL(*sg, endOfSubgroup()).WillByDefault(Return(folly::unit));
+  EXPECT_CALL(*mockConsumer, beginSubgroup(_, _, _, _))
+      .WillOnce([sg](
+                    uint64_t,
+                    uint64_t,
+                    uint8_t,
+                    moxygen::TrackConsumer::BeginSubgroupOptions) {
+        return folly::
+            makeExpected<MoQPublishError, std::shared_ptr<SubgroupConsumer>>(
+                sg);
+      });
+
+  auto pubConsumer = doPublish(publisherSession, ftn, /*addToState=*/false);
+  exec_->drive();
+  auto subgroup = *pubConsumer->beginSubgroup(0, 0, 0);
+
+  // The open subgroup keeps the subscriber draining, so the relay keeps the
+  // subscription entry after the publisher's handle is cleared.
+  EXPECT_CALL(*mockConsumer, publishDone(testing::_))
+      .WillRepeatedly(Return(folly::unit));
+  EXPECT_TRUE(pubConsumer
+                  ->publishDone(
+                      {RequestID(1),
+                       PublishDoneStatusCode::TRACK_ENDED,
+                       0,
+                       "track ended"})
+                  .hasValue());
+
+  // A reconnecting publisher replaces that entry.
+  auto pubConsumer2 = doPublish(publisherSession2, ftn);
+  exec_->drive();
+
+  subgroup->endOfSubgroup();
+  removeSession(publisherSession);
+  removeSession(publisherSession2);
+  removeSession(subscriber);
+}
+
+class MoQRelayPublisherReconnectTest : public MoQRelayTest {
+ protected:
+  void SetUp() override {
+    MoQRelayTest::SetUp();
+    publisherSession1_ = createMockSession();
+    publisherSession2_ = createMockSession();
+    subscriberSession_ = createMockSession();
+  }
+
+  // Runs inside publisherSession1's upstream subscribe(): publisher 2 takes
+  // over the namespace, which erases the subscribe-path entry, then publishes
+  // the track, which creates a new entry with its promise already satisfied.
+  folly::coro::Task<void> reconnectAndPublish() {
+    {
+      folly::RequestContextScopeGuard ctx;
+      folly::RequestContext::get()->setContextData(
+          sessionRequestToken(),
+          std::make_unique<MoQSession::MoQSessionRequestData>(
+              publisherSession2_));
+      PublishNamespace pubNs;
+      pubNs.trackNamespace = kTestNamespace;
+      auto nsRes = co_await relay_->publishNamespace(std::move(pubNs), nullptr);
+      EXPECT_TRUE(nsRes.hasValue());
+      if (nsRes.hasValue()) {
+        getOrCreateMockState(publisherSession2_)
+            ->publishNamespaceHandles.push_back(*nsRes);
+      }
+      PublishRequest pub;
+      pub.fullTrackName = kTestTrackName;
+      auto res =
+          relay_->publish(std::move(pub), createMockSubscriptionHandle());
+      EXPECT_TRUE(res.hasValue());
+      if (res.hasValue()) {
+        pub2Consumer_ = res->consumer;
+      }
+    }
+  }
+
+  Publisher::SubscribeResult subscribe() {
+    return withSessionContext(subscriberSession_, [&]() {
+      SubscribeRequest sub;
+      sub.fullTrackName = kTestTrackName;
+      sub.requestID = RequestID(1);
+      sub.filter = LocationFilter::nextObject();
+      return folly::coro::blockingWait(
+          relay_->subscribe(std::move(sub), createMockConsumer()), exec_.get());
+    });
+  }
+
+  void cleanup() {
+    if (pub2Consumer_) {
+      pub2Consumer_->publishDone(
+          {RequestID(0),
+           PublishDoneStatusCode::SESSION_CLOSED,
+           0,
+           "test cleanup"});
+    }
+    removeSession(publisherSession1_);
+    removeSession(publisherSession2_);
+    removeSession(subscriberSession_);
+  }
+
+  std::shared_ptr<MockMoQSession> publisherSession1_;
+  std::shared_ptr<MockMoQSession> publisherSession2_;
+  std::shared_ptr<MockMoQSession> subscriberSession_;
+  std::shared_ptr<TrackConsumer> pub2Consumer_;
+};
+
+TEST_F(MoQRelayPublisherReconnectTest, UpstreamSubscribeErrorSkipsStaleGuard) {
+  doPublishNamespace(publisherSession1_, kTestNamespace);
+  EXPECT_CALL(*publisherSession1_, subscribe(_, _))
+      .WillOnce(
+          [this](SubscribeRequest, std::shared_ptr<TrackConsumer>)
+              -> folly::coro::Task<Publisher::SubscribeResult> {
+            co_await reconnectAndPublish();
+            co_return folly::makeUnexpected(
+                SubscribeError{
+                    RequestID(0),
+                    SubscribeErrorCode::INTERNAL_ERROR,
+                    "upstream session cancelled"});
+          });
+
+  EXPECT_FALSE(subscribe().hasValue());
+  cleanup();
+}
+
+TEST_F(MoQRelayPublisherReconnectTest, UpstreamSubscribeOkFailsAfterReconnect) {
+  doPublishNamespace(publisherSession1_, kTestNamespace);
+  EXPECT_CALL(*publisherSession1_, subscribe(_, _))
+      .WillOnce(
+          [this](SubscribeRequest subReq, std::shared_ptr<TrackConsumer>)
+              -> folly::coro::Task<Publisher::SubscribeResult> {
+            co_await reconnectAndPublish();
+            SubscribeOk ok;
+            ok.requestID = subReq.requestID;
+            ok.trackAlias = TrackAlias(subReq.requestID.value);
+            ok.expires = std::chrono::milliseconds(0);
+            ok.groupOrder = GroupOrder::OldestFirst;
+            co_return std::make_shared<NiceMock<MockSubscriptionHandle>>(
+                std::move(ok));
+          });
+
+  auto result = subscribe();
+  ASSERT_FALSE(result.hasValue());
+  EXPECT_EQ(
+      result.error().reasonPhrase, "publisher reconnected during subscribe");
+  cleanup();
+}
+
+class MoQRelayRendezvousTest : public MoQRelayTest {
+ protected:
+  std::shared_ptr<MockMoQSession> createV18Session() {
+    auto session = createMockSession();
+    ON_CALL(*session, getNegotiatedVersion())
+        .WillByDefault(Return(std::optional<uint64_t>(kVersionDraft18)));
+    return session;
+  }
+
+  folly::SemiFuture<Publisher::SubscribeResult> startRendezvousSubscribe(
+      std::shared_ptr<MoQSession> session,
+      const FullTrackName& ftn,
+      std::shared_ptr<TrackConsumer> consumer) {
+    SubscribeRequest sub;
+    sub.fullTrackName = ftn;
+    sub.requestID = RequestID(0);
+    sub.filter = LocationFilter::nextObject();
+    sub.params.setMajorVersion(getDraftMajorVersion(kVersionDraft18));
+    EXPECT_TRUE(
+        sub.params
+            .insertParam(Parameter(
+                folly::to_underlying(TrackRequestParamKey::RENDEZVOUS_TIMEOUT),
+                5000))
+            .hasValue());
+    return withSessionContext(session, [&]() {
+      return co_withExecutor(
+                 exec_.get(), relay_->subscribe(std::move(sub), consumer))
+          .start();
+    });
+  }
+};
+
+TEST_F(MoQRelayRendezvousTest, MultipleWaitersOnSameTrackAllResolveOnPublish) {
+  auto subSessionA = createV18Session();
+  auto subSessionB = createV18Session();
+  auto futureA = startRendezvousSubscribe(
+      subSessionA, kTestTrackName, createMockConsumer());
+  auto futureB = startRendezvousSubscribe(
+      subSessionB, kTestTrackName, createMockConsumer());
+  exec_->drive();
+  ASSERT_FALSE(futureA.isReady());
+  ASSERT_FALSE(futureB.isReady());
+
+  auto pubSession = createMockSession();
+  doPublish(pubSession, kTestTrackName);
+  exec_->drive();
+
+  ASSERT_TRUE(futureA.isReady());
+  ASSERT_TRUE(futureB.isReady());
+  auto resultA = std::move(futureA).value();
+  auto resultB = std::move(futureB).value();
+  ASSERT_TRUE(resultA.hasValue());
+  ASSERT_TRUE(resultB.hasValue());
+  getOrCreateMockState(subSessionA)->subscribeHandles.push_back(*resultA);
+  getOrCreateMockState(subSessionB)->subscribeHandles.push_back(*resultB);
+
+  removeSession(pubSession);
+  removeSession(subSessionA);
+  removeSession(subSessionB);
+}
+
+TEST_F(
+    MoQRelayRendezvousTest,
+    MultipleWaitersUnderNamespaceAllResolveOnPublishNamespace) {
+  auto subSessionA = createV18Session();
+  auto subSessionB = createV18Session();
+  const FullTrackName ftnA{kTestNamespace, "track1"};
+  const FullTrackName ftnB{kTestNamespace, "track2"};
+  auto futureA =
+      startRendezvousSubscribe(subSessionA, ftnA, createMockConsumer());
+  auto futureB =
+      startRendezvousSubscribe(subSessionB, ftnB, createMockConsumer());
+  exec_->drive();
+  ASSERT_FALSE(futureA.isReady());
+  ASSERT_FALSE(futureB.isReady());
+
+  auto pubSession = createMockSession();
+  EXPECT_CALL(*pubSession, subscribe(_, _))
+      .Times(2)
+      .WillRepeatedly([](const auto& /*req*/, auto /*consumer*/) {
+        SubscribeOk ok;
+        ok.requestID = RequestID(1);
+        ok.trackAlias = TrackAlias(1);
+        ok.expires = std::chrono::milliseconds(0);
+        ok.groupOrder = GroupOrder::OldestFirst;
+        auto handle = std::make_shared<NiceMock<MockSubscriptionHandle>>(ok);
+        return folly::coro::makeTask<Publisher::SubscribeResult>(
+            folly::
+                Expected<std::shared_ptr<SubscriptionHandle>, SubscribeError>(
+                    handle));
+      });
+  doPublishNamespace(pubSession, kTestNamespace);
+  exec_->drive();
+
+  ASSERT_TRUE(futureA.isReady());
+  ASSERT_TRUE(futureB.isReady());
+  auto resultA = std::move(futureA).value();
+  auto resultB = std::move(futureB).value();
+  ASSERT_TRUE(resultA.hasValue());
+  ASSERT_TRUE(resultB.hasValue());
+  getOrCreateMockState(subSessionA)->subscribeHandles.push_back(*resultA);
+  getOrCreateMockState(subSessionB)->subscribeHandles.push_back(*resultB);
+
+  removeSession(pubSession);
+  removeSession(subSessionA);
+  removeSession(subSessionB);
+}
+
 TEST_F(MoQRelayTest, SubscribeNamespaceEmptyPrefixAllowedV16) {
   auto session = createMockSession();
   // Override the negotiated version to draft-16
@@ -3095,6 +3376,33 @@ TEST_F(MoQRelayTest, OnPublishOkUpdatesForwardingCount) {
   ASSERT_EQ(cb->calls.size(), 1u)
       << "forwardChanged must fire when count rises to 1";
   EXPECT_EQ(cb->calls[0], 1u);
+}
+
+TEST_F(MoQRelayTest, PublishOkForwardFalseWhenNoSubscriberForwards) {
+  auto subSession = createMockSession();
+  setupPublishSucceeds(subSession);
+  doSubscribeNamespaceWithForward(
+      subSession, kTestNamespace, /*forward=*/false);
+
+  auto pubSession = createMockSession();
+  std::shared_ptr<TrackConsumer> pubConsumer;
+  withSessionContext(pubSession, [&]() {
+    PublishRequest pub;
+    pub.fullTrackName = kTestTrackName;
+    auto res = relay_->publish(std::move(pub), createMockSubscriptionHandle());
+    ASSERT_TRUE(res.hasValue());
+    pubConsumer = res->consumer;
+    auto publishOk =
+        folly::coro::blockingWait(std::move(res->reply), exec_.get());
+    ASSERT_TRUE(publishOk.hasValue());
+    EXPECT_FALSE(publishOk->forward);
+  });
+  exec_->drive();
+
+  pubConsumer->publishDone(
+      {RequestID(0), PublishDoneStatusCode::SESSION_CLOSED, 0, "cleanup"});
+  removeSession(subSession);
+  removeSession(pubSession);
 }
 
 // When a subscriber with forward=true joins a namespace whose track forwarder

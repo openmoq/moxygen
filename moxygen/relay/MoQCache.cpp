@@ -4,6 +4,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <folly/ScopeGuard.h>
 #include <folly/logging/xlog.h>
 #include <moxygen/relay/MoQCache.h>
 
@@ -609,7 +610,7 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
         cacheGroupPtr_(std::move(cacheGroupPtr)),
         cacheGroup_(*cacheGroupPtr_),
         cache_(cache) {
-    cache_.removeGroupFromLRU(cacheGroup_, cacheTrack_);
+    cache_.pinGroup(cacheGroup_, cacheTrack_);
   }
   SubgroupWriteback() = delete;
   SubgroupWriteback(const SubgroupWriteback&) = delete;
@@ -620,7 +621,7 @@ class MoQCache::SubgroupWriteback : public SubgroupConsumer {
   ~SubgroupWriteback() override {
     // TODO: If the publisher writes many groups concurrently, all are pinned
     // and none can be evicted, potentially using a lot of memory.
-    cache_.addGroupToLRU(group_, cacheGroup_, cacheTrack_);
+    cache_.unpinGroup(group_, cacheGroup_, cacheTrack_);
   }
 
   folly::Expected<folly::Unit, MoQPublishError> object(
@@ -957,16 +958,12 @@ class MoQCache::SubscribeWriteback : public TrackConsumer {
 
 MoQCache::FetchWriteback* MoQCache::CacheTrack::findFetchInProgress(
     AbsoluteLocation loc) {
-  if (fetchesInProgress.empty()) {
-    return nullptr;
-  }
-  auto it = fetchesInProgress.upper_bound(loc);
-  if (it == fetchesInProgress.begin()) {
-    return nullptr;
-  }
-  --it;
-  if (loc >= it->first && loc < it->second.end && loc >= it->second.progress) {
-    return it->second.writeback;
+  for (auto it = fetchesInProgress.upper_bound(loc);
+       it != fetchesInProgress.begin();) {
+    const auto& entry = (--it)->second;
+    if (loc < entry.end && loc >= entry.progress) {
+      return entry.writeback;
+    }
   }
   return nullptr;
 }
@@ -1008,17 +1005,27 @@ class MoQCache::FetchWriteback : public FetchConsumer {
     inProgress_.post();
     if (fetchRangeIt_.isValid()) {
       auto current = *fetchRangeIt_;
-      fetchInProgressIt_->second.progress = current;
-      // Re-key the map entry when crossing a group boundary so the
-      // old key slot is available for new fetches of evicted groups.
-      if (current.group > fetchInProgressIt_->first.group) {
-        auto entry = fetchInProgressIt_->second;
-        eraseAndMakeGroupEvictable();
-        emplaceAndPinGroup(current, entry);
+      // A group-boundary crossing at the range end may already have retired
+      // the entry.
+      if (fetchInProgressIt_ != fetchRangeIt_.track->fetchesInProgress.end()) {
+        fetchInProgressIt_->second.progress = current;
+        // Re-key the entry when crossing a group boundary so the fetch pins
+        // the group it is writing.
+        if (current.group > fetchInProgressIt_->first.group) {
+          if (current < fetchRangeIt_.maxLocation) {
+            auto entry = fetchInProgressIt_->second;
+            eraseAndMakeGroupEvictable();
+            emplaceAndPinGroup(current, entry);
+          } else {
+            eraseAndMakeGroupEvictable();
+          }
+        }
       }
       inProgress_.reset();
     } else {
-      eraseAndMakeGroupEvictable();
+      if (fetchInProgressIt_ != fetchRangeIt_.track->fetchesInProgress.end()) {
+        eraseAndMakeGroupEvictable();
+      }
     }
   }
 
@@ -1158,12 +1165,13 @@ class MoQCache::FetchWriteback : public FetchConsumer {
     group.totalBytes += addedBytes;
     cache_.totalCachedBytes_ += addedBytes;
     cache_.evictForByteLimitIfNeeded();
-    if (finFetch) {
-      // Iterator still ON the just-completed object; step past it before
-      // tail-marking so the gap range doesn't overlap it. Use the iterator's
-      // order-aware end (DESC: lowest position; ASC: end_).
+    if (currentLength_ == 0 || finFetch) {
+      // A cursor left on a completed object makes the next object's
+      // markNonExistentTo() record this one as a gap.
       fetchRangeIt_.next();
-      markNonExistentTo(fetchRangeIt_.end());
+      if (finFetch) {
+        finishRange();
+      }
       updateInProgress();
     }
     return consumer_->objectPayload(std::move(payload), finFetch && proxyFin_);
@@ -1206,8 +1214,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
   }
 
   folly::Expected<folly::Unit, MoQPublishError> endOfFetch() override {
-    // Mark all remaining positions as known (upstream has completed)
-    markNonExistentTo(fetchRangeIt_.end());
+    finishRange();
     updateInProgress();
     complete_.post();
     if (proxyFin_) {
@@ -1265,6 +1272,14 @@ class MoQCache::FetchWriteback : public FetchConsumer {
         groupId, objectId, finFetch && proxyFin_);
   }
 
+  // A short fetch proves non-existence only below the FETCH_OK End Location.
+  void setUpstreamEnd(AbsoluteLocation end) {
+    upstreamEnd_ = end;
+    for (const auto& [start, gapEnd] : std::exchange(pendingGaps_, {})) {
+      insertGap(start, gapEnd);
+    }
+  }
+
   folly::coro::Task<void> complete() {
     co_await complete_;
   }
@@ -1291,10 +1306,8 @@ class MoQCache::FetchWriteback : public FetchConsumer {
   }
 
   void emplaceAndPinGroup(AbsoluteLocation loc, FetchInProgressEntry entry) {
-    auto [it, inserted] =
+    fetchInProgressIt_ =
         fetchRangeIt_.track->fetchesInProgress.emplace(loc, entry);
-    XCHECK(inserted);
-    fetchInProgressIt_ = it;
     // Eagerly create the group if it doesn't exist so we can pin it before
     // any object lands. Otherwise getOrCreateGroupWithEviction would put
     // it in the LRU and a concurrent eviction could free the group while
@@ -1307,7 +1320,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
           groupMap.emplace(loc.group, std::make_shared<CacheGroup>()).first;
     }
     pinnedGroup_ = groupIt->second;
-    cache_.removeGroupFromLRU(*pinnedGroup_, *fetchRangeIt_.track);
+    cache_.pinGroup(*pinnedGroup_, *fetchRangeIt_.track);
   }
 
   void eraseAndMakeGroupEvictable() {
@@ -1320,7 +1333,7 @@ class MoQCache::FetchWriteback : public FetchConsumer {
     fetchRangeIt_.track->fetchesInProgress.erase(fetchInProgressIt_);
     fetchInProgressIt_ = fetchRangeIt_.track->fetchesInProgress.end();
     if (pinnedGroup_) {
-      cache_.addGroupToLRU(groupID, *pinnedGroup_, *fetchRangeIt_.track);
+      cache_.unpinGroup(groupID, *pinnedGroup_, *fetchRangeIt_.track);
       pinnedGroup_.reset();
     }
   }
@@ -1339,6 +1352,8 @@ class MoQCache::FetchWriteback : public FetchConsumer {
   FetchRangeIterator fetchRangeIt_;
   MoQCache& cache_;
   FullTrackName ftn_;
+  std::optional<AbsoluteLocation> upstreamEnd_;
+  std::vector<std::pair<AbsoluteLocation, AbsoluteLocation>> pendingGaps_;
 
   void markNonExistentTo(AbsoluteLocation target) {
     // Mark all positions from current iterator position up to (but not
@@ -1354,11 +1369,31 @@ class MoQCache::FetchWriteback : public FetchConsumer {
         fetchRangeIt_.minLocation,
         fetchRangeIt_.maxLocation);
     for (const auto& [start, end] : ranges) {
-      fetchRangeIt_.track->insertGap(start, end);
+      insertGap(start, end);
     }
 
     // Advance iterator directly to target
     fetchRangeIt_.advanceTo(target);
+  }
+
+  // A DESC cursor ends at the lowest position and stays valid. Invalidate it so
+  // lookups above it do not wait on a finished fetch.
+  void finishRange() {
+    markNonExistentTo(fetchRangeIt_.end());
+    fetchRangeIt_.invalidate();
+  }
+
+  // Inclusive [start, end]. Held until FETCH_OK, which can arrive after the
+  // fetch stream FINs.
+  void insertGap(AbsoluteLocation start, AbsoluteLocation end) {
+    if (!upstreamEnd_) {
+      pendingGaps_.emplace_back(start, end);
+      return;
+    }
+    if (start >= *upstreamEnd_) {
+      return;
+    }
+    fetchRangeIt_.track->insertGap(start, std::min(end, *upstreamEnd_->prev()));
   }
 
   folly::Expected<folly::Unit, MoQPublishError> cacheImpl(
@@ -1402,10 +1437,8 @@ class MoQCache::FetchWriteback : public FetchConsumer {
       fetchRangeIt_.next();
       updateInProgress();
       if (finFetch) {
-        // Use the iterator's order-aware end. In DESC, end_ is the user's
-        // highest endpoint (the wrong direction); fetchRangeIt_.end()
-        // returns the iteration end (the lowest position).
-        markNonExistentTo(fetchRangeIt_.end());
+        finishRange();
+        updateInProgress();
         complete_.post();
       }
     }
@@ -1459,14 +1492,12 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetch(
         toExclusiveEnd(standalone->end),
         fetch.groupOrder,
         track);
-    auto res = co_await upstream->fetch(
-        fetch,
-        std::make_shared<FetchWriteback>(
-            true,
-            std::move(consumer),
-            fetchRangeIt,
-            *this,
-            fetch.fullTrackName));
+    auto writeback = std::make_shared<FetchWriteback>(
+        true, std::move(consumer), fetchRangeIt, *this, fetch.fullTrackName);
+    auto res = co_await upstream->fetch(fetch, writeback);
+    if (res.hasValue()) {
+      writeback->setUpstreamEnd(res.value()->fetchOk().endLocation);
+    }
     recordUpstreamEndOfTrack(*track, res);
     co_return res;
   }
@@ -1571,12 +1602,20 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchImpl(
       continue;
     }
 
-    // For hits, pin the group so evictOldestGroupsIfNeeded (triggered
-    // by FetchWriteback's cacheImpl during the await below) can't free
-    // the CacheEntry* we're about to publish. Skip for gap boundaries:
-    // no object to keep alive, and the gap's group may not exist, so
-    // groups[current.group] would auto-insert a null entry.
-    auto pin = cachedObject ? track->groups[current.group] : nullptr;
+    // Pin a hit's group out of the LRU until this iteration ends. The upstream
+    // fetch awaited below inserts groups, which can evict others, and the
+    // iterator skips the rest of a group that is no longer cached. A gap's
+    // group may not exist, and groups[current.group] would insert a null one.
+    std::shared_ptr<CacheGroup> pin;
+    if (cachedObject) {
+      pin = track->groups[current.group];
+      pinGroup(*pin, *track);
+    }
+    auto unpin = folly::makeGuard([this, &pin, &track, current] {
+      if (pin) {
+        unpinGroup(current.group, *pin, *track);
+      }
+    });
     // Boundary (hit or gap): flush any accumulated upstream miss range
     // so the upstream fetch doesn't span the boundary. A well-formed
     // upstream cannot transition this position from exists -> not-exists
@@ -1810,6 +1849,7 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchUpstream(
   }
 
   XLOG(DBG1) << "upstream success";
+  writeback->setUpstreamEnd(res.value()->fetchOk().endLocation);
   track->extensions = res.value()->fetchOk().extensions;
   recordUpstreamEndOfTrack(*track, res);
   if (lastObject) {
@@ -2338,6 +2378,10 @@ void MoQCache::addGroupToLRU(
     // Already in LRU
     return;
   }
+  auto it = track.groups.find(groupID);
+  if (track.evicted || it == track.groups.end() || it->second.get() != &group) {
+    return;
+  }
   track.groupLRU.push_front(groupID);
   group.lruIter_ = track.groupLRU.begin();
   XLOG(DBG2) << "Added group " << groupID << " to LRU";
@@ -2351,6 +2395,22 @@ void MoQCache::removeGroupFromLRU(CacheGroup& group, CacheTrack& track) {
   track.groupLRU.erase(*group.lruIter_);
   group.lruIter_.reset();
   XLOG(DBG2) << "Removed group from LRU";
+}
+
+void MoQCache::pinGroup(CacheGroup& group, CacheTrack& track) {
+  if (group.pinCount++ == 0) {
+    removeGroupFromLRU(group, track);
+  }
+}
+
+void MoQCache::unpinGroup(
+    uint64_t groupID,
+    CacheGroup& group,
+    CacheTrack& track) {
+  XCHECK_GT(group.pinCount, 0u);
+  if (--group.pinCount == 0) {
+    addGroupToLRU(groupID, group, track);
+  }
 }
 
 // ============================================================================
@@ -2394,6 +2454,7 @@ void MoQCache::evictTrack(const FullTrackName& ftn) {
   // Remove from LRU if present
   if (track.lruIter_.hasValue()) {
     trackLRU_.erase(*track.lruIter_);
+    track.lruIter_.reset();
   }
 
   // Subtract bytes for all groups in the track
@@ -2415,6 +2476,12 @@ void MoQCache::evictOldestGroupsIfNeeded(CacheTrack& track) {
   while (track.groups.size() > maxCachedGroupsPerTrack_ &&
          !track.groupLRU.empty()) {
     uint64_t oldestGroupID = track.groupLRU.back();
+    if (!track.groups.contains(oldestGroupID)) {
+      XLOG(DFATAL) << "groupLRU has stale entry for evicted group: "
+                   << oldestGroupID;
+      track.groupLRU.pop_back();
+      continue;
+    }
     XLOG(DBG1) << "Evicting oldest group: " << oldestGroupID << " (track has "
                << track.groups.size() << " groups)";
     evictGroup(track, oldestGroupID);
@@ -2438,6 +2505,7 @@ void MoQCache::evictGroup(CacheTrack& track, uint64_t groupID) {
   // Remove from LRU if present
   if (group.lruIter_.hasValue()) {
     track.groupLRU.erase(*group.lruIter_);
+    group.lruIter_.reset();
   }
 
   // Remove from cachedContent
@@ -2471,6 +2539,12 @@ bool MoQCache::evictForByteLimitIfNeeded() {
     if (!track.groupLRU.empty()) {
       // Evict oldest evictable group from the LRU track
       uint64_t oldestGroupID = track.groupLRU.back();
+      if (!track.groups.contains(oldestGroupID)) {
+        XLOG(DFATAL) << "groupLRU has stale entry for evicted group "
+                     << oldestGroupID << " in track " << oldestTrackName;
+        track.groupLRU.pop_back();
+        continue;
+      }
       XLOG(DBG1) << "Evicting group " << oldestGroupID << " from track "
                  << oldestTrackName
                  << " for byte limit (bytes: " << totalCachedBytes_

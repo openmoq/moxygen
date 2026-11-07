@@ -480,7 +480,11 @@ Subscriber::PublishResult MoQRelay::publish(
     // multipublisher
     XLOG(DBG1) << "New publisher for existing subscription";
     nodePtr->publishes.erase(pub.fullTrackName.trackName);
-    it->second.handle->unsubscribe();
+    // onPublishDoneImpl clears the handle but keeps the entry while
+    // subscribers drain.
+    if (it->second.handle) {
+      it->second.handle->unsubscribe();
+    }
     // Move the forwarder out and erase the entry BEFORE calling publishDone.
     // publishDone iterates subscribers via forEachSubscriber; if a subscriber
     // has no open subgroups, drainSubscriber → onEmpty fires. If the entry
@@ -519,12 +523,12 @@ Subscriber::PublishResult MoQRelay::publish(
   rsub.handle = std::move(handle);
   rsub.isPublish = true;
 
-  uint64_t nSubscribers = 0;
+  uint64_t nForwardingSubscribers = 0;
   for (auto& [outSession, info] : sessions) {
     if (outSession != session &&
         (info.options == SubscribeNamespaceOptions::PUBLISH ||
          info.options == SubscribeNamespaceOptions::BOTH)) {
-      nSubscribers++;
+      nForwardingSubscribers += info.forward;
       auto exec = outSession->getExecutor();
       co_withExecutor(
           exec, publishToSession(outSession, forwarder, info.forward))
@@ -535,7 +539,7 @@ Subscriber::PublishResult MoQRelay::publish(
   // options is irrelevant for this tree).
   for (auto& [outSession, info] : tracksSessions) {
     if (outSession != session) {
-      nSubscribers++;
+      nForwardingSubscribers += info.forward;
       auto exec = outSession->getExecutor();
       co_withExecutor(
           exec,
@@ -560,7 +564,7 @@ Subscriber::PublishResult MoQRelay::publish(
 
   wakePendingRendezvousForTrack(pub.fullTrackName);
 
-  const bool shouldForward = nSubscribers > 0;
+  const bool shouldForward = nForwardingSubscribers > 0;
   PublishOk publishOk;
   publishOk.requestID = pub.requestID;
   if (majorVersion >= 22) {
@@ -1610,16 +1614,19 @@ void MoQRelay::erasePendingRendezvousFromNode(
   }
 }
 
-void MoQRelay::wakePendingRendezvousSubtree(PendingRendezvousNode& node) {
+void MoQRelay::wakePendingRendezvousSubtree(
+    PendingRendezvousNode& node,
+    PendingRendezvousNode::WaiterList& toWake) {
   for (auto& [_, trackWaiters] : node.waitersByTrack) {
-    for (auto& waiter : trackWaiters) {
-      waiter->baton.signal();
-    }
-  }
-  for (auto& [_, child] : node.children) {
-    wakePendingRendezvousSubtree(*child);
+    toWake.insert(
+        toWake.end(),
+        std::make_move_iterator(trackWaiters.begin()),
+        std::make_move_iterator(trackWaiters.end()));
   }
   node.waitersByTrack.clear();
+  for (auto& [_, child] : node.children) {
+    wakePendingRendezvousSubtree(*child, toWake);
+  }
   node.children.clear();
 }
 
@@ -1654,22 +1661,29 @@ void MoQRelay::applyFnAtNamespaceNode(
 }
 
 void MoQRelay::wakePendingRendezvousForTrack(const FullTrackName& ftn) {
-  applyFnAtNamespaceNode(
-      ftn.trackNamespace, [&ftn](PendingRendezvousNode& node) {
-        auto waitersIt = node.waitersByTrack.find(ftn.trackName);
-        if (waitersIt != node.waitersByTrack.end()) {
-          for (auto& waiter : waitersIt->second) {
-            waiter->baton.signal();
-          }
-          node.waitersByTrack.erase(waitersIt);
-        }
-      });
+  PendingRendezvousNode::WaiterList toWake;
+  applyFnAtNamespaceNode(ftn.trackNamespace, [&](PendingRendezvousNode& node) {
+    auto waitersIt = node.waitersByTrack.find(ftn.trackName);
+    if (waitersIt != node.waitersByTrack.end()) {
+      toWake = std::move(waitersIt->second);
+      node.waitersByTrack.erase(waitersIt);
+    }
+  });
+  // signal() may resume the waiter inline, and its cleanup re-enters
+  // erasePendingRendezvous(), so signal only once the walk is done.
+  for (auto& waiter : toWake) {
+    waiter->baton.signal();
+  }
 }
 
 void MoQRelay::wakePendingRendezvousUnderNamespace(const TrackNamespace& ns) {
-  applyFnAtNamespaceNode(ns, [](PendingRendezvousNode& node) {
-    wakePendingRendezvousSubtree(node);
+  PendingRendezvousNode::WaiterList toWake;
+  applyFnAtNamespaceNode(ns, [&](PendingRendezvousNode& node) {
+    wakePendingRendezvousSubtree(node, toWake);
   });
+  for (auto& waiter : toWake) {
+    waiter->baton.signal();
+  }
 }
 
 folly::coro::Task<Publisher::SubscribeResult>
@@ -1771,12 +1785,18 @@ MoQRelay::subscribeToFirstRelaySubscription(
   // The iterator returned from emplace does not survive across coroutine
   // resumption, so both the guard and updating the RelaySubscription below
   // require another lookup in the subscriptions_ map.
-  auto g = folly::makeGuard([this, trackName = subReq.fullTrackName] {
+  // A reconnecting publisher may replace this entry before we resume.
+  auto g = folly::makeGuard([this,
+                             trackName = subReq.fullTrackName,
+                             weakForwarder = std::weak_ptr(forwarder)] {
     auto it = subscriptions_.find(trackName);
-    if (it != subscriptions_.end()) {
+    if (it != subscriptions_.end() &&
+        it->second.forwarder == weakForwarder.lock()) {
       it->second.promise.setException(std::runtime_error("failed"));
       XLOG(DBG4) << "Erasing subscription to " << it->first;
       subscriptions_.erase(it);
+    } else {
+      XLOG(DBG4) << "Skipping stale guard for " << trackName;
     }
   });
   // Add subscriber first in case objects come before subscribe OK.
@@ -1832,6 +1852,15 @@ MoQRelay::subscribeToFirstRelaySubscription(
   if (it == subscriptions_.end()) {
     XLOG(ERR) << "Subscription is GONE, returning exception";
     co_yield folly::coro::co_error(std::runtime_error("subscription is gone"));
+  }
+  if (it->second.forwarder != forwarder) {
+    XLOG(ERR) << "Subscription replaced by reconnecting publisher: "
+              << subReq.fullTrackName;
+    co_return folly::makeUnexpected(
+        SubscribeError{
+            subReq.requestID,
+            SubscribeErrorCode::INTERNAL_ERROR,
+            "publisher reconnected during subscribe"});
   }
   auto& rsub = it->second;
   rsub.handle = std::move(subRes.value());

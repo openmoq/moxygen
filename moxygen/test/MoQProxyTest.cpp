@@ -340,6 +340,36 @@ TEST_F(MoQProxyTest, CreatesSeparateTracksForDifferentNames) {
   audio.value()->unsubscribe();
 }
 
+TEST_F(MoQProxyTest, SessionGoawayReachesEveryTrackOnThatSession) {
+  auto videoHandle = makeUpstreamHandle(RequestID(100));
+  auto audioHandle = makeUpstreamHandle(RequestID(101));
+  EXPECT_CALL(*upstreamSession_, subscribe(_, _))
+      .WillOnce(Invoke(
+          [videoHandle](SubscribeRequest, std::shared_ptr<TrackConsumer>)
+              -> folly::coro::Task<Publisher::SubscribeResult> {
+            co_return Publisher::SubscribeResult(videoHandle);
+          }))
+      .WillOnce(Invoke(
+          [audioHandle](SubscribeRequest, std::shared_ptr<TrackConsumer>)
+              -> folly::coro::Task<Publisher::SubscribeResult> {
+            co_return Publisher::SubscribeResult(audioHandle);
+          }));
+  auto video =
+      subscribe(makeDownstreamSession(), makeSubscribeRequest(RequestID(1)));
+  auto audio = subscribe(
+      makeDownstreamSession(),
+      makeSubscribeRequest(RequestID(2), kOtherTrackName));
+  ASSERT_TRUE(video.hasValue());
+  ASSERT_TRUE(audio.hasValue());
+
+  static_cast<MoQControlCodec::ControlCallback&>(*upstreamSession_)
+      .onGoaway(Goaway{});
+
+  EXPECT_EQ(proxy_->switchStats().upstreamGoaways, 2);
+  video.value()->unsubscribe();
+  audio.value()->unsubscribe();
+}
+
 TEST_F(MoQProxyTest, RecreatesTrackAfterLastSubscriberLeaves) {
   auto firstUpstreamHandle = makeUpstreamHandle(RequestID(100));
   auto secondUpstreamHandle = makeUpstreamHandle(RequestID(101));
@@ -371,7 +401,7 @@ TEST_F(MoQProxyTest, RecreatesTrackAfterLastSubscriberLeaves) {
   second.value()->unsubscribe();
 }
 
-TEST_F(MoQProxyTest, CloseStopsTracksAndRejectsNewSubscriptions) {
+TEST_F(MoQProxyTest, CloseEndsViewersWithGoingAwayAndRejectsNewSubscriptions) {
   auto upstreamHandle = makeUpstreamHandle(RequestID(100));
   auto downstreamConsumer = makeConsumer();
   EXPECT_CALL(*upstreamSession_, subscribe(_, _))
@@ -387,7 +417,10 @@ TEST_F(MoQProxyTest, CloseStopsTracksAndRejectsNewSubscriptions) {
   ASSERT_TRUE(result.hasValue());
 
   EXPECT_CALL(*upstreamHandle, unsubscribe());
-  EXPECT_CALL(*downstreamConsumer, publishDone(_));
+  EXPECT_CALL(
+      *downstreamConsumer,
+      publishDone(
+          Field(&PublishDone::statusCode, PublishDoneStatusCode::GOING_AWAY)));
   proxy_->close();
 
   auto rejected =

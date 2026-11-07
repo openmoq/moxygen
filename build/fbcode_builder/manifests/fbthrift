@@ -64,14 +64,8 @@ zlib
 # THRIFT_RPC=ON.
 [dependencies.feature_rpc=on]
 fizz
-libsodium
 wangle
 mvfst
-
-# Pulled only when benchmark executables are enabled; gated inside fbthrift's
-# CMake by THRIFT_BENCHMARKS=ON.
-[dependencies.feature_benchmark=on]
-benchmark
 
 [shipit.pathmap]
 xplat/thrift/public_tld = .

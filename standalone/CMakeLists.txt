@@ -45,13 +45,13 @@ option(BUNDLE_DEPS "Build all dep targets for artifact bundling" OFF)
 option(INSTALL_DEPS "Build and install all transitive dep targets" OFF)
 option(BUILD_PICOQUIC "Build with picoquic transport support" ON)
 
-# When ON, statically link glog/gflags/double-conversion into the bundled
+# When ON, statically link glog/gflags into the bundled
 # artifact. OFF (default) preserves the legacy behavior where these libs
 # stay dynamic so consumers' find_package(Glog) etc. resolve to the same
 # system .so. ON is intended for portable production tarballs that need to
 # run across Ubuntu/Debian/RHEL releases without matching SONAMEs.
 option(BUNDLE_DEPS_STATIC_SYSLIBS
-    "Static-link glog/gflags/double-conversion in BUNDLE_DEPS artifact" OFF)
+    "Static-link glog/gflags in BUNDLE_DEPS artifact" OFF)
 
 # Consumers of the resulting archives must build with the same -fsanitize= flags.
 set(MOXYGEN_SANITIZER "" CACHE STRING
@@ -216,7 +216,7 @@ include_directories(BEFORE SYSTEM ${OPENSSL_INCLUDE_DIR})
 # folly-targets.cmake hardcodes .so paths. Consumers' own find_package(Glog)
 # then resolve to the same .so — no dual-linkage under ASAN.
 # BUNDLE_DEPS_STATIC_SYSLIBS=ON: omit the override so the BUNDLE_DEPS
-# .a preference applies, statically linking glog/gflags/double-conversion
+# .a preference applies, statically linking glog/gflags
 # into the artifact for cross-distro portability.
 if(BUNDLE_DEPS AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
         AND NOT BUNDLE_DEPS_STATIC_SYSLIBS)
@@ -225,13 +225,11 @@ if(BUNDLE_DEPS AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
 endif()
 find_package(gflags CONFIG REQUIRED)
 find_package(Glog REQUIRED)
-find_package(double-conversion CONFIG REQUIRED)
 if(BUNDLE_DEPS AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
         AND NOT BUNDLE_DEPS_STATIC_SYSLIBS)
     set(CMAKE_FIND_LIBRARY_SUFFIXES "${_saved_suffixes}")
 endif()
-find_package(Boost 1.70 REQUIRED COMPONENTS
-    context filesystem program_options regex)
+find_package(Boost 1.70 REQUIRED COMPONENTS context regex)
 find_package(ZLIB REQUIRED)
 find_package(Zstd REQUIRED)
 find_package(LibEvent REQUIRED)

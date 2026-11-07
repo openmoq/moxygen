@@ -746,6 +746,84 @@ CO_TEST_F(MoQCacheTest, TestFetchMissWholeEndGroup) {
   serveCacheRangeFromUpstream({0, 0}, {3, 0});
 }
 
+// A fetch stream that FINs short proves non-existence only up to the FETCH_OK
+// End Location (MoQT, Fetch Handling). The rest of the range stays unknown.
+CO_TEST_F(MoQCacheTest, TestFetchMissEmptyPastUpstreamEndStaysUnknown) {
+  expectUpstreamFetch({0, 0}, {2, 0}, 0, AbsoluteLocation{0, 5});
+  auto res =
+      co_await cache_.fetch(getFetch({0, 0}, {2, 0}), consumer_, upstream_);
+  EXPECT_TRUE(res.hasValue());
+  EXPECT_CALL(*consumer_, endOfFetch()).WillOnce(Return(folly::unit));
+  upstreamFetchConsumer_->endOfFetch();
+  co_await folly::coro::co_reschedule_on_current_executor;
+
+  auto consumer2 = std::make_shared<StrictMock<moxygen::MockFetchConsumer>>();
+  expectUpstreamFetch({1, 0}, {1, 10}, 0, AbsoluteLocation{1, 10});
+  res = co_await cache_.fetch(getFetch({1, 0}, {1, 10}), consumer2, upstream_);
+  EXPECT_TRUE(res.hasValue());
+}
+
+// Same, with the FIN arriving ahead of FETCH_OK.
+CO_TEST_F(MoQCacheTest, TestFetchMissEmptyBeforeFetchOkStaysUnknown) {
+  EXPECT_CALL(*consumer_, endOfFetch()).WillOnce(Return(folly::unit));
+  expectUpstreamFetch(
+      FetchOk{0, GroupOrder::OldestFirst, 0, AbsoluteLocation{0, 5}, {}});
+  auto res =
+      co_await cache_.fetch(getFetch({0, 0}, {2, 0}), consumer_, upstream_);
+  EXPECT_TRUE(res.hasValue());
+  co_await folly::coro::co_reschedule_on_current_executor;
+
+  auto consumer2 = std::make_shared<StrictMock<moxygen::MockFetchConsumer>>();
+  expectUpstreamFetch({1, 0}, {1, 10}, 0, AbsoluteLocation{1, 10});
+  res = co_await cache_.fetch(getFetch({1, 0}, {1, 10}), consumer2, upstream_);
+  EXPECT_TRUE(res.hasValue());
+}
+
+// Same, where the cache holds the head of the range.
+CO_TEST_F(MoQCacheTest, TestFetchPartialHitEmptyPastUpstreamEndStaysUnknown) {
+  populateCacheRange({0, 0}, {0, 1});
+  expectFetchObjects({0, 0}, {0, 1}, false);
+  expectUpstreamFetch({0, 1}, {2, 0}, 0, AbsoluteLocation{0, 5});
+  auto res =
+      co_await cache_.fetch(getFetch({0, 0}, {2, 0}), consumer_, upstream_);
+  EXPECT_TRUE(res.hasValue());
+  EXPECT_CALL(*consumer_, endOfFetch()).WillOnce(Return(folly::unit));
+  upstreamFetchConsumer_->endOfFetch();
+  co_await folly::coro::co_reschedule_on_current_executor;
+
+  auto consumer2 = std::make_shared<StrictMock<moxygen::MockFetchConsumer>>();
+  expectUpstreamFetch({1, 0}, {1, 10}, 0, AbsoluteLocation{1, 10});
+  res = co_await cache_.fetch(getFetch({1, 0}, {1, 10}), consumer2, upstream_);
+  EXPECT_TRUE(res.hasValue());
+}
+
+// Descending order delivers the range past the upstream end first. The first
+// object must not mark it as a gap.
+CO_TEST_F(MoQCacheTest, TestFetchMissDescPastUpstreamEndStaysUnknown) {
+  expectUpstreamFetch(
+      {0, 0}, {2, 0}, 0, AbsoluteLocation{1, 5}, GroupOrder::NewestFirst);
+  auto res = co_await cache_.fetch(
+      getFetch({0, 0}, {2, 0}, GroupOrder::NewestFirst), consumer_, upstream_);
+  EXPECT_TRUE(res.hasValue());
+  {
+    InSequence enforceOrder;
+    EXPECT_CALL(*consumer_, object(1, 0, 0, _, _, _, _))
+        .WillOnce(Return(folly::unit));
+    EXPECT_CALL(*consumer_, object(0, 0, 0, _, _, _, _))
+        .WillOnce(Return(folly::unit));
+    EXPECT_CALL(*consumer_, endOfFetch()).WillOnce(Return(folly::unit));
+  }
+  upstreamFetchConsumer_->object(1, 0, 0, makeBuf(100));
+  upstreamFetchConsumer_->object(0, 0, 0, makeBuf(100));
+  upstreamFetchConsumer_->endOfFetch();
+  co_await folly::coro::co_reschedule_on_current_executor;
+
+  auto consumer2 = std::make_shared<StrictMock<moxygen::MockFetchConsumer>>();
+  expectUpstreamFetch({2, 0}, {2, 10}, 0, AbsoluteLocation{2, 10});
+  res = co_await cache_.fetch(getFetch({2, 0}, {2, 10}), consumer2, upstream_);
+  EXPECT_TRUE(res.hasValue());
+}
+
 // A publisher that sends past the range it was given is misbehaving.  Reject
 // the overrun rather than caching it, forwarding it to a consumer that never
 // asked for it, or walking the writeback's bookkeeping off the end of the
@@ -859,7 +937,7 @@ CO_TEST_F(MoQCacheTest, TestFetchWriteback) {
 
 CO_TEST_F(MoQCacheTest, TestFetchPopulatesNotExist) {
   // Test case for fetch populating OBJECT_NOT_EXIST, GROUP_NOT_EXIST
-  expectUpstreamFetch({0, 0}, {2, 10}, 0, AbsoluteLocation{1, 0});
+  expectUpstreamFetch({0, 0}, {2, 10}, 0, AbsoluteLocation{2, 10});
   auto res = co_await cache_.fetch(
       getFetch({0, 0}, {2, 10}), trackingConsumer_, upstream_);
   EXPECT_TRUE(res.hasValue());
@@ -1684,11 +1762,42 @@ CO_TEST_F(MoQCacheTest, TestUpstreamFetchUsingBeginObjectAndObjectPayload) {
   EXPECT_EQ(res.value()->fetchOk().endLocation, (AbsoluteLocation{0, 0}));
 }
 
+CO_TEST_F(MoQCacheTest, TestSplitObjectNotMarkedNonexistentByNextObject) {
+  expectUpstreamFetch({0, 0}, {0, 2}, 0, AbsoluteLocation{0, 1})
+      .via(co_await folly::coro::co_current_executor)
+      .thenTry([this](const auto&) {
+        upstreamFetchConsumer_->beginObject(0, 0, 0, 100, makeBuf(50));
+        upstreamFetchConsumer_->objectPayload(makeBuf(50), false);
+        upstreamFetchConsumer_->object(
+            0, 0, 1, makeBuf(100), noExtensions(), true);
+      });
+  EXPECT_CALL(*consumer_, beginObject(0, 0, 0, 100, _, _))
+      .WillOnce(Return(folly::unit));
+  EXPECT_CALL(*consumer_, objectPayload(_, false))
+      .WillOnce(Return(ObjectPublishStatus::DONE));
+  EXPECT_CALL(*consumer_, object(0, _, 1, _, _, true, _))
+      .WillOnce(Return(folly::unit))
+      .RetiresOnSaturation();
+  auto res = co_await cache_.fetch(
+      getFetch({0, 0}, {0, 2}), trackingConsumer_, upstream_);
+  EXPECT_TRUE(res.hasValue());
+  co_await folly::coro::co_reschedule_on_current_executor;
+
+  // Replayed from cache, the split object must come back as itself.
+  EXPECT_CALL(*consumer_, object(0, _, 0, _, _, false, _))
+      .WillOnce(Return(folly::unit));
+  EXPECT_CALL(*consumer_, object(0, _, 1, _, _, true, _))
+      .WillOnce(Return(folly::unit));
+  auto res2 = co_await cache_.fetch(
+      getFetch({0, 0}, {0, 2}), trackingConsumer_, upstream_);
+  EXPECT_TRUE(res2.hasValue());
+}
+
 CO_TEST_F(MoQCacheTest, TestObjectPayloadMarksRemainingAsNonexistent) {
   // Fetch for [0,0] - [0,2] exclusive (objects 0 and 1)
   // Upstream returns only object 0 via beginObject + objectPayload with
   // finFetch=true Object 1 should be marked as nonexistent
-  expectUpstreamFetch({0, 0}, {0, 2}, 0, AbsoluteLocation{0, 0})
+  expectUpstreamFetch({0, 0}, {0, 2}, 0, AbsoluteLocation{0, 2})
       .via(co_await folly::coro::co_current_executor)
       .thenTry([this](const auto&) {
         // Send only object 0, then finish the fetch
@@ -1708,7 +1817,7 @@ CO_TEST_F(MoQCacheTest, TestObjectPayloadMarksRemainingAsNonexistent) {
   auto res = co_await cache_.fetch(
       getFetch({0, 0}, {0, 2}), trackingConsumer_, upstream_);
   EXPECT_TRUE(res.hasValue());
-  EXPECT_EQ(res.value()->fetchOk().endLocation, (AbsoluteLocation{0, 0}));
+  EXPECT_EQ(res.value()->fetchOk().endLocation, (AbsoluteLocation{0, 2}));
 
   // Subsequent fetch for [0,1] - [0,2] should return cached non-existence
   // (no upstream call, just endOfFetch)
@@ -2765,6 +2874,37 @@ CO_TEST_F(MoQCacheTest, TestFetchInProgressKeyAdvancesWithCachedData) {
   EXPECT_TRUE(res2.hasValue());
 }
 
+CO_TEST_F(MoQCacheTest, TestFetchInProgressReKeyCollidesWithConcurrentFetch) {
+  InSequence enforceOrder;
+  auto firstUpstream =
+      expectUpstreamFetch({1, 0}, {1, 2}, false, AbsoluteLocation{1, 1});
+  auto secondUpstream =
+      expectUpstreamFetch({0, 0}, {1, 2}, false, AbsoluteLocation{1, 1});
+  auto consumer2 = std::make_shared<NiceMock<moxygen::MockFetchConsumer>>();
+  ON_CALL(*consumer2, object(_, _, _, _, _, _, _))
+      .WillByDefault(Return(folly::unit));
+  ON_CALL(*consumer2, endOfGroup(_, _, _, _))
+      .WillByDefault(Return(folly::unit));
+  EXPECT_CALL(*consumer_, object(_, _, _, _, _, _, _))
+      .WillRepeatedly(Return(folly::unit));
+
+  auto [res1, res2] = co_await folly::coro::collectAll(
+      cache_.fetch(getFetch({1, 0}, {1, 2}), consumer_, upstream_),
+      cache_.fetch(getFetch({0, 0}, {1, 2}), consumer2, upstream_));
+  EXPECT_TRUE(res1.hasValue());
+  EXPECT_TRUE(res2.hasValue());
+  auto first = co_await std::move(firstUpstream);
+  auto second = co_await std::move(secondUpstream);
+
+  // Crossing into group 1 re-keys the second fetch's entry to {1, 0}, the
+  // slot the first fetch already holds.
+  EXPECT_TRUE(second->object(0, 0, 0, makeBuf(100)).hasValue());
+  EXPECT_TRUE(second->endOfGroup(0, 0, 1).hasValue());
+  EXPECT_TRUE(second->object(1, 0, 0, makeBuf(100)).hasValue());
+  EXPECT_TRUE(first->object(1, 0, 0, makeBuf(100)).hasValue());
+  EXPECT_TRUE(cache_.hasCachedObject(kTestTrackName, {1, 0}));
+}
+
 CO_TEST_F(MoQCacheTest, TestFetchWritebackHugeGroupRangeBoundedTime) {
   // Regression: the previous per-group FetchIntervalSet inserted one entry
   // per group covered by the upstream fetch. A 2^60-group range hung the
@@ -3628,6 +3768,35 @@ CO_TEST_F(MoQCacheTest, TestGroupNotEvictedDuringActiveWrite) {
   co_return;
 }
 
+CO_TEST_F(MoQCacheTest, TestGroupPinnedUntilLastSubgroupCloses) {
+  cache_.setMaxCachedGroupsPerTrack(2);
+  auto writeback = cache_.getSubscribeWriteback(kTestTrackName, trackConsumer_);
+
+  auto sub0 = writeback->beginSubgroup(0, 0, 0).value();
+  auto sub1 = writeback->beginSubgroup(0, 1, 0).value();
+  EXPECT_TRUE(sub0->object(0, makeBuf(100), {}, false).hasValue());
+  EXPECT_TRUE(sub1->object(1, makeBuf(100), {}, false).hasValue());
+
+  // Closing one subgroup must not unpin a group the other is still writing.
+  sub0.reset();
+  writeback->datagram(ObjectHeader(1, 0, 0, 0, 100), makeBuf(100));
+  writeback->datagram(ObjectHeader(2, 0, 0, 0, 100), makeBuf(100));
+  writeback->datagram(ObjectHeader(3, 0, 0, 0, 100), makeBuf(100));
+  EXPECT_TRUE(cache_.hasCachedObject(kTestTrackName, {0, 0}));
+
+  // Once the last subgroup closes, group 0 re-enters the LRU as the newest
+  // entry and ages out normally.
+  sub1.reset();
+  writeback->datagram(ObjectHeader(4, 0, 0, 0, 100), makeBuf(100));
+  writeback->datagram(ObjectHeader(5, 0, 0, 0, 100), makeBuf(100));
+  EXPECT_TRUE(cache_.hasCachedObject(kTestTrackName, {0, 0}));
+  writeback->datagram(ObjectHeader(6, 0, 0, 0, 100), makeBuf(100));
+  EXPECT_FALSE(cache_.hasCachedObject(kTestTrackName, {0, 0}));
+
+  writeback.reset();
+  co_return;
+}
+
 CO_TEST_F(MoQCacheTest, TestGroupNotEvictedDuringActiveFetch) {
   // Verify that a group being actively fetched into cannot be evicted
   // when a concurrent subscribe writeback adds enough groups to trigger
@@ -3777,6 +3946,34 @@ CO_TEST_F(MoQCacheTest, TestGroupNotEvictedAfterCrossingGroupBoundary) {
   EXPECT_TRUE(res.hasValue());
   co_await fetchDone;
   writeback.reset();
+}
+
+CO_TEST_F(MoQCacheTest, TestCachedGroupNotEvictedWhileFetchServesIt) {
+  // Groups 0 and 1 come from upstream before cached group 2 is served.
+  // Creating group 1 forces an eviction while group 2 is the oldest in the
+  // LRU, and group 2 must stay cached until the fetch has served it.
+  cache_.setMaxCachedGroupsPerTrack(3);
+  auto writeback = cache_.getSubscribeWriteback(kTestTrackName, trackConsumer_);
+  writeback->datagram(ObjectHeader(2, 0, 0, 0, 100), makeBuf(100));
+  writeback->datagram(ObjectHeader(2, 0, 1, 0, 100), makeBuf(100));
+  writeback->datagram(
+      ObjectHeader(2, 0, 2, 0, ObjectStatus::END_OF_GROUP), nullptr);
+  writeback->datagram(ObjectHeader(10, 0, 0, 0, 100), makeBuf(100));
+  writeback->datagram(ObjectHeader(3, 0, 0, 0, 100), makeBuf(100));
+  writeback->datagram(ObjectHeader(3, 0, 1, 0, 100), makeBuf(100));
+  writeback.reset();
+
+  // An end object of 0 means all of group 1.
+  expectUpstreamFetch({0, 0}, {1, 0}, false, AbsoluteLocation{2, 0});
+  expectFetchObjects({0, 0}, {3, 2}, false, 2, 1, 1, true);
+  auto res = co_await cache_.fetch(
+      getFetch({0, 0}, {3, 2}), trackingConsumer_, upstream_);
+  EXPECT_TRUE(res.hasValue());
+  co_await folly::coro::co_reschedule_on_current_executor;
+  serveCacheRangeFromUpstream({0, 0}, {2, 0}, 2, 1, 1, true);
+  co_await folly::coro::co_reschedule_on_current_executor;
+
+  EXPECT_FALSE(cache_.hasCachedObject(kTestTrackName, {10, 0}));
 }
 
 CO_TEST_F(MoQCacheTest, TestEvictTrackWithSmallCache) {
