@@ -489,12 +489,13 @@ TEST_P(
     relay_ = std::make_shared<MoQRelay>();
     folly::coro::Baton releaseSubscribe;
     origin_->gate = &releaseSubscribe;
-    auto* originLink = co_await connect(relay_, relay_);
+    auto originHandler = MoQRelay::makeSessionHandler(relay_);
+    auto* originLink = co_await connect(originHandler, originHandler);
     originLink->client->setPublishHandler(origin_);
     auto announced = co_await originLink->client->publishNamespace(
         PublishNamespace{RequestID(0), kTrack.trackNamespace}, nullptr);
     CO_ASSERT_TRUE(announced.hasValue());
-    auto* viewer = co_await connect(relay_);
+    auto* viewer = co_await connect(MoQRelay::makeSessionHandler(relay_));
     auto history = std::make_shared<RecordingFetchConsumer>();
 
     auto join =
@@ -504,12 +505,11 @@ TEST_P(
     auto res = co_await std::move(join);
 
     EXPECT_TRUE(res.subscribeResult.hasValue());
-    // The relay's cache can answer the joining FETCH before its own upstream
-    // FETCH reaches the origin.
+    // The relay forwards the unresolved joining FETCH while subscribing.
     CO_ASSERT_TRUE(
         co_await waitUntil([&] { return !origin_->fetches.empty(); }));
     EXPECT_EQ(origin_->fetches.size(), 1);
-    EXPECT_NE(std::get_if<StandaloneFetch>(&origin_->fetches[0].args), nullptr);
+    EXPECT_NE(std::get_if<JoiningFetch>(&origin_->fetches[0].args), nullptr);
   }));
 }
 

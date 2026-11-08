@@ -71,23 +71,19 @@ class MoQProxyTrack::DownstreamSubscriptionHandle final
             "request updates are not supported"});
   }
 
-  // Called after upstream SUBSCRIBE_OK for the first subscriber: its saved
-  // Joining Location and its live filter both come from the upstream Largest,
-  // even if early data already advanced the forwarder.
-  void anchorTo(
-      const SubscribeRequest& request,
-      std::optional<AbsoluteLocation> largest) {
+  // Saves the upstream SUBSCRIBE_OK's Largest Object for a pending subscriber.
+  void setLargestObject(std::optional<AbsoluteLocation> largest) {
     if (!subscriber_) {
       return;
     }
     if (largest) {
       subscriber_->updateLargest(*largest);
     }
-    subscriber_->range = toSubscribeRange(request, largest);
+    subscriber_->range = toSubscribeRange(subscriber_->filter, largest);
   }
 
-  // Called before returning downstream to copy the updated SUBSCRIBE_OK.
-  void refreshSubscribeOk() {
+  // Copies the finalized subscriber state into the returned SUBSCRIBE_OK.
+  void finalizeSubscribeOk() {
     if (subscriber_) {
       setSubscribeOk(subscriber_->subscribeOk());
     }
@@ -160,13 +156,13 @@ class MoQProxyTrack::SubgroupRecorder final : public SubgroupConsumer {
         (finSubgroup && !recordEnd(/*cleanFin=*/true))) {
       return malformed();
     }
-    return leg()->object(
+    return leg_->object(
         objectID, std::move(payload), std::move(extensions), finSubgroup);
   }
 
   void checkpoint() override {
     if (!abandoned()) {
-      leg()->checkpoint();
+      leg_->checkpoint();
     }
   }
 
@@ -184,7 +180,7 @@ class MoQProxyTrack::SubgroupRecorder final : public SubgroupConsumer {
         })) {
       return malformed();
     }
-    return leg()->beginObject(
+    return leg_->beginObject(
         objectID, length, std::move(initialPayload), std::move(extensions));
   }
 
@@ -202,7 +198,7 @@ class MoQProxyTrack::SubgroupRecorder final : public SubgroupConsumer {
     }
     // The forwarder tracks the declared length, so its IN_PROGRESS/DONE is
     // correct even when only the cache is consuming.
-    return leg()->objectPayload(std::move(payload), finSubgroup);
+    return leg_->objectPayload(std::move(payload), finSubgroup);
   }
 
   folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
@@ -213,7 +209,7 @@ class MoQProxyTrack::SubgroupRecorder final : public SubgroupConsumer {
     if (!recordStatus(endOfGroupObjectID, ObjectStatus::END_OF_GROUP)) {
       return malformed();
     }
-    return leg()->endOfGroup(endOfGroupObjectID);
+    return leg_->endOfGroup(endOfGroupObjectID);
   }
 
   folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
@@ -224,7 +220,7 @@ class MoQProxyTrack::SubgroupRecorder final : public SubgroupConsumer {
     if (!recordStatus(endOfTrackObjectID, ObjectStatus::END_OF_TRACK)) {
       return malformed();
     }
-    return leg()->endOfTrackAndGroup(endOfTrackObjectID);
+    return leg_->endOfTrackAndGroup(endOfTrackObjectID);
   }
 
   folly::Expected<folly::Unit, MoQPublishError> endOfSubgroup() override {
@@ -234,7 +230,7 @@ class MoQProxyTrack::SubgroupRecorder final : public SubgroupConsumer {
     if (!recordEnd(/*cleanFin=*/true)) {
       return malformed();
     }
-    return leg()->endOfSubgroup();
+    return leg_->endOfSubgroup();
   }
 
   void reset(ResetStreamErrorCode error) override {
@@ -242,7 +238,7 @@ class MoQProxyTrack::SubgroupRecorder final : public SubgroupConsumer {
       return;
     }
     recordEnd(/*cleanFin=*/false);
-    leg()->reset(error);
+    leg_->reset(error);
   }
 
  private:
@@ -262,10 +258,6 @@ class MoQProxyTrack::SubgroupRecorder final : public SubgroupConsumer {
   static folly::Unexpected<MoQPublishError> abandonedError() {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::CANCELLED, "upstream attempt was abandoned"));
-  }
-
-  SubgroupConsumer* leg() {
-    return leg_.get();
   }
 
   // Returns false only for malformed input. Once this group stops being
@@ -314,7 +306,7 @@ class MoQProxyTrack::SubgroupRecorder final : public SubgroupConsumer {
   }
 
   folly::Unexpected<MoQPublishError> malformed() {
-    leg()->reset(ResetStreamErrorCode::MALFORMED_TRACK);
+    leg_->reset(ResetStreamErrorCode::MALFORMED_TRACK);
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::MALFORMED_TRACK, "malformed subgroup data"));
   }
@@ -570,7 +562,33 @@ folly::coro::Task<Publisher::SubscribeResult> MoQProxyTrack::subscribe(
   }
 
   if (state_ == State::CONNECTING) {
+    const bool rangePending = !forwarder_->largest();
+    auto subscriber =
+        addSubscriber(subscribeRequest, std::move(consumer), downstream);
+    if (subscriber.hasError()) {
+      co_return subscriber;
+    }
+    auto downstreamHandle =
+        std::static_pointer_cast<DownstreamSubscriptionHandle>(
+            subscriber.value());
+    if (rangePending) {
+      pendingSubscribers_.push_back(downstreamHandle);
+    }
     co_await upstreamSubscriptionReadyPromise_.getFuture();
+    if (upstreamSubscriptionFailure_) {
+      co_return folly::makeUnexpected(makeSubscribeError(
+          subscribeRequest.requestID, *upstreamSubscriptionFailure_));
+    }
+    if (state_ != State::READY) {
+      co_return folly::makeUnexpected(
+          SubscribeError{
+              subscribeRequest.requestID,
+              SubscribeErrorCode::DOES_NOT_EXIST,
+              "upstream subscription is no longer available"});
+    }
+    // Copy the finalized subscriber state into the downstream response.
+    downstreamHandle->finalizeSubscribeOk();
+    co_return subscriber;
   }
 
   if (upstreamSubscriptionFailure_) {
@@ -611,6 +629,9 @@ MoQProxyTrack::handleFirstSubscription(
   }
 
   auto subscriber = subscriberResult.value();
+  auto downstreamHandle =
+      std::static_pointer_cast<DownstreamSubscriptionHandle>(subscriber);
+  pendingSubscribers_.push_back(downstreamHandle);
   auto upstream = co_await establishUpstream(
       subscribeRequest, downstream, establishing_.getToken());
   if (upstream.hasError()) {
@@ -631,13 +652,7 @@ MoQProxyTrack::handleFirstSubscription(
     co_return folly::makeUnexpected(std::move(returnedFailure));
   }
   adoptFirstUpstream(std::move(upstream.value()));
-  auto downstreamHandle =
-      std::dynamic_pointer_cast<DownstreamSubscriptionHandle>(subscriber);
-  XCHECK(downstreamHandle);
-  downstreamHandle->anchorTo(subscribeRequest, upstreamLargest_);
-  downstreamHandle->refreshSubscribeOk();
-  state_ = State::READY;
-  completeUpstreamEstablishment(std::nullopt);
+  downstreamHandle->finalizeSubscribeOk();
   co_return subscriber;
 }
 
@@ -676,6 +691,11 @@ Publisher::SubscribeResult MoQProxyTrack::addSubscriber(
   return std::make_shared<DownstreamSubscriptionHandle>(std::move(subscriber));
 }
 
+folly::coro::Task<folly::Unit> MoQProxyTrack::awaitUpstreamSubscription() {
+  auto self = shared_from_this();
+  co_return co_await upstreamSubscriptionReadyPromise_.getFuture();
+}
+
 folly::coro::Task<MoQProxyTrack::UpstreamEstablishmentResult>
 MoQProxyTrack::establishUpstream(
     SubscribeRequest subscribeRequest,
@@ -712,6 +732,9 @@ void MoQProxyTrack::adoptFirstUpstream(UpstreamAttempt attempt) {
   }
   forwarder_->setExtensions(subscribeOk.extensions);
   upstream_ = std::move(attempt);
+  setLargestObjectForPendingSubscribers();
+  state_ = State::READY;
+  completeUpstreamEstablishment(std::nullopt);
 }
 
 folly::coro::Task<MoQProxyTrack::UpstreamEstablishmentResult>
@@ -835,6 +858,15 @@ MoQProxyTrack::establishWithProvider(
   };
 }
 
+void MoQProxyTrack::setLargestObjectForPendingSubscribers() {
+  for (auto& pending : pendingSubscribers_) {
+    if (auto handle = pending.lock()) {
+      handle->setLargestObject(upstreamLargest_);
+    }
+  }
+  pendingSubscribers_.clear();
+}
+
 SubscribeError MoQProxyTrack::makeSubscribeError(
     RequestID requestID,
     const UpstreamEstablishmentFailure& failure) const {
@@ -845,6 +877,9 @@ void MoQProxyTrack::completeUpstreamEstablishment(
     std::optional<UpstreamEstablishmentFailure> failure) {
   if (upstreamSubscriptionPromiseResolved_) {
     return;
+  }
+  if (failure) {
+    pendingSubscribers_.clear();
   }
   upstreamSubscriptionPromiseResolved_ = true;
   upstreamSubscriptionFailure_ = std::move(failure);
