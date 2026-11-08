@@ -5475,6 +5475,15 @@ folly::coro::Task<void> MoQSession::handleSubscribe(
   //// publishHandler_
   params.eraseAllParamsOfType(TrackRequestParamKey::DELIVERY_TIMEOUT);
 
+  // The application can clear the handler while this request is queued.
+  if (!publishHandler_) {
+    subscribeError(
+        {requestID,
+         SubscribeErrorCode::INTERNAL_ERROR,
+         "No publisher callback set"},
+        *replyContext);
+    co_return;
+  }
   auto token = co_await folly::coro::co_current_cancellation_token;
   auto subscribeResult = co_await co_awaitTry(publishHandler_->subscribe(
       std::move(sub), std::static_pointer_cast<TrackConsumer>(trackPublisher)));
@@ -6244,6 +6253,13 @@ folly::coro::Task<void> MoQSession::handlePublish(
       PublishError{requestID, PublishErrorCode::INTERNAL_ERROR, ""};
   auto token = co_await folly::coro::co_current_cancellation_token;
 
+  // The application can clear the handler while this request is queued.
+  if (!subscribeHandler_) {
+    publishErr.errorCode = PublishErrorCode::NOT_SUPPORTED;
+    publishErr.reasonPhrase = "Not a subscriber";
+    publishError(publishErr, *replyContext);
+    co_return;
+  }
   try {
     // Call publish handler synchronously (now returns PublishResult)
     auto publishResult =
@@ -6907,6 +6923,16 @@ folly::coro::Task<void> MoQSession::handleTrackStatus(
   const bool sendTrackProperties =
       getDraftMajorVersion(*getNegotiatedVersion()) < 22 ||
       trackStatus.includeProperties;
+  // The application can clear the handler while this request is queued.
+  if (!publishHandler_) {
+    trackStatusError(
+        {trackStatus.requestID,
+         TrackStatusErrorCode::INTERNAL_ERROR,
+         "No publisher callback set"},
+        *replyContext);
+    retireRequestID(/*signalWriteLoop=*/false);
+    co_return;
+  }
   auto token = co_await folly::coro::co_current_cancellation_token;
   auto trackStatusResult =
       co_await co_awaitTry(publishHandler_->trackStatus(trackStatus));

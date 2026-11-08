@@ -6,6 +6,8 @@
 
 #include "moxygen/test/MoQSessionTestCommon.h"
 
+#include <folly/coro/Collect.h>
+
 using namespace moxygen;
 using namespace moxygen::test;
 using testing::_;
@@ -30,6 +32,34 @@ CO_TEST_P_X(MoQSessionTest, PublishNamespace) {
       co_await clientSession_->publishNamespace(getPublishNamespace());
   EXPECT_FALSE(publishNamespaceResult.hasError());
   co_await folly::coro::co_reschedule_on_current_executor;
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// The subscriber clears its handler while answering the first of two
+// PUBLISH_NAMESPACEs. The second gets an error.
+CO_TEST_P_X(MoQSessionTest, PublishNamespaceAfterSubscribeHandlerCleared) {
+  co_await setupMoQSession();
+  EXPECT_CALL(*serverSubscriber, publishNamespace(_, _))
+      .WillOnce(
+          [this](
+              auto pubNs,
+              auto) -> folly::coro::Task<Subscriber::PublishNamespaceResult> {
+            serverSession_->setSubscribeHandler(nullptr);
+            co_return folly::makeUnexpected(
+                PublishNamespaceError{
+                    pubNs.requestID,
+                    PublishNamespaceErrorCode::INTERNAL_ERROR,
+                    "first"});
+          });
+
+  auto second = getPublishNamespace();
+  second.trackNamespace = TrackNamespace{{"other"}};
+  auto [firstRes, secondRes] = co_await folly::coro::collectAll(
+      clientSession_->publishNamespace(getPublishNamespace()),
+      clientSession_->publishNamespace(std::move(second)));
+  EXPECT_TRUE(firstRes.hasError());
+  EXPECT_TRUE(secondRes.hasError());
+  EXPECT_FALSE(serverSession_->isClosed());
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 

@@ -6,6 +6,7 @@
 
 #include "moxygen/test/MoQSessionTestCommon.h"
 
+#include <folly/coro/Collect.h>
 #include <folly/coro/Timeout.h>
 #include "moxygen/MoQTrackProperties.h"
 
@@ -39,6 +40,32 @@ CO_TEST_P_X(Draft22Test, SubscribeOmitsUnrequestedTrackProperties) {
       .WillOnce(testing::Return(folly::unit));
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
   co_await rescheduleN(4);
+}
+
+// The publisher clears its handler while answering the first of two
+// SUBSCRIBEs. The second gets an error.
+CO_TEST_P_X(MoQSessionTest, SubscribeAfterPublishHandlerCleared) {
+  co_await setupMoQSession();
+  EXPECT_CALL(*serverPublisher, subscribe(_, _))
+      .WillOnce([this](auto sub, auto) -> TaskSubscribeResult {
+        serverSession_->setPublishHandler(nullptr);
+        co_return folly::makeUnexpected(
+            SubscribeError{
+                sub.requestID, SubscribeErrorCode::INTERNAL_ERROR, "first"});
+      });
+
+  auto secondConsumer =
+      std::make_shared<testing::NiceMock<MockTrackConsumer>>();
+  auto [first, second] = co_await folly::coro::collectAll(
+      clientSession_->subscribe(
+          getSubscribe(kTestTrackName), subscribeCallback_),
+      clientSession_->subscribe(
+          getSubscribe(FullTrackName{TrackNamespace{{"foo"}}, "other"}),
+          secondConsumer));
+  EXPECT_TRUE(first.hasError());
+  EXPECT_TRUE(second.hasError());
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
 // The subscriber's requested order wins over the publisher's default.
