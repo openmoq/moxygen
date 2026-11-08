@@ -16,3 +16,12 @@ moxygen_add_test(TARGET MoQTrackServerTests
     testmain
     Folly::folly_coro_gtest_helpers
 )
+
+moxygen_add_test(TARGET MoQTrackTests
+  PREFIX "MoQTrack"
+  SOURCES
+    MoQTrackTest.cpp
+  DEPENDS
+    moqtest_utils
+    testmain
+)
