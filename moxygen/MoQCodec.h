@@ -221,14 +221,14 @@ class MoQControlCodec : public MoQCodec {
 
   folly::Expected<folly::Unit, ErrorCode> parseFrame(folly::io::Cursor& cursor);
 
+  using FrameDirection = MoQFrameObserver::Direction;
+
   template <typename Msg>
   void notifyReceived(
-      void (MoQFrameObserver::*
-                hook)(MoQFrameObserver::Direction, uint64_t, const Msg&),
+      void (MoQFrameObserver::*hook)(FrameDirection, uint64_t, const Msg&),
       const Msg& msg) {
     if (frameObserver_) {
-      ((*frameObserver_).*hook)(
-          MoQFrameObserver::Direction::Received, streamId_, msg);
+      ((*frameObserver_).*hook)(FrameDirection::Received, streamId_, msg);
     }
   }
 
@@ -422,6 +422,10 @@ class MoQObjectStreamCodec : public MoQCodec {
     callback_ = callback;
   }
 
+  void setFrameObserver(std::shared_ptr<MoQFrameObserver> observer) {
+    frameObserver_ = std::move(observer);
+  }
+
   void setFetchGroupOrder(GroupOrder groupOrder) {
     moqFrameParser_.setFetchGroupOrder(groupOrder);
   }
@@ -446,7 +450,9 @@ class MoQObjectStreamCodec : public MoQCodec {
   ParseState parseState_{ParseState::STREAM_HEADER_TYPE};
   StreamType streamType_{StreamType::SUBGROUP_HEADER_SG};
   SubgroupOptions subgroupOptions_;
+  TrackAlias trackAlias_{0};
   ObjectCallback* callback_;
+  std::shared_ptr<MoQFrameObserver> frameObserver_;
 };
 
 } // namespace moxygen
