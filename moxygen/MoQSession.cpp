@@ -639,7 +639,7 @@ void StreamPublisherImpl::setWriteHandle(
       logger_->logStreamTypeSet(
           streamID, MOQTStreamType::FETCH_HEADER, Owner::LOCAL);
       RequestID req = publisher_->requestID();
-      logger_->logFetchHeaderCreated(streamID, req.value, publisher_->isFill());
+      logger_->logFetchHeaderCreated(streamID, req.value);
     } else {
       logger_->logStreamTypeSet(
           streamID, MOQTStreamType::SUBGROUP_HEADER, Owner::LOCAL);
@@ -2634,15 +2634,12 @@ class MoQSession::SubscribeTrackReceiveState
       std::shared_ptr<TrackConsumer> callback,
       MoQSession* session,
       TrackAlias alias,
-      std::shared_ptr<MLogger> logger = nullptr,
       bool publish = false)
       : TrackReceiveStateBase(std::move(fullTrackName), requestID),
         callback_(std::move(callback)),
         publish_(publish),
         session_(session),
-        alias_(alias) {
-    logger_ = std::move(logger);
-  }
+        alias_(alias) {}
 
   ~SubscribeTrackReceiveState() {
     cancelStreamCountTimeout();
@@ -2720,10 +2717,6 @@ class MoQSession::SubscribeTrackReceiveState
   }
 
   void onSubgroup() {
-    if (logger_) {
-      logger_->logStreamTypeSet(
-          currentStreamId_, MOQTStreamType::SUBGROUP_HEADER, Owner::REMOTE);
-    }
     countStream();
   }
 
@@ -2841,7 +2834,6 @@ class MoQSession::SubscribeTrackReceiveState
     deliverPublishDoneAndRemove();
   }
 
-  std::shared_ptr<MLogger> logger_ = nullptr;
   std::shared_ptr<TrackConsumer> callback_;
   folly::coro::Promise<SubscribeResult> subscribePromise_;
   std::optional<PublishDone> pendingPublishDone_;
@@ -2909,13 +2901,10 @@ class MoQSession::FetchTrackReceiveState
       FullTrackName fullTrackName,
       RequestID requestID,
       std::shared_ptr<FetchConsumer> fetchCallback,
-      GroupOrder fetchGroupOrder = GroupOrder::OldestFirst,
-      std::shared_ptr<MLogger> logger = nullptr)
+      GroupOrder fetchGroupOrder = GroupOrder::OldestFirst)
       : TrackReceiveStateBase(std::move(fullTrackName), requestID),
         callback_(std::move(fetchCallback)),
-        fetchGroupOrder_(fetchGroupOrder) {
-    logger_ = std::move(logger);
-  }
+        fetchGroupOrder_(fetchGroupOrder) {}
 
   folly::coro::Future<FetchResult> fetchFuture() {
     auto contract = folly::coro::makePromiseContract<FetchResult>();
@@ -3076,14 +3065,8 @@ class MoQSession::FetchTrackReceiveState
     } // there's likely a missing case here from shutdown
   }
 
-  void onFetchHeader(RequestID requestID) {
+  void onFetchHeader(RequestID /*requestID*/) {
     streamOpened_ = true;
-    if (logger_) {
-      logger_->logStreamTypeSet(
-          currentStreamId_, MOQTStreamType::FETCH_HEADER, Owner::REMOTE);
-      logger_->logFetchHeaderParsed(
-          currentStreamId_, requestID.value, isFill());
-    }
   }
 
   bool fetchOkAndAllDataReceived() const {
@@ -3095,7 +3078,6 @@ class MoQSession::FetchTrackReceiveState
   }
 
  private:
-  std::shared_ptr<MLogger> logger_ = nullptr;
   std::shared_ptr<FetchConsumer> callback_;
   GroupOrder fetchGroupOrder_;
   folly::coro::Promise<FetchResult> promise_;
@@ -4702,7 +4684,7 @@ MoQSession::registerFillReceiveState(
     GroupOrder groupOrder,
     RequestID owningSubscribeID) {
   auto state = std::make_shared<FetchTrackReceiveState>(
-      fullTrackName, requestID, std::move(consumer), groupOrder, logger_);
+      fullTrackName, requestID, std::move(consumer), groupOrder);
   state->markFill(owningSubscribeID);
   return fetches_.emplace(requestID, std::move(state)).first->second;
 }
@@ -4779,8 +4761,7 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       uint64_t subgroup,
       std::optional<uint8_t> priority,
       const SubgroupOptions& options) override {
-    trackAlias_ = alias; // Store for use in onObjectBegin logging
-    XLOG(DBG1) << "onSubgroup: alias=" << trackAlias_ << " group=" << group
+    XLOG(DBG1) << "onSubgroup: alias=" << alias << " group=" << group
                << " subgroup=" << subgroup << " priority="
                << (priority.has_value() ? std::to_string(*priority) : "none");
 
@@ -4819,10 +4800,6 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       return MoQCodec::ParseResult::ERROR_TERMINATE;
     }
     subgroupCallback_ = *res;
-    if (logger_) {
-      logger_->logSubgroupHeaderParsed(
-          currentStreamId_, alias, group, subgroup, effectivePriority, options);
-    }
 
     subscribeState_->setCurrentStreamId(currentStreamId_);
     subscribeState_->onSubgroup();
@@ -4855,31 +4832,6 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       bool forwardingPreferenceIsDatagram = false) override {
     if (isCancelled()) {
       return MoQCodec::ParseResult::ERROR_TERMINATE;
-    }
-
-    if (logger_) {
-      ObjectHeader obj = ObjectHeader();
-      obj.id = objectID;
-      obj.group = group;
-      obj.subgroup = subgroup;
-      obj.status = ObjectStatus::NORMAL;
-      obj.length = length;
-      obj.extensions = extensions;
-      obj.forwardingPreferenceIsDatagram = forwardingPreferenceIsDatagram;
-      if (objectComplete && subscribeState_) {
-        logger_->logSubgroupObjectParsed(
-            currentStreamId_,
-            trackAlias_,
-            obj,
-            initialPayload ? initialPayload->clone() : nullptr);
-      } else if (objectComplete && fetchState_) {
-        logger_->logFetchObjectParsed(
-            currentStreamId_,
-            obj,
-            initialPayload ? initialPayload->clone() : nullptr);
-      } else {
-        currentObj_ = std::move(obj);
-      }
     }
 
     folly::Expected<folly::Unit, MoQPublishError> res{folly::unit};
@@ -4924,16 +4876,6 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       override {
     if (isCancelled()) {
       return MoQCodec::ParseResult::ERROR_TERMINATE;
-    }
-
-    if (logger_ && objectComplete) {
-      if (subscribeState_) {
-        logger_->logSubgroupObjectParsed(
-            currentStreamId_, trackAlias_, currentObj_, payload->clone());
-      } else if (fetchState_) {
-        logger_->logFetchObjectParsed(
-            currentStreamId_, currentObj_, payload->clone());
-      }
     }
 
     bool finStream = false;
@@ -5054,10 +4996,6 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     return true;
   }
 
-  void setLogger(std::shared_ptr<MLogger> logger) {
-    logger_ = logger;
-  }
-
   bool hasFetchState() const {
     return fetchState_ != nullptr;
   }
@@ -5125,7 +5063,6 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       subgroupCallback_.reset();
     }
   }
-  std::shared_ptr<MLogger> logger_ = nullptr;
   MoQSession* session_{nullptr};
   OnSubgroupFunc onSubgroupFunc_;
   OnFetchFunc onFetchFunc_;
@@ -5133,8 +5070,6 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
   std::shared_ptr<SubgroupConsumer> subgroupCallback_;
   std::shared_ptr<MoQSession::FetchTrackReceiveState> fetchState_;
   uint64_t currentStreamId_{0};
-  TrackAlias trackAlias_{0};
-  ObjectHeader currentObj_;
 };
 
 } // namespace detail
@@ -5237,12 +5172,10 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
       };
 
   detail::ObjectStreamCallback dcb(this, onSubgroupFunc, onFetchFunc);
-  if (logger_) {
-    dcb.setLogger(logger_);
-  }
   dcb.setCurrentStreamId(id);
   codec.setCallback(&dcb);
   codec.setStreamId(id);
+  codec.setFrameObserver(frameObservers_);
 
   bool codecBlocked = false;
   while (!token.isCancellationRequested()) {
@@ -6212,7 +6145,7 @@ bool MoQSession::installPublishReceiveState(
     std::optional<uint64_t> publisherPriority,
     const std::shared_ptr<TrackConsumer>& consumer) {
   auto trackReceiveState = std::make_shared<SubscribeTrackReceiveState>(
-      fullTrackName, requestID, consumer, this, alias, logger_, true);
+      fullTrackName, requestID, consumer, this, alias, true);
   auto emplaceRes = subTracks_.try_emplace(alias, trackReceiveState);
   if (!emplaceRes.second) {
     XLOG(ERR) << "TrackAlias already in use alias=" << alias
@@ -7655,7 +7588,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
   }
   auto control = std::move(sendResult.value());
   auto trackReceiveState = std::make_shared<SubscribeTrackReceiveState>(
-      fullTrackName, reqID, callback, this, trackAlias, logger_);
+      fullTrackName, reqID, callback, this, trackAlias);
   trackReceiveState->setBidiControl(control);
   trackReceiveState->setRequestedGroupOrder(sub.groupOrder);
   if (sub.fill) {
@@ -8255,7 +8188,7 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
   }
   auto control = std::move(sendResult.value());
   auto trackReceiveState = std::make_shared<FetchTrackReceiveState>(
-      fullTrackName, reqID, std::move(consumer), fetch.groupOrder, logger_);
+      fullTrackName, reqID, std::move(consumer), fetch.groupOrder);
   trackReceiveState->setBidiControl(control);
   auto fetchTrack = fetches_.try_emplace(reqID, trackReceiveState);
   XCHECK(fetchTrack.second)

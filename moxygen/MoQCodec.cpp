@@ -12,6 +12,11 @@
 
 namespace moxygen {
 
+namespace {
+using FrameDirection = MoQFrameObserver::Direction;
+using DataStream = MoQFrameObserver::DataStream;
+} // namespace
+
 void MoQCodec::onIngressStart(std::unique_ptr<folly::IOBuf> data) {
   ingress_.append(std::move(data));
 }
@@ -186,6 +191,12 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
           parseState_ = ParseState::FETCH_HEADER;
         } else if (isPaddingStreamType(*version, type->first)) {
           parseState_ = ParseState::PADDING_STREAM;
+          if (frameObserver_) {
+            frameObserver_->notify(
+                &MoQFrameObserver::onPaddingStream,
+                FrameDirection::Received,
+                DataStream{streamId_});
+          }
         } else if (isValidSubgroupType(*version, type->first)) {
           parseState_ = ParseState::OBJECT_STREAM;
           subgroupOptions_ = getSubgroupOptions(*version, streamType_);
@@ -223,6 +234,13 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
         }
         totalBytesConsumed += res->bytesConsumed;
         auto requestID = res->value;
+        if (frameObserver_) {
+          frameObserver_->notify(
+              &MoQFrameObserver::onFetchHeader,
+              FrameDirection::Received,
+              DataStream{streamId_},
+              requestID.value);
+        }
         if (callback_) {
           auto result = callback_->onFetchHeader(requestID);
           if (result == ParseResult::ERROR_TERMINATE) {
@@ -245,8 +263,20 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
         }
         totalBytesConsumed += res->bytesConsumed;
         curObjectHeader_ = res->value.objectHeader;
+        trackAlias_ = res->value.trackAlias;
         parseState_ = ParseState::MULTI_OBJECT_HEADER;
         XCHECK_EQ(streamType_, StreamType::SUBGROUP_HEADER_SG);
+        if (frameObserver_) {
+          frameObserver_->notify(
+              &MoQFrameObserver::onSubgroupHeader,
+              FrameDirection::Received,
+              DataStream{streamId_},
+              trackAlias_,
+              curObjectHeader_.group,
+              curObjectHeader_.subgroup,
+              curObjectHeader_.priority,
+              subgroupOptions_);
+        }
         if (callback_) {
           auto result = callback_->onSubgroup(
               res->value.trackAlias,
@@ -282,6 +312,16 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
             // End of Range marker received
             auto& marker =
                 std::get<MoQFrameParser::EndOfRangeMarker>(fetchRes->value);
+            if (frameObserver_) {
+              frameObserver_->notify(
+                  &MoQFrameObserver::onFetchEndOfRange,
+                  FrameDirection::Received,
+                  DataStream{streamId_},
+                  marker.groupId,
+                  marker.objectId,
+                  marker.isUnknownOrNonexistent ? FetchRangeEnd::Unknown
+                                                : FetchRangeEnd::NonExistent);
+            }
             if (callback_) {
               auto result = callback_->onEndOfRange(
                   marker.groupId,
@@ -309,6 +349,22 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
           }
           totalBytesConsumed += subgroupRes->bytesConsumed;
           curObjectHeader_ = subgroupRes->value;
+        }
+        if (frameObserver_) {
+          if (streamType_ == StreamType::FETCH_HEADER) {
+            frameObserver_->notify(
+                &MoQFrameObserver::onFetchObject,
+                FrameDirection::Received,
+                DataStream{streamId_},
+                curObjectHeader_);
+          } else {
+            frameObserver_->notify(
+                &MoQFrameObserver::onSubgroupObject,
+                FrameDirection::Received,
+                DataStream{streamId_},
+                trackAlias_,
+                curObjectHeader_);
+          }
         }
         if (curObjectHeader_.status == ObjectStatus::NORMAL) {
           XLOG(DBG2) << "Parsing object with length, need="
