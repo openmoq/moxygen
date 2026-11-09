@@ -10,6 +10,7 @@
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBufQueue.h>
 #include <folly/logging/xlog.h>
+#include <moxygen/MoQFrameObserver.h>
 #include <moxygen/MoQTokenCache.h>
 #include <moxygen/MoQTypes.h>
 #include <moxygen/MoQVarint.h>
@@ -636,8 +637,6 @@ WriteResult writeServerSetup(
     const Setup& serverSetup,
     uint64_t version) noexcept;
 
-// writeSetup, writeClientSetup and writeServerSetup are the only functions that
-// are version-agnostic, so we are leaving them out of the MoQFrameWriter.
 class MoQFrameWriter {
  public:
   // options.priorityPresent is ignored; objectHeader.priority decides whether
@@ -837,6 +836,23 @@ class MoQFrameWriter {
     extensions_ = extensions;
   }
 
+  // Setup is version-agnostic. This wraps the free writeSetup so the frame is
+  // reported like any other.
+  WriteResult writeSetup(
+      folly::IOBufQueue& writeBuf,
+      const Setup& setup,
+      uint64_t version,
+      bool isClient) const noexcept;
+
+  void setFrameObserver(std::shared_ptr<MoQFrameObserver> observer) noexcept {
+    frameObserver_ = std::move(observer);
+  }
+
+  // Frames serialized from here on are reported as sent on streamID.
+  void bindStream(uint64_t streamID) noexcept {
+    frameStreamID_ = streamID;
+  }
+
   SetupExtensions getNegotiatedExtensions() const noexcept {
     return extensions_;
   }
@@ -1014,8 +1030,21 @@ class MoQFrameWriter {
 
   void resetWriterFetchContext() const noexcept;
 
+  template <typename Msg>
+  void notifySent(
+      void (MoQFrameObserver::*
+                hook)(MoQFrameObserver::Direction, uint64_t, const Msg&),
+      const Msg& msg) const noexcept {
+    if (frameObserver_) {
+      ((*frameObserver_).*hook)(
+          MoQFrameObserver::Direction::Sent, frameStreamID_, msg);
+    }
+  }
+
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
+  std::shared_ptr<MoQFrameObserver> frameObserver_;
+  uint64_t frameStreamID_{0};
   std::shared_ptr<const MessageParameterExtensions> messageParameterExtensions_;
   SetupExtensions extensions_;
   mutable std::optional<uint64_t> previousObjectID_;
