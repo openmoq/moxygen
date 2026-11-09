@@ -45,13 +45,14 @@ class MoQTestServer : public moxygen::MoQServer {
 
   // Relay client support. Workers come from an externally-supplied EventBase
   // (use the QUIC server's worker pool when QUIC is running, otherwise the
-  // QMUX server's worker pool).
+  // QMUX server's worker pool).  Publishes nsPrefix + 'moq-test-00'.
   bool startRelayClient(
       folly::EventBase* workerEvb,
       const std::string& relayUrl,
       int32_t connectTimeout,
       int32_t transactionTimeout,
-      samples::TransportType transportType);
+      samples::TransportType transportType,
+      std::vector<std::string> nsPrefix = {});
 
  private:
   // Dials a fresh transport and completes MoQ setup. Returns null if either
