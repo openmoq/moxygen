@@ -79,8 +79,9 @@ class MoQFrameObserver {
   onRequestsBlocked(Direction, uint64_t streamID, const RequestsBlocked&) {}
 
   // A data-stream frame serialized before its stream exists carries a pending
-  // key instead of a stream ID. onDataStreamBound later gives the key's
-  // stream. onDataStreamAbandoned means the stream will not exist.
+  // key from onDataStreamPending instead of a stream ID. onDataStreamBound
+  // later gives the key's stream. onDataStreamAbandoned means the stream will
+  // not exist.
   struct DataStream {
     enum class Kind : uint8_t { StreamID, PendingKey };
     uint64_t value{0};
@@ -108,6 +109,18 @@ class MoQFrameObserver {
       uint64_t group,
       uint64_t object,
       FetchRangeEnd) {}
+  // A datagram does not belong to a stream.
+  virtual void onDatagramObject(
+      Direction,
+      TrackAlias,
+      const ObjectHeader&,
+      bool endOfGroup) {}
+  virtual void onPaddingDatagram(Direction, uint64_t paddingLength) {}
+  // Returns a key for a data stream that is not open yet. 0 means the
+  // observer does not track the stream.
+  virtual uint64_t onDataStreamPending() {
+    return 0;
+  }
   virtual void onDataStreamBound(uint64_t pendingKey, uint64_t streamID) {}
   virtual void onDataStreamAbandoned(uint64_t pendingKey) {}
 };
