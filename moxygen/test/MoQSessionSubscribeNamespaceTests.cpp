@@ -6,6 +6,8 @@
 
 #include "moxygen/test/MoQSessionTestCommon.h"
 
+#include <folly/coro/Collect.h>
+
 using namespace moxygen;
 using namespace moxygen::test;
 using testing::_;
@@ -45,6 +47,35 @@ CO_TEST_P_X(MoQSessionTest, SubscribeAndUnsubscribeNamespace) {
   co_await barricade;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+
+// The publisher clears its handler while answering the first of two
+// SUBSCRIBE_NAMESPACEs. The second gets an error.
+CO_TEST_P_X(MoQSessionTest, SubscribeNamespaceAfterPublishHandlerCleared) {
+  co_await setupMoQSession();
+  EXPECT_CALL(*serverPublisher, subscribeNamespace(_, _))
+      .WillOnce(
+          [this](
+              auto subNs,
+              auto) -> folly::coro::Task<Publisher::SubscribeNamespaceResult> {
+            serverSession_->setPublishHandler(nullptr);
+            co_return folly::makeUnexpected(
+                SubscribeNamespaceError{
+                    subNs.requestID,
+                    SubscribeNamespaceErrorCode::INTERNAL_ERROR,
+                    "first"});
+          });
+
+  auto second = getSubscribeNamespace();
+  second.trackNamespacePrefix = TrackNamespace{{"other"}};
+  auto [firstRes, secondRes] = co_await folly::coro::collectAll(
+      clientSession_->subscribeNamespace(getSubscribeNamespace(), nullptr),
+      clientSession_->subscribeNamespace(std::move(second), nullptr));
+  EXPECT_TRUE(firstRes.hasError());
+  EXPECT_TRUE(secondRes.hasError());
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 // Unsubscribing must release the caller's NamespacePublishHandle without
 // waiting for the peer to close its half of the stream.
 CO_TEST_P_X(MoQSessionTest, UnsubscribeNamespaceReleasesPublishHandle) {

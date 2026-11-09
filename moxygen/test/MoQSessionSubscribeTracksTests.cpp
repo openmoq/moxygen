@@ -8,6 +8,8 @@
 #include "moxygen/ReplyContext.h"
 #include "moxygen/test/MoQSessionTestCommon.h"
 
+#include <folly/coro/Collect.h>
+
 #include <optional>
 #include <vector>
 
@@ -165,6 +167,38 @@ CO_TEST_P_X(Draft22Test, SubscribeTracksCarriesIncludePropertiesFalse) {
   });
   result.value()->unsubscribeTracks();
   co_await unsubscribed;
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// The publisher clears its handler while answering the first of two
+// SUBSCRIBE_TRACKS. The second gets an error.
+CO_TEST_P_X(
+    V18PlusSubscribeTracksTest,
+    SubscribeTracksAfterPublishHandlerCleared) {
+  co_await setupMoQSession();
+  EXPECT_CALL(*serverPublisher, subscribeTracks(_, _))
+      .WillOnce(
+          [this](
+              SubscribeTracks subTracks,
+              auto) -> folly::coro::Task<Publisher::SubscribeTracksResult> {
+            serverSession_->setPublishHandler(nullptr);
+            co_return folly::makeUnexpected(
+                SubscribeTracksError{
+                    subTracks.requestID,
+                    SubscribeTracksErrorCode::INTERNAL_ERROR,
+                    "first"});
+          });
+
+  auto first = getSubscribeTracks();
+  first.trackNamespacePrefix = TrackNamespace{{"first"}};
+  auto second = getSubscribeTracks();
+  second.trackNamespacePrefix = TrackNamespace{{"second"}};
+  auto [firstRes, secondRes] = co_await folly::coro::collectAll(
+      clientSession_->subscribeTracks(std::move(first)),
+      clientSession_->subscribeTracks(std::move(second)));
+  EXPECT_TRUE(firstRes.hasError());
+  EXPECT_TRUE(secondRes.hasError());
+  EXPECT_FALSE(serverSession_->isClosed());
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
