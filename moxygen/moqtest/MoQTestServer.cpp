@@ -93,7 +93,8 @@ bool MoQTestServer::startRelayClient(
     const std::string& relayUrl,
     int32_t connectTimeout,
     int32_t transactionTimeout,
-    samples::TransportType transportType) {
+    samples::TransportType transportType,
+    std::vector<std::string> nsPrefix) {
   proxygen::URL url(relayUrl);
   if (!url.isValid() || !url.hasHost()) {
     XLOG(ERR) << "Invalid relay url: " << relayUrl;
@@ -111,10 +112,11 @@ bool MoQTestServer::startRelayClient(
             url, transportType, connectTimeout, transactionTimeout);
       });
 
-  // Publishes 'moq-test-00' and then keeps the session alive with a periodic
-  // ping, so an idle relay doesn't time us out.  Start async (schedule on evb,
-  // don't block).
-  std::vector<TrackNamespace> namespaces{TrackNamespace("moq-test-00", "/")};
+  // Publishes nsPrefix/moq-test-00 and then keeps the session alive with a
+  // periodic ping, so an idle relay doesn't time us out.  Start async (schedule
+  // on evb, don't block).
+  nsPrefix.emplace_back("moq-test-00");
+  std::vector<TrackNamespace> namespaces{TrackNamespace(std::move(nsPrefix))};
   co_withExecutor(
       workerEvb, relayClient_->run(publisher_, std::move(namespaces)))
       .start();
