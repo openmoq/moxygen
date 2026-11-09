@@ -254,6 +254,31 @@ TEST_F(MoQProxyTest, FillOpensAndResets) {
   result.value()->unsubscribe();
 }
 
+TEST_F(MoQProxyTest, RejectsSwitchOptionsItCannotRun) {
+  auto withSwitch = [](MoQProxySwitchOptions upstreamSwitch) {
+    MoQProxyOptions options;
+    options.upstreamSwitch = upstreamSwitch;
+    return options;
+  };
+  using std::chrono::milliseconds;
+  EXPECT_THROW(
+      MoQProxy::create({provider_}, withSwitch({.deadline = milliseconds(-1)})),
+      std::invalid_argument);
+  EXPECT_THROW(
+      MoQProxy::create(
+          {provider_}, withSwitch({.retryBackoff = milliseconds(0)})),
+      std::invalid_argument);
+  EXPECT_THROW(
+      MoQProxy::create(
+          {provider_},
+          withSwitch(
+              {.retryBackoff = milliseconds(100),
+               .maxRetryBackoff = milliseconds(50)})),
+      std::invalid_argument);
+  EXPECT_NO_THROW(
+      MoQProxy::create({provider_}, withSwitch({.deadline = milliseconds(0)})));
+}
+
 TEST_F(MoQProxyTest, TriesUpstreamProvidersInOrder) {
   auto fallbackSession =
       std::make_shared<NiceMock<test::MockMoQSession>>(executor_);
@@ -851,6 +876,16 @@ class MoQProxyJoiningTest : public MoQProxyTest {
  protected:
   void SetUp() override {
     MoQProxyTest::SetUp();
+    ON_CALL(*upstreamSession_, fetch(_, _))
+        .WillByDefault(
+            [](Fetch request, std::shared_ptr<FetchConsumer>)
+                -> folly::coro::Task<Publisher::FetchResult> {
+              co_return folly::makeUnexpected(
+                  FetchError{
+                      request.requestID,
+                      FetchErrorCode::NOT_SUPPORTED,
+                      "no speculative history"});
+            });
     proxy_ = MoQProxy::create({provider_}, makeOptions());
   }
 
@@ -904,6 +939,7 @@ class MoQProxyJoiningTest : public MoQProxyTest {
         firstViewer_, makeSubscribeRequest(RequestID(1)), firstViewerLive_);
     ASSERT_TRUE(result.hasValue());
     firstHandle_ = std::move(result.value());
+    drive();
   }
 
   std::shared_ptr<SubgroupConsumer> openSubgroup(
@@ -915,6 +951,17 @@ class MoQProxyJoiningTest : public MoQProxyTest {
         upstreamConsumer_->beginSubgroup(group, 0, kDefaultPriority, options);
     EXPECT_TRUE(res.hasValue());
     return res.hasValue() ? res.value() : nullptr;
+  }
+
+  void expectUncacheableHistory(Fetch& upstreamRequest) {
+    EXPECT_CALL(*upstreamSession_, fetch(_, _))
+        .WillOnce(
+            [this, &upstreamRequest](
+                Fetch request, std::shared_ptr<FetchConsumer>)
+                -> folly::coro::Task<Publisher::FetchResult> {
+              upstreamRequest = std::move(request);
+              co_return makeFetchHandle(upstreamRequest.requestID);
+            });
   }
 
   // Objects [0, count) of a group, ended by the last-in-group flag and a
@@ -1246,13 +1293,7 @@ TEST_F(MoQProxyJoiningTest, UncachedHistoryGoesUpstreamWithoutWaiting) {
   }
   auto viewer = addViewer(RequestID(5));
   Fetch upstreamRequest;
-  EXPECT_CALL(*upstreamSession_, fetch(_, _))
-      .WillOnce(
-          [&](Fetch request, std::shared_ptr<FetchConsumer>)
-              -> folly::coro::Task<Publisher::FetchResult> {
-            upstreamRequest = std::move(request);
-            co_return makeFetchHandle(RequestID(200));
-          });
+  expectUncacheableHistory(upstreamRequest);
 
   auto result = fetch(viewer, joiningFetch(RequestID(7), RequestID(5), 10));
 
@@ -1345,13 +1386,7 @@ TEST_F(MoQProxyJoiningTest, RelativeOffsetPastGroupZeroStartsAtGroupZero) {
   openSubgroup(43, false)->object(0, payloadOf(10), noExtensions(), false);
   auto viewer = addViewer(RequestID(5));
   Fetch upstreamRequest;
-  EXPECT_CALL(*upstreamSession_, fetch(_, _))
-      .WillOnce(
-          [&](Fetch request, std::shared_ptr<FetchConsumer>)
-              -> folly::coro::Task<Publisher::FetchResult> {
-            upstreamRequest = std::move(request);
-            co_return makeFetchHandle(RequestID(200));
-          });
+  expectUncacheableHistory(upstreamRequest);
 
   auto result = fetch(
       viewer,
@@ -1420,14 +1455,9 @@ TEST_F(MoQProxyJoiningTest, FirstViewerKeepsTheUpstreamAnchor) {
   auto subscribed = subscribe(
       firstViewer_, makeSubscribeRequest(RequestID(1)), firstViewerLive_);
   ASSERT_TRUE(subscribed.hasValue());
+  drive();
   Fetch upstreamRequest;
-  EXPECT_CALL(*upstreamSession_, fetch(_, _))
-      .WillOnce(
-          [&](Fetch request, std::shared_ptr<FetchConsumer>)
-              -> folly::coro::Task<Publisher::FetchResult> {
-            upstreamRequest = std::move(request);
-            co_return makeFetchHandle(RequestID(200));
-          });
+  expectUncacheableHistory(upstreamRequest);
 
   auto result =
       fetch(firstViewer_, joiningFetch(RequestID(7), RequestID(1), 10));

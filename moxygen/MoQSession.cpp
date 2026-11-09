@@ -55,6 +55,18 @@ uint32_t subgroupPriorityBits(uint32_t subgroupID) {
   return static_cast<uint32_t>(subgroupID) & kSubgroupMask;
 }
 
+// WebTransport ends a stream with its internal error when the stream fails,
+// and every stream of a connection that failed, which ends the session too.
+ResetStreamErrorCode streamResetCode(
+    uint32_t wtError,
+    uint64_t negotiatedVersion,
+    bool sessionClosed) {
+  if (wtError == proxygen::WebTransport::kInternalError && sessionClosed) {
+    return ResetStreamErrorCode::SESSION_CLOSED;
+  }
+  return fromWireResetStreamErrorCode(wtError, negotiatedVersion);
+}
+
 struct StreamPriority {
   uint8_t urgency;
   uint32_t order;
@@ -4781,11 +4793,13 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     beginOptions.includeExtensions = options.hasExtensions;
     auto res = callback->beginSubgroup(
         group, subgroup, effectivePriority, beginOptions);
-    if (res.hasValue()) {
-      subgroupCallback_ = *res;
-    } else {
+    if (res.hasError()) {
+      // The publisher counted the stream when it opened it.
+      subscribeState_->setCurrentStreamId(currentStreamId_);
+      subscribeState_->onSubgroup();
       return MoQCodec::ParseResult::ERROR_TERMINATE;
     }
+    subgroupCallback_ = *res;
     if (logger_) {
       logger_->logSubgroupHeaderParsed(
           currentStreamId_, alias, group, subgroup, effectivePriority, options);
@@ -5232,7 +5246,7 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
                 .tryGetExceptionObject<proxygen::WebTransport::Exception>();
         if (wtEx) {
           errorCode =
-              fromWireResetStreamErrorCode(wtEx->error, *negotiatedVersion_);
+              streamResetCode(wtEx->error, *negotiatedVersion_, closed_);
         }
         if (!dcb.reset(errorCode)) {
           XLOG(ERR) << __func__ << " terminating for unknown "

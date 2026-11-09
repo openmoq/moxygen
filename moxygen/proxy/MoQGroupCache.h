@@ -22,6 +22,8 @@
 namespace moxygen {
 
 // The newest groups of one live track, fed by its associated upstream requests.
+// During a switch, each group comes from whichever upstream subscription owns
+// it: the current one or its replacement.
 // A joining FETCH is served from it only when every requested location is
 // proven: a complete object, or authoritative evidence that it does not
 // exist.
@@ -29,6 +31,13 @@ class MoQGroupCache {
  public:
   using Coverage = MoQCacheCoverage;
   using Result = MoQCacheResult;
+
+  struct Range {
+    AbsoluteLocation start;
+    AbsoluteLocation end;
+
+    bool operator==(const Range&) const = default;
+  };
 
   // maxGroups == 0 disables caching.
   MoQGroupCache(size_t maxGroups, std::shared_ptr<MoQCacheBudget> budget);
@@ -89,6 +98,8 @@ class MoQGroupCache {
   // --- Joining FETCH ---
 
   Coverage inspect(AbsoluteLocation start, AbsoluteLocation end) const;
+  std::vector<Range> missingRanges(AbsoluteLocation start, AbsoluteLocation end)
+      const;
   // Only for a Ready range. Nullopt if the plan cannot be charged.
   std::optional<MoQReplayPlan> snapshot(
       AbsoluteLocation start,

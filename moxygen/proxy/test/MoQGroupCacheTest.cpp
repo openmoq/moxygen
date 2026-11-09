@@ -150,6 +150,73 @@ TEST(MoQGroupCacheTest, CompletesGroupFromFetchAndSubscription) {
   EXPECT_FALSE(cacheable.has_value());
 }
 
+TEST(MoQGroupCacheTest, FailedFetchKeepsCompletedGroups) {
+  auto cache = std::make_shared<MoQGroupCache>(4, makeBudget());
+  bool cacheable = true;
+  auto writer = fetchWriter(cache, {10, 0}, {12, 0}, cacheable);
+  ASSERT_TRUE(writer->object(10, 0, 0, bytes(1), noExtensions(), false, false)
+                  .hasValue());
+  ASSERT_TRUE(
+      writer->beginObject(11, 0, 0, 2, bytes(1), noExtensions()).hasValue());
+  ASSERT_TRUE(cache->openSubgroup(20, 0, true));
+
+  writer->abort();
+
+  EXPECT_FALSE(cacheable);
+  EXPECT_EQ(wholeGroups(*cache, 10, 10), Coverage::Ready);
+  EXPECT_NE(wholeGroups(*cache, 11, 11), Coverage::Ready);
+  EXPECT_EQ(
+      cache->subgroupObject(
+          20, 0, 0, ObjectStatus::NORMAL, bytes(1), noExtensions()),
+      Result::Recorded);
+  EXPECT_EQ(cache->endSubgroup(20, 0, true), Result::Recorded);
+  EXPECT_EQ(wholeGroups(*cache, 20, 20), Coverage::Ready);
+}
+
+TEST(MoQGroupCacheTest, FailedFetchPreservesConcurrentWriterData) {
+  auto cache = std::make_shared<MoQGroupCache>(4, makeBudget());
+  bool failedCacheable = true;
+  bool survivorCacheable = false;
+  auto failed = fetchWriter(cache, {20, 0}, {21, 0}, failedCacheable);
+  auto survivor = fetchWriter(cache, {10, 0}, {12, 0}, survivorCacheable);
+  ASSERT_TRUE(failed->object(20, 0, 0, bytes(1), noExtensions(), false, false)
+                  .hasValue());
+  ASSERT_TRUE(survivor->object(10, 0, 0, bytes(1), noExtensions(), false, false)
+                  .hasValue());
+
+  failed->invalidate();
+
+  EXPECT_FALSE(failedCacheable);
+  EXPECT_EQ(cache->inspect({20, 0}, {20, 1}), Coverage::Ready);
+  ASSERT_TRUE(survivor->object(10, 0, 1, bytes(1), noExtensions(), false, false)
+                  .hasValue());
+  ASSERT_TRUE(survivor->object(11, 0, 0, bytes(1), noExtensions(), true, false)
+                  .hasValue());
+  ASSERT_TRUE(survivorCacheable);
+  auto plan = cache->snapshot({10, 0}, {12, 0}, GroupOrder::OldestFirst);
+  ASSERT_TRUE(plan.has_value());
+  EXPECT_EQ(
+      locations(*plan),
+      (std::vector<AbsoluteLocation>{{10, 0}, {10, 1}, {11, 0}}));
+}
+
+TEST(MoQGroupCacheTest, AbortAfterCleanFetchRejectsLateRange) {
+  auto cache = std::make_shared<MoQGroupCache>(3, makeBudget());
+  std::optional<bool> cacheable;
+  auto writer = std::make_shared<MoQFetchCacheWriter>(
+      cache, [&](bool result) { cacheable = result; });
+  ASSERT_TRUE(writer->object(7, 0, 0, bytes(1), noExtensions(), true, false)
+                  .hasValue());
+  ASSERT_FALSE(cacheable.has_value());
+
+  writer->abort();
+
+  ASSERT_TRUE(cacheable.has_value());
+  EXPECT_FALSE(*cacheable);
+  EXPECT_FALSE(writer->setRange({7, 0}, {8, 0}));
+  EXPECT_EQ(wholeGroups(*cache, 7, 7), Coverage::Miss);
+}
+
 TEST(MoQGroupCacheTest, ValidatesDataThatPrecedesFetchOk) {
   auto cache = std::make_shared<MoQGroupCache>(3, makeBudget());
   std::optional<bool> cacheable;
@@ -165,7 +232,7 @@ TEST(MoQGroupCacheTest, ValidatesDataThatPrecedesFetchOk) {
   EXPECT_TRUE(*cacheable);
 }
 
-TEST(MoQGroupCacheTest, RejectsEarlyDataOutsideFetchOkRange) {
+TEST(MoQGroupCacheTest, RejectsFetchOkRangeThatExcludesEarlyData) {
   auto cache = std::make_shared<MoQGroupCache>(3, makeBudget());
   std::optional<bool> cacheable;
   auto writer = std::make_shared<MoQFetchCacheWriter>(
@@ -177,7 +244,7 @@ TEST(MoQGroupCacheTest, RejectsEarlyDataOutsideFetchOkRange) {
 
   ASSERT_TRUE(cacheable.has_value());
   EXPECT_FALSE(*cacheable);
-  EXPECT_EQ(cache->inspect({7, 0}, {7, 1}), Coverage::Miss);
+  EXPECT_EQ(cache->inspect({7, 0}, {7, 1}), Coverage::Ready);
 }
 
 TEST(MoQGroupCacheTest, RejectsDataOutsideRequestedBoundsBeforeFetchOk) {
@@ -744,6 +811,38 @@ TEST(MoQGroupCacheTest, LostDatagramIsAMiss) {
   EXPECT_EQ(cache.inspect({1, 0}, {1, 1}), Coverage::Ready);
 }
 
+TEST(MoQGroupCacheTest, MissingRangesExcludeCachedObjects) {
+  MoQGroupCache cache(3, makeBudget());
+  for (uint64_t objectID : {0, 2}) {
+    ASSERT_EQ(
+        cache.standaloneObject(
+            ObjectHeader(7, 0, objectID), bytes(1), /*datagram=*/true),
+        Result::Recorded);
+  }
+  recordGroup(cache, 9, 1);
+
+  EXPECT_EQ(
+      cache.missingRanges({7, 0}, {10, 0}),
+      (std::vector<MoQGroupCache::Range>{{{7, 1}, {7, 2}}, {{7, 3}, {9, 0}}}));
+}
+
+TEST(MoQGroupCacheTest, MissingRangesExcludeKnownGroupTail) {
+  MoQGroupCache cache(3, makeBudget());
+  ASSERT_TRUE(cache.openSubgroup(7, 0, false));
+  ASSERT_EQ(
+      cache.subgroupObject(
+          7, 0, 0, ObjectStatus::NORMAL, bytes(1), noExtensions()),
+      Result::Recorded);
+  ASSERT_EQ(
+      cache.subgroupObject(
+          7, 0, 2, ObjectStatus::END_OF_GROUP, nullptr, noExtensions()),
+      Result::Recorded);
+
+  EXPECT_EQ(
+      cache.missingRanges({7, 0}, {8, 0}),
+      (std::vector<MoQGroupCache::Range>{{{7, 1}, {7, 2}}}));
+}
+
 TEST(MoQGroupCacheTest, ConflictingDuplicateIsMalformed) {
   MoQGroupCache cache(3, makeBudget());
   ASSERT_TRUE(cache.openSubgroup(1, 0, false));
@@ -758,6 +857,9 @@ TEST(MoQGroupCacheTest, ConflictingDuplicateIsMalformed) {
 
   EXPECT_EQ(result, Result::Malformed);
   EXPECT_EQ(cache.inspect({1, 0}, {1, 1}), Coverage::Miss);
+  EXPECT_EQ(
+      cache.missingRanges({1, 0}, {1, 1}),
+      (std::vector<MoQGroupCache::Range>{{{1, 0}, {1, 1}}}));
 }
 
 TEST(MoQGroupCacheTest, PayloadBeyondDeclaredLengthIsMalformed) {
