@@ -10,6 +10,7 @@
 #include <optional>
 #include <set>
 #include <utility>
+#include <vector>
 
 namespace moxygen {
 
@@ -28,6 +29,9 @@ namespace moxygen {
 // forwarder. Once old has ended, the replacement owns every group after both
 // the highest group old opened and the highest group whose replacement data
 // was refused, which can no longer reach viewers whole from the replacement.
+// When old ends with nothing left to send and the replacement starts right
+// after the track's Largest, the replacement owns that group's rest too, and
+// its streams there that start mid-subgroup go on from what viewers have.
 //
 // Draft 18+ says on the wire when a stream starts mid-subgroup, so the
 // replacement is missing that subgroup's first objects; the arbiter refuses
@@ -48,6 +52,12 @@ namespace moxygen {
 // down once it has stayed caught up for a short reorder grace, or when it ends
 // or a tail or old-stall timer fires, and reports that with onOldEnded().
 // Everything from old is refused after that.
+//
+// A replacement can end before old does, after it froze the split. Old and
+// the next replacement then go through the arbiter afterReplacementEnded()
+// returns: old keeps its own groups and takes back the ended replacement's
+// after the highest group the track had opened. The ended replacement's
+// groups up to that one are no one's, since viewers may have part of them.
 //
 // The caller also keeps track aliases hop-local (the replacement's
 // setTrackAlias is not passed on) and lets only a group's owner advance the
@@ -80,6 +90,10 @@ class MoQUpstreamHandoffArbiter {
 
   explicit MoQUpstreamHandoffArbiter(OldProgress oldProgress = {});
 
+  // For when the replacement that froze the split ended before old did. What
+  // old has open, and the highest group the track opened, come from progress.
+  MoQUpstreamHandoffArbiter afterReplacementEnded(OldProgress progress) const;
+
   // A received object stream is a subgroup of its own, so it arrives here
   // too. startsMidSubgroup is true only when the stream is known not to begin
   // with its subgroup's first object; draft 16 doesn't say.
@@ -94,7 +108,9 @@ class MoQUpstreamHandoffArbiter {
   // An accepted subgroup finished or was reset. Only old's matter, to tell
   // when it has caught up; the replacement's are ignored.
   void onSubgroupEnded(Source source, uint64_t group, uint64_t subgroup);
-  void onOldEnded();
+  // continuedGroup: the group of the track's Largest, when the replacement
+  // starts right after it.
+  void onOldEnded(std::optional<uint64_t> continuedGroup = std::nullopt);
 
   // The split as the replacement's first data froze it while old was still
   // running. Old ending hands the replacement more groups but leaves this as
@@ -102,10 +118,20 @@ class MoQUpstreamHandoffArbiter {
   const std::optional<Split>& split() const {
     return split_;
   }
+  // The highest group old has opened, counting what it was seeded with.
+  const std::optional<uint64_t>& highestOldGroup() const {
+    return highestOldGroup_;
+  }
+  // Some replacement data was refused for a group not yet the replacement's.
+  bool replacementRefused() const {
+    return replacementIncompleteGroup_.has_value();
+  }
   // Old has reached the replacement's groups and finished every group it
   // opened before them. A late stream for one of those groups makes this false
   // again until it finishes.
   bool oldCaughtUp() const;
+  // The groups old opened and hasn't finished.
+  std::set<uint64_t> oldUnfinishedGroups() const;
   // The replacement has delivered objects of its groups while old still has
   // unfinished groups that viewers may be waiting on.
   bool oldBlocksReplacement() const;
@@ -116,7 +142,19 @@ class MoQUpstreamHandoffArbiter {
     bool open;
   };
 
+  // The groups of a replacement that ended before old, up to the highest
+  // group the track had opened by then.
+  struct EndedReplacement {
+    Split split;
+    uint64_t lastGroup;
+
+    bool owned(uint64_t group) const {
+      return group <= lastGroup && split.ownedByReplacement(group);
+    }
+  };
+
   Admit admit(Source source, uint64_t group);
+  bool endedReplacementOwned(uint64_t group) const;
   Split splitAfterOldEnded() const;
   void raiseHighestOldGroup(uint64_t group);
   void raiseReplacementIncompleteGroup(uint64_t group);
@@ -135,6 +173,9 @@ class MoQUpstreamHandoffArbiter {
   // refused: a stream that started mid-subgroup, or data for a group old
   // owned.
   std::optional<uint64_t> replacementIncompleteGroup_;
+  std::optional<uint64_t> continuedGroup_;
+  // Old can't take these back.
+  std::vector<EndedReplacement> endedReplacements_;
   bool oldReachedReplacement_{false};
   bool oldEnded_{false};
   bool replacementDelivering_{false};

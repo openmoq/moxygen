@@ -7,7 +7,10 @@
 #include "moxygen/test/MoQProxySwitchHarness.h"
 
 #include <fmt/core.h>
+#include <folly/coro/Sleep.h>
 #include <algorithm>
+
+#include "moxygen/MoQVersions.h"
 
 namespace moxygen::test {
 namespace {
@@ -38,6 +41,22 @@ void SwitchOrigin::notePublished(
     AbsoluteLocation location) {
   published_[track].insert(location);
 }
+
+class SwitchTestHub::FetchHandle final : public Publisher::FetchHandle {
+ public:
+  explicit FetchHandle(FetchOk ok) : Publisher::FetchHandle(std::move(ok)) {}
+
+  void fetchCancel() override {}
+
+  folly::coro::Task<RequestUpdateResult> requestUpdate(
+      RequestUpdate update) override {
+    co_return folly::makeUnexpected(
+        RequestError{
+            update.requestID,
+            RequestErrorCode::NOT_SUPPORTED,
+            "test hub takes no updates"});
+  }
+};
 
 class SwitchTestHub::Handle final : public Publisher::SubscriptionHandle {
  public:
@@ -78,6 +97,8 @@ folly::coro::Task<Publisher::SubscribeResult> SwitchTestHub::subscribe(
     ok.largest = largest->second;
   }
   filters_[request.fullTrackName].push_back(request.filter);
+  subscribeTimes_[request.fullTrackName].push_back(
+      std::chrono::steady_clock::now());
   // Draft 16+ carries the publisher's group order only as a track property.
   ok.extensions.insertMutableExtension(Extension(
       kPublisherGroupOrderExtensionType,
@@ -96,6 +117,64 @@ folly::coro::Task<Publisher::SubscribeResult> SwitchTestHub::subscribe(
   co_return std::make_shared<Handle>(std::move(ok), weak_from_this(), id);
 }
 
+folly::coro::Task<Publisher::FetchResult> SwitchTestHub::fetch(
+    Fetch fetch,
+    std::shared_ptr<FetchConsumer> consumer) {
+  const auto* range = std::get_if<StandaloneFetch>(&fetch.args);
+  if (!range) {
+    co_return folly::makeUnexpected(
+        FetchError{
+            fetch.requestID,
+            FetchErrorCode::NOT_SUPPORTED,
+            "test hub answers standalone FETCH only"});
+  }
+  ++fetches_[fetch.fullTrackName];
+  auto inRange = [range](AbsoluteLocation location) {
+    return !(location < range->start) &&
+        (range->end.object == 0 ? location.group <= range->end.group
+                                : location < range->end);
+  };
+  std::vector<AbsoluteLocation> served;
+  for (const auto& [key, next] : nextObject_) {
+    if (key.first != fetch.fullTrackName) {
+      continue;
+    }
+    for (uint64_t object = 0; object < next; ++object) {
+      if (inRange({key.second, object})) {
+        served.emplace_back(key.second, object);
+      }
+    }
+  }
+  // The exclusive end the request names, cut back to the hub's largest.
+  AbsoluteLocation end = range->end.object == 0
+      ? AbsoluteLocation{range->end.group + 1, 0}
+      : range->end;
+  auto largest = largest_.find(fetch.fullTrackName);
+  if (largest == largest_.end()) {
+    end = range->start;
+  } else if (auto next = largest->second.next(); next && *next < end) {
+    end = std::max(*next, range->start);
+  }
+  for (size_t i = 0; i < served.size(); ++i) {
+    const auto location = served[i];
+    Extensions extensions;
+    extensions.insertMutableExtension(Extension(kHubIdExtensionType, id_));
+    consumer->object(
+        location.group,
+        origin_->shape().subgroupOf(location.object),
+        location.object,
+        folly::IOBuf::copyBuffer(
+            SwitchOrigin::payload(fetch.fullTrackName, location)),
+        std::move(extensions),
+        /*finFetch=*/i + 1 == served.size());
+  }
+  if (served.empty()) {
+    consumer->endOfFetch();
+  }
+  co_return std::make_shared<FetchHandle>(
+      FetchOk{fetch.requestID, GroupOrder::OldestFirst, /*endOfTrack=*/0, end});
+}
+
 void SwitchTestHub::publish(
     const FullTrackName& track,
     uint64_t group,
@@ -109,16 +188,35 @@ void SwitchTestHub::publish(
       largest->second = std::max(largest->second, location);
     }
     // Publishing can end a subscription.
-    for (auto id : subscriptionsTo(track)) {
+    for (auto id : subscriptionsTo(track, /*includeEnded=*/true)) {
       auto it = subscriptions_.find(id);
       if (it == subscriptions_.end()) {
         continue;
       }
-      const auto& range = it->second.range;
+      auto& subscription = it->second;
+      if (subscription.ended) {
+        finishStream(id, subscription, location);
+        continue;
+      }
+      const auto& range = subscription.range;
       if (range.start <= location && location <= range.end) {
-        publishObject(id, it->second, location);
+        publishObject(id, subscription, location);
       }
     }
+  }
+}
+
+void SwitchTestHub::finishStream(
+    uint64_t subscriptionID,
+    Subscription& subscription,
+    AbsoluteLocation location) {
+  if (!subscription.openSubgroups.contains(
+          {location.group, origin_->shape().subgroupOf(location.object)})) {
+    return;
+  }
+  publishObject(subscriptionID, subscription, location);
+  if (subscription.openSubgroups.empty()) {
+    subscriptions_.erase(subscriptionID);
   }
 }
 
@@ -191,26 +289,34 @@ void SwitchTestHub::publishObject(
 }
 
 void SwitchTestHub::attach(const std::shared_ptr<MoQSession>& session) {
-  sessions_.push_back(session);
+  sessions_.push_back({session});
 }
 
-void SwitchTestHub::sendGoaway(const Goaway& goaway) {
-  for (const auto& weakSession : sessions_) {
-    if (auto session = weakSession.lock()) {
+size_t SwitchTestHub::sendGoaway(const Goaway& goaway) {
+  size_t sent = 0;
+  for (auto& attached : sessions_) {
+    if (auto session = attached.session.lock()) {
       session->goaway(goaway);
+      sent += !std::exchange(attached.goawaySent, true);
     }
   }
+  return sent;
 }
 
-void SwitchTestHub::sendRequestGoaway(
+size_t SwitchTestHub::sendRequestGoaway(
     const FullTrackName& track,
     std::chrono::milliseconds timeout) {
+  size_t sent = 0;
   for (auto id : subscriptionsTo(track)) {
-    const auto& subscription = subscriptions_.at(id);
+    auto& subscription = subscriptions_.at(id);
     if (auto session = subscription.session.lock()) {
       session->requestStreamGoaway(subscription.requestID, "", timeout);
+      const auto version = session->getNegotiatedVersion();
+      sent += version && getDraftMajorVersion(*version) >= 18 &&
+          !std::exchange(subscription.goawaySent, true);
     }
   }
+  return sent;
 }
 
 void SwitchTestHub::endSubscriptions(
@@ -234,12 +340,35 @@ void SwitchTestHub::endSubscriptions(
   }
 }
 
-void SwitchTestHub::closeSessions(SessionCloseErrorCode error) {
-  for (const auto& weakSession : std::exchange(sessions_, {})) {
-    if (auto session = weakSession.lock()) {
+void SwitchTestHub::finishSubscriptions(
+    const FullTrackName& track,
+    PublishDoneStatusCode statusCode) {
+  for (auto id : subscriptionsTo(track)) {
+    auto it = subscriptions_.find(id);
+    if (it == subscriptions_.end()) {
+      continue;
+    }
+    auto consumer = it->second.consumer;
+    const auto requestID = it->second.requestID;
+    if (it->second.openSubgroups.empty()) {
+      subscriptions_.erase(it);
+    } else {
+      it->second.ended = true;
+    }
+    consumer->publishDone(
+        PublishDone{requestID, statusCode, 0, "test hub ended the track"});
+  }
+}
+
+size_t SwitchTestHub::closeSessions(SessionCloseErrorCode error) {
+  size_t closed = 0;
+  for (const auto& attached : std::exchange(sessions_, {})) {
+    if (auto session = attached.session.lock()) {
       session->close(error);
+      ++closed;
     }
   }
+  return closed;
 }
 
 size_t SwitchTestHub::subscriptions(const FullTrackName& track) const {
@@ -252,11 +381,25 @@ std::vector<LocationFilter> SwitchTestHub::subscribeFilters(
   return it == filters_.end() ? std::vector<LocationFilter>{} : it->second;
 }
 
+std::vector<std::chrono::steady_clock::time_point>
+SwitchTestHub::subscribeTimes(const FullTrackName& track) const {
+  auto it = subscribeTimes_.find(track);
+  return it == subscribeTimes_.end()
+      ? std::vector<std::chrono::steady_clock::time_point>{}
+      : it->second;
+}
+
+size_t SwitchTestHub::fetches(const FullTrackName& track) const {
+  auto it = fetches_.find(track);
+  return it == fetches_.end() ? 0 : it->second;
+}
+
 std::vector<uint64_t> SwitchTestHub::subscriptionsTo(
-    const FullTrackName& track) const {
+    const FullTrackName& track,
+    bool includeEnded) const {
   std::vector<uint64_t> ids;
   for (const auto& [id, subscription] : subscriptions_) {
-    if (subscription.track == track) {
+    if (subscription.track == track && (includeEnded || !subscription.ended)) {
       ids.push_back(id);
     }
   }
@@ -269,7 +412,7 @@ void SwitchTestHub::unsubscribe(uint64_t subscriptionID) {
 
 size_t ScriptedUpstreamProvider::addUpstream(
     std::shared_ptr<MoQSession> session) {
-  upstreams_.push_back(Upstream{.session = std::move(session)});
+  upstreams_.push_back(Upstream{.held = session, .session = session});
   return upstreams_.size() - 1;
 }
 
@@ -286,6 +429,13 @@ ScriptedUpstreamProvider::getSession(
     const FullTrackName&,
     const TrackRequestParameters&,
     bool hasFallbackProvider) {
+  if (std::exchange(holdNext_, false)) {
+    attempts_.push_back(Attempt{.hasFallbackProvider = hasFallbackProvider});
+    co_await folly::coro::co_awaitTry(
+        folly::coro::sleep(std::chrono::seconds(30)));
+    co_return folly::makeUnexpected(
+        MoQUpstreamProviderError{"held attempt ended"});
+  }
   auto& attempt = attempts_.emplace_back(
       Attempt{.hasFallbackProvider = hasFallbackProvider});
   if (failuresLeft_ > 0) {
@@ -294,9 +444,13 @@ ScriptedUpstreamProvider::getSession(
         MoQUpstreamProviderError{"scripted provider failure"});
   }
   for (size_t i = 0; i < upstreams_.size(); i++) {
-    if (upstreams_[i].available && !upstreams_[i].session->isClosed()) {
+    auto session = upstreams_[i].session.lock();
+    if (upstreams_[i].available && session && !session->isClosed()) {
       attempt.upstream = i;
-      co_return upstreams_[i].session;
+      if (handOutOnce_) {
+        upstreams_[i].held.reset();
+      }
+      co_return session;
     }
   }
   co_return folly::makeUnexpected(
@@ -495,6 +649,7 @@ folly::Expected<folly::Unit, MoQPublishError> CheckingViewer::publishDone(
             pubDone.reasonPhrase));
   }
   done_ = std::move(pubDone);
+  doneAt_ = clock();
   return folly::unit;
 }
 
@@ -571,6 +726,7 @@ void CheckingViewer::receive(
     const Payload& payload,
     const Extensions& extensions) {
   received_.push_back(location);
+  arrivals_.push_back(clock());
   if (!receivedSet_.insert(location).second) {
     violations_.push_back(
         fmt::format("object {} received twice", describe(location)));
@@ -630,6 +786,156 @@ void CheckingViewer::onReset(
             group,
             subgroup,
             folly::to_underlying(error)));
+  }
+}
+
+folly::Expected<folly::Unit, MoQPublishError> CheckingFetch::object(
+    uint64_t groupID,
+    uint64_t /*subgroupID*/,
+    uint64_t objectID,
+    Payload payload,
+    Extensions extensions,
+    bool finFetch,
+    bool /*forwardingPreferenceIsDatagram*/) {
+  if (!open("an object")) {
+    return folly::unit;
+  }
+  receive({groupID, objectID}, bytesOf(payload), extensions);
+  ended_ = finFetch;
+  return folly::unit;
+}
+
+folly::Expected<folly::Unit, MoQPublishError> CheckingFetch::beginObject(
+    uint64_t groupID,
+    uint64_t /*subgroupID*/,
+    uint64_t objectID,
+    uint64_t length,
+    Payload initialPayload,
+    Extensions extensions) {
+  if (!open("an object")) {
+    return folly::unit;
+  }
+  partial_ = PartialObject{
+      {groupID, objectID}, length, bytesOf(initialPayload), extensions};
+  return folly::unit;
+}
+
+folly::Expected<ObjectPublishStatus, MoQPublishError>
+CheckingFetch::objectPayload(Payload payload, bool /*finSubgroup*/) {
+  if (!partial_) {
+    violations_.push_back("object payload without an object");
+    return ObjectPublishStatus::IN_PROGRESS;
+  }
+  partial_->payload += bytesOf(payload);
+  if (partial_->payload.size() < partial_->length) {
+    return ObjectPublishStatus::IN_PROGRESS;
+  }
+  auto object = std::move(*std::exchange(partial_, std::nullopt));
+  receive(object.location, object.payload, object.extensions);
+  return ObjectPublishStatus::DONE;
+}
+
+folly::Expected<folly::Unit, MoQPublishError> CheckingFetch::endOfGroup(
+    uint64_t /*groupID*/,
+    uint64_t /*subgroupID*/,
+    uint64_t /*objectID*/,
+    bool finFetch) {
+  if (open("an end of group")) {
+    ended_ = finFetch;
+  }
+  return folly::unit;
+}
+
+folly::Expected<folly::Unit, MoQPublishError> CheckingFetch::endOfTrackAndGroup(
+    uint64_t /*groupID*/,
+    uint64_t /*subgroupID*/,
+    uint64_t /*objectID*/) {
+  if (open("an end of track")) {
+    ended_ = true;
+  }
+  return folly::unit;
+}
+
+folly::Expected<folly::Unit, MoQPublishError> CheckingFetch::endOfFetch() {
+  if (open("an end of fetch")) {
+    ended_ = true;
+  }
+  return folly::unit;
+}
+
+void CheckingFetch::reset(ResetStreamErrorCode error) {
+  if (open("a reset")) {
+    reset_ = error;
+  }
+}
+
+std::vector<AbsoluteLocation> CheckingFetch::missing(
+    AbsoluteLocation start,
+    AbsoluteLocation end) const {
+  const std::set<AbsoluteLocation> received(received_.begin(), received_.end());
+  std::vector<AbsoluteLocation> missing;
+  const auto& published = origin_->published(track_);
+  for (auto it = published.lower_bound(start);
+       it != published.end() && *it < end;
+       ++it) {
+    if (!received.contains(*it)) {
+      missing.push_back(*it);
+    }
+  }
+  return missing;
+}
+
+bool CheckingFetch::open(const char* what) {
+  if (ended_ || reset_) {
+    violations_.push_back(fmt::format("{} after the fetch ended", what));
+    return false;
+  }
+  if (partial_) {
+    violations_.push_back(
+        fmt::format(
+            "{} in the middle of object {}",
+            what,
+            describe(partial_->location)));
+    partial_.reset();
+  }
+  return true;
+}
+
+void CheckingFetch::receive(
+    AbsoluteLocation location,
+    const std::string& payload,
+    const Extensions& extensions) {
+  if (!received_.empty() && !(received_.back() < location)) {
+    violations_.push_back(
+        fmt::format(
+            "object {} after {}",
+            describe(location),
+            describe(received_.back())));
+  }
+  received_.push_back(location);
+  if ((expectedStart && location < *expectedStart) ||
+      (expectedEnd && !(location < *expectedEnd))) {
+    violations_.push_back(
+        fmt::format("object {} is outside the range", describe(location)));
+  }
+  if (payload != SwitchOrigin::payload(track_, location)) {
+    violations_.push_back(
+        fmt::format("object {} has payload '{}'", describe(location), payload));
+  }
+  auto hub = extensions.getIntExtension(kHubIdExtensionType);
+  if (!hub) {
+    violations_.push_back(
+        fmt::format("object {} has no hub ID", describe(location)));
+    return;
+  }
+  auto [groupHub, inserted] = hubOfGroup_.try_emplace(location.group, *hub);
+  if (!inserted && groupHub->second != *hub) {
+    violations_.push_back(
+        fmt::format(
+            "group {} came from hubs {} and {}",
+            location.group,
+            groupHub->second,
+            *hub));
   }
 }
 

@@ -12,7 +12,9 @@
 namespace moxygen::test {
 namespace {
 
-constexpr uint64_t kMaxRequestID = 100;
+// Enough for 100 requests open at once on draft 16, which spends two IDs per
+// request.
+constexpr uint64_t kMaxRequestID = 256;
 
 } // namespace
 
@@ -22,9 +24,28 @@ folly::coro::Task<MoQTestLink*> MoQTestLinks::connect(
   auto link = std::make_unique<MoQTestLink>();
   std::tie(link->clientWt, link->serverWt) =
       proxygen::test::FakeSharedWebTransport::makeSharedWebTransport();
-  link->client = std::make_shared<MoQRelaySession>(
-      folly::MaybeManagedPtr<proxygen::WebTransport>(link->clientWt.get()),
-      executor_);
+  // Ends its transport once released, as MoQWebTransportBootstrapHandler's
+  // sessions do, unless the link went first.
+  link->client = std::shared_ptr<MoQRelaySession>(
+      new MoQRelaySession(
+          folly::MaybeManagedPtr<proxygen::WebTransport>(link->clientWt.get()),
+          executor_),
+      [weakTransport = std::weak_ptr(link->clientWt),
+       weakPeerTransport =
+           std::weak_ptr(link->serverWt)](MoQRelaySession* session) {
+        const bool closed = session->isClosed();
+        delete session;
+        auto transport = weakTransport.lock();
+        auto peerTransport = weakPeerTransport.lock();
+        if (!transport || !peerTransport) {
+          return;
+        }
+        peerTransport->setPeerHandler(nullptr);
+        if (!closed) {
+          transport->closeSession(
+              folly::to_underlying(SessionCloseErrorCode::NO_ERROR));
+        }
+      });
   link->serverWt->setPeerHandler(link->client.get());
   link->server = std::make_shared<MoQRelaySession>(
       folly::MaybeManagedPtr<proxygen::WebTransport>(link->serverWt.get()),
@@ -64,7 +85,9 @@ folly::coro::Task<MoQTestLink*> MoQTestLinks::connect(
 
 void MoQTestLinks::closeClients() {
   for (auto& link : links_) {
-    link->client->close(SessionCloseErrorCode::NO_ERROR);
+    if (link->client) {
+      link->client->close(SessionCloseErrorCode::NO_ERROR);
+    }
   }
 }
 

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -92,6 +93,14 @@ class SwitchTestHub : public Publisher,
   folly::coro::Task<SubscribeResult> subscribe(
       SubscribeRequest request,
       std::shared_ptr<TrackConsumer> consumer) override;
+  // Answers a standalone FETCH with the objects of its range the hub has
+  // published, oldest first, each carrying the hub's ID. An end object of 0
+  // takes all of the end group. As a relay does, the hub serves up to the
+  // largest object it has published, and FETCH_OK's exclusive end says where
+  // the reply stops.
+  folly::coro::Task<FetchResult> fetch(
+      Fetch fetch,
+      std::shared_ptr<FetchConsumer> consumer) override;
 
   // Publishes objects [0, endObject) of a group to every subscription to the
   // track, continuing where an earlier call stopped. A subgroup stream ends
@@ -102,19 +111,29 @@ class SwitchTestHub : public Publisher,
   // The hub serves on the server side of these sessions.
   void attach(const std::shared_ptr<MoQSession>& session);
 
-  void sendGoaway(const Goaway& goaway);
+  // Returns how many sessions got their first GOAWAY; a session ignores any
+  // later one.
+  size_t sendGoaway(const Goaway& goaway);
   // A request-stream GOAWAY on each subscription to the track (draft 18+).
-  void sendRequestGoaway(
+  // Returns how many subscriptions got their first, on a session that can
+  // send one.
+  size_t sendRequestGoaway(
       const FullTrackName& track,
       std::chrono::milliseconds timeout = {});
   // Resets the subscriptions' open subgroup streams, then sends PUBLISH_DONE,
-  // as a session does when a request-stream GOAWAY times out. A relay passing
-  // on its upstream's PUBLISH_DONE lets open streams finish instead.
+  // as a session does when a request-stream GOAWAY times out.
   void endSubscriptions(
       const FullTrackName& track,
       PublishDoneStatusCode statusCode,
       ResetStreamErrorCode reset = ResetStreamErrorCode::CANCELLED);
-  void closeSessions(
+  // Sends PUBLISH_DONE while open subgroup streams stay open, and later
+  // publishing finishes them, as a relay passing on its upstream's
+  // PUBLISH_DONE does.
+  void finishSubscriptions(
+      const FullTrackName& track,
+      PublishDoneStatusCode statusCode);
+  // Returns how many sessions it closed.
+  size_t closeSessions(
       SessionCloseErrorCode error = SessionCloseErrorCode::NO_ERROR);
 
   size_t subscriptions(const FullTrackName& track) const;
@@ -122,12 +141,18 @@ class SwitchTestHub : public Publisher,
   // order.
   std::vector<LocationFilter> subscribeFilters(
       const FullTrackName& track) const;
+  // When each of those arrived.
+  std::vector<std::chrono::steady_clock::time_point> subscribeTimes(
+      const FullTrackName& track) const;
+  // How many FETCHes for the track the hub has answered.
+  size_t fetches(const FullTrackName& track) const;
 
   uint64_t id() const {
     return id_;
   }
 
  private:
+  class FetchHandle;
   class Handle;
   struct Subscription {
     FullTrackName track;
@@ -138,13 +163,28 @@ class SwitchTestHub : public Publisher,
     // Subgroup streams still open, by group and subgroup.
     std::map<std::pair<uint64_t, uint64_t>, std::shared_ptr<SubgroupConsumer>>
         openSubgroups;
+    // Sent PUBLISH_DONE; only finishes its open subgroup streams.
+    bool ended{false};
+    bool goawaySent{false};
+  };
+  struct AttachedSession {
+    std::weak_ptr<MoQSession> session;
+    bool goawaySent{false};
   };
 
   void publishObject(
       uint64_t subscriptionID,
       Subscription& subscription,
       AbsoluteLocation location);
-  std::vector<uint64_t> subscriptionsTo(const FullTrackName& track) const;
+  // For an ended subscription: publishes the object if it continues an open
+  // stream, and drops the subscription once none is left.
+  void finishStream(
+      uint64_t subscriptionID,
+      Subscription& subscription,
+      AbsoluteLocation location);
+  std::vector<uint64_t> subscriptionsTo(
+      const FullTrackName& track,
+      bool includeEnded = false) const;
   void unsubscribe(uint64_t subscriptionID);
 
   uint64_t id_;
@@ -154,7 +194,10 @@ class SwitchTestHub : public Publisher,
   std::map<std::pair<FullTrackName, uint64_t>, uint64_t> nextObject_;
   std::map<FullTrackName, AbsoluteLocation> largest_;
   std::map<FullTrackName, std::vector<LocationFilter>> filters_;
-  std::vector<std::weak_ptr<MoQSession>> sessions_;
+  std::map<FullTrackName, std::vector<std::chrono::steady_clock::time_point>>
+      subscribeTimes_;
+  std::map<FullTrackName, size_t> fetches_;
+  std::vector<AttachedSession> sessions_;
 };
 
 // Routes the proxy to the first available upstream, as a consistent-hash pool
@@ -172,6 +215,17 @@ class ScriptedUpstreamProvider : public MoQUpstreamProvider {
   size_t addUpstream(std::shared_ptr<MoQSession> session);
   void setAvailable(size_t upstream, bool available);
   void failNextAttempts(size_t count);
+  // Once it hands a session out, keeps only a weak reference to it, so the
+  // proxy that took it is its only owner, as with a provider that connects a
+  // new session for each attempt.
+  void handOutOnce() {
+    handOutOnce_ = true;
+  }
+  // The next attempt waits, as one still connecting does, until it is
+  // cancelled, or for 30 s, then fails.
+  void holdNextAttempt() {
+    holdNext_ = true;
+  }
 
   const std::vector<Attempt>& attempts() const {
     return attempts_;
@@ -184,12 +238,16 @@ class ScriptedUpstreamProvider : public MoQUpstreamProvider {
 
  private:
   struct Upstream {
-    std::shared_ptr<MoQSession> session;
+    // Until handed out, with handOutOnce().
+    std::shared_ptr<MoQSession> held;
+    std::weak_ptr<MoQSession> session;
     bool available{true};
   };
 
   std::vector<Upstream> upstreams_;
   size_t failuresLeft_{0};
+  bool handOutOnce_{false};
+  bool holdNext_{false};
   std::vector<Attempt> attempts_;
 };
 
@@ -269,12 +327,20 @@ class CheckingViewer : public TrackConsumer,
   const std::vector<AbsoluteLocation>& received() const {
     return received_;
   }
+  // When each object of received() arrived, by clock.
+  const std::vector<std::chrono::steady_clock::time_point>& arrivals() const {
+    return arrivals_;
+  }
   std::map<uint64_t, uint64_t> hubOfGroup() const;
   const std::map<uint64_t, Source>& sourceOfGroup() const {
     return sourceOfGroup_;
   }
   const std::optional<PublishDone>& done() const {
     return done_;
+  }
+  // When done() arrived, by clock.
+  const std::optional<std::chrono::steady_clock::time_point>& doneAt() const {
+    return doneAt_;
   }
   // Subgroup streams, by group and subgroup, that neither finished nor were
   // reset.
@@ -295,6 +361,8 @@ class CheckingViewer : public TrackConsumer,
   // Where the viewer's objects should start: an object before it is a
   // violation, and missing() counts from it.
   std::optional<AbsoluteLocation> expectedStart;
+  std::function<std::chrono::steady_clock::time_point()> clock{
+      [] { return std::chrono::steady_clock::now(); }};
 
  private:
   class Subgroup;
@@ -309,6 +377,7 @@ class CheckingViewer : public TrackConsumer,
   FullTrackName track_;
   std::vector<std::string> violations_;
   std::vector<AbsoluteLocation> received_;
+  std::vector<std::chrono::steady_clock::time_point> arrivals_;
   std::set<AbsoluteLocation> receivedSet_;
   std::map<uint64_t, Source> sourceOfGroup_;
   // Each source's lowest group.
@@ -317,6 +386,100 @@ class CheckingViewer : public TrackConsumer,
   std::vector<OpenedSubgroup> opened_;
   std::vector<Reset> resets_;
   std::optional<PublishDone> done_;
+  std::optional<std::chrono::steady_clock::time_point> doneAt_;
+};
+
+// A FETCH's consumer that checks each object against the origin as it
+// arrives, and records the hub it came from.
+class CheckingFetch : public FetchConsumer {
+ public:
+  CheckingFetch(std::shared_ptr<SwitchOrigin> origin, FullTrackName track)
+      : origin_(std::move(origin)), track_(std::move(track)) {}
+
+  folly::Expected<folly::Unit, MoQPublishError> object(
+      uint64_t groupID,
+      uint64_t subgroupID,
+      uint64_t objectID,
+      Payload payload,
+      Extensions extensions,
+      bool finFetch,
+      bool forwardingPreferenceIsDatagram) override;
+  folly::Expected<folly::Unit, MoQPublishError> beginObject(
+      uint64_t groupID,
+      uint64_t subgroupID,
+      uint64_t objectID,
+      uint64_t length,
+      Payload initialPayload,
+      Extensions extensions) override;
+  folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
+      Payload payload,
+      bool finSubgroup) override;
+  folly::Expected<folly::Unit, MoQPublishError> endOfGroup(
+      uint64_t groupID,
+      uint64_t subgroupID,
+      uint64_t objectID,
+      bool finFetch) override;
+  folly::Expected<folly::Unit, MoQPublishError> endOfTrackAndGroup(
+      uint64_t groupID,
+      uint64_t subgroupID,
+      uint64_t objectID) override;
+  folly::Expected<folly::Unit, MoQPublishError> endOfFetch() override;
+  void reset(ResetStreamErrorCode error) override;
+  folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>
+  awaitReadyToConsume() override {
+    return folly::makeSemiFuture<uint64_t>(0);
+  }
+
+  // Corrupt, duplicate or out-of-order objects, objects outside the expected
+  // range or without a hub ID, groups from two hubs, and anything after the
+  // end or a reset.
+  const std::vector<std::string>& violations() const {
+    return violations_;
+  }
+  const std::vector<AbsoluteLocation>& received() const {
+    return received_;
+  }
+  // Objects the origin published in [start, end) that never arrived.
+  std::vector<AbsoluteLocation> missing(
+      AbsoluteLocation start,
+      AbsoluteLocation end) const;
+  // The hub that sent each group's objects, by group.
+  const std::map<uint64_t, uint64_t>& hubOfGroup() const {
+    return hubOfGroup_;
+  }
+  bool ended() const {
+    return ended_;
+  }
+  const std::optional<ResetStreamErrorCode>& resetError() const {
+    return reset_;
+  }
+  // The range the FETCH asked for, [expectedStart, expectedEnd): an object
+  // outside it is a violation.
+  std::optional<AbsoluteLocation> expectedStart;
+  std::optional<AbsoluteLocation> expectedEnd;
+
+ private:
+  struct PartialObject {
+    AbsoluteLocation location;
+    uint64_t length;
+    std::string payload;
+    Extensions extensions;
+  };
+
+  void receive(
+      AbsoluteLocation location,
+      const std::string& payload,
+      const Extensions& extensions);
+  bool open(const char* what);
+
+  std::shared_ptr<SwitchOrigin> origin_;
+  FullTrackName track_;
+  std::vector<std::string> violations_;
+  std::vector<AbsoluteLocation> received_;
+  std::map<uint64_t, uint64_t> hubOfGroup_;
+  std::optional<PartialObject> partial_;
+  bool ended_{false};
+  std::optional<ResetStreamErrorCode> reset_;
 };
 
 } // namespace moxygen::test
