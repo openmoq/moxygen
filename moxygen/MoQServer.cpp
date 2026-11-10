@@ -9,15 +9,15 @@
 #include <folly/String.h>
 #include <folly/logging/xlog.h>
 #include <folly/net/NetOps.h>
+#include <moxygen/MoQTypes.h>
+#include <moxygen/MoQVersions.h>
+#include <moxygen/events/MoQFollyExecutorImpl.h>
 #include <proxygen/httpserver/samples/hq/FizzContext.h>
 #include <proxygen/lib/http/session/HQSession.h>
 #include <proxygen/lib/http/webtransport/HTTPWebTransport.h>
 #include <proxygen/lib/http/webtransport/QuicWebTransport.h>
 #include <proxygen/lib/http/webtransport/QuicWtSession.h>
 #include <quic/common/address/QuicSocketAddressBridge.h>
-#include <moxygen/MoQTypes.h>
-#include <moxygen/MoQVersions.h>
-#include <moxygen/events/MoQFollyExecutorImpl.h>
 
 #include <utility>
 
@@ -86,7 +86,10 @@ MoQServer::MoQServer(
       fizzContext_(std::move(fizzContext)),
       useQuicWtSession_(std::move(options.useQuicWtSession)) {
   params_.serverThreads = 1;
-  params_.txnTimeout = options.txnTimeout;
+  // Wangle skips scheduling a non-positive timeout, which would disable it.
+  if (options.txnTimeout.count() > 0) {
+    params_.txnTimeout = options.txnTimeout;
+  }
   params_.transportSettings = options.transportSettings
       ? *options.transportSettings
       : defaultTransportSettings();
@@ -329,8 +332,7 @@ void MoQServer::Handler::onHeadersComplete(
     txn_->sendHeadersWithEOM(resp);
     return;
   }
-  if (req->getMethod() != HTTPMethod::CONNECT || !req->getUpgradeProtocol() ||
-      *req->getUpgradeProtocol() != std::string("webtransport")) {
+  if (!HTTPWebTransport::isConnectMessage(*req)) {
     resp.setStatusCode(400);
     txn_->sendHeadersWithEOM(resp);
     return;
