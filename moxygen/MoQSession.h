@@ -751,6 +751,7 @@ class MoQSession : public Subscriber,
         MoQSession* session,
         proxygen::WebTransport::StreamReadHandle* handle)
         : session_(session),
+          frameObserver_(session->frameObservers_),
           handle_(handle),
           id_(handle->getID()),
           cancelToken_(handle->getCancelToken()) {}
@@ -758,6 +759,7 @@ class MoQSession : public Subscriber,
     // The callback captures this, so it cannot travel with the move.
     ReadHandleRef(ReadHandleRef&& other) noexcept
         : session_(other.session_),
+          frameObserver_(std::move(other.frameObserver_)),
           handle_(std::exchange(other.handle_, nullptr)),
           id_(other.id_),
           cancelToken_(std::move(other.cancelToken_)),
@@ -813,6 +815,11 @@ class MoQSession : public Subscriber,
         XLOG(DBG1) << "Sending STOP_SENDING id=" << id_ << " code=" << error
                    << " sess=" << session_;
         handle->stopSending(error);
+        frameObserver_->notify(
+            &MoQFrameObserver::onStopSending,
+            MoQFrameObserver::Direction::Sent,
+            id_,
+            uint64_t(error));
       }
     }
 
@@ -836,6 +843,7 @@ class MoQSession : public Subscriber,
     }
 
     void* session_{nullptr}; // opaque, only streamed as "sess="
+    std::shared_ptr<MoQFrameObserverList> frameObserver_;
     proxygen::WebTransport::StreamReadHandle* handle_{nullptr};
     uint64_t id_{0};
     folly::CancellationToken cancelToken_;

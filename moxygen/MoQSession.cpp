@@ -153,13 +153,14 @@ class StreamPublisherImpl
   StreamPublisherImpl() = delete;
   ~StreamPublisherImpl() override {
     cancelStreamRequest();
+    moqFrameWriter_.abandonStream();
   }
 
   // Fetch constructor - we defer creating the stream/writeHandle until the
   // first published object.
   explicit StreamPublisherImpl(
       std::shared_ptr<MoQSession::PublisherImpl> publisher,
-      std::shared_ptr<MLogger> logger = nullptr,
+      std::shared_ptr<MoQFrameObserverList> frameObserver = nullptr,
       std::shared_ptr<DeliveryCallback> deliveryCallback = nullptr,
       std::optional<std::chrono::milliseconds> deliveryTimeout = std::nullopt);
 
@@ -175,10 +176,19 @@ class StreamPublisherImpl
       bool includeExtensions,
       bool endOfGroup,
       bool beginsWithFirstObject,
-      std::shared_ptr<MLogger> logger = nullptr,
+      std::shared_ptr<MoQFrameObserverList> frameObserver = nullptr,
       std::shared_ptr<DeliveryCallback> deliveryCallback = nullptr,
       std::optional<std::chrono::milliseconds> deliveryTimeout = std::nullopt);
 
+ private:
+  struct CommonInit {};
+  StreamPublisherImpl(
+      CommonInit,
+      std::shared_ptr<MoQSession::PublisherImpl> publisher,
+      std::shared_ptr<DeliveryCallback> deliveryCallback,
+      std::optional<std::chrono::milliseconds> deliveryTimeout);
+
+ public:
   // SubgroupConsumer overrides
   // Note where the interface uses finSubgroup, this class uses finStream,
   // since it is used for fetch and subgroups
@@ -392,7 +402,6 @@ class StreamPublisherImpl
   }
 
  private:
-  std::shared_ptr<MLogger> logger_;
   std::shared_ptr<DeliveryCallback> deliveryCallback_;
   std::unique_ptr<MoQDeliveryTimer> deliveryTimer_;
   bool deliveryTimeoutActive_{false};
@@ -467,10 +476,6 @@ class StreamPublisherImpl
   void cancelStreamRequest();
 
   void setWriteHandle(proxygen::WebTransport::StreamWriteHandle* writeHandle);
-  void logObjectCreated(
-      uint64_t streamID,
-      const ObjectHeader& header,
-      Payload payload);
 
   folly::Expected<folly::Unit, MoQPublishError> validatePublish(
       uint64_t objectID,
@@ -510,8 +515,6 @@ class StreamPublisherImpl
   };
   std::optional<StreamRequest> streamRequest_;
   uint64_t pendingBytesBuffered_{0}; // Held bytes counted as buffered
-  // Replayed once the stream has an ID
-  std::vector<std::pair<ObjectHeader, Payload>> pendingObjectLogs_;
   StreamType streamType_;
   SubgroupOptions subgroupOptions_{.hasExtensions = true}; // Subgroups only
   TrackAlias trackAlias_{0}; // Store track alias separately from ObjectHeader
@@ -533,8 +536,8 @@ class StreamPublisherImpl
 // StreamPublisherImpl
 
 StreamPublisherImpl::StreamPublisherImpl(
+    CommonInit,
     std::shared_ptr<MoQSession::PublisherImpl> publisher,
-    std::shared_ptr<MLogger> logger,
     std::shared_ptr<DeliveryCallback> deliveryCallback,
     std::optional<std::chrono::milliseconds> deliveryTimeout)
     : publisher_(publisher),
@@ -545,7 +548,6 @@ StreamPublisherImpl::StreamPublisherImpl(
           std::numeric_limits<uint64_t>::max(),
           0,
           ObjectStatus::NORMAL) {
-  logger_ = std::move(logger);
   deliveryCallback_ = std::move(deliveryCallback);
   egressTracker_ = publisher->getEgressTracker();
 
@@ -572,6 +574,21 @@ StreamPublisherImpl::StreamPublisherImpl(
 
   moqFrameWriter_.initializeVersion(
       publisher->getVersion(), publisher->getNegotiatedExtensions());
+}
+
+StreamPublisherImpl::StreamPublisherImpl(
+    std::shared_ptr<MoQSession::PublisherImpl> publisher,
+    std::shared_ptr<MoQFrameObserverList> frameObserver,
+    std::shared_ptr<DeliveryCallback> deliveryCallback,
+    std::optional<std::chrono::milliseconds> deliveryTimeout)
+    : StreamPublisherImpl(
+          CommonInit{},
+          publisher,
+          std::move(deliveryCallback),
+          std::move(deliveryTimeout)) {
+  // The fetch stream is opened with the first object.
+  moqFrameWriter_.setFrameObserver(std::move(frameObserver));
+  moqFrameWriter_.setPendingStream();
   moqFrameWriter_.setFetchGroupOrder(publisher->getGroupOrder());
   (void)moqFrameWriter_.writeFetchHeader(writeBuf_, publisher->requestID());
 }
@@ -587,13 +604,13 @@ StreamPublisherImpl::StreamPublisherImpl(
     bool includeExtensions,
     bool endOfGroup,
     bool beginsWithFirstObject,
-    std::shared_ptr<MLogger> logger,
+    std::shared_ptr<MoQFrameObserverList> frameObserver,
     std::shared_ptr<DeliveryCallback> deliveryCallback,
     std::optional<std::chrono::milliseconds> deliveryTimeout)
     : StreamPublisherImpl(
+          CommonInit{},
           publisher,
-          logger,
-          deliveryCallback,
+          std::move(deliveryCallback),
           std::move(deliveryTimeout)) {
   // When sgPriority is none, the receiver will use the value from
   // PUBLISHER_PRIORITY, which defaults to 128 if not sent by the publisher when
@@ -615,11 +632,13 @@ StreamPublisherImpl::StreamPublisherImpl(
   // Set the priority in the header
   header_.priority = sgPriority;
   // The owner calls requestStream when writeHandle is null.
+  moqFrameWriter_.setFrameObserver(std::move(frameObserver));
   if (writeHandle) {
     setWriteHandle(writeHandle);
+  } else {
+    moqFrameWriter_.setPendingStream();
   }
 
-  writeBuf_.move(); // clear FETCH_HEADER
   (void)moqFrameWriter_.writeSubgroupHeader(
       writeBuf_, trackAlias_, header_, subgroupOptions_);
 }
@@ -633,30 +652,7 @@ void StreamPublisherImpl::setWriteHandle(
   XCHECK(!writeHandle_);
   XCHECK(writeHandle);
   writeHandle_ = writeHandle;
-  if (logger_) {
-    auto streamID = writeHandle_->getID();
-    if (streamType_ == StreamType::FETCH_HEADER) {
-      logger_->logStreamTypeSet(
-          streamID, MOQTStreamType::FETCH_HEADER, Owner::LOCAL);
-      RequestID req = publisher_->requestID();
-      logger_->logFetchHeaderCreated(streamID, req.value);
-    } else {
-      logger_->logStreamTypeSet(
-          streamID, MOQTStreamType::SUBGROUP_HEADER, Owner::LOCAL);
-      logger_->logSubgroupHeaderCreated(
-          streamID,
-          trackAlias_,
-          header_.group,
-          header_.subgroup,
-          publisher_->subPriority(),
-          subgroupOptions_.subgroupIDFormat,
-          subgroupOptions_.hasExtensions,
-          subgroupOptions_.hasEndOfGroup);
-    }
-    for (auto& [header, payload] : std::exchange(pendingObjectLogs_, {})) {
-      logObjectCreated(streamID, header, std::move(payload));
-    }
-  }
+  moqFrameWriter_.bindStream(writeHandle_->getID());
 
   cancelCallback_.emplace(writeHandle_->getCancelToken(), [this] {
     if (writeHandle_) {
@@ -664,24 +660,16 @@ void StreamPublisherImpl::setWriteHandle(
       XLOG(DBG0) << "Peer requested write termination id="
                  << writeHandle_->getID() << " code=" << (ex ? ex->what() : "")
                  << " sgp=" << this;
+      if (ex) {
+        moqFrameWriter_.reportStopSending(
+            MoQFrameObserver::Direction::Received, ex->error);
+      }
       cancelled_ = true;
       reset(ResetStreamErrorCode::CANCELLED);
     }
   });
   if (publisher_) {
     publisher_->onStreamCreated();
-  }
-}
-
-void StreamPublisherImpl::logObjectCreated(
-    uint64_t streamID,
-    const ObjectHeader& header,
-    Payload payload) {
-  if (streamType_ != StreamType::FETCH_HEADER) {
-    logger_->logSubgroupObjectCreated(
-        streamID, trackAlias_, header, std::move(payload));
-  } else {
-    logger_->logFetchObjectCreated(streamID, header, std::move(payload));
   }
 }
 
@@ -813,6 +801,7 @@ StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
       writeBuf_.move(), finStream, deliveryCallback);
   if (writeRes.hasValue()) {
     if (finStream) {
+      moqFrameWriter_.reportStreamFin(MoQFrameObserver::Direction::Sent);
       // The stream is done, so there is nothing left to pace and no write
       // handle to await on.  Report success even if the transport is blocked.
       onStreamComplete();
@@ -903,15 +892,6 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::objectImpl(
   }
   auto length = payload ? payload->computeChainDataLength() : 0;
   header_.status = ObjectStatus::NORMAL;
-
-  if (logger_) {
-    auto payloadClone = payload ? payload->clone() : nullptr;
-    if (writeHandle_) {
-      logObjectCreated(writeHandle_->getID(), header_, std::move(payloadClone));
-    } else if (waitingForStream()) {
-      pendingObjectLogs_.emplace_back(header_, std::move(payloadClone));
-    }
-  }
 
   // Start delivery timeout timer when object begins being sent to stream. A 0
   // ("no timeout") value leaves deliveryTimeoutActive_ false, so no timer arms.
@@ -1115,8 +1095,11 @@ void StreamPublisherImpl::reset(ResetStreamErrorCode error) {
       // TODO: stream header is pending, reliable reset?
       XLOG(WARN) << "Stream header pending on subgroup=" << header_;
     }
-    wh->resetStream(
-        toWireResetStreamErrorCode(error, publisher_->getVersion()));
+    auto wireError =
+        toWireResetStreamErrorCode(error, publisher_->getVersion());
+    wh->resetStream(wireError);
+    moqFrameWriter_.reportResetStream(
+        MoQFrameObserver::Direction::Sent, wireError);
   } else {
     // Can happen while waiting for a stream, after a write error, or prior to
     // first fetch write
@@ -1128,7 +1111,6 @@ void StreamPublisherImpl::reset(ResetStreamErrorCode error) {
         publisher_->onBytesUnbuffered(std::exchange(pendingBytesBuffered_, 0));
       }
       writeBuf_.move();
-      pendingObjectLogs_.clear();
     }
   }
   onStreamComplete();
@@ -1939,8 +1921,9 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
 
   void setDeliveryCallback(std::shared_ptr<DeliveryCallback> callback) override;
 
-  void setLogger(std::shared_ptr<MLogger> logger) {
-    logger_ = logger;
+  void setFrameObserver(std::shared_ptr<MoQFrameObserverList> frameObserver) {
+    moqFrameWriter_.setFrameObserver(frameObserver);
+    frameObserver_ = std::move(frameObserver);
   }
 
  private:
@@ -1953,7 +1936,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
 
   std::optional<uint64_t> groupRank(uint64_t groupID);
 
-  std::shared_ptr<MLogger> logger_ = nullptr;
+  std::shared_ptr<MoQFrameObserverList> frameObserver_;
   std::shared_ptr<Subscriber::SubscriptionHandle> subscriptionHandle_;
   std::optional<LocationType> subscribeLocType_;
   std::optional<TrackAlias> trackAlias_;
@@ -2000,7 +1983,7 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
 
   void initialize() {
     streamPublisher_ = std::make_shared<StreamPublisherImpl>(
-        shared_from_this(), logger_, nullptr);
+        shared_from_this(), frameObserver_, nullptr);
   }
 
   std::shared_ptr<StreamPublisherImpl> getStreamPublisher() const {
@@ -2097,8 +2080,8 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
     // FETCH.
   }
 
-  void setLogger(std::shared_ptr<MLogger> logger) {
-    logger_ = logger;
+  void setFrameObserver(std::shared_ptr<MoQFrameObserverList> frameObserver) {
+    frameObserver_ = std::move(frameObserver);
   }
 
   void onRequestUpdate(RequestUpdate requestUpdate) {
@@ -2189,7 +2172,7 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
     }
   }
 
-  std::shared_ptr<MLogger> logger_;
+  std::shared_ptr<MoQFrameObserverList> frameObserver_;
   std::shared_ptr<Publisher::FetchHandle> handle_;
   std::shared_ptr<StreamPublisherImpl> streamPublisher_;
   std::weak_ptr<TrackPublisherImpl> fillOwner_;
@@ -2325,7 +2308,7 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
       includeExtensions,
       options.containsLastInGroup,
       options.beginsWithFirstObject,
-      logger_,
+      frameObserver_,
       deliveryCallback_,
       effectiveTimeout);
   // TODO: these are currently unused, but the intent might be to reset
@@ -2480,10 +2463,6 @@ MoQSession::TrackPublisherImpl::datagram(
     XLOG(ERR) << "Trying to publish after publishDone";
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Publish after publishDone"));
-  }
-
-  if (logger_) {
-    logger_->logObjectDatagramCreated(*trackAlias_, header, payload);
   }
 
   // Elide priority if it matches publisher priority
@@ -4217,6 +4196,7 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
   // The session may be gone by the time exec_ starts this loop.
   co_await folly::coro::co_safe_point;
   const auto negotiatedVersion = negotiatedVersion_;
+  const auto sessionToken = cancellationSource_.getToken();
   auto g = folly::makeGuard([func = __func__, this] {
     XLOG(DBG1) << "exit " << func << " sess=" << this;
   });
@@ -4269,6 +4249,10 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
           negotiatedVersion && wtEx) {
         peerTerminationError =
             fromWireResetStreamErrorCode(wtEx->error, *negotiatedVersion);
+        // The session may be gone, so only the loop's own codec is safe here.
+        if (codec && !sessionToken.isCancellationRequested()) {
+          codec->reportResetStream(wtEx->error);
+        }
       }
       break;
     }
@@ -4286,6 +4270,9 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
   // before the fail-pending block below so both close paths agree.
   if (control) {
     control->markReadLoopExited();
+  }
+  if (fin && codec) {
+    codec->reportStreamFin();
   }
   // TODO: close session on control exit.
   // On read-loop exit, fire responder close (RST always; FIN when
@@ -5199,6 +5186,9 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
         if (wtEx) {
           errorCode =
               streamResetCode(wtEx->error, *negotiatedVersion_, closed_);
+          if (!closed_) {
+            codec.reportResetStream(wtEx->error);
+          }
         }
         if (!dcb.reset(errorCode)) {
           XLOG(ERR) << __func__ << " terminating for unknown "
@@ -5294,6 +5284,7 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
 
     if (streamData.fin) {
       XLOG(DBG3) << "End of stream id=" << id << " sess=" << this;
+      codec.reportStreamFin();
       break;
     } else if (result == MoQCodec::ParseResult::ERROR_TERMINATE) {
       XLOG(ERR) << "Error parsing/consuming stream id=" << id
@@ -5382,9 +5373,7 @@ void MoQSession::onSubscribeImpl(
   trackPublisher->setReplyContext(replyContext);
   trackPublisher->setSubscribeLocType(
       toSubscriptionFilter(subscribeRequest.filter).filterType);
-  if (logger_) {
-    trackPublisher->setLogger(logger_);
-  }
+  trackPublisher->setFrameObserver(frameObservers_);
 
   // Check for duplicate subscription: if there's already a pending outgoing
   // PUBLISH for the same track, reject the SUBSCRIBE
@@ -5498,7 +5487,7 @@ MoQSession::openFillStream(
       fill.groupOrder.value_or(GroupOrder::OldestFirst),
       *negotiatedVersion_,
       moqSettings_.bufferingThresholds.perSubscription);
-  fillPublisher->setLogger(logger_);
+  fillPublisher->setFrameObserver(frameObservers_);
   fillPublisher->initialize();
   auto streamPublisher = fillPublisher->getStreamPublisher();
   if (!streamPublisher) {
@@ -6588,7 +6577,7 @@ void MoQSession::onFetchImpl(
       fetch.groupOrder,
       *negotiatedVersion_,
       moqSettings_.bufferingThresholds.perSubscription);
-  fetchPublisher->setLogger(logger_);
+  fetchPublisher->setFrameObserver(frameObservers_);
   fetchPublisher->initialize();
   // Kept for draft-18+ REQUEST_UPDATE replies on the FETCH bidi.
   fetchPublisher->setReplyContext(replyContext);
@@ -8751,17 +8740,18 @@ void MoQSession::handleDatagram(
   remainingLength -= type->second;
 
   if (isPaddingDatagramType(*negotiatedVersion_, type->first)) {
+    const auto paddingLength = remainingLength;
     auto paddingResult = parsePaddingData(cursor, remainingLength);
     if (paddingResult.hasError()) {
       XLOG(ERR) << __func__ << " Bad padding datagram";
       close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+    } else {
+      frameObservers_->notify(
+          &MoQFrameObserver::onPaddingDatagram,
+          MoQFrameObserver::Direction::Received,
+          paddingLength);
     }
     return;
-  }
-
-  std::unique_ptr<folly::IOBuf> payload;
-  if (logger_) {
-    payload = readBuf.front()->clone();
   }
 
   if (!isValidDatagramType(*negotiatedVersion_, type->first)) {
@@ -8804,18 +8794,12 @@ void MoQSession::handleDatagram(
     return;
   }
   readBuf.trimStart(readBuf.chainLength() - remainingLength);
-  if (logger_) {
-    if (payload) {
-      auto payloadChainLength = payload->computeChainDataLength();
-      if (payloadChainLength >= remainingLength) {
-        payload->trimStart(payloadChainLength - remainingLength);
-      } else {
-        payload.reset();
-      }
-    }
-    logger_->logObjectDatagramParsed(
-        objHeader.trackAlias, objHeader.objectHeader, payload);
-  }
+  frameObservers_->notify(
+      &MoQFrameObserver::onDatagramObject,
+      MoQFrameObserver::Direction::Received,
+      alias,
+      objHeader.objectHeader,
+      objHeader.endOfGroup);
   if (state) {
     auto callback = state->getSubscribeCallback();
     if (callback) {

@@ -83,9 +83,19 @@ class MoQFrameObserver {
   virtual void
   onRequestsBlocked(Direction, uint64_t streamID, const RequestsBlocked&) {}
 
+  // QUIC RESET_STREAM, STOP_SENDING and FIN on a request or data stream. Sent
+  // fires when the session asks the transport to send one. Received fires when
+  // the session learns of the peer's. errorCode is the value on the wire.
+  virtual void
+  onResetStream(Direction, uint64_t /*streamID*/, uint64_t /*errorCode*/) {}
+  virtual void
+  onStopSending(Direction, uint64_t /*streamID*/, uint64_t /*errorCode*/) {}
+  virtual void onStreamFin(Direction, uint64_t /*streamID*/) {}
+
   // A data-stream frame serialized before its stream exists carries a pending
-  // key instead of a stream ID. onDataStreamBound later gives the key's
-  // stream. onDataStreamAbandoned means the stream will not exist.
+  // key from onDataStreamPending instead of a stream ID. onDataStreamBound
+  // later gives the key's stream. onDataStreamAbandoned means the stream will
+  // not exist.
   struct DataStream {
     enum class Kind : uint8_t { StreamID, PendingKey };
     uint64_t value{0};
@@ -113,6 +123,16 @@ class MoQFrameObserver {
       uint64_t group,
       uint64_t object,
       FetchRangeEnd) {}
+  // A datagram does not belong to a stream.
+  virtual void onDatagramObject(
+      Direction,
+      TrackAlias,
+      const ObjectHeader&,
+      bool endOfGroup) {}
+  virtual void onPaddingDatagram(Direction, uint64_t paddingLength) {}
+  // pendingKey names a data stream that is not open yet. It is unique within
+  // the session.
+  virtual void onDataStreamPending(uint64_t /*pendingKey*/) {}
   virtual void onDataStreamBound(uint64_t pendingKey, uint64_t streamID) {}
   virtual void onDataStreamAbandoned(uint64_t pendingKey) {}
 };
@@ -155,8 +175,15 @@ class MoQFrameObserverList {
     dispatchDepth_--;
   }
 
+  uint64_t newPendingStream() {
+    auto key = ++nextPendingKey_;
+    notify(&MoQFrameObserver::onDataStreamPending, key);
+    return key;
+  }
+
  private:
   folly::small_vector<std::shared_ptr<MoQFrameObserver>, 2> observers_;
+  uint64_t nextPendingKey_{0};
   mutable uint32_t dispatchDepth_{0};
 };
 

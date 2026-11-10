@@ -4158,6 +4158,19 @@ WriteResult MoQFrameWriter::writeSubgroupHeader(
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
   }
+  if (hasObservers()) {
+    observedAlias_ = trackAlias;
+    auto stream = observedDataStream();
+    frameObserver_->notify(
+        &MoQFrameObserver::onSubgroupHeader,
+        FrameDirection::Sent,
+        stream,
+        trackAlias,
+        objectHeader.group,
+        objectHeader.subgroup,
+        objectHeader.priority,
+        options);
+  }
   return size;
 }
 
@@ -4178,6 +4191,14 @@ WriteResult MoQFrameWriter::writeFetchHeader(
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
   }
+  if (hasObservers()) {
+    auto stream = observedDataStream();
+    frameObserver_->notify(
+        &MoQFrameObserver::onFetchHeader,
+        FrameDirection::Sent,
+        stream,
+        requestID.value);
+  }
   return size;
 }
 
@@ -4195,6 +4216,12 @@ WriteResult MoQFrameWriter::writePaddingStream(
   appendZeroPadding(writeBuf, paddingLength, size, error);
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
+  }
+  if (hasObservers()) {
+    frameObserver_->notify(
+        &MoQFrameObserver::onPaddingStream,
+        FrameDirection::Sent,
+        observedDataStream());
   }
   return size;
 }
@@ -4214,6 +4241,12 @@ WriteResult MoQFrameWriter::writePaddingDatagram(
   appendZeroPadding(writeBuf, paddingLength, size, error);
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
+  }
+  if (hasObservers()) {
+    frameObserver_->notify(
+        &MoQFrameObserver::onPaddingDatagram,
+        FrameDirection::Sent,
+        paddingLength);
   }
   return size;
 }
@@ -4800,6 +4833,14 @@ WriteResult MoQFrameWriter::writeDatagramObject(
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
   }
+  if (hasObservers()) {
+    frameObserver_->notify(
+        &MoQFrameObserver::onDatagramObject,
+        FrameDirection::Sent,
+        trackAlias,
+        objectHeader,
+        endOfGroup);
+  }
   return size;
 }
 
@@ -5021,6 +5062,22 @@ WriteResult MoQFrameWriter::writeStreamObject(
   }
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
+  }
+  if (hasObservers()) {
+    if (streamType == StreamType::FETCH_HEADER) {
+      frameObserver_->notify(
+          &MoQFrameObserver::onFetchObject,
+          FrameDirection::Sent,
+          observedDataStream(),
+          objectHeader);
+    } else {
+      frameObserver_->notify(
+          &MoQFrameObserver::onSubgroupObject,
+          FrameDirection::Sent,
+          observedDataStream(),
+          observedAlias_,
+          objectHeader);
+    }
   }
   return size;
 }
