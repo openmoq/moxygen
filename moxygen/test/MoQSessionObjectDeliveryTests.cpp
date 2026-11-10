@@ -1965,15 +1965,16 @@ class ObjectRecordingMLogger : public MLogger {
   Counts counts() const {
     Counts c;
     for (const auto& event : logs_) {
-      if (std::get_if<MOQTSubgroupHeaderCreated>(&event.data_)) {
+      const auto& name = event.name_;
+      if (name == kSubgroupHeaderCreatedName) {
         c.subgroupHeadersCreated++;
-      } else if (std::get_if<MOQTSubgroupHeaderParsed>(&event.data_)) {
+      } else if (name == kSubgroupHeaderParsedName) {
         c.subgroupHeadersParsed++;
-      } else if (std::get_if<MOQTSubgroupObjectCreated>(&event.data_)) {
+      } else if (name == kSubgroupObjectCreatedName) {
         c.subgroupObjectsCreated++;
-      } else if (std::get_if<MOQTSubgroupObjectParsed>(&event.data_)) {
+      } else if (name == kSubgroupObjectParsedName) {
         c.subgroupObjectsParsed++;
-      } else if (std::get_if<MOQTObjectDatagramParsed>(&event.data_)) {
+      } else if (name == kObjectDatagramParsedName) {
         c.datagramsParsed++;
       } else if (
           const auto* rec = std::get_if<MOQTStreamTypeSet>(&event.data_);
@@ -1991,22 +1992,18 @@ class ObjectRecordingMLogger : public MLogger {
   std::vector<uint64_t> sentStreamIds() const {
     std::vector<uint64_t> ids;
     for (const auto& event : logs_) {
-      if (const auto* rec =
-              std::get_if<MOQTSubgroupHeaderCreated>(&event.data_)) {
-        ids.push_back(rec->streamId);
+      const auto& name = event.name_;
+      if (name == kSubgroupHeaderCreatedName) {
+        ids.push_back(std::get<MOQTSubgroupHeader>(event.data_).streamId);
+      } else if (name == kSubgroupObjectCreatedName) {
+        ids.push_back(std::get<MOQTSubgroupObject>(event.data_).streamId);
+      } else if (name == kFetchHeaderCreatedName) {
+        ids.push_back(std::get<MOQTFetchHeader>(event.data_).streamId);
+      } else if (name == kFetchObjectCreatedName) {
+        ids.push_back(std::get<MOQTFetchObject>(event.data_).streamId);
       } else if (
-          const auto* rec =
-              std::get_if<MOQTSubgroupObjectCreated>(&event.data_)) {
-        ids.push_back(rec->streamId);
-      } else if (
-          const auto* rec = std::get_if<MOQTFetchHeaderCreated>(&event.data_)) {
-        ids.push_back(rec->streamId);
-      } else if (
-          const auto* rec = std::get_if<MOQTFetchObjectCreated>(&event.data_)) {
-        ids.push_back(rec->streamId);
-      } else if (
-          const auto* rec = std::get_if<MOQTStreamTypeSet>(&event.data_); rec &&
-          rec->owner == Owner::LOCAL &&
+          const auto* rec = std::get_if<MOQTStreamTypeSet>(&event.data_);
+          rec && rec->owner == Owner::LOCAL &&
           rec->streamType != MOQTStreamType::CONTROL) {
         ids.push_back(rec->streamId);
       }
@@ -2017,11 +2014,8 @@ class ObjectRecordingMLogger : public MLogger {
   std::optional<uint64_t> parsedObjectPayloadLength(size_t index) const {
     size_t seen = 0;
     for (const auto& event : logs_) {
-      if (const auto* parsed =
-              std::get_if<MOQTSubgroupObjectParsed>(&event.data_)) {
-        if (seen++ == index) {
-          return parsed->objectPayloadLength;
-        }
+      if (event.name_ == kSubgroupObjectParsedName && seen++ == index) {
+        return std::get<MOQTSubgroupObject>(event.data_).objectPayloadLength;
       }
     }
     return std::nullopt;
