@@ -33,6 +33,10 @@ class MoQCodec {
     streamId_ = streamId;
   }
 
+  void setFrameObserver(std::shared_ptr<MoQFrameObserverList> observers) {
+    frameObserver_ = std::move(observers);
+  }
+
   void initializeVersion(uint64_t version, SetupExtensions extensions = {}) {
     negotiatedVersion_ = version;
     moqFrameParser_.initializeVersion(version, extensions);
@@ -67,6 +71,7 @@ class MoQCodec {
   void onIngressEnd(size_t remainingLength, bool eom, Callback* callback);
 
   uint64_t streamId_{std::numeric_limits<uint64_t>::max()};
+  std::shared_ptr<MoQFrameObserverList> frameObserver_;
   folly::IOBufQueue ingress_{folly::IOBufQueue::cacheChainLength()};
 
   std::optional<ErrorCode> connError_;
@@ -128,10 +133,6 @@ class MoQControlCodec : public MoQCodec {
 
   void setCallback(ControlCallback* callback) {
     callback_ = callback;
-  }
-
-  void setFrameObserver(std::shared_ptr<MoQFrameObserverList> observers) {
-    frameObserver_ = std::move(observers);
   }
 
   // If ParseResult::BLOCKED is returned, must call onIngress again to restart
@@ -221,20 +222,19 @@ class MoQControlCodec : public MoQCodec {
 
   folly::Expected<folly::Unit, ErrorCode> parseFrame(folly::io::Cursor& cursor);
 
+  using FrameDirection = MoQFrameObserver::Direction;
+
   template <typename Msg>
   void notifyReceived(
-      void (MoQFrameObserver::*
-                hook)(MoQFrameObserver::Direction, uint64_t, const Msg&),
+      void (MoQFrameObserver::*hook)(FrameDirection, uint64_t, const Msg&),
       const Msg& msg) {
     if (frameObserver_) {
-      frameObserver_->notify(
-          hook, MoQFrameObserver::Direction::Received, streamId_, msg);
+      frameObserver_->notify(hook, FrameDirection::Received, streamId_, msg);
     }
   }
 
   Direction dir_;
   ControlCallback* callback_{nullptr};
-  std::shared_ptr<MoQFrameObserverList> frameObserver_;
   FrameType curFrameType_;
   size_t curFrameLength_{0};
   enum class ParseState {
@@ -446,6 +446,7 @@ class MoQObjectStreamCodec : public MoQCodec {
   ParseState parseState_{ParseState::STREAM_HEADER_TYPE};
   StreamType streamType_{StreamType::SUBGROUP_HEADER_SG};
   SubgroupOptions subgroupOptions_;
+  TrackAlias trackAlias_{0};
   ObjectCallback* callback_;
 };
 
