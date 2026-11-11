@@ -311,14 +311,11 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
     XLOG(ERR) << "addSubscriber called on draining track";
     return nullptr;
   }
-  if (consumer && trackAlias_) {
-    consumer->setTrackAlias(*trackAlias_);
-  }
   auto subscriber = std::make_shared<MoQForwarder::Subscriber>(
       *this,
       SubscribeOk{
           RequestID(0),
-          trackAlias_.value_or(TrackAlias(0)),
+          TrackAlias(0),
           std::chrono::milliseconds(0),
           groupOrder_,
           largest_,
