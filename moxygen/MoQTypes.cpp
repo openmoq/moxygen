@@ -572,6 +572,19 @@ bool isPublishSubscriptionParameter(TrackRequestParamKey key) {
   }
 }
 
+const folly::F14FastSet<FrameType> kAllowedFramesForTrackFilter = {
+    FrameType::SUBSCRIBE_NAMESPACE};
+
+const folly::F14FastSet<FrameType> kAllowedFramesForHopPath = {
+    FrameType::PUBLISH_NAMESPACE,
+    FrameType::NAMESPACE,
+    FrameType::REQUEST_UPDATE};
+
+const folly::F14FastSet<FrameType> kAllowedFramesForRouteCost = {
+    FrameType::PUBLISH_NAMESPACE,
+    FrameType::NAMESPACE,
+    FrameType::REQUEST_UPDATE};
+
 // Allowlist mapping: TrackRequestParamKey -> set of allowed FrameTypes
 // Empty set means allowed for all frame types
 const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
@@ -607,6 +620,9 @@ const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
           FrameType::TRACK_STATUS,
           FrameType::FETCH,
           FrameType::SUBSCRIBE_TRACKS}},
+        {TrackRequestParamKey::TRACK_FILTER, kAllowedFramesForTrackFilter},
+        {TrackRequestParamKey::HOP_PATH, kAllowedFramesForHopPath},
+        {TrackRequestParamKey::ROUTE_COST, kAllowedFramesForRouteCost},
 };
 
 // Frame types that allow all parameters (no validation)
@@ -624,6 +640,8 @@ static bool isV18OnlyParamKey(TrackRequestParamKey key) {
     case TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT:
     case TrackRequestParamKey::FILL_TIMEOUT:
     case TrackRequestParamKey::TRACK_NAMESPACE_PREFIX:
+    case TrackRequestParamKey::HOP_PATH:
+    case TrackRequestParamKey::ROUTE_COST:
       return true;
     default:
       return false;
@@ -705,8 +723,10 @@ bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
   }
 
   // v18-only parameter keys.
+  const bool clusterKey = key == TrackRequestParamKey::HOP_PATH ||
+      key == TrackRequestParamKey::ROUTE_COST;
   if (isV18OnlyParamKey(key) &&
-      (!majorVersion_.has_value() || *majorVersion_ < 18)) {
+      (majorVersion_ ? *majorVersion_ < 18 : !clusterKey)) {
     return false;
   }
 
@@ -843,6 +863,27 @@ Fetch::Fetch(
     auto result = params.insertParam(param);
     if (result.hasError()) {
       XLOG(ERR) << "Fetch: param not allowed, key=" << param.key;
+    }
+  }
+}
+
+SetupExtensionNegotiator bothAdvertise(uint64_t key) {
+  return [key](
+             const SetupParameters& local,
+             const SetupParameters& peer,
+             uint64_t /*version*/) {
+    return local.hasParam(key) && peer.hasParam(key);
+  };
+}
+
+void applySetupParameters(
+    SetupParameters& params,
+    const std::vector<SetupParameter>& extraParams) {
+  for (const auto& param : extraParams) {
+    params.eraseAllParamsOfType(param.key);
+    auto result = params.insertParam(param);
+    if (result.hasError()) {
+      XLOG(ERR) << "Setup param not allowed, key=" << param.key;
     }
   }
 }
