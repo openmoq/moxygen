@@ -237,9 +237,7 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
     XLOG(ERR) << "addSubscriber called on draining track";
     return nullptr;
   }
-  auto trackAlias = replaceDuplicateSubscriptions_
-      ? TrackAlias(subReq.requestID.value)
-      : trackAlias_.value_or(subReq.requestID.value);
+  const TrackAlias trackAlias(subReq.requestID.value);
   XCHECK(consumer);
   consumer->setTrackAlias(trackAlias);
   auto subscriber = std::make_shared<MoQForwarder::Subscriber>(
@@ -287,7 +285,7 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
       *this,
       SubscribeOk{
           RequestID(0),
-          trackAlias_.value_or(TrackAlias(0)),
+          TrackAlias(0),
           std::chrono::milliseconds(0),
           groupOrder_,
           largest_,
@@ -313,14 +311,11 @@ std::shared_ptr<MoQForwarder::Subscriber> MoQForwarder::addSubscriber(
     XLOG(ERR) << "addSubscriber called on draining track";
     return nullptr;
   }
-  if (consumer && trackAlias_) {
-    consumer->setTrackAlias(*trackAlias_);
-  }
   auto subscriber = std::make_shared<MoQForwarder::Subscriber>(
       *this,
       SubscribeOk{
           RequestID(0),
-          trackAlias_.value_or(TrackAlias(0)),
+          TrackAlias(0),
           std::chrono::milliseconds(0),
           groupOrder_,
           largest_,
@@ -636,8 +631,7 @@ void MoQForwarder::handleSubgroupError(
 }
 
 folly::Expected<folly::Unit, MoQPublishError> MoQForwarder::setTrackAlias(
-    TrackAlias alias) {
-  trackAlias_ = alias;
+    TrackAlias) {
   return folly::unit;
 }
 

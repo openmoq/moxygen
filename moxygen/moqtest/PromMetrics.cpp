@@ -76,7 +76,7 @@ void PromWriter::writeFile(const std::string& path) const {
   try {
     // writeFileAtomic does the temp-write + rename the textfile collector
     // requires.
-    folly::writeFileAtomic(path, folly::StringPiece(data));
+    folly::writeFileAtomic(path, std::string_view(data));
   } catch (const std::exception& ex) {
     XLOG(ERR) << "Failed to write metrics file " << path << ": " << ex.what();
   }
