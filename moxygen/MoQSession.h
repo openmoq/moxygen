@@ -310,12 +310,15 @@ class MoQSession : public Subscriber,
   const std::optional<SetupParameters>& getLocalSetupParams() const {
     return localSetupParams_;
   }
-  const std::optional<SetupParameters>& getPeerSetupParams() const {
+  // This and getMessageParameterExtensions are virtual so a mock session can
+  // report a peer without a SETUP exchange.
+  virtual const std::optional<SetupParameters>& getPeerSetupParams() const {
     return peerSetupParams_;
   }
   // The message parameters negotiated for this session; empty until both
   // SETUPs are known.
-  const MessageParameterExtensions& getMessageParameterExtensions() const {
+  virtual const MessageParameterExtensions& getMessageParameterExtensions()
+      const {
     return *messageParameterExtensions_;
   }
   // Accessor used by PublisherImpl and others
