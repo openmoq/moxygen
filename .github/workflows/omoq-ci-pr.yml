@@ -30,9 +30,6 @@ jobs:
           - runner: ubuntu-22.04
             name: linux
             cache_prefix: ci-ninja-ubuntu-22.04
-          - runner: macos-15
-            name: macos
-            cache_prefix: ci-ninja-macos-15
           - runner: ubuntu-22.04   # fork-PR fallback (same-repo PRs route to self-hosted)
             self_hosted: true
             name: asan debug
@@ -86,7 +83,7 @@ jobs:
         with:
           key: ${{ matrix.cache_prefix }}
           # The standalone build compiles the whole dependency stack, ~1958 TUs.
-          # 500M evicted mid-build (50 cleanups on linux, 308 on macOS).
+          # 500M evicted mid-build (50 cleanups on linux).
           max-size: 2G
 
       - name: Configure

@@ -32,7 +32,7 @@ with upstream workflow files:
 - `omoq-auto-merge-sync.yml` (`sync auto-merge`) — Merges a sync PR when
   `ci pr` passes on its branch; notifies Slack and email when it fails.
 - `omoq-ci-pr.yml` (`ci pr`) — Standalone build and tests for PRs to `main`:
-  linux, macos and asan debug.
+  linux and asan debug.
 - `omoq-gemini-review.yml` (`🔎 Gemini Review`) — Gemini review, or answers
   to `/gemini` questions, when the `gemini-review` label is added to a PR.
 - `omoq-ci-main.yml` (`ci main`) — On push to `main` or `release/**`: build
