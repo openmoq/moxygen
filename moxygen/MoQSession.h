@@ -227,6 +227,10 @@ class MoQSession : public Subscriber,
     return id_;
   }
 
+  // Unique within the process, so a forwarder subscriber that is not a session
+  // can use one as its key.
+  static SessionId makeSessionId();
+
   void setServerMaxTokenCacheSizeGuess(size_t size);
 
   class ServerSetupCallback {
@@ -1021,8 +1025,6 @@ class MoQSession : public Subscriber,
   static const folly::RequestToken& sessionRequestToken();
 
   void handleDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept;
-
-  static SessionId makeSessionId();
 
   const SessionId id_{makeSessionId()};
 
