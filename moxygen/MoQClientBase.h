@@ -163,11 +163,9 @@ class MoQClientBase {
     earlyDataHandler_ = handler;
   }
 
-  // Adds a parameter to every SETUP, replacing (not duplicating) any parameter
-  // this class would otherwise send with the same key. Call before setting up
-  // the session.
-  void addSetupParameter(SetupParameter parameter) {
-    setupParams_.emplace_back(std::move(parameter));
+  // Added to every session this client creates. Call before setupMoQSession().
+  void addExtension(std::shared_ptr<MoQExtension> extension) {
+    extensions_.push_back(std::move(extension));
   }
 
   void goaway(const Goaway& goaway);
@@ -195,7 +193,6 @@ class MoQClientBase {
 
   std::shared_ptr<MoQExecutor> exec_;
   proxygen::URL url_;
-  std::vector<SetupParameter> setupParams_;
   SessionFactory sessionFactory_;
   std::shared_ptr<proxygen::QuicWebTransport> quicWebTransport_;
   std::shared_ptr<proxygen::QuicWtSession> quicWtSession_;
@@ -206,6 +203,7 @@ class MoQClientBase {
   // Non-null when the caller supplied a connected transport; consumed by the
   // first session setup.
   std::shared_ptr<quic::QuicClientTransport> adoptedTransport_;
+  std::vector<std::shared_ptr<MoQExtension>> extensions_;
   bool useQuicWtSession_{false};
   std::chrono::milliseconds transportConnectTime_{0};
   std::chrono::milliseconds moqHandshakeTime_{0};

@@ -33,13 +33,9 @@ class MoQCodec {
     streamId_ = streamId;
   }
 
-  void initializeVersion(uint64_t version, SetupExtensions extensions = {}) {
+  void initializeVersion(uint64_t version) {
     negotiatedVersion_ = version;
-    moqFrameParser_.initializeVersion(version, extensions);
-  }
-
-  void setNegotiatedExtensions(SetupExtensions extensions) {
-    moqFrameParser_.setNegotiatedExtensions(extensions);
+    moqFrameParser_.initializeVersion(version);
   }
 
   void setMaxAuthTokenCacheSize(size_t size) {

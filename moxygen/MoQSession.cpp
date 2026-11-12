@@ -7,6 +7,7 @@
 #include "moxygen/MoQSession.h"
 #include <folly/Chrono.h>
 #include <folly/concurrency/ProcessLocalUniqueId.h>
+#include <folly/container/F14Set.h>
 #include <folly/coro/Baton.h>
 #include <folly/coro/Collect.h>
 #include <folly/coro/DetachOnCancel.h>
@@ -32,6 +33,9 @@ constexpr size_t kGroupRankWindow = 64;
 
 // Draft-18 §10.4: GOAWAY newSessionUri MUST NOT exceed 8192 bytes.
 constexpr uint64_t kMaxGoawayUriLength(8192);
+// how long to wait for the peer's close after the control stream is lost
+constexpr std::chrono::milliseconds kMinControlStreamLossGrace{200};
+constexpr std::chrono::milliseconds kMaxControlStreamLossGrace{1000};
 
 // Bit allocations for 32-bit order: sub=5, pub=8, group=14, subgroup=5
 constexpr uint32_t kSubPriBits = 5;
@@ -602,8 +606,7 @@ StreamPublisherImpl::StreamPublisherImpl(
     }
   }
 
-  moqFrameWriter_.initializeVersion(
-      publisher->getVersion(), publisher->getNegotiatedExtensions());
+  moqFrameWriter_.initializeVersion(publisher->getVersion());
   moqFrameWriter_.setFetchGroupOrder(publisher->getGroupOrder());
   (void)moqFrameWriter_.writeFetchHeader(writeBuf_, publisher->requestID());
 }
@@ -3282,6 +3285,32 @@ class MoQSession::GoawayTimeoutCallback : public quic::QuicTimerCallback {
   MoQSession& session_;
 };
 
+class MoQSession::ControlStreamLossTimeoutCallback
+    : public quic::QuicTimerCallback {
+ public:
+  explicit ControlStreamLossTimeoutCallback(MoQSession& session)
+      : session_(session), lostAt_(std::chrono::steady_clock::now()) {}
+
+  void timeoutExpired() noexcept override {
+    auto weakSession = session_.weak_from_this();
+    session_.exec_->add([weakSession = std::move(weakSession)]() mutable {
+      if (auto session = weakSession.lock()) {
+        session->onControlStreamLossTimeoutExpired();
+      }
+    });
+  }
+
+  void callbackCanceled() noexcept override {}
+
+  std::chrono::steady_clock::time_point lostAt() const {
+    return lostAt_;
+  }
+
+ private:
+  MoQSession& session_;
+  const std::chrono::steady_clock::time_point lostAt_;
+};
+
 // Constructors
 MoQSession::MoQSession(
     folly::MaybeManagedPtr<proxygen::WebTransport> wt,
@@ -3329,6 +3358,9 @@ MoQSession::~MoQSession() {
 
 void MoQSession::cleanup() {
   cancelGoawayTimeout();
+  if (auto timeout = std::exchange(controlStreamLossTimeout_, nullptr)) {
+    timeout->cancelTimerCallback();
+  }
   egressTracker_->setOnIdle(nullptr);
   for (auto& waiter : std::exchange(uniStreamCreditWaiters_, {})) {
     waiter.setException(std::runtime_error("session closed"));
@@ -3470,12 +3502,60 @@ void MoQSession::startControlWriteLoop(
     logger_->logStreamTypeSet(
         writeHandle->getID(), MOQTStreamType::CONTROL, Owner::LOCAL);
   }
+  launchControlWriteLoop(writeHandle);
+}
+
+void MoQSession::launchControlWriteLoop(
+    proxygen::WebTransport::StreamWriteHandle* writeHandle) {
   auto mergeToken = folly::cancellation_token_merge(
       cancellationSource_.getToken(), writeHandle->getCancelToken());
   co_withExecutor(
       exec_.get(),
       co_withCancellation(std::move(mergeToken), controlWriteLoop(writeHandle)))
-      .start();
+      // Weak, as the loop can end after the session is gone.
+      .start([weakSelf = weak_from_this()](folly::Try<void>&&) {
+        // the loop ends when the session closes, the peer stops the stream or
+        // a write fails
+        if (auto self = weakSelf.lock()) {
+          self->onControlStreamLost();
+        }
+      });
+}
+
+void MoQSession::onControlStreamLost() {
+  if (closed_ || cancellationSource_.isCancellationRequested() ||
+      controlStreamLossTimeout_) {
+    return;
+  }
+  // Must not call into the transport: the stream can be lost while the
+  // transport is being torn down.
+  controlStreamLossTimeout_ =
+      std::make_unique<ControlStreamLossTimeoutCallback>(*this);
+  // the timer keeps the current request context, which can hold this session
+  folly::RequestContextScopeGuard guard;
+  exec_->scheduleTimeout(
+      controlStreamLossTimeout_.get(), kMinControlStreamLossGrace);
+}
+
+void MoQSession::onControlStreamLossTimeoutExpired() {
+  if (closed_ || !controlStreamLossTimeout_) {
+    return;
+  }
+  // the peer's close takes longer to arrive on a high-RTT path
+  const auto grace = std::clamp(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          3 * getTransportInfo().srtt),
+      kMinControlStreamLossGrace,
+      kMaxControlStreamLossGrace);
+  const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - controlStreamLossTimeout_->lostAt());
+  if (waited < grace) {
+    folly::RequestContextScopeGuard guard;
+    exec_->scheduleTimeout(controlStreamLossTimeout_.get(), grace - waited);
+    return;
+  }
+  XLOG(ERR) << "Control stream lost sess=" << this;
+  close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
 }
 
 void MoQSession::start() {
@@ -3763,9 +3843,7 @@ MoQSession::PublisherImpl::PublisherImpl(
       groupOrder_(groupOrder),
       version_(version),
       bytesBufferedThreshold_(bytesBufferedThreshold) {
-  moqFrameWriter_.initializeVersion(
-      version,
-      session_ ? session_->getNegotiatedExtensions() : SetupExtensions());
+  moqFrameWriter_.initializeVersion(version);
 }
 
 MoQSession::PublisherImpl::~PublisherImpl() {
@@ -3877,17 +3955,29 @@ folly::Expected<folly::Unit, quic::TransportErrorCode> MoQSession::sendSetup(
   std::tie(setupPromise_, setupFuture_) =
       folly::coro::makePromiseContract<Setup>();
 
-  auto maxRequestID = getMaxRequestIDIfPresent(setup.params);
-
-  // Don't duplicate a key the application already set via addSetupParameter().
-  if (!setup.params.hasParam(
-          folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION))) {
-    setup.params.insertParam(SetupParameter(
-        {folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION),
-         getMoQTImplementationString()}));
+  setup.params.insertParam(SetupParameter(
+      {folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION),
+       getMoQTImplementationString()}));
+  folly::F14FastSet<uint64_t> extensionOptionKeys;
+  for (const auto& extension : extensions_) {
+    auto options = extension->getSetupOptions(*negotiatedVersion_);
+    folly::F14FastSet<uint64_t> keys;
+    for (const auto& option : options) {
+      keys.insert(option.key);
+    }
+    for (auto key : keys) {
+      if (!extensionOptionKeys.insert(key).second) {
+        XLOG(DFATAL) << "SETUP option supplied by two extensions, key=" << key
+                     << " sess=" << this;
+      }
+      setup.params.eraseAllParamsOfType(key);
+    }
+    for (auto& option : options) {
+      setup.params.insertParam(std::move(option));
+    }
   }
 
-  onSetupParams(setup.params, /*local=*/true);
+  auto maxRequestID = getMaxRequestIDIfPresent(setup.params);
 
   uint64_t setupSerializationVersion = *negotiatedVersion_;
 
@@ -3928,17 +4018,41 @@ folly::Expected<folly::Unit, quic::TransportErrorCode> MoQSession::sendSetup(
       logger_->logServerSetup(setup, setupSerializationVersion);
     }
   }
-  negotiateMessageParameters();
+  localSetupParams_ = setup.params;
+  if (!negotiateMessageParameters()) {
+    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
+  }
   initLocalMaxRequestID(maxRequestID);
   controlWriteEvent_.signal();
   return folly::unit;
 }
 
-void MoQSession::negotiateMessageParameters() {
-  if (messageParameterNegotiator_ && localSetupParams_ && peerSetupParams_) {
-    *messageParameterExtensions_ = messageParameterNegotiator_(
-        *negotiatedVersion_, *localSetupParams_, *peerSetupParams_);
+bool MoQSession::negotiateMessageParameters() {
+  if (!localSetupParams_ || !peerSetupParams_) {
+    return true;
   }
+  const auto version = *negotiatedVersion_;
+  auto& negotiated = *messageParameterExtensions_;
+  for (const auto& extension : extensions_) {
+    auto result =
+        extension->negotiate(version, *localSetupParams_, *peerSetupParams_);
+    if (result.hasError()) {
+      XLOG(ERR) << "Extension rejected SETUP err="
+                << folly::to_underlying(result.error()) << " sess=" << this;
+      close(result.error());
+      return false;
+    }
+    for (auto& [key, rule] : result.value()) {
+      if (Parameters::isKnownParamKey(key, getDraftMajorVersion(version)) ||
+          negotiated.count(key) > 0) {
+        XLOG(DFATAL) << "Message parameter key already in use, key=" << key
+                     << " sess=" << this;
+        continue;
+      }
+      negotiated.emplace(key, std::move(rule));
+    }
+  }
+  return true;
 }
 
 void MoQSession::initLocalMaxRequestID(uint64_t fromParam) {
@@ -4037,8 +4151,6 @@ void MoQSession::onServerSetup(Setup serverSetup) {
     return;
   }
 
-  onSetupParams(serverSetup.params, /*local=*/false);
-
   initPeerMaxRequestID(serverSetup.params);
   auto peerAuthCacheSize = getMaxAuthTokenCacheSizeIfPresent(
       serverSetup.params, *getNegotiatedVersion());
@@ -4047,7 +4159,10 @@ void MoQSession::onServerSetup(Setup serverSetup) {
           ? std::min(kMaxSendTokenCacheSize, peerAuthCacheSize)
           : 0,
       /*evict=*/true);
-  negotiateMessageParameters();
+  peerSetupParams_ = serverSetup.params;
+  if (!negotiateMessageParameters()) {
+    return;
+  }
   setupPromise_.setValue(std::move(serverSetup));
 }
 
@@ -4117,11 +4232,6 @@ void MoQSession::onClientSetup(Setup clientSetup) {
     return;
   }
 
-  // After the version is settled: in uni control mode the server has already
-  // sent SERVER_SETUP, making this the second half, and extension rules are
-  // version-dependent.
-  onSetupParams(clientSetup.params, /*local=*/false);
-
   // Validate authority with the negotiated version
   auto authorityValidation = serverSetupCallback_->validateAuthority(
       clientSetup, *getNegotiatedVersion(), shared_from_this());
@@ -4133,7 +4243,10 @@ void MoQSession::onClientSetup(Setup clientSetup) {
     return;
   }
 
-  negotiateMessageParameters();
+  peerSetupParams_ = clientSetup.params;
+  if (!negotiateMessageParameters()) {
+    return;
+  }
 
   {
     auto negotiatedVersion = *getNegotiatedVersion();
@@ -4170,7 +4283,7 @@ std::unique_ptr<MoQControlCodec> MoQSession::makeBidiCodec(
     std::deque<RequestID>* responseIDQueue) {
   auto codec = std::make_unique<MoQBidiStreamCodec>(
       callback, std::move(allowedFrames), requestID, okType);
-  codec->initializeVersion(*negotiatedVersion_, negotiatedExtensions_);
+  codec->initializeVersion(*negotiatedVersion_);
   codec->setTokenCache(&receiveTokenCache_);
   codec->setMessageParameterExtensions(messageParameterExtensions_);
   codec->setResponseIDQueue(responseIDQueue);
@@ -4322,6 +4435,7 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
   }
 
   bool exceptionalExit = false;
+  bool peerReset = false;
   std::optional<ResetStreamErrorCode> peerTerminationError;
   auto token = co_await folly::coro::co_current_cancellation_token;
   while (readHandle) {
@@ -4333,10 +4447,10 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
       XLOG(DBG4) << folly::exceptionStr(streamData.exception())
                  << " id=" << streamId << " sess=" << this;
       exceptionalExit = true;
-      if (auto* wtEx =
-              streamData
-                  .tryGetExceptionObject<proxygen::WebTransport::Exception>();
-          negotiatedVersion && wtEx) {
+      auto* wtEx =
+          streamData.tryGetExceptionObject<proxygen::WebTransport::Exception>();
+      peerReset = wtEx != nullptr;
+      if (negotiatedVersion && wtEx) {
         peerTerminationError =
             fromWireResetStreamErrorCode(wtEx->error, *negotiatedVersion);
       }
@@ -4356,8 +4470,12 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
   // before the fail-pending block below so both close paths agree.
   if (control) {
     control->markReadLoopExited();
+  } else if (
+      !token.isCancellationRequested() && (peerReset || !peerSetupParams_)) {
+    // MoQT forbids ending the control stream, but a FIN after the peer's
+    // SETUP is tolerated
+    onControlStreamLost();
   }
-  // TODO: close session on control exit.
   // On read-loop exit, fire responder close (RST always; FIN when
   // finIsCancellation) and fail any still-pending sender request. Both
   // suppressed during shutdown — cleanup() delivers the canonical error.
@@ -5242,7 +5360,7 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
   }
 
   MoQObjectStreamCodec codec(nullptr);
-  codec.initializeVersion(*negotiatedVersion_, negotiatedExtensions_);
+  codec.initializeVersion(*negotiatedVersion_);
 
   // Lambda for onSubgroup
   TrackAlias deferredAlias{std::numeric_limits<uint64_t>::max()};
@@ -8836,13 +8954,7 @@ void MoQSession::handleClientSetup(
             cancellationSource_.getToken(),
             controlReadLoop(std::move(readHandle), std::move(initialData))))
         .start();
-    auto mergeToken = folly::cancellation_token_merge(
-        cancellationSource_.getToken(), writeHandle->getCancelToken());
-    co_withExecutor(
-        exec_.get(),
-        co_withCancellation(
-            std::move(mergeToken), controlWriteLoop(writeHandle)))
-        .start();
+    launchControlWriteLoop(writeHandle);
   }
 }
 
@@ -9071,7 +9183,7 @@ void MoQSession::handleDatagram(
   size_t remainingLength = readBuf.chainLength();
   folly::io::Cursor cursor(readBuf.front());
   MoQFrameParser parser;
-  parser.initializeVersion(*negotiatedVersion_, negotiatedExtensions_);
+  parser.initializeVersion(*negotiatedVersion_);
   auto type = parser.decodeVarint(cursor);
   if (!type) {
     XLOG(ERR) << __func__ << " Bad datagram header failed to parse type l="
@@ -9282,69 +9394,6 @@ void MoQSession::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
   if (logger_) {
     logger_->setNegotiatedMoQVersion(negotiatedVersion);
   }
-}
-
-/*static*/
-const std::vector<SetupExtensionDescriptor>& MoQSession::kSetupExtensions() {
-  static const std::vector<SetupExtensionDescriptor> kExtensions{
-      {SetupExtension::RelayHops,
-       [](const SetupParameters& local,
-          const SetupParameters& peer,
-          uint64_t version) {
-         const auto draft = getDraftMajorVersion(version);
-         return draft >= 18 &&
-             local.hasParam(folly::to_underlying(SetupKey::HOP_ID)) &&
-             peer.hasParam(folly::to_underlying(SetupKey::HOP_ID));
-       }}};
-  return kExtensions;
-}
-
-/*static*/
-SetupExtensions MoQSession::computeNegotiatedExtensions(
-    const SetupParameters& localParams,
-    const SetupParameters& peerParams,
-    uint64_t version,
-    const std::vector<SetupExtensionDescriptor>& descriptors) {
-  SetupExtensions extensions;
-  for (const auto& descriptor : descriptors) {
-    if (descriptor.negotiate(localParams, peerParams, version)) {
-      extensions.add(descriptor.extension);
-    }
-  }
-  return extensions;
-}
-
-void MoQSession::onSetupParams(SetupParameters params, bool local) {
-  auto& half = local ? localSetupParams_ : peerSetupParams_;
-  XCHECK(!half) << "Setup already recorded local=" << local << " sess=" << this;
-  half = std::move(params);
-  if (!localSetupParams_ || !peerSetupParams_) {
-    return;
-  }
-
-  // Rules may be version-dependent, so both callers record their half only
-  // after the version is settled.
-  XCHECK(negotiatedVersion_) << "Setup complete without a version sess=" << this;
-  negotiatedExtensions_ = computeNegotiatedExtensions(
-      *localSetupParams_, *peerSetupParams_, *negotiatedVersion_);
-  moqFrameWriter_.setNegotiatedExtensions(negotiatedExtensions_);
-  controlCodec_->setNegotiatedExtensions(negotiatedExtensions_);
-}
-
-uint64_t MoQSession::getPeerHopID() const noexcept {
-  if (!negotiatedExtensions_.has(SetupExtension::RelayHops)) {
-    return kMoQClusterAnonHopId;
-  }
-  return peerSetupParams_->getFirstParam(SetupKey::HOP_ID)->asUint64;
-}
-
-uint64_t MoQSession::getRelayLinkCost() const noexcept {
-  if (!negotiatedExtensions_.has(SetupExtension::RelayHops)) {
-    return 1;
-  }
-  // Each endpoint prices its own egress; this is the peer's advertised cost.
-  const auto* cost = peerSetupParams_->getFirstParam(SetupKey::RELAY_COST);
-  return cost ? cost->asUint64 : 1;
 }
 
 /*static*/
@@ -9781,11 +9830,9 @@ void MoQSession::setMoqSettings(MoQSettings settings) {
   moqSettings_ = settings;
 }
 
-void MoQSession::setMessageParameterNegotiator(
-    MessageParameterNegotiator negotiator) {
-  XCHECK(!setupComplete_);
-  messageParameterNegotiator_ = std::move(negotiator);
-  negotiateMessageParameters();
+void MoQSession::addExtension(std::shared_ptr<MoQExtension> extension) {
+  XCHECK(!localSetupParams_) << "addExtension after sendSetup sess=" << this;
+  extensions_.push_back(std::move(extension));
 }
 
 void SessionScoped::bind(const std::shared_ptr<MoQSession>& session) {

@@ -171,6 +171,7 @@ class Publisher {
    public:
     virtual ~NamespacePublishHandle() = default;
 
+    // Override to see NAMESPACE parameters; the default drops them.
     virtual void namespaceMsg(const Namespace& ns) {
       namespaceMsg(ns.trackNamespaceSuffix);
     }

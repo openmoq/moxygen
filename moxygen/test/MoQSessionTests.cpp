@@ -2635,6 +2635,233 @@ CO_TEST_P_X(MoQSessionTest, ControlStreamFailureWaitsForTheSetupTimeout) {
   EXPECT_TRUE(setup.hasException<folly::FutureTimeout>());
 }
 
+// Holds back the first uni stream (the peer's control stream) so that setup
+// cannot complete. onSessionEnd can be delayed, because a peer that closes the
+// session resets its streams before the close arrives.
+class WithholdFirstUniStreamHandler : public proxygen::WebTransportHandler {
+ public:
+  WithholdFirstUniStreamHandler(
+      MoQSession& session,
+      folly::EventBase& evb,
+      std::chrono::milliseconds sessionEndDelay = std::chrono::milliseconds(0))
+      : session_(session), evb_(evb), sessionEndDelay_(sessionEndDelay) {}
+
+  void onNewUniStream(
+      proxygen::WebTransport::StreamReadHandle* readHandle) noexcept override {
+    if (!withheld_) {
+      withheld_ = readHandle;
+      return;
+    }
+    session_.onNewUniStream(readHandle);
+  }
+  void onNewBidiStream(
+      proxygen::WebTransport::BidiStreamHandle bidiHandle) noexcept override {
+    session_.onNewBidiStream(bidiHandle);
+  }
+  void onDatagrams(
+      std::vector<std::unique_ptr<folly::IOBuf>> datagrams) noexcept override {
+    session_.onDatagrams(std::move(datagrams));
+  }
+  void onSessionEnd(folly::Optional<uint32_t> error) noexcept override {
+    evb_.timer().scheduleTimeoutFn(
+        [weakSession = session_.weak_from_this(), error] {
+          if (auto session = weakSession.lock()) {
+            session->onSessionEnd(error);
+          }
+        },
+        sessionEndDelay_);
+  }
+  void onSessionDrain() noexcept override {
+    session_.onSessionDrain();
+  }
+
+  proxygen::WebTransport::StreamReadHandle* withheld() const {
+    return withheld_;
+  }
+
+ private:
+  MoQSession& session_;
+  folly::EventBase& evb_;
+  std::chrono::milliseconds sessionEndDelay_;
+  proxygen::WebTransport::StreamReadHandle* withheld_{nullptr};
+};
+
+CO_TEST_P_X(MoQUniControlTest, StoppedServerControlStreamFailsSetupAtOnce) {
+  WithholdFirstUniStreamHandler clientHandler(*clientSession_, eventBase_);
+  serverWt_->setPeerHandler(&clientHandler);
+  auto peerHandlerGuard =
+      folly::makeGuard([this] { serverWt_->setPeerHandler(nullptr); });
+  clientSession_->start();
+  serverSession_->start();
+  serverSession_->sendSetup(moxygen::Setup{});
+  co_await rescheduleN(1);
+  CO_ASSERT_NE(clientHandler.withheld(), nullptr);
+  // as an H3 session does with a peer stream it rejects
+  clientHandler.withheld()->stopSending(/*error=*/0);
+
+  const auto start = std::chrono::steady_clock::now();
+  auto setup = co_await folly::coro::co_awaitTry(
+      clientSession_->setup(getClientSetup(initialMaxRequestID_)));
+  EXPECT_TRUE(setup.hasException<folly::OperationCancelled>());
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(1));
+  CO_ASSERT_TRUE(serverSession_->getCloseResult().has_value());
+  EXPECT_EQ(
+      serverSession_->getCloseResult()->error,
+      SessionCloseErrorCode::PROTOCOL_VIOLATION);
+}
+
+// The server has the client's SETUP, so it considers setup complete, but the
+// client never got the server's SETUP.
+CO_TEST_P_X(MoQUniControlTest, ServerControlStreamStoppedAfterClientSetup) {
+  WithholdFirstUniStreamHandler clientHandler(*clientSession_, eventBase_);
+  serverWt_->setPeerHandler(&clientHandler);
+  auto peerHandlerGuard =
+      folly::makeGuard([this] { serverWt_->setPeerHandler(nullptr); });
+  clientSession_->start();
+  serverSession_->start();
+  serverSession_->sendSetup(moxygen::Setup{});
+
+  const auto start = std::chrono::steady_clock::now();
+  folly::coro::Baton clientSetupDone;
+  folly::Try<moxygen::Setup> clientSetupResult;
+  co_withExecutor(
+      MoQExecutor_.get(),
+      clientSession_->setup(getClientSetup(initialMaxRequestID_)))
+      .start([&](folly::Try<moxygen::Setup>&& result) {
+        clientSetupResult = std::move(result);
+        clientSetupDone.post();
+      });
+  co_await serverSession_->awaitPeerSetup();
+  CO_ASSERT_NE(clientHandler.withheld(), nullptr);
+  clientHandler.withheld()->stopSending(/*error=*/0);
+
+  co_await clientSetupDone;
+  EXPECT_TRUE(clientSetupResult.hasException<folly::OperationCancelled>());
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(1));
+  CO_ASSERT_TRUE(serverSession_->getCloseResult().has_value());
+  EXPECT_EQ(
+      serverSession_->getCloseResult()->error,
+      SessionCloseErrorCode::PROTOCOL_VIOLATION);
+}
+
+// A server that rejects or drains a session mid-setup resets its streams
+// before its CLOSE_WEBTRANSPORT_SESSION arrives; the client keeps its reason.
+CO_TEST_P_X(MoQUniControlTest, ServerCloseDuringSetupKeepsItsReason) {
+  WithholdFirstUniStreamHandler clientHandler(
+      *clientSession_, eventBase_, std::chrono::milliseconds(20));
+  serverWt_->setPeerHandler(&clientHandler);
+  auto peerHandlerGuard =
+      folly::makeGuard([this] { serverWt_->setPeerHandler(nullptr); });
+  clientSession_->start();
+  serverSession_->start();
+  serverSession_->sendSetup(moxygen::Setup{});
+
+  folly::coro::Baton clientSetupDone;
+  folly::Try<moxygen::Setup> clientSetupResult;
+  co_withExecutor(
+      MoQExecutor_.get(),
+      clientSession_->setup(getClientSetup(initialMaxRequestID_)))
+      .start([&](folly::Try<moxygen::Setup>&& result) {
+        clientSetupResult = std::move(result);
+        clientSetupDone.post();
+      });
+  co_await serverSession_->awaitPeerSetup();
+  serverSession_->close(SessionCloseErrorCode::UNAUTHORIZED);
+
+  co_await clientSetupDone;
+  EXPECT_TRUE(clientSetupResult.hasException());
+  CO_ASSERT_TRUE(clientSession_->getCloseResult().has_value());
+  EXPECT_EQ(
+      clientSession_->getCloseResult()->error, SessionCloseErrorCode::NO_ERROR);
+  EXPECT_EQ(
+      clientSession_->getCloseResult()->wtError,
+      folly::to_underlying(SessionCloseErrorCode::UNAUTHORIZED));
+}
+
+// The client's wait for the server's close grows with the RTT, so that a slow
+// close still keeps the server's reason.
+CO_TEST_P_X(
+    MoQUniControlTest,
+    ServerCloseDuringSetupOnHighRttPathKeepsItsReason) {
+  quic::TransportInfo transportInfo;
+  transportInfo.srtt = std::chrono::milliseconds(300);
+  clientWt_->setTransportInfo(transportInfo);
+  WithholdFirstUniStreamHandler clientHandler(
+      *clientSession_, eventBase_, std::chrono::milliseconds(500));
+  serverWt_->setPeerHandler(&clientHandler);
+  auto peerHandlerGuard =
+      folly::makeGuard([this] { serverWt_->setPeerHandler(nullptr); });
+  clientSession_->start();
+  serverSession_->start();
+  serverSession_->sendSetup(moxygen::Setup{});
+
+  folly::coro::Baton clientSetupDone;
+  folly::Try<moxygen::Setup> clientSetupResult;
+  co_withExecutor(
+      MoQExecutor_.get(),
+      clientSession_->setup(getClientSetup(initialMaxRequestID_)))
+      .start([&](folly::Try<moxygen::Setup>&& result) {
+        clientSetupResult = std::move(result);
+        clientSetupDone.post();
+      });
+  co_await serverSession_->awaitPeerSetup();
+  serverSession_->close(SessionCloseErrorCode::UNAUTHORIZED);
+
+  co_await clientSetupDone;
+  EXPECT_TRUE(clientSetupResult.hasException());
+  CO_ASSERT_TRUE(clientSession_->getCloseResult().has_value());
+  EXPECT_EQ(
+      clientSession_->getCloseResult()->error, SessionCloseErrorCode::NO_ERROR);
+  EXPECT_EQ(
+      clientSession_->getCloseResult()->wtError,
+      folly::to_underlying(SessionCloseErrorCode::UNAUTHORIZED));
+}
+
+CO_TEST_P_X(
+    MoQUniControlTest,
+    ServerControlStreamResetAfterSetupClosesSession) {
+  co_await setupMoQSession();
+  // the server's control stream, reset as the client sees it
+  serverWt_->writeHandles.at(3)->deliverPeerReset(/*err=*/0);
+
+  const auto start = std::chrono::steady_clock::now();
+  while (!clientSession_->isClosed() &&
+         std::chrono::steady_clock::now() - start < std::chrono::seconds(1)) {
+    co_await folly::coro::sleep(std::chrono::milliseconds(10));
+  }
+  CO_ASSERT_TRUE(clientSession_->getCloseResult().has_value());
+  EXPECT_EQ(
+      clientSession_->getCloseResult()->error,
+      SessionCloseErrorCode::PROTOCOL_VIOLATION);
+}
+
+CO_TEST_P_X(MoQUniControlTest, ResetServerControlStreamFailsSetupAtOnce) {
+  NullWebTransportHandler nullHandler;
+  clientWt_->setPeerHandler(&nullHandler);
+  auto peerHandlerGuard =
+      folly::makeGuard([this] { clientWt_->setPeerHandler(nullptr); });
+  clientSession_->start();
+
+  // all of SETUP but its last byte, then a reset
+  auto* wh = CHECK_NOTNULL(serverWt_->createUniStream().value_or(nullptr));
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  writeServerSetup(writeBuf, moxygen::Setup{}, getServerSelectedVersion());
+  writeBuf.trimEnd(1);
+  wh->writeStreamData(writeBuf.move(), /*fin=*/false, nullptr);
+  co_await rescheduleN(2);
+  wh->resetStream(/*error=*/0);
+
+  const auto start = std::chrono::steady_clock::now();
+  auto setup = co_await folly::coro::co_awaitTry(
+      clientSession_->setup(getClientSetup(initialMaxRequestID_)));
+  EXPECT_TRUE(setup.hasException<folly::OperationCancelled>());
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(1));
+  CO_ASSERT_TRUE(clientSession_->getCloseResult().has_value());
+  EXPECT_EQ(
+      clientSession_->getCloseResult()->error,
+      SessionCloseErrorCode::PROTOCOL_VIOLATION);
+}
+
 CO_TEST_P_X(MoQUniControlTest, ClosedServerSessionIsNotStarted) {
   serverSession_->close(SessionCloseErrorCode::NO_ERROR);
 
@@ -2864,7 +3091,7 @@ CO_TEST_P_X(MoQUniControlTest, BidiRequestBeforeClientSetupWaitsForSetup) {
 }
 
 CO_TEST_P_X(MoQUniControlTest, NegotiatesParameterBeforeBufferedRequest) {
-  constexpr uint64_t kTestSetupOption = 0x4d;
+  static constexpr uint64_t kTestSetupOption = 0x4d;
   constexpr uint64_t kTestParameter = 0x4f;
   const std::string kTestValue = "route";
 
@@ -2872,16 +3099,31 @@ CO_TEST_P_X(MoQUniControlTest, NegotiatesParameterBeforeBufferedRequest) {
   extensions->emplace(
       kTestParameter,
       MessageParameterExtension{
-          ParameterValueEncoding::LengthPrefixed, {FrameType::SUBSCRIBE}});
-  serverSession_->setMessageParameterNegotiator(
-      [extensions, kTestValue](uint64_t, const auto& local, const auto& peer) {
-        auto hasOption = [&](const auto& params) {
-          return getFirstStringParam(params, kTestSetupOption) == kTestValue;
-        };
-        return hasOption(local) && hasOption(peer)
-            ? *extensions
-            : MessageParameterExtensions{};
-      });
+          .encoding = ParameterValueEncoding::LengthPrefixed,
+          .allowedFrames = {FrameType::SUBSCRIBE}});
+  class RouteExtension : public MoQExtension {
+   public:
+    explicit RouteExtension(MessageParameterExtensions extensions)
+        : extensions_(std::move(extensions)) {}
+
+    folly::Expected<MessageParameterExtensions, SessionCloseErrorCode>
+    negotiate(
+        uint64_t /*version*/,
+        const SetupParameters& local,
+        const SetupParameters& peer) const override {
+      auto hasOption = [](const auto& params) {
+        return getFirstStringParam(params, kTestSetupOption) == "route";
+      };
+      if (!hasOption(local) || !hasOption(peer)) {
+        return MessageParameterExtensions{};
+      }
+      return extensions_;
+    }
+
+   private:
+    MessageParameterExtensions extensions_;
+  };
+  serverSession_->addExtension(std::make_shared<RouteExtension>(*extensions));
 
   NullWebTransportHandler nullHandler;
   serverWt_->setPeerHandler(&nullHandler);
@@ -2934,6 +3176,279 @@ CO_TEST_P_X(MoQUniControlTest, NegotiatesParameterBeforeBufferedRequest) {
   EXPECT_FALSE(reached.hasException());
 
   serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// === Extension tests ===
+
+namespace {
+
+constexpr uint64_t kTestSetupOption = 0x4e;
+// Odd, so it is length-prefixed on draft 16 as well.
+constexpr uint64_t kTestParameter = 0x4f;
+constexpr uint64_t kOtherTestParameter = 0x51;
+
+// Sends `option` in SETUP and enables `param` on SUBSCRIBE when both peers
+// sent it. A peer that sends `option` twice is rejected.
+class TestExtension : public MoQExtension {
+ public:
+  TestExtension(uint64_t option, uint64_t param, uint64_t value = 1)
+      : option_(option), param_(param), value_(value) {}
+
+  std::vector<SetupParameter> getSetupOptions(
+      uint64_t /*version*/) const override {
+    return {SetupParameter(option_, value_)};
+  }
+
+  folly::Expected<MessageParameterExtensions, SessionCloseErrorCode> negotiate(
+      uint64_t /*version*/,
+      const SetupParameters& local,
+      const SetupParameters& peer) const override {
+    auto peerCount =
+        std::count_if(peer.begin(), peer.end(), [this](const auto& p) {
+          return p.key == option_;
+        });
+    if (peerCount > 1) {
+      return folly::makeUnexpected(
+          SessionCloseErrorCode::KEY_VALUE_FORMATTING_ERROR);
+    }
+    if (!local.hasParam(option_) || peerCount == 0) {
+      return MessageParameterExtensions{};
+    }
+    MessageParameterExtensions extensions;
+    extensions.emplace(
+        param_,
+        MessageParameterExtension{
+            .encoding = ParameterValueEncoding::LengthPrefixed,
+            .allowedFrames = {FrameType::SUBSCRIBE}});
+    return extensions;
+  }
+
+ private:
+  uint64_t option_;
+  uint64_t param_;
+  uint64_t value_;
+};
+
+class ImplementationExtension : public MoQExtension {
+ public:
+  std::vector<SetupParameter> getSetupOptions(
+      uint64_t /*version*/) const override {
+    return {SetupParameter(
+        folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION),
+        std::string("test-impl"))};
+  }
+};
+
+// Sends kTestSetupOption twice, which TestExtension rejects.
+class RepeatedOptionExtension : public MoQExtension {
+ public:
+  std::vector<SetupParameter> getSetupOptions(
+      uint64_t /*version*/) const override {
+    return {
+        SetupParameter(kTestSetupOption, uint64_t{1}),
+        SetupParameter(kTestSetupOption, uint64_t{2})};
+  }
+};
+
+// Registers a key moxygen already defines.
+class BuiltInKeyExtension : public MoQExtension {
+ public:
+  folly::Expected<MessageParameterExtensions, SessionCloseErrorCode> negotiate(
+      uint64_t /*version*/,
+      const SetupParameters& /*local*/,
+      const SetupParameters& /*peer*/) const override {
+    MessageParameterExtensions extensions;
+    extensions.emplace(
+        folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
+        MessageParameterExtension{
+            .encoding = ParameterValueEncoding::LengthPrefixed,
+            .allowedFrames = {FrameType::SUBSCRIBE}});
+    return extensions;
+  }
+};
+
+} // namespace
+
+using MoQExtensionTest = MoQSessionTest;
+
+INSTANTIATE_TEST_SUITE_P(
+    MoQExtensionTest,
+    MoQExtensionTest,
+    testing::ValuesIn(getSupportedVersionParams()));
+
+CO_TEST_P_X(MoQExtensionTest, NegotiatedParameterReachesPeer) {
+  clientSession_->addExtension(
+      std::make_shared<TestExtension>(kTestSetupOption, kTestParameter));
+  serverSession_->addExtension(
+      std::make_shared<TestExtension>(kTestSetupOption, kTestParameter));
+  co_await setupMoQSession();
+
+  for (auto* session : {clientSession_.get(), serverSession_.get()}) {
+    CO_ASSERT_TRUE(session->getLocalSetupParams().has_value());
+    CO_ASSERT_TRUE(session->getPeerSetupParams().has_value());
+    EXPECT_TRUE(session->getLocalSetupParams()->hasParam(kTestSetupOption));
+    EXPECT_TRUE(session->getPeerSetupParams()->hasParam(kTestSetupOption));
+    EXPECT_EQ(
+        session->getMessageParameterExtensions().count(kTestParameter), 1);
+  }
+
+  expectSubscribe([](auto sub, auto /*pub*/) -> TaskSubscribeResult {
+    const auto* param = sub.params.getFirstParam(kTestParameter);
+    EXPECT_NE(param, nullptr);
+    if (param) {
+      EXPECT_EQ(param->asString, "route");
+    }
+    co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+  });
+  auto subscribeRequest = getSubscribe(kTestTrackName);
+  subscribeRequest.params.insertParam(
+      Parameter(kTestParameter, std::string("route")));
+  auto res =
+      co_await clientSession_->subscribe(subscribeRequest, subscribeCallback_);
+  CO_ASSERT_TRUE(res.hasValue());
+  res.value()->unsubscribe();
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQExtensionTest, NotNegotiatedWithoutPeerOption) {
+  serverSession_->addExtension(
+      std::make_shared<TestExtension>(kTestSetupOption, kTestParameter));
+  co_await setupMoQSession();
+
+  EXPECT_TRUE(clientSession_->getMessageParameterExtensions().empty());
+  EXPECT_TRUE(serverSession_->getMessageParameterExtensions().empty());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQExtensionTest, ExtensionsCompose) {
+  constexpr uint64_t kOtherSetupOption = 0x50;
+  for (auto* session : {clientSession_.get(), serverSession_.get()}) {
+    session->addExtension(
+        std::make_shared<TestExtension>(kTestSetupOption, kTestParameter));
+    session->addExtension(
+        std::make_shared<TestExtension>(
+            kOtherSetupOption, kOtherTestParameter));
+  }
+  co_await setupMoQSession();
+
+  for (auto* session : {clientSession_.get(), serverSession_.get()}) {
+    const auto& negotiated = session->getMessageParameterExtensions();
+    EXPECT_EQ(negotiated.size(), 2);
+    EXPECT_EQ(negotiated.count(kTestParameter), 1);
+    EXPECT_EQ(negotiated.count(kOtherTestParameter), 1);
+  }
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQExtensionTest, SetupOptionReplacesBuiltIn) {
+  clientSession_->addExtension(std::make_shared<ImplementationExtension>());
+  co_await setupMoQSession();
+
+  const auto& peerParams = serverSession_->getPeerSetupParams();
+  CO_ASSERT_TRUE(peerParams.has_value());
+  auto count =
+      std::count_if(peerParams->begin(), peerParams->end(), [](const auto& p) {
+        return p.key == folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION);
+      });
+  EXPECT_EQ(count, 1);
+  EXPECT_EQ(
+      getFirstStringParam(
+          *peerParams, folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION)),
+      "test-impl");
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQExtensionTest, RejectedSetupClosesSession) {
+  serverSession_->addExtension(
+      std::make_shared<TestExtension>(kTestSetupOption, kTestParameter));
+  // The client sends the option twice, which TestExtension rejects.
+  auto clientSetup = getClientSetup(initialMaxRequestID_);
+  clientSetup.params.insertParam(SetupParameter(kTestSetupOption, uint64_t{1}));
+  clientSetup.params.insertParam(SetupParameter(kTestSetupOption, uint64_t{2}));
+
+  clientSession_->start();
+  serverSession_->setPublishHandler(serverPublisher);
+  serverSession_->start();
+  if (useUniControlStreams(getServerSelectedVersion())) {
+    serverSession_->sendSetup(moxygen::Setup{});
+  }
+  auto res = co_await folly::coro::co_awaitTry(
+      folly::coro::timeout(
+          clientSession_->setup(std::move(clientSetup)),
+          std::chrono::seconds(1)));
+  EXPECT_TRUE(res.hasException());
+
+  CO_ASSERT_TRUE(serverSession_->getCloseResult().has_value());
+  EXPECT_EQ(
+      serverSession_->getCloseResult()->error,
+      SessionCloseErrorCode::KEY_VALUE_FORMATTING_ERROR);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+CO_TEST_P_X(MoQExtensionTest, ClientRejectsServerSetup) {
+  clientSession_->addExtension(
+      std::make_shared<TestExtension>(kTestSetupOption, kTestParameter));
+  serverSession_->addExtension(std::make_shared<RepeatedOptionExtension>());
+
+  clientSession_->start();
+  serverSession_->setPublishHandler(serverPublisher);
+  serverSession_->start();
+  if (useUniControlStreams(getServerSelectedVersion())) {
+    serverSession_->sendSetup(moxygen::Setup{});
+  }
+  auto res = co_await folly::coro::co_awaitTry(
+      folly::coro::timeout(
+          clientSession_->setup(getClientSetup(initialMaxRequestID_)),
+          std::chrono::seconds(1)));
+  EXPECT_TRUE(res.hasException());
+
+  const auto& peerParams = clientSession_->getPeerSetupParams();
+  CO_ASSERT_TRUE(peerParams.has_value());
+  EXPECT_EQ(
+      std::count_if(
+          peerParams->begin(),
+          peerParams->end(),
+          [](const auto& p) { return p.key == kTestSetupOption; }),
+      2);
+  CO_ASSERT_TRUE(clientSession_->getCloseResult().has_value());
+  EXPECT_EQ(
+      clientSession_->getCloseResult()->error,
+      SessionCloseErrorCode::KEY_VALUE_FORMATTING_ERROR);
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+TEST_P(MoQExtensionTest, DuplicateSetupOptionIsFatal) {
+  // The fixture's EventBase can't run in a forked child.
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  clientSession_->addExtension(std::make_shared<ImplementationExtension>());
+  clientSession_->addExtension(std::make_shared<ImplementationExtension>());
+  EXPECT_DEBUG_DEATH(
+      folly::coro::blockingWait(setupMoQSession(), getExecutor()),
+      "SETUP option supplied by two extensions");
+}
+
+TEST_P(MoQExtensionTest, BuiltInKeyRegistrationIsFatal) {
+  // The fixture's EventBase can't run in a forked child.
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  clientSession_->addExtension(std::make_shared<BuiltInKeyExtension>());
+  EXPECT_DEBUG_DEATH(
+      folly::coro::blockingWait(setupMoQSession(), getExecutor()),
+      "Message parameter key already in use");
+}
+
+TEST_P(MoQExtensionTest, DuplicateRegistrationIsFatal) {
+  // The fixture's EventBase can't run in a forked child.
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  constexpr uint64_t kOtherSetupOption = 0x50;
+  for (auto* session : {clientSession_.get(), serverSession_.get()}) {
+    session->addExtension(
+        std::make_shared<TestExtension>(kTestSetupOption, kTestParameter));
+    session->addExtension(
+        std::make_shared<TestExtension>(kOtherSetupOption, kTestParameter));
+  }
+  EXPECT_DEBUG_DEATH(
+      folly::coro::blockingWait(setupMoQSession(), getExecutor()),
+      "Message parameter key already in use");
 }
 
 CO_TEST_P_X(MoQUniControlTest, BidiRequestStreamFinWithFirstFrame) {

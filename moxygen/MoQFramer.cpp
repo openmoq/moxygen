@@ -55,7 +55,6 @@ moxygen::ParameterValueEncoding paramEncodingV18(uint64_t key) {
     case K::FILL_TIMEOUT:
     case K::EXPIRES:
     case K::NEW_GROUP_REQUEST:
-    case K::ROUTE_COST:
     // PUBLISHER_PRIORITY is extensions-only; parsed as varint so the
     // caller's allowlist check can reject it cleanly.
     case K::PUBLISHER_PRIORITY:
@@ -66,25 +65,45 @@ moxygen::ParameterValueEncoding paramEncodingV18(uint64_t key) {
     case K::SUBSCRIPTION_FILTER:
     case K::TRACK_NAMESPACE_PREFIX:
     case K::FILL_PARAMETERS:
-    case K::HOP_PATH:
-    // TRACK_FILTER (0x30) is a fork-local active proposal; length-prefixed
-    // value decoded via parseVariableParam (see parseTrackFilter).
-    case K::TRACK_FILTER:
       return E::LengthPrefixed;
   }
   XLOG(DFATAL) << "paramEncodingV18: unknown key " << key;
   return E::Varint;
 }
 
+bool encodingMatchesParity(
+    moxygen::ParameterValueEncoding encoding,
+    uint64_t key) {
+  using E = moxygen::ParameterValueEncoding;
+  if (key & 0x01) {
+    return encoding == E::LengthPrefixed;
+  }
+  return encoding == E::Uint8 || encoding == E::Varint;
+}
+
+// Before draft 18, the parity of `key` fixes its encoding.
+bool isMessageParameterExtensionUsable(
+    uint64_t key,
+    const moxygen::MessageParameterExtension& extension,
+    uint64_t majorVersion) {
+  return majorVersion >= 18 || encodingMatchesParity(extension.encoding, key);
+}
+
+// Null when `key` isn't registered or its encoding is unusable on this draft.
 const moxygen::MessageParameterExtension* findMessageParameterExtension(
     const std::shared_ptr<const moxygen::MessageParameterExtensions>&
         extensions,
-    uint64_t key) {
+    uint64_t key,
+    uint64_t majorVersion) {
   if (!extensions) {
     return nullptr;
   }
   auto it = extensions->find(key);
-  return it == extensions->end() ? nullptr : &it->second;
+  if (it == extensions->end() ||
+      !isMessageParameterExtensionUsable(key, it->second, majorVersion)) {
+    return nullptr;
+  }
+  return &it->second;
 }
 
 bool isMessageParameterAllowed(
@@ -108,10 +127,81 @@ bool containsInvalidMessageParameterExtension(
         if (moxygen::Parameters::isKnownParamKey(parameter.key, majorVersion)) {
           return false;
         }
-        const auto* extension =
-            findMessageParameterExtension(extensions, parameter.key);
+        const auto* extension = findMessageParameterExtension(
+            extensions, parameter.key, majorVersion);
         return !extension || !isMessageParameterAllowed(*extension, frameType);
       });
+}
+
+// NAMESPACE has no parameter block of its own; it carries one when a usable
+// registry entry lists NAMESPACE in its allowedFrames or requiredFrames.
+bool namespaceCarriesParams(
+    const std::shared_ptr<const moxygen::MessageParameterExtensions>&
+        extensions,
+    uint64_t majorVersion) {
+  if (!extensions) {
+    return false;
+  }
+  return std::any_of(
+      extensions->begin(), extensions->end(), [&](const auto& keyAndRule) {
+        return keyAndRule.second.explicitlyAllows(
+                   moxygen::FrameType::NAMESPACE) &&
+            isMessageParameterExtensionUsable(
+                   keyAndRule.first, keyAndRule.second, majorVersion);
+      });
+}
+
+// Applies each registered parameter's validate, repeatable and requiredFrames
+// rules to one message's parameters.
+template <class Params>
+bool satisfiesMessageParameterRules(
+    const Params& parameters,
+    uint64_t version,
+    moxygen::FrameType frameType,
+    const std::shared_ptr<const moxygen::MessageParameterExtensions>&
+        extensions,
+    moxygen::ParameterDirection direction) {
+  if (!extensions || extensions->empty()) {
+    return true;
+  }
+  const auto majorVersion = moxygen::getDraftMajorVersion(version);
+  folly::F14FastMap<uint64_t, size_t> counts;
+  for (const auto& parameter : parameters) {
+    if (moxygen::Parameters::isKnownParamKey(parameter.key, majorVersion)) {
+      continue;
+    }
+    const auto* rule =
+        findMessageParameterExtension(extensions, parameter.key, majorVersion);
+    if (!rule) {
+      continue;
+    }
+    if (rule->validate) {
+      try {
+        if (!rule->validate(version, parameter, direction)) {
+          return false;
+        }
+      } catch (const std::exception& ex) {
+        XLOG(ERR) << "validate threw for parameter key=" << parameter.key
+                  << ": " << ex.what();
+        return false;
+      }
+    }
+    if (++counts[parameter.key] > 1 && !rule->repeatable) {
+      return false;
+    }
+  }
+  for (const auto& [key, rule] : *extensions) {
+    const bool isMissing = counts.count(key) == 0;
+    const bool isRequired = std::find(
+                                rule.requiredFrames.begin(),
+                                rule.requiredFrames.end(),
+                                frameType) != rule.requiredFrames.end();
+    if (isMissing && isRequired &&
+        isMessageParameterExtensionUsable(key, rule, majorVersion)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // The parameter types draft 22 permits inside FILL_PARAMETERS. Range Filters
@@ -618,86 +708,6 @@ folly::Expected<std::string, ErrorCode> MoQFrameParser::parseFixedString(
   return res;
 }
 
-folly::Expected<std::string, ErrorCode> encodeRelayHopPath(
-    const std::vector<uint64_t>& hopPath,
-    uint64_t version) noexcept {
-  if (hopPath.empty()) {
-    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-  }
-
-  folly::IOBufQueue encoded{folly::IOBufQueue::cacheChainLength()};
-  MoQFrameWriter writer;
-  writer.initializeVersion(version);
-  size_t size = 0;
-  bool error = false;
-  folly::F14FastSet<uint64_t> seen;
-  for (const auto hop : hopPath) {
-    if (hop != kMoQClusterAnonHopId && !seen.insert(hop).second) {
-      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-    }
-    writer.writeVarint(encoded, hop, size, error);
-    if (error) {
-      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-    }
-  }
-  return encoded.move()->moveToFbString().toStdString();
-}
-
-folly::Expected<std::vector<uint64_t>, ErrorCode> decodeRelayHopPath(
-    std::string_view encoded,
-    uint64_t version) noexcept {
-  if (encoded.empty()) {
-    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-  }
-
-  auto buffer = folly::IOBuf::copyBuffer(encoded);
-  folly::io::Cursor cursor(buffer.get());
-  size_t remaining = encoded.size();
-  std::vector<uint64_t> hopPath;
-  folly::F14FastSet<uint64_t> seen;
-  while (remaining > 0) {
-    const auto decoded = getDraftMajorVersion(version) >= 17
-        ? decodeMoQVarint(cursor, remaining)
-        : quic::follyutils::decodeQuicInteger(cursor, remaining);
-    if (!decoded) {
-      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-    }
-    if (decoded->first != kMoQClusterAnonHopId &&
-        !seen.insert(decoded->first).second) {
-      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-    }
-    hopPath.push_back(decoded->first);
-    remaining -= decoded->second;
-  }
-  return hopPath;
-}
-
-namespace {
-bool validClusterAdvertisement(
-    const Parameters& params,
-    uint64_t version,
-    bool negotiated = true,
-    bool update = false) {
-  size_t paths = 0;
-  size_t costs = 0;
-  for (const auto& param : params) {
-    paths += param.key == folly::to_underlying(TrackRequestParamKey::HOP_PATH);
-    costs +=
-        param.key == folly::to_underlying(TrackRequestParamKey::ROUTE_COST);
-  }
-  if (!negotiated) {
-    return paths == 0 && costs == 0;
-  }
-  const auto* path = params.getFirstParam(TrackRequestParamKey::HOP_PATH);
-  if (update && paths == 0 && costs == 0) {
-    return true;
-  }
-  return getDraftMajorVersion(version) >= 18 &&
-      (update ? paths <= 1 : paths == 1) && costs <= 1 &&
-      (!path || decodeRelayHopPath(path->asString, version).hasValue());
-}
-} // namespace
-
 folly::Expected<std::optional<AuthToken>, ErrorCode>
 MoQFrameParser::parseAuthToken(
     folly::io::Cursor& cursor,
@@ -915,24 +925,28 @@ MoQFrameParser::parseSubscriptionFilter(
 folly::Expected<LocationFilter, ErrorCode> MoQFrameParser::parseLocationFilter(
     folly::io::Cursor& cursor,
     size_t& length) const noexcept {
+  auto type = decodeVarint(cursor, length);
+  if (!type) {
+    XLOG(DBG4) << "parseLocationFilter: UNDERFLOW on type";
+    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  }
+  length -= type->second;
+  const auto count = LocationFilter::fieldCountForType(type->first);
+  if (!count) {
+    XLOG(ERR) << "parseLocationFilter: undefined type " << type->first;
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
   std::array<uint64_t, LocationFilter::kMaxFields> fields{};
-  uint8_t count = 0;
-  while (length > 0) {
-    if (count == LocationFilter::kMaxFields) {
-      XLOG(ERR) << "parseLocationFilter: more than four fields";
-      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-    }
+  for (uint8_t i = 0; i < *count; i++) {
     auto field = decodeVarint(cursor, length);
     if (!field) {
-      // The parameter length is known, so a field running past it is
-      // malformed rather than a signal to wait for more bytes.
-      XLOG(ERR) << "parseLocationFilter: field crosses the parameter length";
-      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+      XLOG(DBG4) << "parseLocationFilter: UNDERFLOW on field " << int(i);
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
-    fields[count++] = field->first;
+    fields[i] = field->first;
     length -= field->second;
   }
-  return LocationFilter::fromFields(fields, count);
+  return LocationFilter::fromWire(type->first, fields);
 }
 
 folly::Expected<FillParameters, ErrorCode> MoQFrameParser::parseFillParameters(
@@ -953,17 +967,7 @@ folly::Expected<FillParameters, ErrorCode> MoQFrameParser::parseFillParameters(
       return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
     }
     if (*key == folly::to_underlying(TrackRequestParamKey::LOCATION_FILTER)) {
-      auto lenRes = decodeVarint(cursor, length);
-      if (!lenRes) {
-        return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
-      }
-      length -= lenRes->second;
-      if (lenRes->first > length || !cursor.canAdvance(lenRes->first)) {
-        return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
-      }
-      size_t valueLen = lenRes->first;
-      length -= valueLen;
-      auto filter = parseLocationFilter(cursor, valueLen);
+      auto filter = parseLocationFilter(cursor, length);
       if (!filter) {
         return folly::makeUnexpected(filter.error());
       }
@@ -995,32 +999,6 @@ folly::Expected<FillParameters, ErrorCode> MoQFrameParser::parseFillParameters(
   return fill;
 }
 
-folly::Expected<TrackFilter, ErrorCode> MoQFrameParser::parseTrackFilter(
-    folly::io::Cursor& cursor,
-    size_t& length) const noexcept {
-  TrackFilter filter;
-
-  // Parse propertyType
-  auto propertyType = decodeVarint(cursor, length);
-  if (!propertyType) {
-    XLOG(DBG4) << "parseTrackFilter: UNDERFLOW on propertyType";
-    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
-  }
-  length -= propertyType->second;
-  filter.propertyType = propertyType->first;
-
-  // Parse maxSelected (N)
-  auto maxSelected = decodeVarint(cursor, length);
-  if (!maxSelected) {
-    XLOG(DBG4) << "parseTrackFilter: UNDERFLOW on maxSelected";
-    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
-  }
-  length -= maxSelected->second;
-  filter.maxSelected = maxSelected->first;
-
-  return filter;
-}
-
 folly::Expected<std::optional<Parameter>, ErrorCode>
 MoQFrameParser::parseVariableParam(
     folly::io::Cursor& cursor,
@@ -1033,8 +1011,6 @@ MoQFrameParser::parseVariableParam(
       folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN);
   const auto subscriptionFilterKey =
       folly::to_underlying(TrackRequestParamKey::SUBSCRIPTION_FILTER);
-  const auto trackFilterKey =
-      folly::to_underlying(TrackRequestParamKey::TRACK_FILTER);
   if (key == authKey) {
     auto res = decodeVarint(cursor, length);
     if (!res) {
@@ -1056,6 +1032,13 @@ MoQFrameParser::parseVariableParam(
       return std::nullopt;
     }
     p.asAuthToken = std::move(*tokenRes.value());
+  } else if (key == subscriptionFilterKey && useLocationFilter(version)) {
+    // The Location Filter Type, not a length, decides how many fields follow.
+    auto res = parseLocationFilter(cursor, length);
+    if (!res) {
+      return folly::makeUnexpected(res.error());
+    }
+    p.asLocationFilter = res.value();
   } else if (
       key == subscriptionFilterKey ||
       (key == folly::to_underlying(TrackRequestParamKey::FILL_PARAMETERS) &&
@@ -1080,12 +1063,6 @@ MoQFrameParser::parseVariableParam(
         return folly::makeUnexpected(res.error());
       }
       p.asFillParameters = res.value();
-    } else if (useLocationFilter(version)) {
-      auto res = parseLocationFilter(cursor, valueSize);
-      if (!res) {
-        return folly::makeUnexpected(res.error());
-      }
-      p.asLocationFilter = res.value();
     } else {
       auto res = parseSubscriptionFilter(cursor, valueSize);
       if (!res) {
@@ -1098,32 +1075,6 @@ MoQFrameParser::parseVariableParam(
       }
       p.asLocationFilter = fromSubscriptionFilter(res.value());
     }
-  } else if (key == trackFilterKey) {
-    // TRACK_FILTER is an active proposal, not yet landed in the core
-    // specification. Its key is even but its value is length-prefixed.
-    auto lenRes = decodeVarint(cursor, length);
-    if (!lenRes) {
-      XLOG(DBG4) << "parseVariableParam: UNDERFLOW on trackFilter length";
-      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
-    }
-    length -= lenRes->second;
-    auto filterLen = lenRes->first;
-    if (filterLen > length || !cursor.canAdvance(filterLen)) {
-      XLOG(DBG4) << "parseVariableParam: UNDERFLOW on trackFilter data";
-      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
-    }
-    size_t filterSize = filterLen;
-    auto res = parseTrackFilter(cursor, filterSize);
-    if (!res) {
-      return folly::makeUnexpected(res.error());
-    }
-    if (filterSize > 0) {
-      XLOG(DBG4) << "parseVariableParam: track filter did not consume"
-                 << " all declared bytes, remaining=" << filterSize;
-      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
-    }
-    length -= filterLen;
-    p.asTrackFilter = res.value();
   }
 
   else {
@@ -1279,12 +1230,6 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseSetupParams(
       param.emplace(*key, value.value());
     }
 
-    if (getDraftMajorVersion(version) >= 18 &&
-        (*key == folly::to_underlying(SetupKey::HOP_ID) ||
-         *key == folly::to_underlying(SetupKey::RELAY_COST)) &&
-        params.hasParam(*key)) {
-      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-    }
     if (params.insertParam(std::move(*param)).hasError()) {
       XLOG(ERR) << "parseSetupParams: rejected setup option at index=" << i
                 << ", key=" << *key;
@@ -1969,7 +1914,8 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseTrackRequestParams(
         Parameters::isKnownParamKey(key, getDraftMajorVersion(version));
     const auto* extension = isBuiltIn
         ? nullptr
-        : findMessageParameterExtension(messageParameterExtensions_, key);
+        : findMessageParameterExtension(
+              messageParameterExtensions_, key, getDraftMajorVersion(version));
     if (!isBuiltIn && !extension) {
       XLOG(ERR) << "Unknown parameter key " << key;
       return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
@@ -1988,9 +1934,6 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseTrackRequestParams(
           version,
           key,
           extension ? extension->encoding : paramEncodingV18(key));
-    } else if (
-        key == folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
-      res = parseVariableParam(cursor, length, version, key);
     } else if ((key & 0x01) == 0) {
       res = parseIntParam(cursor, length, version, key);
     } else if (
@@ -2071,6 +2014,15 @@ folly::Expected<folly::Unit, ErrorCode> MoQFrameParser::parseTrackRequestParams(
       }
     }
   }
+  if (!satisfiesMessageParameterRules(
+          params,
+          version,
+          params.getFrameType(),
+          messageParameterExtensions_,
+          ParameterDirection::Received)) {
+    XLOG(ERR) << "parseTrackRequestParams: extension parameter rule violated";
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
   XLOG(DBG4) << "parseTrackRequestParams: returning success";
   return folly::unit;
 }
@@ -2097,16 +2049,6 @@ std::optional<LocationFilter> MoQFrameParser::extractLocationFilter(
     if (param.key ==
         folly::to_underlying(TrackRequestParamKey::LOCATION_FILTER)) {
       return param.asLocationFilter;
-    }
-  }
-  return std::nullopt;
-}
-
-std::optional<TrackFilter> MoQFrameParser::extractTrackFilter(
-    const std::vector<Parameter>& requestSpecificParams) const noexcept {
-  for (const auto& param : requestSpecificParams) {
-    if (param.key == folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
-      return param.asTrackFilter;
     }
   }
   return std::nullopt;
@@ -2245,13 +2187,6 @@ folly::Expected<RequestUpdate, ErrorCode> MoQFrameParser::parseRequestUpdate(
       requestSpecificParams);
   if (!res2) {
     return folly::makeUnexpected(res2.error());
-  }
-  if (!validClusterAdvertisement(
-          requestUpdate.params,
-          *version_,
-          hasExtension(SetupExtension::RelayHops),
-          true)) {
-    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   handleRequestSpecificParams(requestUpdate, requestSpecificParams);
   // TRACK_NAMESPACE_PREFIX carries a Track Namespace tuple, so a malformed
@@ -2706,12 +2641,6 @@ MoQFrameParser::parsePublishNamespace(folly::io::Cursor& cursor, size_t length)
   if (length > 0) {
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
-  if (!validClusterAdvertisement(
-          publishNamespace.params,
-          *version_,
-          hasExtension(SetupExtension::RelayHops))) {
-    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-  }
   return publishNamespace;
 }
 
@@ -2744,20 +2673,19 @@ folly::Expected<PublishNamespaceOk, ErrorCode> MoQFrameParser::parseRequestOk(
     return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
   }
   length -= numParams->second;
-  if (numParams->first > 0) {
-    if (frameType == FrameType::SUBSCRIBE_NAMESPACE_OK) {
-      // no params supported
-      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-    }
-    auto res = parseTrackRequestParams(
-        cursor,
-        length,
-        numParams->first,
-        requestOk.params,
-        requestOk.requestSpecificParams);
-    if (!res) {
-      return folly::makeUnexpected(res.error());
-    }
+  if (frameType == FrameType::SUBSCRIBE_NAMESPACE_OK && numParams->first > 0) {
+    // no params supported
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+  }
+  // Runs even with no params, so that requiredFrames is enforced.
+  auto res = parseTrackRequestParams(
+      cursor,
+      length,
+      numParams->first,
+      requestOk.params,
+      requestOk.requestSpecificParams);
+  if (!res) {
+    return folly::makeUnexpected(res.error());
   }
 
   if (getDraftMajorVersion(*version_) >= 18 && length > 0) {
@@ -3408,29 +3336,25 @@ folly::Expected<Namespace, ErrorCode> MoQFrameParser::parseNamespace(
   }
   ns.trackNamespaceSuffix = TrackNamespace(std::move(res.value()));
 
-  if (length > 0) {
-    if (!hasExtension(SetupExtension::RelayHops)) {
-      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-    }
+  if (namespaceCarriesParams(
+          messageParameterExtensions_, getDraftMajorVersion(*version_))) {
     auto numParams = decodeVarint(cursor, length);
     if (!numParams) {
+      XLOG(DBG4) << "parseNamespace: UNDERFLOW on numParams";
       return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
     }
     length -= numParams->second;
     std::vector<Parameter> requestSpecificParams;
-    auto paramsResult = parseTrackRequestParams(
+    auto paramsRes = parseTrackRequestParams(
         cursor, length, numParams->first, ns.params, requestSpecificParams);
-    if (!paramsResult) {
-      return folly::makeUnexpected(paramsResult.error());
+    if (!paramsRes) {
+      return folly::makeUnexpected(paramsRes.error());
     }
-  } else if (hasExtension(SetupExtension::RelayHops)) {
-    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    if (!requestSpecificParams.empty()) {
+      return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+    }
   }
   if (length > 0) {
-    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-  }
-  if (hasExtension(SetupExtension::RelayHops) &&
-      !validClusterAdvertisement(ns.params, *version_)) {
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   return ns;
@@ -4034,12 +3958,6 @@ std::string MoQFrameWriter::encodeTokenValue(
 }
 
 bool includeSetupParam(uint64_t version, uint64_t key) {
-  // Cluster setup parameters are defined for draft 18+.
-  if (getDraftMajorVersion(version) < 18 &&
-      (key == folly::to_underlying(SetupKey::HOP_ID) ||
-       key == folly::to_underlying(SetupKey::RELAY_COST))) {
-    return false;
-  }
   // Draft 18 removed this param in favor of QUIC stream limits.
   if (key == folly::to_underlying(SetupKey::MAX_REQUEST_ID) &&
       useBidiRequestStreams(version)) {
@@ -4427,7 +4345,13 @@ void MoQFrameWriter::writeTrackRequestParams(
           allParams,
           majorVersion,
           params.getFrameType(),
-          messageParameterExtensions_)) {
+          messageParameterExtensions_) ||
+      !satisfiesMessageParameterRules(
+          allParams,
+          *version_,
+          params.getFrameType(),
+          messageParameterExtensions_,
+          ParameterDirection::Sent)) {
     error = true;
     return;
   }
@@ -4473,24 +4397,15 @@ void MoQFrameWriter::writeV18ParamValue(
       writeVarint(writeBuf, param.largestObject->object, size, error);
       return;
     case ParameterValueEncoding::LengthPrefixed: {
-      if (param.key ==
-          folly::to_underlying(TrackRequestParamKey::TRACK_FILTER)) {
-        // TRACK_FILTER (0x30) is a fork-local length-prefixed param; its value
-        // lives in asTrackFilter, not asString. Mirror the draft-16 path in
-        // writeParamValue so the v18 wire form round-trips (see
-        // parseTrackFilter via parseV18ParamValue -> parseVariableParam).
-        folly::IOBufQueue tmpBuf{folly::IOBufQueue::cacheChainLength()};
-        size_t tmpSize = 0;
-        writeTrackFilter(tmpBuf, param.asTrackFilter, tmpSize, error);
-        if (!error) {
-          writeVarint(writeBuf, tmpSize, size, error);
-          writeBuf.append(tmpBuf.move());
-          size += tmpSize;
-        }
-        return;
-      }
       const bool isFill = param.key ==
           folly::to_underlying(TrackRequestParamKey::FILL_PARAMETERS);
+      if (!isExtension &&
+          param.key ==
+              folly::to_underlying(TrackRequestParamKey::LOCATION_FILTER) &&
+          useLocationFilter(*version_)) {
+        writeLocationFilter(writeBuf, param.asLocationFilter, size, error);
+        return;
+      }
       if (isExtension ||
           (!isFill &&
            param.key !=
@@ -4503,8 +4418,6 @@ void MoQFrameWriter::writeV18ParamValue(
       size_t tmpSize = 0;
       if (isFill) {
         writeFillParameters(tmpBuf, param.asFillParameters, tmpSize, error);
-      } else if (useLocationFilter(*version_)) {
-        writeLocationFilter(tmpBuf, param.asLocationFilter, tmpSize, error);
       } else {
         writeSubscriptionFilter(
             tmpBuf,
@@ -4529,8 +4442,6 @@ void MoQFrameWriter::writeParamValue(
     bool& error) const noexcept {
   const auto subscriptionFilterKey =
       folly::to_underlying(TrackRequestParamKey::SUBSCRIPTION_FILTER);
-  const auto trackFilterKey =
-      folly::to_underlying(TrackRequestParamKey::TRACK_FILTER);
   const auto largestObjectKey =
       folly::to_underlying(TrackRequestParamKey::LARGEST_OBJECT);
   const auto expiresKey = folly::to_underlying(TrackRequestParamKey::EXPIRES);
@@ -4541,7 +4452,10 @@ void MoQFrameWriter::writeParamValue(
     const auto* extension =
         Parameters::isKnownParamKey(param.key, getDraftMajorVersion(*version_))
         ? nullptr
-        : findMessageParameterExtension(messageParameterExtensions_, param.key);
+        : findMessageParameterExtension(
+              messageParameterExtensions_,
+              param.key,
+              getDraftMajorVersion(*version_));
     writeV18ParamValue(
         writeBuf,
         param,
@@ -4559,17 +4473,6 @@ void MoQFrameWriter::writeParamValue(
     size_t tmpSize = 0;
     writeSubscriptionFilter(
         tmpBuf, toSubscriptionFilter(param.asLocationFilter), tmpSize, error);
-    if (!error) {
-      writeVarint(writeBuf, tmpSize, size, error);
-      writeBuf.append(tmpBuf.move());
-      size += tmpSize;
-    }
-  } else if (param.key == trackFilterKey) {
-    // Track filter key is even, but its value is length-prefixed.
-    // Write to a temporary buffer to compute the length first.
-    folly::IOBufQueue tmpBuf{folly::IOBufQueue::cacheChainLength()};
-    size_t tmpSize = 0;
-    writeTrackFilter(tmpBuf, param.asTrackFilter, tmpSize, error);
     if (!error) {
       writeVarint(writeBuf, tmpSize, size, error);
       writeBuf.append(tmpBuf.move());
@@ -4662,6 +4565,7 @@ void MoQFrameWriter::writeLocationFilter(
     const LocationFilter& filter,
     size_t& size,
     bool& error) const noexcept {
+  writeVarint(writeBuf, filter.type(), size, error);
   const auto fields = filter.fields();
   for (uint8_t i = 0; i < filter.fieldCount(); i++) {
     writeVarint(writeBuf, fields[i], size, error);
@@ -4691,15 +4595,7 @@ void MoQFrameWriter::writeFillParameters(
   }
   if (fill.locationFilter) {
     writeKey(TrackRequestParamKey::LOCATION_FILTER);
-    folly::IOBufQueue tmpBuf{folly::IOBufQueue::cacheChainLength()};
-    size_t tmpSize = 0;
-    writeLocationFilter(tmpBuf, *fill.locationFilter, tmpSize, error);
-    if (error) {
-      return;
-    }
-    writeVarint(writeBuf, tmpSize, size, error);
-    writeBuf.append(tmpBuf.move());
-    size += tmpSize;
+    writeLocationFilter(writeBuf, *fill.locationFilter, size, error);
   }
   if (fill.groupOrder) {
     writeKey(TrackRequestParamKey::GROUP_ORDER);
@@ -4707,17 +4603,6 @@ void MoQFrameWriter::writeFillParameters(
     writeBuf.append(&order, 1);
     size += 1;
   }
-}
-
-void MoQFrameWriter::writeTrackFilter(
-    folly::IOBufQueue& writeBuf,
-    const TrackFilter& filter,
-    size_t& size,
-    bool& error) const noexcept {
-  // Write propertyType
-  writeVarint(writeBuf, filter.propertyType, size, error);
-  // Write maxSelected (N)
-  writeVarint(writeBuf, filter.maxSelected, size, error);
 }
 
 WriteResult MoQFrameWriter::writeDatagramObject(
@@ -5136,13 +5021,6 @@ WriteResult MoQFrameWriter::writeRequestUpdate(
     const RequestUpdate& update) const noexcept {
   XCHECK(version_.has_value())
       << "Version needs to be set to write request update";
-  if (!validClusterAdvertisement(
-          update.params,
-          *version_,
-          hasExtension(SetupExtension::RelayHops),
-          true)) {
-    return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
-  }
   size_t size = 0;
   bool error = false;
   auto sizePtr = writeFrameHeader(writeBuf, FrameType::SUBSCRIBE_UPDATE, error);
@@ -5443,12 +5321,6 @@ WriteResult MoQFrameWriter::writePublishNamespace(
     const PublishNamespace& publishNamespace) const noexcept {
   XCHECK(version_.has_value())
       << "Version needs to be set to write publishNamespace";
-  if (!validClusterAdvertisement(
-          publishNamespace.params,
-          *version_,
-          hasExtension(SetupExtension::RelayHops))) {
-    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
-  }
   size_t size = 0;
   bool error = false;
   auto sizePtr =
@@ -5753,21 +5625,24 @@ WriteResult MoQFrameWriter::writeNamespace(
     folly::IOBufQueue& writeBuf,
     const Namespace& ns) const noexcept {
   XCHECK(version_.has_value()) << "Version needs to be set to write namespace";
-  if (hasExtension(SetupExtension::RelayHops) &&
-      !validClusterAdvertisement(ns.params, *version_)) {
-    return folly::makeUnexpected(quic::TransportErrorCode::PROTOCOL_VIOLATION);
-  }
   size_t size = 0;
   bool error = false;
-  auto sizePtr = writeFrameHeader(writeBuf, FrameType::NAMESPACE, error);
-  writeTrackNamespace(writeBuf, ns.trackNamespaceSuffix, size, error);
-  if (hasExtension(SetupExtension::RelayHops)) {
-    writeTrackRequestParams(writeBuf, ns.params, {}, size, error);
+  const bool carriesParams = namespaceCarriesParams(
+      messageParameterExtensions_, getDraftMajorVersion(*version_));
+  if (!carriesParams && !ns.params.empty()) {
+    return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
+  }
+  folly::IOBufQueue frameBuf{folly::IOBufQueue::cacheChainLength()};
+  auto sizePtr = writeFrameHeader(frameBuf, FrameType::NAMESPACE, error);
+  writeTrackNamespace(frameBuf, ns.trackNamespaceSuffix, size, error);
+  if (carriesParams) {
+    writeTrackRequestParams(frameBuf, ns.params, {}, size, error);
   }
   writeSize(sizePtr, size, error, *version_);
   if (error) {
     return folly::makeUnexpected(quic::TransportErrorCode::INTERNAL_ERROR);
   }
+  writeBuf.append(frameBuf.move());
   return size;
 }
 

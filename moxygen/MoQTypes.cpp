@@ -224,7 +224,7 @@ SubscribeRange LocationFilter::resolve(
       largest ? largest->next().value_or(kLocationMax) : kLocationMin;
 
   SubscribeRange result;
-  if (fieldCount_ == 1) {
+  if (type_ == 1) {
     const uint64_t nextGroup = largest ? saturatingAdd(largest->group, 1) : 0;
     const uint64_t groupsBack = start_.group;
     result.start = {groupsBack > nextGroup ? 0 : nextGroup - groupsBack, 0};
@@ -239,10 +239,10 @@ SubscribeRange LocationFilter::resolve(
     }
   }
 
-  if (fieldCount_ >= 3) {
-    result.end = {end_.group, fieldCount_ == 3 ? kEightByteLimit : end_.object};
-  } else {
+  if (isOpenEnded()) {
     result.end = kLocationMax;
+  } else {
+    result.end = {end_.group, type_ == 3 ? kEightByteLimit : end_.object};
   }
   // A fetch never runs past Largest Object. Without one, an omitted end stays
   // open and the publisher bounds it.
@@ -266,16 +266,26 @@ std::pair<AbsoluteLocation, AbsoluteLocation> LocationFilter::fetchRange(
   return {range.start, range.end.next().value_or(kLocationMax)};
 }
 
-folly::Expected<LocationFilter, ErrorCode> LocationFilter::fromFields(
-    const std::array<uint64_t, kMaxFields>& fields,
-    uint8_t count) {
-  if (count > kMaxFields) {
-    XLOG(ERR) << "LocationFilter: " << int(count) << " fields, max is "
-              << int(kMaxFields);
+folly::Expected<LocationFilter, ErrorCode> LocationFilter::fromWire(
+    uint64_t type,
+    const std::array<uint64_t, kMaxFields>& fields) {
+  const auto count = fieldCountForType(type);
+  if (!count) {
+    XLOG(ERR) << "LocationFilter: undefined type " << type;
     return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
+  if (type == kNextObjectType) {
+    return nextObject();
+  }
+  AbsoluteLocation start;
+  if (*count >= 1) {
+    start.group = fields[0];
+  }
+  if (*count >= 2) {
+    start.object = fields[1];
+  }
   AbsoluteLocation end;
-  if (count >= 3) {
+  if (*count >= 3) {
     // Only a sum past 2^64-1 is a violation. Both operands arrive as varints,
     // so a parsed filter cannot reach that sum, but a direct caller can.
     if (fields[2] > std::numeric_limits<uint64_t>::max() - fields[0]) {
@@ -287,19 +297,21 @@ folly::Expected<LocationFilter, ErrorCode> LocationFilter::fromFields(
     // The sum saturates so that it stays encodable.
     end = AbsoluteLocation{
         saturatingAdd(fields[0], fields[2]),
-        count == kMaxFields ? fields[3] : 0};
+        *count == kMaxFields ? fields[3] : 0};
   }
-  return LocationFilter(count, AbsoluteLocation{fields[0], fields[1]}, end);
+  return LocationFilter(*count, start, end);
 }
 
 std::string LocationFilter::describe() const {
-  switch (fieldCount_) {
+  switch (type_) {
     case 0:
       return "{none}";
     case 1:
       return folly::to<std::string>("{relative ", start_.group, "}");
     case 2:
-      return isNextObjectForm() ? "{nextObject}" : start_.describe();
+      return start_.describe();
+    case kNextObjectType:
+      return "{nextObject}";
     case 3:
       return folly::to<std::string>(start_.describe(), "-{", end_.group, ",*}");
     default:
@@ -329,7 +341,7 @@ SubscriptionFilter toSubscriptionFilter(const LocationFilter& filter) {
   if (auto endGroup = filter.legacyEndGroup()) {
     return SubscriptionFilter(LocationType::AbsoluteRange, start, endGroup);
   }
-  switch (filter.fieldCount()) {
+  switch (filter.type()) {
     case 0:
       return SubscriptionFilter(
           LocationType::AbsoluteStart, kLocationMin, std::nullopt);
@@ -572,19 +584,6 @@ bool isPublishSubscriptionParameter(TrackRequestParamKey key) {
   }
 }
 
-const folly::F14FastSet<FrameType> kAllowedFramesForTrackFilter = {
-    FrameType::SUBSCRIBE_NAMESPACE};
-
-const folly::F14FastSet<FrameType> kAllowedFramesForHopPath = {
-    FrameType::PUBLISH_NAMESPACE,
-    FrameType::NAMESPACE,
-    FrameType::REQUEST_UPDATE};
-
-const folly::F14FastSet<FrameType> kAllowedFramesForRouteCost = {
-    FrameType::PUBLISH_NAMESPACE,
-    FrameType::NAMESPACE,
-    FrameType::REQUEST_UPDATE};
-
 // Allowlist mapping: TrackRequestParamKey -> set of allowed FrameTypes
 // Empty set means allowed for all frame types
 const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
@@ -620,9 +619,6 @@ const folly::F14FastMap<TrackRequestParamKey, folly::F14FastSet<FrameType>>
           FrameType::TRACK_STATUS,
           FrameType::FETCH,
           FrameType::SUBSCRIBE_TRACKS}},
-        {TrackRequestParamKey::TRACK_FILTER, kAllowedFramesForTrackFilter},
-        {TrackRequestParamKey::HOP_PATH, kAllowedFramesForHopPath},
-        {TrackRequestParamKey::ROUTE_COST, kAllowedFramesForRouteCost},
 };
 
 // Frame types that allow all parameters (no validation)
@@ -640,8 +636,6 @@ static bool isV18OnlyParamKey(TrackRequestParamKey key) {
     case TrackRequestParamKey::SUBGROUP_DELIVERY_TIMEOUT:
     case TrackRequestParamKey::FILL_TIMEOUT:
     case TrackRequestParamKey::TRACK_NAMESPACE_PREFIX:
-    case TrackRequestParamKey::HOP_PATH:
-    case TrackRequestParamKey::ROUTE_COST:
       return true;
     default:
       return false;
@@ -723,10 +717,8 @@ bool Parameters::isParamAllowed(TrackRequestParamKey key) const {
   }
 
   // v18-only parameter keys.
-  const bool clusterKey = key == TrackRequestParamKey::HOP_PATH ||
-      key == TrackRequestParamKey::ROUTE_COST;
   if (isV18OnlyParamKey(key) &&
-      (majorVersion_ ? *majorVersion_ < 18 : !clusterKey)) {
+      (!majorVersion_.has_value() || *majorVersion_ < 18)) {
     return false;
   }
 
@@ -863,27 +855,6 @@ Fetch::Fetch(
     auto result = params.insertParam(param);
     if (result.hasError()) {
       XLOG(ERR) << "Fetch: param not allowed, key=" << param.key;
-    }
-  }
-}
-
-SetupExtensionNegotiator bothAdvertise(uint64_t key) {
-  return [key](
-             const SetupParameters& local,
-             const SetupParameters& peer,
-             uint64_t /*version*/) {
-    return local.hasParam(key) && peer.hasParam(key);
-  };
-}
-
-void applySetupParameters(
-    SetupParameters& params,
-    const std::vector<SetupParameter>& extraParams) {
-  for (const auto& param : extraParams) {
-    params.eraseAllParamsOfType(param.key);
-    auto result = params.insertParam(param);
-    if (result.hasError()) {
-      XLOG(ERR) << "Setup param not allowed, key=" << param.key;
     }
   }
 }

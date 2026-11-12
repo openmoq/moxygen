@@ -158,6 +158,9 @@ void MoQClientBase::completeSetupMoQSession(
 
   //  Create MoQSession and Setup MoQSession parameters
   moqSession_ = createSession(std::move(wt));
+  for (const auto& extension : extensions_) {
+    moqSession_->addExtension(extension);
+  }
   if (quicWebTransport_) {
     quicWebTransport_->setHandler(moqSession_.get());
   } else if (quicWtSession_) {
@@ -205,9 +208,6 @@ Setup MoQClientBase::getClientSetup(const std::optional<std::string>& path) {
     clientSetup.params.insertParam(
         SetupParameter(folly::to_underlying(SetupKey::AUTHORITY), authority));
   }
-
-  // Last, so the application can override anything set above.
-  applySetupParameters(clientSetup.params, setupParams_);
 
   return clientSetup;
 }

@@ -19,6 +19,8 @@
 #include <quic/codec/QuicInteger.h>
 #include <quic/folly_utils/Utils.h>
 
+#include <algorithm>
+#include <functional>
 #include <memory>
 #include <variant>
 
@@ -36,9 +38,40 @@ enum class ParameterValueEncoding {
   LengthPrefixed,
 };
 
+// Whether a message is being parsed from the peer or written to it. A limit
+// that each endpoint advertises to its peer bounds the two directions
+// separately.
+enum class ParameterDirection : uint8_t {
+  Received,
+  Sent,
+};
+
+// Before draft 18 a key's parity sets its encoding: an even key is usable only
+// as Uint8 or Varint, an odd key only as LengthPrefixed, and a Uint8 is not
+// range-checked.
 struct MessageParameterExtension {
   ParameterValueEncoding encoding;
+  // Empty allows every frame. Frames are matched by wire type, so REQUEST_OK
+  // matches every OK response.
   std::vector<FrameType> allowedFrames;
+  // Frames that must carry the parameter.
+  std::vector<FrameType> requiredFrames;
+  // False allows at most one per message.
+  bool repeatable{true};
+  // Optional check of each value. Throwing counts as invalid. `direction` says
+  // whether the value was parsed from the peer or is being written to it.
+  std::function<
+      bool(uint64_t version, const Parameter&, ParameterDirection direction)>
+      validate;
+
+  // True if allowedFrames or requiredFrames lists frameType; an empty
+  // allowedFrames does not count.
+  bool explicitlyAllows(FrameType frameType) const {
+    return std::find(allowedFrames.begin(), allowedFrames.end(), frameType) !=
+        allowedFrames.end() ||
+        std::find(requiredFrames.begin(), requiredFrames.end(), frameType) !=
+        requiredFrames.end();
+  }
 };
 
 using MessageParameterExtensions =
@@ -56,18 +89,6 @@ void writeVarint(
 folly::Expected<std::string, ErrorCode> parseFixedString(
     folly::io::Cursor& cursor,
     size_t& length);
-
-// A relay that declares Hop ID 0 is anonymous: it opts out of loop detection,
-// so repeated zeros in one HOP_PATH are not a loop.
-constexpr uint64_t kMoQClusterAnonHopId = 0;
-
-folly::Expected<std::string, ErrorCode> encodeRelayHopPath(
-    const std::vector<uint64_t>& hopPath,
-    uint64_t version) noexcept;
-
-folly::Expected<std::vector<uint64_t>, ErrorCode> decodeRelayHopPath(
-    std::string_view encoded,
-    uint64_t version) noexcept;
 
 inline StreamType getSubgroupStreamType(
     uint64_t version,
@@ -328,30 +349,14 @@ class MoQFrameParser {
       size_t& length,
       ObjectHeader& objectHeader) const noexcept;
 
-  // Framers built after the setup exchange should pass the session's
-  // extensions here; the session's own pair learns its version first and picks
-  // the extensions up later via setNegotiatedExtensions().
-  void initializeVersion(uint64_t versionIn, SetupExtensions extensions = {}) {
+  void initializeVersion(uint64_t versionIn) {
     XCHECK(!version_) << "Version already initialized";
     version_ = versionIn;
     useMoQVarint_ = getDraftMajorVersion(versionIn) >= 17;
-    extensions_ = extensions;
   }
 
   std::optional<uint64_t> getVersion() const {
     return version_;
-  }
-
-  void setNegotiatedExtensions(SetupExtensions extensions) noexcept {
-    extensions_ = extensions;
-  }
-
-  SetupExtensions getNegotiatedExtensions() const noexcept {
-    return extensions_;
-  }
-
-  bool hasExtension(SetupExtension extension) const noexcept {
-    return extensions_.has(extension);
   }
 
   // Decode a TRACK_NAMESPACE_PREFIX parameter value (a Track Namespace tuple,
@@ -415,9 +420,6 @@ class MoQFrameParser {
     previousFetchPriority_ = std::nullopt;
     fetchGroupOrder_ = GroupOrder::OldestFirst;
   }
-
-  std::optional<TrackFilter> extractTrackFilter(
-      const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
  private:
   MoQTokenCache& getTokenCache() const noexcept {
@@ -538,10 +540,6 @@ class MoQFrameParser {
       folly::io::Cursor& cursor,
       size_t& length) const noexcept;
 
-  folly::Expected<TrackFilter, ErrorCode> parseTrackFilter(
-      folly::io::Cursor& cursor,
-      size_t& length) const noexcept;
-
   // Draft 22+. A nested parameter block with its own allowlist and its own
   // duplicate scope, so a type may appear both here and in the message.
   folly::Expected<FillParameters, ErrorCode> parseFillParameters(
@@ -599,7 +597,6 @@ class MoQFrameParser {
 
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
-  SetupExtensions extensions_;
   mutable MoQTokenCache fallbackTokenCache_;
   MoQTokenCache* tokenCache_{nullptr};
   std::shared_ptr<const MessageParameterExtensions> messageParameterExtensions_;
@@ -816,12 +813,10 @@ class MoQFrameWriter {
       const std::string& tokenValue,
       const std::optional<uint64_t>& forceVersion = std::nullopt) const;
 
-  // See MoQFrameParser::initializeVersion.
-  void initializeVersion(uint64_t versionIn, SetupExtensions extensions = {}) {
+  void initializeVersion(uint64_t versionIn) {
     XCHECK(!version_) << "Version already initialized";
     version_ = versionIn;
     useMoQVarint_ = getDraftMajorVersion(versionIn) >= 17;
-    extensions_ = extensions;
   }
 
   std::optional<uint64_t> getVersion() const {
@@ -831,18 +826,6 @@ class MoQFrameWriter {
   void setMessageParameterExtensions(
       std::shared_ptr<const MessageParameterExtensions> extensions) {
     messageParameterExtensions_ = std::move(extensions);
-  }
-
-  void setNegotiatedExtensions(SetupExtensions extensions) noexcept {
-    extensions_ = extensions;
-  }
-
-  SetupExtensions getNegotiatedExtensions() const noexcept {
-    return extensions_;
-  }
-
-  bool hasExtension(SetupExtension extension) const noexcept {
-    return extensions_.has(extension);
   }
 
   // Encode a TrackNamespace as a TRACK_NAMESPACE_PREFIX parameter (a Track
@@ -977,12 +960,6 @@ class MoQFrameWriter {
       size_t& size,
       bool& error) const noexcept;
 
-  void writeTrackFilter(
-      folly::IOBufQueue& writeBuf,
-      const TrackFilter& filter,
-      size_t& size,
-      bool& error) const noexcept;
-
   void writeFillParameters(
       folly::IOBufQueue& writeBuf,
       const FillParameters& fill,
@@ -1017,7 +994,6 @@ class MoQFrameWriter {
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
   std::shared_ptr<const MessageParameterExtensions> messageParameterExtensions_;
-  SetupExtensions extensions_;
   mutable std::optional<uint64_t> previousObjectID_;
   // Context for FETCH object delta encoding
   mutable std::optional<uint64_t> previousFetchGroup_;

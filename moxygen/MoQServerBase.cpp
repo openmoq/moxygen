@@ -44,6 +44,9 @@ folly::coro::Task<void> MoQServerBase::handleClientSession(
   if (clientSession->isClosed()) {
     co_return;
   }
+  for (const auto& extension : extensions_) {
+    clientSession->addExtension(extension);
+  }
   onNewSession(clientSession);
   if (clientSession->isClosed()) {
     terminateClientSession(std::move(clientSession));
@@ -86,17 +89,6 @@ Setup MoQServerBase::makeServerSetup() {
       Parameter{
           folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
           authTokenCacheEnabled_ ? kDefaultMaxAuthTokenCacheSize : 0});
-  // Last, so the application can override anything set above.
-  applySetupParameters(setup.params, setupParams_);
-  if (!authTokenCacheEnabled_) {
-    // MoQSession forces the receive cache to zero when caching is disabled;
-    // advertising more would invite aliases we cannot resolve.
-    applySetupParameters(
-        setup.params,
-        {SetupParameter{
-            folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
-            uint64_t{0}}});
-  }
   return setup;
 }
 

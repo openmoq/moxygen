@@ -16,10 +16,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -115,10 +117,33 @@ void logObjectEvent(MLogger& logger, ObjectEvent event, Payload payload) {
   }
 }
 
-folly::dynamic parseSingleEvent(const std::string& path) {
+std::string readLogFile(const std::string& path) {
   std::ifstream input(path);
-  return folly::parseJson(
-      std::string(std::istreambuf_iterator<char>(input), {}));
+  return std::string(std::istreambuf_iterator<char>(input), {});
+}
+
+folly::dynamic parseLogFile(const std::string& path) {
+  return folly::parseJson(readLogFile(path));
+}
+
+folly::dynamic parseSingleEvent(const std::string& path) {
+  return parseLogFile(path)["traces"][0]["events"][0];
+}
+
+void expectLowercaseKeys(const folly::dynamic& value) {
+  if (value.isObject()) {
+    for (const auto& [key, child] : value.items()) {
+      EXPECT_EQ(
+          key.asString().find_first_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+          std::string::npos)
+          << key.asString();
+      expectLowercaseKeys(child);
+    }
+  } else if (value.isArray()) {
+    for (const auto& child : value) {
+      expectLowercaseKeys(child);
+    }
+  }
 }
 
 void expectEventControls(
@@ -126,7 +151,6 @@ void expectEventControls(
     const ObjectEventCase& testCase) {
   ASSERT_TRUE(event.isObject());
   EXPECT_EQ(event["name"].asString(), testCase.name);
-  EXPECT_EQ(event["vantagePoint"].asString(), "server");
   const auto* data = event.get_ptr("data");
   ASSERT_NE(data, nullptr);
   const auto* objectId =
@@ -201,6 +225,15 @@ class InspectableMLogger final : public MLogger {
   }
 };
 
+class InspectableFileMLogger final : public FileMLogger {
+ public:
+  using FileMLogger::FileMLogger;
+
+  void setEventTime(size_t index, std::chrono::system_clock::duration elapsed) {
+    logs_.at(index).time_ = static_cast<uint64_t>(elapsed.count());
+  }
+};
+
 } // namespace
 
 class FileMLoggerTest : public ::testing::Test {
@@ -240,6 +273,143 @@ TEST_F(FileMLoggerTest, SyncWrite_CreatesFile) {
   logger.outputLogs();
 
   EXPECT_TRUE(fs::exists(path));
+}
+
+TEST_F(FileMLoggerTest, EmptyLogIsAJsonDocument) {
+  const auto path = (dir_ / "empty.mlog").string();
+  FileMLogger logger(VantagePoint::SERVER, path);
+  logger.outputLogs();
+
+  const auto document = parseLogFile(path);
+  ASSERT_EQ(document["traces"].size(), 1);
+  EXPECT_TRUE(document["traces"][0]["events"].empty());
+}
+
+TEST_F(FileMLoggerTest, QlogSchemaMetadata) {
+  const auto path = (dir_ / "metadata.mlog").string();
+  FileMLogger logger(VantagePoint::SERVER, path);
+  logger.logPaddingDatagramCreated(17);
+  logger.outputLogs();
+
+  const auto serialized = readLogFile(path);
+  const auto document = folly::parseJson(serialized);
+  EXPECT_EQ(
+      document["file_schema"].asString(),
+      "urn:ietf:params:qlog:file:contained");
+  EXPECT_EQ(
+      document["serialization_format"].asString(), "application/qlog+json");
+  const auto& trace = document["traces"][0];
+  EXPECT_EQ(
+      trace["event_schemas"],
+      folly::dynamic::array("urn:ietf:params:qlog:events:moqt-08"));
+  const folly::dynamic expectedTimeContext =
+      folly::dynamic::object("time_format", "relative_to_epoch")(
+          "reference_time",
+          folly::dynamic::object("clock_type", "system")("epoch", "unknown"));
+  EXPECT_EQ(trace["common_fields"], expectedTimeContext);
+
+  const auto header = serialized.substr(0, 256);
+  for (const auto* field :
+       {"file_schema",
+        "urn:ietf:params:qlog:file:contained",
+        "serialization_format",
+        "application/qlog+json"}) {
+    EXPECT_NE(header.find(field), std::string::npos) << field;
+  }
+}
+
+TEST_F(FileMLoggerTest, VantagePointIsTraceMetadata) {
+  for (const auto& [vantagePoint, type] :
+       {std::pair{VantagePoint::CLIENT, "client"},
+        std::pair{VantagePoint::SERVER, "server"}}) {
+    SCOPED_TRACE(type);
+    const auto path = (dir_ / (std::string(type) + ".mlog")).string();
+    FileMLogger logger(vantagePoint, path);
+    logger.logPaddingDatagramCreated(17);
+    logger.logPaddingDatagramParsed(19);
+    logger.outputLogs();
+
+    const auto document = parseLogFile(path);
+    const auto& trace = document["traces"][0];
+    const folly::dynamic expectedPoint = folly::dynamic::object("type", type);
+    EXPECT_EQ(trace["vantage_point"], expectedPoint);
+    for (const auto& event : trace["events"]) {
+      EXPECT_EQ(event.count("vantagePoint"), 0);
+      EXPECT_EQ(event.count("vantage_point"), 0);
+    }
+    expectLowercaseKeys(document);
+  }
+}
+
+TEST_F(FileMLoggerTest, LegacyUnsubscribeUsesLowercaseJsonKeys) {
+  const auto path = (dir_ / "unsubscribe.mlog").string();
+  FileMLogger logger(VantagePoint::CLIENT, path);
+  MOQTControlMessageCreated created;
+  created.streamId = 17;
+  auto unsubscribe = std::make_unique<MOQTUnsubscribe>();
+  unsubscribe->subscribeId = 23;
+  created.message = std::move(unsubscribe);
+  logger.addControlMessageCreatedLog(std::move(created));
+  logger.outputLogs();
+
+  const auto document = parseLogFile(path);
+  const auto& message = document["traces"][0]["events"][0]["data"]["message"];
+  EXPECT_EQ(message["subscribe_id"], "23");
+  expectLowercaseKeys(document);
+}
+
+TEST_F(FileMLoggerTest, MultipleEventsAreAJsonDocument) {
+  const auto path = (dir_ / "multiple.mlog").string();
+  FileMLogger logger(VantagePoint::SERVER, path);
+  logger.logPaddingDatagramCreated(17);
+  logger.logPaddingDatagramParsed(19);
+  logger.outputLogs();
+
+  const auto document = parseLogFile(path);
+  ASSERT_EQ(document["traces"].size(), 1);
+  const auto& events = document["traces"][0]["events"];
+  std::vector<std::pair<std::string, int64_t>> observed;
+  for (const auto& event : events) {
+    observed.emplace_back(
+        event["name"].asString(), event["data"]["padding_length"].asInt());
+  }
+  const std::vector<std::pair<std::string, int64_t>> expected{
+      {"moqt:padding_datagram_created", 17},
+      {"moqt:padding_datagram_parsed", 19}};
+  EXPECT_EQ(observed, expected);
+}
+
+TEST_F(FileMLoggerTest, EventTimeIsNumericMilliseconds) {
+  const auto path = (dir_ / "time.mlog").string();
+  InspectableFileMLogger logger(VantagePoint::SERVER, path);
+  logger.logPaddingDatagramCreated(17);
+  logger.setEventTime(
+      0,
+      std::chrono::duration_cast<std::chrono::system_clock::duration>(
+          std::chrono::microseconds(12345)));
+  logger.outputLogs();
+
+  const auto event = parseSingleEvent(path);
+  ASSERT_TRUE(event["time"].isDouble());
+  EXPECT_DOUBLE_EQ(event["time"].asDouble(), 12.345);
+}
+
+TEST_F(FileMLoggerTest, OutputLogsWritesTheLatestSnapshot) {
+  const auto path = (dir_ / "snapshot.mlog").string();
+  FileMLogger logger(VantagePoint::SERVER, path);
+  logger.logPaddingDatagramCreated(17);
+  logger.outputLogs();
+  ASSERT_EQ(parseLogFile(path)["traces"][0]["events"].size(), 1);
+
+  logger.logPaddingDatagramParsed(19);
+  logger.outputLogs();
+  const auto events = parseLogFile(path)["traces"][0]["events"];
+  std::vector<int64_t> observed;
+  for (const auto& event : events) {
+    observed.push_back(event["data"]["padding_length"].asInt());
+  }
+  const std::vector<int64_t> expected{17, 19};
+  EXPECT_EQ(observed, expected);
 }
 
 TEST_F(FileMLoggerTest, SyncWrite_ErrorOnBadPath) {

@@ -13,7 +13,6 @@
 #include <proxygen/lib/http/webtransport/WebTransport.h>
 #include <algorithm>
 #include <limits>
-#include <functional>
 #include <optional>
 #include <vector>
 
@@ -314,9 +313,7 @@ enum class SetupKey : uint64_t {
   AUTHORIZATION_TOKEN = 3,
   MAX_AUTH_TOKEN_CACHE_SIZE = 4,
   AUTHORITY = 5,
-  MOQT_IMPLEMENTATION = 7,
-  HOP_ID = 0x40B54,
-  RELAY_COST = 0x40B56,
+  MOQT_IMPLEMENTATION = 7
 };
 
 constexpr uint64_t kDefaultMaxRequestID = 100;
@@ -477,11 +474,12 @@ struct SubscribeRange {
   AbsoluteLocation end; // inclusive
 };
 
-// Draft-22 Location Filter. How many optional varints are present on the wire
-// decides which fields they are, so the count is part of the value.
+// Draft-22 Location Filter. The Location Filter Type decides which fields
+// follow it: types 0-4 carry that many fields, Next Object carries none.
 class LocationFilter {
  public:
   static constexpr uint8_t kMaxFields = 4;
+  static constexpr uint8_t kNextObjectType = 5;
 
   LocationFilter() = default;
 
@@ -495,11 +493,11 @@ class LocationFilter {
   }
 
   static LocationFilter nextObject() {
-    return LocationFilter{2, kLocationMin, {}};
+    return LocationFilter{kNextObjectType, kLocationMin, {}};
   }
 
-  // An open-ended filter starting at {0,0} is unfiltered; encoding it as two
-  // zero fields would instead mean Next Object.
+  // An open-ended filter starting at {0,0} selects the same Objects as no
+  // filter.
   static LocationFilter absoluteStart(AbsoluteLocation start) {
     if (start == kLocationMin) {
       return none();
@@ -527,36 +525,34 @@ class LocationFilter {
   }
 
   bool isOpenEnded() const {
-    return fieldCount_ < 3;
+    return type_ != 3 && type_ != 4;
   }
 
   // Whether the start depends on Largest Object, which is not available at
   // parse time. Resolving one without a largest yields {0,0}.
   bool needsLargest() const {
-    return fieldCount_ == 1 || isNextObjectForm();
+    return type_ == 1 || isNextObjectForm();
   }
 
   // Groups back from the Next Group, for the relative form only.
   std::optional<uint64_t> relativeStartGroupsBack() const {
-    return fieldCount_ == 1 ? std::optional<uint64_t>(start_.group)
-                            : std::nullopt;
+    return type_ == 1 ? std::optional<uint64_t>(start_.group) : std::nullopt;
   }
 
   // The Start Location as written, for the callers that must not resolve it
   // against Largest Object. The relative forms have none until resolved.
   std::optional<AbsoluteLocation> absoluteStartLocation() const {
-    if (fieldCount_ == 0) {
+    if (type_ == 0) {
       return kLocationMin;
     }
-    if (fieldCount_ == 1 || isNextObjectForm()) {
+    if (type_ == 1 || isNextObjectForm()) {
       return std::nullopt;
     }
     return start_;
   }
 
   bool operator==(const LocationFilter& other) const {
-    return fieldCount_ == other.fieldCount_ && start_ == other.start_ &&
-        end_ == other.end_;
+    return type_ == other.type_ && start_ == other.start_ && end_ == other.end_;
   }
 
   // Applies the Location Filter table. An omitted end is Largest Object for a
@@ -577,10 +573,25 @@ class LocationFilter {
     return os;
   }
 
+  // Number of fields a Location Filter Type carries, or nullopt if the type is
+  // undefined.
+  static std::optional<uint8_t> fieldCountForType(uint64_t type) {
+    if (type == kNextObjectType) {
+      return 0;
+    }
+    if (type > kMaxFields) {
+      return std::nullopt;
+    }
+    return static_cast<uint8_t>(type);
+  }
+
   // Wire form, for the framer. The end group goes out delta encoded, which
   // cannot represent an end before the start.
+  uint8_t type() const {
+    return endBeforeStart() ? kMaxFields : type_;
+  }
   uint8_t fieldCount() const {
-    return endBeforeStart() ? kMaxFields : fieldCount_;
+    return fieldCountForType(type()).value_or(0);
   }
   std::array<uint64_t, kMaxFields> fields() const {
     // The wire forms do not encode an empty range, so an end before the start
@@ -592,35 +603,31 @@ class LocationFilter {
         start_.group, start_.object, end_.group - start_.group, end_.object};
   }
 
-  // Rejects the forms the draft calls a PROTOCOL_VIOLATION: more than four
-  // fields, or an EndGroup that overflows.
-  static folly::Expected<LocationFilter, ErrorCode> fromFields(
-      const std::array<uint64_t, kMaxFields>& fields,
-      uint8_t count);
+  // Rejects the forms the draft calls a PROTOCOL_VIOLATION: an undefined
+  // type, or an EndGroup that overflows. Only the type's fields are read.
+  static folly::Expected<LocationFilter, ErrorCode> fromWire(
+      uint64_t type,
+      const std::array<uint64_t, kMaxFields>& fields);
 
  private:
-  LocationFilter(
-      uint8_t fieldCount,
-      AbsoluteLocation start,
-      AbsoluteLocation end)
-      : fieldCount_(fieldCount), start_(start), end_(end) {}
+  LocationFilter(uint8_t type, AbsoluteLocation start, AbsoluteLocation end)
+      : type_(type), start_(start), end_(end) {}
 
-  // Two zero fields, which the draft defines as the Next Object.
   bool isNextObjectForm() const {
-    return fieldCount_ == 2 && start_ == kLocationMin;
+    return type_ == kNextObjectType;
   }
 
   // Only an earlier end group counts, since the unsigned delta cannot carry
   // it. An inverted end object goes on the wire for the peer to reject.
   bool endBeforeStart() const {
-    return fieldCount_ >= 3 && end_.group < start_.group;
+    return !isOpenEnded() && end_.group < start_.group;
   }
 
   static uint64_t saturatingAdd(uint64_t a, uint64_t b) {
     return (b > kEightByteLimit - a) ? kEightByteLimit : a + b;
   }
 
-  uint8_t fieldCount_{0}; // 0..kMaxFields
+  uint8_t type_{0}; // 0..kNextObjectType
   // For the relative form, start_.group is a count of groups back rather than
   // a group ID.
   AbsoluteLocation start_;
@@ -680,23 +687,6 @@ struct FillParameters {
   }
 };
 
-// TRACK_FILTER parameter for SUBSCRIBE_NAMESPACE (0x30)
-// Used to filter tracks based on a property value, selecting the top N tracks.
-struct TrackFilter {
-  uint64_t propertyType{0}; // Property type to filter on (e.g., audio level)
-  uint64_t maxSelected{0};  // Maximum number of tracks to select (N)
-
-  TrackFilter() = default;
-  TrackFilter(uint64_t pt, uint64_t ms) : propertyType(pt), maxSelected(ms) {}
-
-  bool operator==(const TrackFilter& other) const {
-    return propertyType == other.propertyType && maxSelected == other.maxSelected;
-  }
-};
-
-// TODO: Consider refactoring to std::variant<std::string, uint64_t,
-// AuthToken, LocationFilter, FillParameters, TrackFilter, AbsoluteLocation> to
-// reduce memory footprint and clarify semantics.
 struct Parameter {
   uint64_t key = 0;
   std::string asString;
@@ -704,7 +694,6 @@ struct Parameter {
   AuthToken asAuthToken;
   LocationFilter asLocationFilter;
   FillParameters asFillParameters;
-  TrackFilter asTrackFilter;
   std::optional<AbsoluteLocation> largestObject;
 
   // Constructors for Parameter for each type, provided the key and the type
@@ -717,7 +706,6 @@ struct Parameter {
         asAuthToken(),
         asLocationFilter(),
         asFillParameters(),
-        asTrackFilter(),
         largestObject() {}
 
   // uint64_t parameter
@@ -728,7 +716,6 @@ struct Parameter {
         asAuthToken(),
         asLocationFilter(),
         asFillParameters(),
-        asTrackFilter(),
         largestObject() {}
 
   // AuthToken parameter
@@ -739,7 +726,6 @@ struct Parameter {
         asAuthToken(token),
         asLocationFilter(),
         asFillParameters(),
-        asTrackFilter(),
         largestObject() {}
 
   // FillParameters parameter
@@ -750,7 +736,6 @@ struct Parameter {
         asAuthToken(),
         asLocationFilter(),
         asFillParameters(fill),
-        asTrackFilter(),
         largestObject() {}
 
   // LocationFilter parameter
@@ -761,18 +746,6 @@ struct Parameter {
         asAuthToken(),
         asLocationFilter(filter),
         asFillParameters(),
-        asTrackFilter(),
-        largestObject() {}
-
-  // TrackFilter parameter
-  Parameter(uint64_t keyIn, const TrackFilter& filter)
-      : key(keyIn),
-        asString(),
-        asUint64(0),
-        asAuthToken(),
-        asLocationFilter(),
-        asFillParameters(),
-        asTrackFilter(filter),
         largestObject() {}
 
   // LargestObject parameter (std::optional<AbsoluteLocation>)
@@ -782,8 +755,6 @@ struct Parameter {
         asUint64(0),
         asAuthToken(),
         asLocationFilter(),
-        asFillParameters(),
-        asTrackFilter(),
         largestObject(loc) {}
 
   // Default constructor
@@ -816,12 +787,9 @@ enum class TrackRequestParamKey : uint64_t {
   LARGEST_OBJECT = 0x9,
   FILL_TIMEOUT = 0x0A,
   FORWARD = 0x10,
-  TRACK_FILTER = 0x30,
   NEW_GROUP_REQUEST = 0x32,
   TRACK_NAMESPACE_PREFIX = 0x34,
   INCLUDE_PROPERTIES = 0x35,
-  HOP_PATH = 0x40B57,
-  ROUTE_COST = 0x40B58,
 };
 
 bool isPublishSubscriptionParameter(TrackRequestParamKey key);
@@ -861,22 +829,13 @@ class Parameters {
     return params_.at(position);
   }
 
-  // Returns the first parameter with `key`, or nullptr. Invalidated by any
-  // subsequent mutation.
+  // The first parameter with `key`, or nullptr. Invalidated by any mutation.
   const Parameter* getFirstParam(uint64_t key) const {
     auto it = std::find_if(
         params_.begin(), params_.end(), [key](const Parameter& param) {
           return param.key == key;
         });
     return it == params_.end() ? nullptr : &*it;
-  }
-
-  const Parameter* getFirstParam(TrackRequestParamKey key) const {
-    return getFirstParam(folly::to_underlying(key));
-  }
-
-  const Parameter* getFirstParam(SetupKey key) const {
-    return getFirstParam(folly::to_underlying(key));
   }
 
   bool hasParam(uint64_t key) const {
@@ -999,62 +958,6 @@ inline std::string getFirstStringParam(
   const auto* param = params.getFirstParam(key);
   return param ? param->asString : std::string();
 }
-
-// Applies extraParams onto params, replacing any parameter with the same key
-// so a SETUP never carries a key twice.
-void applySetupParameters(
-    SetupParameters& params,
-    const std::vector<SetupParameter>& extraParams);
-
-// A protocol extension that is off unless the two SETUPs negotiate it on. Each
-// extension owns one bit; MoQSession::kSetupExtensions says how a bit is won.
-enum class SetupExtension : uint32_t {
-  None = 0,
-  RelayHops = 1u << 0,
-};
-
-// The set of extensions in force on a session.
-class SetupExtensions {
- public:
-  SetupExtensions() = default;
-
-  bool has(SetupExtension extension) const {
-    auto bit = folly::to_underlying(extension);
-    return bit != 0 && (bits_ & bit) == bit;
-  }
-
-  void add(SetupExtension extension) {
-    bits_ |= folly::to_underlying(extension);
-  }
-
-  bool empty() const {
-    return bits_ == 0;
-  }
-
-  bool operator==(const SetupExtensions& other) const {
-    return bits_ == other.bits_;
-  }
-
- private:
-  uint32_t bits_{0};
-};
-
-// Decides whether one extension is on, given both SETUPs and the negotiated
-// draft. Free to look at values rather than presence, to apply an asymmetric
-// rule, and to turn itself off on drafts it doesn't apply to.
-using SetupExtensionNegotiator = std::function<bool(
-    const SetupParameters& local,
-    const SetupParameters& peer,
-    uint64_t version)>;
-
-// Ties an extension bit to the rule that wins it.
-struct SetupExtensionDescriptor {
-  SetupExtension extension;
-  SetupExtensionNegotiator negotiate;
-};
-
-// Negotiator for the simplest rule: both peers carry `key`, whatever its value.
-SetupExtensionNegotiator bothAdvertise(uint64_t key);
 
 struct Setup {
   SetupParameters params{FrameType::CLIENT_SETUP};
@@ -1724,6 +1627,7 @@ struct NamespaceDone {
 
 struct Namespace {
   TrackNamespace trackNamespaceSuffix;
+  // On the wire only when a negotiated extension allows NAMESPACE parameters.
   TrackRequestParameters params{FrameType::NAMESPACE};
 };
 

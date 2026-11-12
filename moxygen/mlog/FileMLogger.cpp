@@ -9,6 +9,7 @@
 #include <folly/futures/Future.h>
 #include <folly/json/json.h>
 #include <folly/logging/xlog.h>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 
@@ -40,21 +41,38 @@ void FileMLogger::outputLogs() {
 
   // Pre-format logs on the calling thread (where formatLog() is safe to
   // call), then execute the write lambda either inline or via the executor.
-  std::vector<std::string> serialized;
-  serialized.reserve(logs_.size());
+  folly::dynamic events = folly::dynamic::array;
   for (const auto& log : logs_) {
-    serialized.push_back(folly::toPrettyJson(formatLog(log)));
+    auto event = formatLog(log);
+    event.erase("vantagePoint");
+    const auto elapsed =
+        std::chrono::duration<double, std::chrono::system_clock::period>(
+            static_cast<double>(log.time_));
+    event["time"] = std::chrono::duration<double, std::milli>(elapsed).count();
+    events.push_back(std::move(event));
   }
+  folly::dynamic trace = folly::dynamic::object("events", std::move(events));
+  trace["event_schemas"] =
+      folly::dynamic::array("urn:ietf:params:qlog:events:moqt-08");
+  trace["vantage_point"] = folly::dynamic::object(
+      "type", vantagePoint_ == VantagePoint::CLIENT ? "client" : "server");
+  trace["common_fields"] =
+      folly::dynamic::object("time_format", "relative_to_epoch")(
+          "reference_time",
+          folly::dynamic::object("clock_type", "system")("epoch", "unknown"));
+  folly::dynamic document = folly::dynamic::object(
+      "file_schema", "urn:ietf:params:qlog:file:contained")(
+      "serialization_format", "application/qlog+json")(
+      "traces", folly::dynamic::array(std::move(trace)));
+  auto serialized = folly::toPrettyJson(document);
 
-  auto write = [p = std::move(*path), lines = std::move(serialized)]() {
+  auto write = [p = std::move(*path), contents = std::move(serialized)]() {
     std::ofstream fileObj(p);
     if (!fileObj.is_open()) {
       XLOG(WARN) << "Failed to open mlog output file: " << p;
       return;
     }
-    for (const auto& line : lines) {
-      fileObj << line << '\n';
-    }
+    fileObj << contents << '\n';
   };
 
   if (writeExecutor_) {

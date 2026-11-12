@@ -76,12 +76,12 @@ class MoQServerBase : public MoQSession::ServerSetupCallback,
     authTokenCacheEnabled_ = enabled;
   }
 
-  // Adds a parameter to every SETUP, replacing (not duplicating) any parameter
-  // makeServerSetup() would otherwise send with the same key. Call before
-  // accepting sessions. MAX_AUTH_TOKEN_CACHE_SIZE cannot be raised this way
-  // while setAuthTokenCacheEnabled(false) is in effect.
-  void addSetupParameter(SetupParameter parameter) {
-    setupParams_.emplace_back(std::move(parameter));
+  /**
+   * Add an extension to every session this server accepts. Sessions on
+   * different threads share it. Configure before accepting sessions.
+   */
+  void addExtension(std::shared_ptr<MoQExtension> extension) {
+    extensions_.push_back(std::move(extension));
   }
 
   // ServerSetupCallback overrides
@@ -121,7 +121,7 @@ class MoQServerBase : public MoQSession::ServerSetupCallback,
 
   std::unordered_set<std::string> endpoints_;
   std::shared_ptr<MLoggerFactory> mLoggerFactory_;
-  std::vector<SetupParameter> setupParams_;
+  std::vector<std::shared_ptr<MoQExtension>> extensions_;
   bool authTokenCacheEnabled_{true};
 };
 

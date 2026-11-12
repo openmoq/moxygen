@@ -25,6 +25,7 @@
 #include <quic/mvfst-config.h>
 #include <moxygen/EgressAckTracker.h>
 #include <moxygen/MoQConsumers.h>
+#include <moxygen/MoQExtension.h>
 #include <moxygen/Publisher.h>
 #include <moxygen/Subscriber.h>
 #include <moxygen/UniStreamQueue.h>
@@ -302,11 +303,24 @@ class MoQSession : public Subscriber,
 
   void setVersion(uint64_t version);
   void setMoqSettings(MoQSettings settings);
-  using MessageParameterNegotiator = folly::Function<MessageParameterExtensions(
-      uint64_t /* version */,
-      const SetupParameters& /* localParams */,
-      const SetupParameters& /* peerParams */)>;
-  void setMessageParameterNegotiator(MessageParameterNegotiator negotiator);
+  // Must be called before sendSetup().
+  void addExtension(std::shared_ptr<MoQExtension> extension);
+
+  // The SETUP this endpoint sent / the peer sent; empty until then.
+  const std::optional<SetupParameters>& getLocalSetupParams() const {
+    return localSetupParams_;
+  }
+  // This and getMessageParameterExtensions are virtual so a mock session can
+  // report a peer without a SETUP exchange.
+  virtual const std::optional<SetupParameters>& getPeerSetupParams() const {
+    return peerSetupParams_;
+  }
+  // The message parameters negotiated for this session; empty until both
+  // SETUPs are known.
+  virtual const MessageParameterExtensions& getMessageParameterExtensions()
+      const {
+    return *messageParameterExtensions_;
+  }
   // Accessor used by PublisherImpl and others
   const MoQSettings& getMoqSettings() const {
     return moqSettings_;
@@ -320,47 +334,6 @@ class MoQSession : public Subscriber,
 
   virtual std::optional<uint64_t> getNegotiatedVersion() const {
     return negotiatedVersion_;
-  }
-
-  // Derived from the retained SETUPs rather than stored. Anonymous (0) and a
-  // link cost of 1 unless RelayHops was negotiated.
-  virtual uint64_t getPeerHopID() const noexcept;
-  virtual uint64_t getRelayLinkCost() const noexcept;
-
-  // Every extension this build knows how to negotiate, and the rule that wins
-  // each one. Adding one is a bit in SetupExtension plus a row here.
-  static const std::vector<SetupExtensionDescriptor>& kSetupExtensions();
-
-  // Runs each rule in `descriptors` over the two SETUPs. `descriptors` is a
-  // parameter so tests can negotiate extensions this build doesn't ship.
-  static SetupExtensions computeNegotiatedExtensions(
-      const SetupParameters& localParams,
-      const SetupParameters& peerParams,
-      uint64_t version,
-      const std::vector<SetupExtensionDescriptor>& descriptors =
-          kSetupExtensions());
-
-  // Whether `extension` is in force here. False until both SETUPs are known.
-  virtual bool negotiatedSetupExtension(SetupExtension extension) const
-      noexcept {
-    return negotiatedExtensions_.has(extension);
-  }
-
-  // For framers built after the setup exchange; see
-  // MoQFrameParser::initializeVersion.
-  SetupExtensions getNegotiatedExtensions() const noexcept {
-    return negotiatedExtensions_;
-  }
-
-  // The SETUP this endpoint sent / the peer sent, retained for extensions that
-  // negotiate on something other than mutual advertisement. Empty until sent /
-  // received respectively.
-  const std::optional<SetupParameters>& getLocalSetupParams() const {
-    return localSetupParams_;
-  }
-
-  const std::optional<SetupParameters>& getPeerSetupParams() const {
-    return peerSetupParams_;
   }
 
   virtual std::shared_ptr<SubNSReply> getSubNsReply(
@@ -638,10 +611,6 @@ class MoQSession : public Subscriber,
 
     uint64_t getVersion() const {
       return version_;
-    }
-
-    SetupExtensions getNegotiatedExtensions() const {
-      return moqFrameWriter_.getNegotiatedExtensions();
     }
 
     void onBytesBuffered(uint64_t amount) {
@@ -1074,6 +1043,12 @@ class MoQSession : public Subscriber,
 
   void startControlWriteLoop(
       proxygen::WebTransport::StreamWriteHandle* writeHandle);
+  void launchControlWriteLoop(
+      proxygen::WebTransport::StreamWriteHandle* writeHandle);
+  // Closes the session with PROTOCOL_VIOLATION after a grace period, since a
+  // peer that closes the session resets its streams before the close arrives.
+  void onControlStreamLost();
+  void onControlStreamLossTimeoutExpired();
 
   void replayBufferedUniStreams();
 
@@ -1722,6 +1697,7 @@ class MoQSession : public Subscriber,
 
  private:
   class GoawayTimeoutCallback;
+  class ControlStreamLossTimeoutCallback;
 
   // A data stream read loop that is waiting for an unknown track alias.  The
   // waiting coroutine frame owns it, so any unwind deregisters it.
@@ -1743,12 +1719,8 @@ class MoQSession : public Subscriber,
 
   // Private implementation methods
   void initializeNegotiatedVersion(uint64_t negotiatedVersion);
-  void negotiateMessageParameters();
-  // Records one half of the setup exchange. Once both halves are in, computes
-  // the negotiated extensions and pushes them to the framers, which is why
-  // this runs before any frame that an extension could alter is sent or
-  // parsed.
-  void onSetupParams(SetupParameters params, bool local);
+  // Returns false if an extension rejected the SETUPs and closed the session.
+  bool negotiateMessageParameters();
   void markSetupComplete();
   void pruneBufferedSubgroups(TrackAlias alias);
   void scheduleGoawayTimeout(uint64_t timeoutMs);
@@ -1758,9 +1730,6 @@ class MoQSession : public Subscriber,
   bool egressIdle() const;
 
   // Private session state
-  std::optional<SetupParameters> localSetupParams_;
-  std::optional<SetupParameters> peerSetupParams_;
-  SetupExtensions negotiatedExtensions_;
   folly::F14FastMap<RequestID, std::shared_ptr<PublisherImpl>, RequestID::hash>
       pubTracks_;
   folly::F14FastSet<FullTrackName, FullTrackName::hash> pendingPublishTracks_;
@@ -1795,9 +1764,11 @@ class MoQSession : public Subscriber,
 
   folly::coro::Promise<Setup> setupPromise_;
   folly::coro::Future<Setup> setupFuture_;
+  std::optional<SetupParameters> localSetupParams_;
+  std::optional<SetupParameters> peerSetupParams_;
   std::shared_ptr<MessageParameterExtensions> messageParameterExtensions_{
       std::make_shared<MessageParameterExtensions>()};
-  MessageParameterNegotiator messageParameterNegotiator_;
+  std::vector<std::shared_ptr<MoQExtension>> extensions_;
   bool setupComplete_{false};
   using SetupWaiters = folly::F14FastMap<uint64_t, folly::coro::Promise<void>>;
   std::shared_ptr<SetupWaiters> setupWaiters_;
@@ -1832,6 +1803,7 @@ class MoQSession : public Subscriber,
   mutable quic::TransportInfo cachedTransportInfo_;
   mutable std::chrono::steady_clock::time_point lastTransportInfoUpdate_{};
   std::unique_ptr<GoawayTimeoutCallback> goawayTimeout_;
+  std::unique_ptr<ControlStreamLossTimeoutCallback> controlStreamLossTimeout_;
   std::optional<CloseResult> closeResult_;
   bool closed_{false};
   std::string authority_;

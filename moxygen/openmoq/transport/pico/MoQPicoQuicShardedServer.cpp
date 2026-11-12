@@ -151,6 +151,10 @@ void MoQPicoQuicShardedServer::start(
     if (mLoggerFactory_) {
       shard->setMLoggerFactory(mLoggerFactory_);
     }
+    // Each shard runs handleClientSession, which adds only its own extensions.
+    for (const auto& extension : extensions_) {
+      shard->addExtension(extension);
+    }
 
     folly::Try<void> bound;
     workerEvb->runImmediatelyOrRunInEventBaseThreadAndWait([&] {

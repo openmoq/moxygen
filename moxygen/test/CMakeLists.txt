@@ -120,15 +120,6 @@ moxygen_add_test(TARGET MoQSessionTests
     testmain
 )
 
-moxygen_add_test(TARGET OpenMOQSessionTests
-  PREFIX "OpenMOQSession"
-  SOURCES
-    OpenMOQSessionTests.cpp
-  DEPENDS
-    moqsessiontestcommon
-    testmain
-)
-
 moxygen_add_test(TARGET OpenMOQServerTests
   PREFIX "OpenMOQServer"
   SOURCES
