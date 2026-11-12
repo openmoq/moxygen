@@ -10,8 +10,8 @@ name: ci main
 #
 # Job graph:
 #
-#   build (linux, macos, asan debug) ──┐
-#   publish (7 platforms) ─────────────┼── release ──┬── alias ── notify
+#   build (linux, asan debug) ─────────┐
+#   publish (6 platforms) ─────────────┼── release ──┬── alias ── notify
 #                                      └── prune-caches
 
 on:
@@ -44,9 +44,6 @@ jobs:
           - runner: ubuntu-22.04
             name: linux
             cache_prefix: ci-ninja-ubuntu-22.04
-          - runner: macos-15
-            name: macos
-            cache_prefix: ci-ninja-macos-15
           - runner: [self-hosted, build]
             name: asan debug
             cache_prefix: ci-asan-ubuntu-22.04
@@ -95,7 +92,7 @@ jobs:
         with:
           key: ${{ matrix.cache_prefix }}
           # The standalone build compiles the whole dependency stack, ~1958 TUs.
-          # 500M evicted mid-build (50 cleanups on linux, 308 on macOS).
+          # 500M evicted mid-build (50 cleanups on linux).
           max-size: 2G
 
       - name: Configure
@@ -220,12 +217,6 @@ jobs:
             sanitizer: tsan
             build_type: Debug
 
-          - name: macos-15-arm64
-            runner: macos-15
-            artifact: moxygen-macos-15-arm64.tar.gz
-            debug_artifact: moxygen-macos-15-arm64-dbg.tar.gz
-            container: ""
-
           - name: bookworm-amd64
             runner: [self-hosted, build]
             artifact: moxygen-bookworm-amd64.tar.gz
@@ -329,10 +320,9 @@ jobs:
             --debug-output "${{ matrix.debug_artifact }}"
 
       # Straight into the draft snapshot. Each job carries only its own two
-      # tarballs, so one slow or hung upload cannot hold up the other six.
+      # tarballs, so one slow or hung upload cannot hold up the other five.
       - name: Upload assets to the draft snapshot
-        # The per-attempt bound needs GNU timeout, which macOS lacks; this caps
-        # the step on every platform regardless.
+        # Caps the whole step; publish-artifacts.sh bounds each attempt.
         timeout-minutes: 30
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -379,7 +369,7 @@ jobs:
           echo "pin_tag=$PIN_TAG" >> "$GITHUB_OUTPUT"
           echo "Release tags: $PIN_TAG + $TAG (branch: $BRANCH)"
 
-      # Every publish job is green, so the draft holds all 14 assets: flipping
+      # Every publish job is green, so the draft holds all 12 assets: flipping
       # it public is the point at which the rev becomes fetchable by pin. It
       # happens before the alias moves, so if the alias update fails the rev is
       # still reachable. Pinned snapshots older than 30 days go with their tags.
@@ -387,10 +377,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 7 publish platforms x (tarball + debug sidecar).
+          # 6 publish platforms x (tarball + debug sidecar).
           bash openmoq/scripts/publish-artifacts.sh \
             --finalize \
-            --expect-assets 14 \
+            --expect-assets 12 \
             --sha "$GITHUB_SHA" \
             --tag "${{ steps.tag.outputs.pin_tag }}" \
             --branch "${{ github.ref_name }}" \

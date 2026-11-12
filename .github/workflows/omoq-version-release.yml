@@ -360,9 +360,9 @@ jobs:
             xargs -n1 -P 2 -I{} gh release upload "$TAG" {} --clobber
 
   # ════════════════════════════════════════════════════════════════════════════
-  # Promote-snapshot: copy the existing platform tarballs (bookworm/ubuntu/
-  # macos) from the rolling snapshot to the new release. Runs in parallel
-  # with portable-build; uploads via xargs -P for further fan-out.
+  # Promote-snapshot: copy the existing platform tarballs (bookworm, ubuntu)
+  # from the rolling snapshot to the new release. Runs in parallel with
+  # portable-build; uploads via xargs -P for further fan-out.
   # ════════════════════════════════════════════════════════════════════════════
 
   promote-snapshot:

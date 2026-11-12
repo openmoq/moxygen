@@ -81,7 +81,6 @@ Every PR must pass:
 
 - `check-format` — clang-format + license headers.
 - `linux` — build + test on Ubuntu 22.04.
-- `macos` — build + test on macOS.
 - `asan debug` — build + test with AddressSanitizer.
 
 See [.github/workflows/omoq-ci-pr.yml](.github/workflows/omoq-ci-pr.yml).
