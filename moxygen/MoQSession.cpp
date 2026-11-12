@@ -183,6 +183,7 @@ void logRequestError(
 class StreamPublisherImpl
     : public SubgroupConsumer,
       public FetchConsumer,
+      public MoQTrackStatsSource,
       public std::enable_shared_from_this<StreamPublisherImpl>,
       public proxygen::WebTransport::ByteEventCallback {
  public:
@@ -237,6 +238,13 @@ class StreamPublisherImpl
       uint64_t endOfTrackObjectId) override;
   folly::Expected<folly::Unit, MoQPublishError> endOfSubgroup() override;
   void reset(ResetStreamErrorCode error) override;
+
+  // A FETCH's counts. A subgroup stream reports none, because its counts are
+  // the whole track's.
+  std::shared_ptr<const MoQTrackStats> getTrackStats() const override {
+    return streamType_ == StreamType::FETCH_HEADER ? publisher_->trackStats()
+                                                   : nullptr;
+  }
 
   // FetchConsumer overrides
   folly::Expected<folly::Unit, MoQPublishError> object(
@@ -346,6 +354,9 @@ class StreamPublisherImpl
       auto latencyUsec = std::chrono::duration_cast<std::chrono::microseconds>(
                              now - pendingDelivery.enqueuedAt)
                              .count();
+      if (pendingDelivery.dataObject) {
+        counts().onAcked(uint64_t(latencyUsec));
+      }
       MOQ_PUBLISHER_STATS(
           pubStats, recordObjectAckLatency, uint64_t(latencyUsec));
 
@@ -355,13 +366,13 @@ class StreamPublisherImpl
       }
       pendingDeliveries_.pop_front();
     }
-    onByteEventCommon(id, offset);
+    onByteEventCommon(id, offset, &counts().bytesAcked);
   }
 
   void onByteEventCanceled(quic::StreamId id, uint64_t offset) noexcept
       override {
     cancelDeliveriesFrom(offset);
-    onByteEventCommon(id, offset);
+    onByteEventCommon(id, offset, &counts().bytesCancelled);
   }
 
   // Notify delivery cancelled for all objects delivered after this offset.
@@ -440,28 +451,38 @@ class StreamPublisherImpl
     uint64_t objectId;
     uint64_t endOffset;
     folly::chrono::coarse_steady_clock::time_point enqueuedAt;
+    // False for a status object.
+    bool dataObject;
 
     ObjectDeliveryInfo(
         uint64_t g,
         uint64_t sg,
         uint64_t o,
         uint64_t offset,
-        folly::chrono::coarse_steady_clock::time_point enq)
+        folly::chrono::coarse_steady_clock::time_point enq,
+        bool data)
         : groupId(g),
           subgroupId(sg),
           objectId(o),
           endOffset(offset),
-          enqueuedAt(enq) {}
+          enqueuedAt(enq),
+          dataObject(data) {}
   };
   quic::CircularDeque<ObjectDeliveryInfo> pendingDeliveries_;
 
-  void onByteEventCommon(quic::StreamId /*id*/, uint64_t offset) {
+  // settled is the track counter that the newly settled bytes add to, or
+  // null when the track does not count them as written.
+  void
+  onByteEventCommon(quic::StreamId /*id*/, uint64_t offset, uint64_t* settled) {
     // The FIN takes a stream offset of its own but was never buffered.
     uint64_t bytesDeliveredOrCanceled =
         std::min<uint64_t>(offset + 1, bytesWritten_);
     if (bytesDeliveredOrCanceled > bytesDeliveredOrCanceled_) {
-      publisher_->onBytesUnbuffered(
-          bytesDeliveredOrCanceled - bytesDeliveredOrCanceled_);
+      auto newlySettled = bytesDeliveredOrCanceled - bytesDeliveredOrCanceled_;
+      publisher_->onBytesUnbuffered(newlySettled);
+      if (settled) {
+        *settled += newlySettled;
+      }
       bytesDeliveredOrCanceled_ = bytesDeliveredOrCanceled;
     }
 
@@ -560,8 +581,23 @@ class StreamPublisherImpl
   uint32_t refCountForCallbacks_{0};
   std::shared_ptr<EgressAckTracker> egressTracker_;
 
-  uint32_t bytesWritten_{0};
-  uint32_t bytesDeliveredOrCanceled_{0};
+  uint64_t bytesWritten_{0};
+  uint64_t bytesDeliveredOrCanceled_{0};
+  // Data objects that ended while the stream waited for credit.
+  uint64_t heldObjects_{0};
+  // Payload in writeBuf_ that bytesQueued does not count yet.
+  uint64_t unqueuedPayload_{0};
+  // The group that this stream last counted. A fetch stream carries several.
+  std::optional<uint64_t> countedGroup_;
+
+  MoQTrackStats& counts() const {
+    return *publisher_->trackStats();
+  }
+
+  void countObject(uint64_t payloadBytes) {
+    counts().onStreamObject(countedGroup_, header_.group, payloadBytes);
+    unqueuedPayload_ += payloadBytes;
+  }
 
   bool forward_{true};
 };
@@ -810,6 +846,7 @@ StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::CANCELLED, "Cancelled: writeCurrentObject"));
   }
+  counts().onQueued(newBytes, std::exchange(unqueuedPayload_, 0));
 
   // Delivery offsets are recorded as each object ends, including held objects.
   bool trackForStats =
@@ -822,10 +859,13 @@ StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
         header_.subgroup,
         header_.id,
         endOffset,
-        folly::chrono::coarse_steady_clock::now());
+        folly::chrono::coarse_steady_clock::now(),
+        header_.status == ObjectStatus::NORMAL);
   }
 
+  bool endsDataObject = endObject && header_.status == ObjectStatus::NORMAL;
   if (!writeHandle_) {
+    heldObjects_ += endsDataObject ? 1 : 0;
     pendingFin_ = pendingFin_ || finStream;
     publisher_->onBytesBuffered(newBytes);
     pendingBytesBuffered_ += newBytes;
@@ -842,6 +882,7 @@ StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
   }
 
   proxygen::WebTransport::ByteEventCallback* deliveryCallback = nullptr;
+  uint64_t writtenBytes = writeBuf_.chainLength();
   if (!writeBuf_.empty() || finStream) {
     deliveryCallback = this;
     bytesWritten_ += writeBuf_.chainLength();
@@ -858,6 +899,9 @@ StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
   auto writeRes = writeHandle->writeStreamData(
       writeBuf_.move(), finStream, deliveryCallback);
   if (writeRes.hasValue()) {
+    counts().onWritten(
+        writtenBytes,
+        std::exchange(heldObjects_, 0) + (endsDataObject ? 1 : 0));
     if (finStream) {
       // The stream is done, so there is nothing left to pace and no write
       // handle to await on.  Report success even if the transport is blocked.
@@ -878,8 +922,9 @@ StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
   auto self = shared_from_this();
   if (deliveryCallback) {
     // A rejected write never registers its byte event, so settle it here.
-    onByteEventCommon(writeHandle->getID(), bytesWritten_);
+    onByteEventCommon(writeHandle->getID(), bytesWritten_, nullptr);
   }
+  counts().bytesDropped += writtenBytes;
   reset(ResetStreamErrorCode::INTERNAL_ERROR);
   return folly::makeUnexpected(
       MoQPublishError(MoQPublishError::WRITE_ERROR, "write error"));
@@ -949,6 +994,7 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::objectImpl(
   }
   auto length = payload ? payload->computeChainDataLength() : 0;
   header_.status = ObjectStatus::NORMAL;
+  countObject(length);
 
   // Start delivery timeout timer when object begins being sent to stream. A 0
   // ("no timeout") value leaves deliveryTimeoutActive_ false, so no timer arms.
@@ -987,6 +1033,7 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::beginObject(
     return folly::makeUnexpected(validateObjectPublishRes.error());
   }
   header_.status = ObjectStatus::NORMAL;
+  countObject(initialPayload ? initialPayload->computeChainDataLength() : 0);
 
   // Start delivery timeout timer when object begins being sent to stream. A 0
   // ("no timeout") value leaves deliveryTimeoutActive_ false, so no timer arms.
@@ -1024,6 +1071,9 @@ StreamPublisherImpl::objectPayload(Payload payload, bool finStream) {
   if (!validateObjectPublishRes) {
     return validateObjectPublishRes;
   }
+  auto length = payload ? payload->computeChainDataLength() : 0;
+  counts().bytes += length;
+  unqueuedPayload_ += length;
   writeBuf_.append(std::move(payload));
   bool entireObjectWritten = (!currentLengthRemaining_.has_value());
   auto writeRes = writeToStream(finStream, entireObjectWritten);
@@ -1088,6 +1138,7 @@ StreamPublisherImpl::publishStatus(
   }
   header_.status = status;
   header_.length = std::nullopt;
+  ++counts().statusObjects;
   return writeCurrentObject(
       objectID,
       /*length=*/0,
@@ -1123,6 +1174,7 @@ void StreamPublisherImpl::reset(ResetStreamErrorCode error) {
   if (publisher_ && !pendingReset_) {
     MOQ_PUBLISHER_STATS(
         publisher_->getPublisherStatsCallback(), onSubgroupReset, error);
+    counts().onReset(folly::to_underlying(error));
   }
   // Cancel all delivery timeout timers for this stream since it's being reset
   if (deliveryTimer_) {
@@ -1161,6 +1213,7 @@ void StreamPublisherImpl::reset(ResetStreamErrorCode error) {
     if (bytesWritten_ == 0) {
       // Data that never reached the transport does not get a byte event.
       cancelDeliveriesFrom(0);
+      counts().bytesDropped += pendingBytesBuffered_;
       if (publisher_) {
         publisher_->onBytesUnbuffered(std::exchange(pendingBytesBuffered_, 0));
       }
@@ -1494,7 +1547,8 @@ bool hasLargestObject(const std::vector<Parameter>& params) {
 } // namespace
 
 class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
-                                       public TrackConsumer {
+                                       public TrackConsumer,
+                                       public MoQTrackStatsSource {
  public:
   TrackPublisherImpl() = delete;
   TrackPublisherImpl(
@@ -1970,6 +2024,10 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
 
   void setDeliveryCallback(std::shared_ptr<DeliveryCallback> callback) override;
 
+  std::shared_ptr<const MoQTrackStats> getTrackStats() const override {
+    return trackStats_;
+  }
+
   void setLogger(std::shared_ptr<MLogger> logger) {
     logger_ = logger;
   }
@@ -2338,6 +2396,8 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
     XLOG(DBG4) << "No uni stream credit, subgroup waits tp=" << this;
   }
   session_->onSubscriptionStreamOpened();
+  // Before requestStream(), which can reset the subgroup and close it.
+  trackStats_->onSubgroupOpened();
 
   // Get effective timeout to pass to StreamPublisherImpl
   auto effectiveTimeout = deliveryTimeoutManager_.getEffectiveTimeout();
@@ -2406,6 +2466,7 @@ void MoQSession::TrackPublisherImpl::onStreamComplete(
   if (session_) {
     session_->onSubscriptionStreamClosed();
   }
+  trackStats_->onSubgroupClosed();
   // The reason we need the keepalive is that when we call
   // subgroups_.erase(), we might end up erasing the last
   // SubgroupPublisherImpl that has a shared_ptr reference to this
@@ -2544,10 +2605,21 @@ MoQSession::TrackPublisherImpl::datagram(
       std::move(payload),
       lastInGroup);
   // TODO: set priority when WT has an API for that
+  auto wireBytes = writeBuf.chainLength();
   auto res = wt->sendDatagram(writeBuf.move());
   if (res.hasError()) {
     return folly::makeUnexpected(
         MoQPublishError(MoQPublishError::WRITE_ERROR, "sendDatagram failed"));
+  }
+  bool isData = header.status == ObjectStatus::NORMAL;
+  if (isData) {
+    trackStats_->onDatagram(header.group, headerLength);
+  } else {
+    ++trackStats_->statusObjects;
+  }
+  trackStats_->datagramBytes += wireBytes;
+  if (isData) {
+    ++trackStats_->objectsWritten;
   }
   // Only advance the largest after the datagram is actually sent.
   updateLargest({header.group, header.id});
@@ -2633,12 +2705,22 @@ class MoQSession::TrackReceiveStateBase {
     return !std::exchange(requestStreamGoawaySeen_, true);
   }
 
+  // The app's handle shares these. A fill shares the stats of the
+  // subscription that it fills.
+  const std::shared_ptr<MoQTrackStats>& trackStats() const {
+    return trackStats_;
+  }
+  void setTrackStats(std::shared_ptr<MoQTrackStats> stats) {
+    trackStats_ = std::move(stats);
+  }
+
  protected:
   FullTrackName fullTrackName_;
   RequestID requestID_;
   folly::CancellationSource cancelSource_;
   std::shared_ptr<BidiStreamControl> bidiControl_;
   bool requestStreamGoawaySeen_{false};
+  std::shared_ptr<MoQTrackStats> trackStats_{std::make_shared<MoQTrackStats>()};
 };
 
 class MoQSession::SubscribeTrackReceiveState
@@ -4877,6 +4959,9 @@ MoQSession::registerFillReceiveState(
   auto state = std::make_shared<FetchTrackReceiveState>(
       fullTrackName, requestID, std::move(consumer), groupOrder, logger_);
   state->markFill(owningSubscribeID);
+  if (auto subState = findSubscribeStateByRequestID(owningSubscribeID)) {
+    state->setTrackStats(subState->trackStats());
+  }
   return fetches_.emplace(requestID, std::move(state)).first->second;
 }
 
@@ -4946,6 +5031,20 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     subscribeState_ = std::move(state);
   }
 
+  ~ObjectStreamCallback() override {
+    if (subgroupOpen_) {
+      subscribeState_->trackStats()->onSubgroupClosed();
+    }
+  }
+
+  // A fill's fetch state shares its subscription's stats.
+  MoQTrackStats* receiveStats() const {
+    if (fetchState_) {
+      return fetchState_->trackStats().get();
+    }
+    return subscribeState_ ? subscribeState_->trackStats().get() : nullptr;
+  }
+
   MoQCodec::ParseResult onSubgroup(
       TrackAlias alias,
       uint64_t group,
@@ -4999,6 +5098,8 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
 
     subscribeState_->setCurrentStreamId(currentStreamId_);
     subscribeState_->onSubgroup();
+    subscribeState_->trackStats()->onSubgroupOpened();
+    subgroupOpen_ = true;
     return MoQCodec::ParseResult::CONTINUE;
   }
 
@@ -5055,6 +5156,12 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       }
     }
 
+    if (auto* stats = receiveStats()) {
+      stats->onStreamObject(
+          countedGroup_,
+          group,
+          initialPayload ? initialPayload->computeChainDataLength() : 0);
+    }
     folly::Expected<folly::Unit, MoQPublishError> res{folly::unit};
     if (objectComplete) {
       // Handle fetch and subscribe consumers differently due to different
@@ -5109,6 +5216,9 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       }
     }
 
+    if (auto* stats = receiveStats(); stats && payload) {
+      stats->bytes += payload->computeChainDataLength();
+    }
     bool finStream = false;
     // Handle subscription/fetch consumers
     auto res = invokeCallbackNoGroup(
@@ -5143,6 +5253,9 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
           trackAlias_,
           ObjectHeader(group, subgroup, objectID, priority, status),
           nullptr);
+    }
+    if (auto* stats = receiveStats(); stats && status != ObjectStatus::NORMAL) {
+      ++stats->statusObjects;
     }
     // Handle subscription/fetch consumers
     switch (status) {
@@ -5318,6 +5431,10 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
   OnSubgroupFunc onSubgroupFunc_;
   OnFetchFunc onFetchFunc_;
   std::shared_ptr<MoQSession::SubscribeTrackReceiveState> subscribeState_;
+  // Whether openSubgroups counts this stream.
+  bool subgroupOpen_{false};
+  // The group that this stream last counted. A fetch stream carries several.
+  std::optional<uint64_t> countedGroup_;
   std::shared_ptr<SubgroupConsumer> subgroupCallback_;
   std::shared_ptr<MoQSession::FetchTrackReceiveState> fetchState_;
   uint64_t currentStreamId_{0};
@@ -5461,6 +5578,9 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
         } else {
           MOQ_SUBSCRIBER_STATS(
               subscriberStatsCallback_, onSubgroupReset, errorCode);
+          if (auto* stats = dcb.receiveStats()) {
+            stats->onReset(folly::to_underlying(errorCode));
+          }
         }
         break;
       }
@@ -5553,7 +5673,12 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
     } else if (result == MoQCodec::ParseResult::ERROR_TERMINATE) {
       XLOG(ERR) << "Error parsing/consuming stream id=" << id
                 << " sess=" << this;
-      dcb.reset(ResetStreamErrorCode::INTERNAL_ERROR);
+      if (dcb.reset(ResetStreamErrorCode::INTERNAL_ERROR)) {
+        if (auto* stats = dcb.receiveStats()) {
+          stats->onReset(
+              folly::to_underlying(ResetStreamErrorCode::INTERNAL_ERROR));
+        }
+      }
       break;
     }
   }
@@ -5764,6 +5889,7 @@ MoQSession::openFillStream(
       *negotiatedVersion_,
       moqSettings_.bufferingThresholds.perSubscription);
   fillPublisher->setLogger(logger_);
+  fillPublisher->setTrackStats(trackPublisher->trackStats());
   fillPublisher->initialize();
   auto streamPublisher = fillPublisher->getStreamPublisher();
   if (!streamPublisher) {
@@ -6209,7 +6335,8 @@ void MoQSession::pruneBufferedSubgroups(TrackAlias alias) {
 }
 
 class MoQSession::ReceiverSubscriptionHandle
-    : public Publisher::SubscriptionHandle {
+    : public Publisher::SubscriptionHandle,
+      public MoQTrackStatsSource {
  public:
   ReceiverSubscriptionHandle(
       SubscribeOk ok,
@@ -6224,6 +6351,18 @@ class MoQSession::ReceiverSubscriptionHandle
     if (!waitForPublishOk) {
       setRequestUpdateState(RequestUpdateState::READY);
     }
+  }
+
+  std::shared_ptr<const MoQTrackStats> getTrackStats() const override {
+    return trackStats_;
+  }
+  // The receive state shares these. A PUBLISH from the peer creates them with
+  // the handle, before its receive state exists.
+  const std::shared_ptr<MoQTrackStats>& trackStats() const {
+    return trackStats_;
+  }
+  void setTrackStats(std::shared_ptr<MoQTrackStats> stats) {
+    trackStats_ = std::move(stats);
   }
 
   void publishOkSent() {
@@ -6355,6 +6494,7 @@ class MoQSession::ReceiverSubscriptionHandle
   std::shared_ptr<MoQSession> session_;
   std::shared_ptr<BidiStreamControl> control_;
   folly::coro::SharedPromise<RequestUpdateState> requestUpdatesReady_;
+  std::shared_ptr<MoQTrackStats> trackStats_{std::make_shared<MoQTrackStats>()};
 };
 
 void MoQSession::onPublish(PublishRequest publish) {
@@ -6432,9 +6572,11 @@ bool MoQSession::installPublishReceiveState(
     RequestID requestID,
     TrackAlias alias,
     std::optional<uint64_t> publisherPriority,
-    const std::shared_ptr<TrackConsumer>& consumer) {
+    const std::shared_ptr<TrackConsumer>& consumer,
+    std::shared_ptr<MoQTrackStats> trackStats) {
   auto trackReceiveState = std::make_shared<SubscribeTrackReceiveState>(
       fullTrackName, requestID, consumer, this, alias, logger_, true);
+  trackReceiveState->setTrackStats(std::move(trackStats));
   auto emplaceRes = subTracks_.try_emplace(alias, trackReceiveState);
   if (!emplaceRes.second) {
     XLOG(ERR) << "TrackAlias already in use alias=" << alias
@@ -6485,7 +6627,12 @@ folly::coro::Task<void> MoQSession::handlePublish(
       // A ready consumer takes objects before the reply arrives.
       if (initiator.consumerReady &&
           !installPublishReceiveState(
-              ftn, requestID, alias, publisherPriority, initiator.consumer)) {
+              ftn,
+              requestID,
+              alias,
+              publisherPriority,
+              initiator.consumer,
+              publishHandle->trackStats())) {
         close(SessionCloseErrorCode::DUPLICATE_TRACK_ALIAS);
         co_return;
       }
@@ -6504,7 +6651,12 @@ folly::coro::Task<void> MoQSession::handlePublish(
       } else {
         if (!initiator.consumerReady &&
             !installPublishReceiveState(
-                ftn, requestID, alias, publisherPriority, initiator.consumer)) {
+                ftn,
+                requestID,
+                alias,
+                publisherPriority,
+                initiator.consumer,
+                publishHandle->trackStats())) {
           close(SessionCloseErrorCode::DUPLICATE_TRACK_ALIAS);
           co_return;
         }
@@ -8037,11 +8189,13 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
   } else {
     MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscribeSuccess);
     MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscriptionBegin);
-    co_return std::make_shared<ReceiverSubscriptionHandle>(
+    auto handle = std::make_shared<ReceiverSubscriptionHandle>(
         std::move(subscribeResult.value()),
         trackAlias,
         shared_from_this(),
         std::move(control));
+    handle->setTrackStats(trackReceiveState->trackStats());
+    co_return handle;
   }
 }
 
@@ -8488,7 +8642,8 @@ bool MoQSession::requestUpdate(
   return true;
 }
 
-class MoQSession::ReceiverFetchHandle : public Publisher::FetchHandle {
+class MoQSession::ReceiverFetchHandle : public Publisher::FetchHandle,
+                                        public MoQTrackStatsSource {
  public:
   ReceiverFetchHandle(
       FetchOk ok,
@@ -8497,6 +8652,13 @@ class MoQSession::ReceiverFetchHandle : public Publisher::FetchHandle {
       : FetchHandle(std::move(ok)),
         session_(std::move(session)),
         control_(std::move(control)) {}
+
+  std::shared_ptr<const MoQTrackStats> getTrackStats() const override {
+    return trackStats_;
+  }
+  void setTrackStats(std::shared_ptr<MoQTrackStats> stats) {
+    trackStats_ = std::move(stats);
+  }
 
   folly::coro::Task<FetchHandle::RequestUpdateResult> requestUpdate(
       RequestUpdate reqUpdate) override {
@@ -8517,6 +8679,7 @@ class MoQSession::ReceiverFetchHandle : public Publisher::FetchHandle {
  private:
   std::shared_ptr<MoQSession> session_;
   std::shared_ptr<BidiStreamControl> control_;
+  std::shared_ptr<MoQTrackStats> trackStats_{std::make_shared<MoQTrackStats>()};
 };
 
 folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
@@ -8651,8 +8814,10 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
     co_return folly::makeUnexpected(fetchResult.error());
   } else {
     MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onFetchSuccess);
-    co_return std::make_shared<ReceiverFetchHandle>(
+    auto handle = std::make_shared<ReceiverFetchHandle>(
         std::move(fetchResult.value()), shared_from_this(), std::move(control));
+    handle->setTrackStats(trackReceiveState->trackStats());
+    co_return handle;
   }
 }
 
@@ -9271,6 +9436,12 @@ void MoQSession::handleDatagram(
       // Populate priority from publisher priority if not set in object header
       if (!objHeader.objectHeader.priority.has_value()) {
         objHeader.objectHeader.priority = state->getPublisherPriority();
+      }
+      auto& stats = *state->trackStats();
+      if (objHeader.objectHeader.status == ObjectStatus::NORMAL) {
+        stats.onDatagram(objHeader.objectHeader.group, readBuf.chainLength());
+      } else {
+        ++stats.statusObjects;
       }
       callback->datagram(
           objHeader.objectHeader, readBuf.move(), objHeader.endOfGroup);
