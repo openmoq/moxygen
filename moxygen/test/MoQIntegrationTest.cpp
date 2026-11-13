@@ -4,9 +4,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <fizz/backend/openssl/certificate/CertUtils.h>
+#include <fizz/client/CertManager.h>
 #include <fizz/client/FizzClientContext.h>
 #include <fizz/protocol/DefaultCertificateVerifier.h>
 #include <fizz/protocol/test/CertUtil.h>
+#include <folly/CancellationToken.h>
 #include <folly/FileUtil.h>
 #include <folly/ScopeGuard.h>
 #include <folly/Singleton.h>
@@ -39,6 +42,7 @@
 #include <moxygen/StreamingObjectReceiver.h>
 #include <moxygen/Subscriber.h>
 #include <moxygen/events/MoQFollyExecutorImpl.h>
+#include <moxygen/proxy/MoQWtSessionFactory.h>
 #include <moxygen/util/InsecureVerifierDangerousDoNotUseInProduction.h>
 
 #include <algorithm>
@@ -599,29 +603,65 @@ proxygen::HTTPMessage makeWebTransportConnect(
   return req;
 }
 
+// Accepts any client certificate and records the identity of each.
+class RecordingClientCertVerifier : public fizz::InsecureCertificateVerifier {
+ public:
+  RecordingClientCertVerifier()
+      : fizz::InsecureCertificateVerifier(fizz::VerificationContext::Server) {}
+
+  fizz::Status verify(
+      std::shared_ptr<const fizz::Cert>& ret,
+      fizz::Error& err,
+      const std::vector<std::shared_ptr<const fizz::PeerCert>>& certs)
+      const override {
+    if (!certs.empty()) {
+      identities.wlock()->push_back(certs.front()->getIdentity());
+      presented.post();
+    }
+    return fizz::InsecureCertificateVerifier::verify(ret, err, certs);
+  }
+
+  mutable folly::Synchronized<std::vector<std::string>> identities;
+  mutable folly::coro::Baton presented;
+};
+
 class TestServer : public MoQServer {
  public:
+  // With a `clientVerifier`, clients must present a certificate it accepts.
   TestServer(
       std::shared_ptr<TestPublisher> publisher,
       std::shared_ptr<TestSubscriber> subscriber,
       bool rejectSetup = false,
       const std::string& certPath = "",
-      const std::string& keyPath = "")
+      const std::string& keyPath = "",
+      MoQServer::Options options = {},
+      std::shared_ptr<fizz::CertificateVerifier> clientVerifier = nullptr)
       : MoQServer(
-            [&] {
+            [&]() -> std::shared_ptr<const fizz::server::FizzServerContext> {
               std::vector<std::string> alpns = {"h3"};
               auto moqt = getDefaultMoqtProtocols(true);
               alpns.insert(alpns.end(), moqt.begin(), moqt.end());
               alpns.emplace_back(kAlpnMoqtDraft18Latest);
-              if (certPath.empty()) {
-                return quic::samples::
-                    createFizzServerContextWithInsecureDefault(
-                        alpns, fizz::server::ClientAuthMode::None, "", "");
+              auto context = certPath.empty()
+                  ? quic::samples::createFizzServerContextWithInsecureDefault(
+                        alpns, fizz::server::ClientAuthMode::None, "", "")
+                  : quic::samples::createFizzServerContext(
+                        alpns,
+                        fizz::server::ClientAuthMode::None,
+                        certPath,
+                        keyPath);
+              if (!clientVerifier) {
+                return context;
               }
-              return quic::samples::createFizzServerContext(
-                  alpns, fizz::server::ClientAuthMode::None, certPath, keyPath);
+              auto requiring =
+                  std::make_shared<fizz::server::FizzServerContext>(*context);
+              requiring->setClientAuthMode(
+                  fizz::server::ClientAuthMode::Required);
+              requiring->setClientCertVerifier(std::move(clientVerifier));
+              return requiring;
             }(),
-            kTestEndpoint),
+            kTestEndpoint,
+            std::move(options)),
         publisher_(std::move(publisher)),
         subscriber_(std::move(subscriber)),
         rejectSetup_(rejectSetup) {}
@@ -656,6 +696,15 @@ class TestServer : public MoQServer {
   folly::Synchronized<std::vector<std::string>> transportReadyPaths;
   std::atomic<size_t> observersAdded{0};
   std::atomic<int> sessionsCreated{0};
+
+  size_t liveSessions() {
+    return transportReadySessions_.withRLock([](const auto& sessions) {
+      return static_cast<size_t>(std::count_if(
+          sessions.begin(), sessions.end(), [](const auto& session) {
+            return !session.expired();
+          }));
+    });
+  }
 
  protected:
   void onSessionTransportReady(
@@ -767,7 +816,8 @@ class MoQIntegrationTest : public ::testing::TestWithParam<uint64_t> {
     publisher_ = std::make_shared<TestPublisher>();
     subscriber_ = std::make_shared<TestSubscriber>();
 
-    server_ = std::make_shared<TestServer>(publisher_, subscriber_);
+    server_ = std::make_shared<TestServer>(
+        publisher_, subscriber_, false, "", "", serverOptions());
     server_->start(folly::SocketAddress("::", 0));
     server_->waitUntilInitialized();
 
@@ -796,6 +846,10 @@ class MoQIntegrationTest : public ::testing::TestWithParam<uint64_t> {
   }
 
  protected:
+  virtual MoQServer::Options serverOptions() const {
+    return {};
+  }
+
   // Run a test coroutine on the client's EventBase thread with a timeout.
   void runTest(folly::coro::Task<void> testBody) {
     auto result = folly::coro::blockingWait(
@@ -857,6 +911,9 @@ class MoQIntegrationTest : public ::testing::TestWithParam<uint64_t> {
       client_ = std::make_unique<MoQClient>(
           exec, std::move(url), std::move(verifier));
     }
+    if (clientCertificates_) {
+      client_->setClientCertificates(clientCertificates_);
+    }
 
     quic::TransportSettings ts;
     ts.advertisedInitialConnectionFlowControlWindow = 1024 * 1024;
@@ -876,18 +933,26 @@ class MoQIntegrationTest : public ::testing::TestWithParam<uint64_t> {
 
   // MoQWebTransportClient drains its connection after one CONNECT; tests that
   // need several CONNECTs on one connection use this instead.
-  folly::coro::Task<proxygen::HQUpstreamSession*> connectH3() {
+  folly::coro::Task<proxygen::HQUpstreamSession*> connectH3(
+      std::optional<uint64_t> wtInitialMaxData = std::nullopt) {
     H3ConnectCallback callback;
     proxygen::HQConnector connector(&callback, 5s);
     quic::TransportSettings ts;
     ts.datagramConfig.enabled = true;
     connector.setTransportSettings(ts);
     connector.setSupportedQuicVersions({quic::QuicVersion::QUIC_V1});
-    connector.setH3Settings(
-        {{proxygen::SettingsId::ENABLE_CONNECT_PROTOCOL, 1},
-         {proxygen::SettingsId::_HQ_DATAGRAM, 1},
-         {proxygen::SettingsId::_HQ_DATAGRAM_RFC, 1},
-         {proxygen::SettingsId::ENABLE_WEBTRANSPORT, 1}});
+    proxygen::SettingsList settings{
+        {proxygen::SettingsId::ENABLE_CONNECT_PROTOCOL, 1},
+        {proxygen::SettingsId::_HQ_DATAGRAM, 1},
+        {proxygen::SettingsId::_HQ_DATAGRAM_RFC, 1},
+        {proxygen::SettingsId::ENABLE_WEBTRANSPORT, 1},
+        // Adds the initial WebTransport limits to SETTINGS.
+        {proxygen::SettingsId::H3_WT_ENABLED, 1}};
+    if (wtInitialMaxData) {
+      settings.emplace_back(
+          proxygen::SettingsId::WT_INITIAL_MAX_DATA, *wtInitialMaxData);
+    }
+    connector.setH3Settings(std::move(settings));
     auto fizzContext = std::make_shared<fizz::client::FizzClientContext>();
     fizzContext->setSupportedAlpns({"h3"});
     connector.connect(
@@ -994,11 +1059,18 @@ class MoQIntegrationTest : public ::testing::TestWithParam<uint64_t> {
 
   void restartServerWithCertificate(
       const std::string& certPath,
-      const std::string& keyPath) {
+      const std::string& keyPath,
+      std::shared_ptr<fizz::CertificateVerifier> clientVerifier = nullptr) {
     server_->stop();
     server_.reset();
     server_ = std::make_shared<TestServer>(
-        publisher_, subscriber_, /*rejectSetup=*/false, certPath, keyPath);
+        publisher_,
+        subscriber_,
+        /*rejectSetup=*/false,
+        certPath,
+        keyPath,
+        serverOptions(),
+        std::move(clientVerifier));
     server_->start(folly::SocketAddress("::", 0));
     server_->waitUntilInitialized();
 
@@ -1061,10 +1133,34 @@ class MoQIntegrationTest : public ::testing::TestWithParam<uint64_t> {
     return verifier;
   }
 
+  // Restarts the server requiring a client certificate, and returns what
+  // records the identities of those presented.
+  std::shared_ptr<RecordingClientCertVerifier> requireClientCertificate() {
+    auto verifier = std::make_shared<RecordingClientCertVerifier>();
+    restartServerWithCertificate("", "", verifier);
+    return verifier;
+  }
+
+  void presentClientCertificate(const std::string& identity) {
+    auto [cert, key] = fizz::test::createCert(
+        identity, /*ca=*/false, /*issuer=*/nullptr, fizz::KeyType::P256);
+    std::vector<folly::ssl::X509UniquePtr> chain;
+    chain.push_back(std::move(cert));
+    std::unique_ptr<fizz::SelfCert> self;
+    fizz::Error err;
+    ASSERT_EQ(
+        fizz::openssl::CertUtils::makeSelfCert(
+            self, err, std::move(chain), std::move(key)),
+        fizz::Status::Success);
+    clientCertificates_ = std::make_shared<fizz::client::CertManager>();
+    clientCertificates_->addCert(std::move(self));
+  }
+
   std::shared_ptr<TestPublisher> publisher_;
   std::shared_ptr<TestSubscriber> subscriber_;
   std::shared_ptr<TestServer> server_;
   std::unique_ptr<MoQClient> client_;
+  std::shared_ptr<fizz::client::CertManager> clientCertificates_;
   std::unique_ptr<folly::test::TemporaryDirectory> certificateDir_;
   uint16_t serverPort_{0};
   folly::ScopedEventBaseThread clientEvbThread_{"MoQIntegrationTestClient"};
@@ -1135,6 +1231,55 @@ TEST_P(MoQIntegrationTest, RejectsWrongIpTlsIdentity) {
                 connectClientWithVerifier(std::move(verifier), "127.0.0.1"));
             EXPECT_TRUE(result.hasException());
           }));
+}
+
+// From draft 18 the server sends SERVER_SETUP before it has the client's
+// certificate, so a client can complete setup before the server checks it.
+// These tests therefore wait for the server's verdict rather than for setup.
+
+TEST_P(MoQIntegrationTest, PresentsClientCertificateOverQuic) {
+  const auto verifier = requireClientCertificate();
+  presentClientCertificate("moq-test-client");
+
+  runTest(folly::coro::co_invoke([this, verifier]() -> folly::coro::Task<void> {
+    co_await connectClient();
+    co_await verifier->presented;
+  }));
+
+  EXPECT_EQ(
+      *verifier->identities.rlock(),
+      std::vector<std::string>{"moq-test-client"});
+}
+
+TEST_P(MoQIntegrationTest, PresentsClientCertificateOverWebTransport) {
+  const auto verifier = requireClientCertificate();
+  presentClientCertificate("moq-test-client");
+
+  runTest(folly::coro::co_invoke([this, verifier]() -> folly::coro::Task<void> {
+    co_await connectClient(/*webTransport=*/true);
+    co_await verifier->presented;
+  }));
+
+  EXPECT_EQ(
+      *verifier->identities.rlock(),
+      std::vector<std::string>{"moq-test-client"});
+}
+
+TEST_P(MoQIntegrationTest, ClosedWithoutARequiredClientCertificate) {
+  const auto verifier = requireClientCertificate();
+
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    auto connected = co_await folly::coro::co_awaitTry(connectClient());
+    if (connected.hasException()) {
+      co_return;
+    }
+    folly::coro::Baton closed;
+    folly::CancellationCallback onClose(
+        client_->moqSession_->getCancelToken(), [&] { closed.post(); });
+    co_await closed;
+  }));
+
+  EXPECT_TRUE(verifier->identities.rlock()->empty());
 }
 
 // ============================================================================
@@ -1544,6 +1689,59 @@ TEST_P(MoQIntegrationTest, Fetch_EmptyResult) {
     co_await callback->waitForAllDataReceived();
     EXPECT_TRUE(callback->isAllDataReceived());
     EXPECT_EQ(callback->getObjects().size(), 0u);
+  }));
+}
+
+// The session stays usable after a FETCH completes. Up to draft 16 the FETCH
+// reply shares the control stream, which WebTransport loses on an empty write.
+TEST_P(MoQIntegrationTest, Fetch_WebTransportSessionOutlivesCompletedFetch) {
+  publisher_->setFetchHandler(
+      [](Fetch fetch, std::shared_ptr<FetchConsumer> fetchCallback)
+          -> folly::coro::Task<Publisher::FetchResult> {
+        FetchOk ok;
+        ok.requestID = fetch.requestID;
+        ok.groupOrder = GroupOrder::OldestFirst;
+        ok.endOfTrack = 0;
+        ok.endLocation = AbsoluteLocation{0, 0};
+        auto handle = std::make_shared<TestFetchHandle>(ok);
+        // The fetch ends after FETCH_OK has gone out on its own.
+        folly::EventBaseManager::get()->getEventBase()->runAfterDelay(
+            [fetchCallback = std::move(fetchCallback)]() {
+              fetchCallback->object(0, 0, 0, makePayload(kTestPayload));
+              fetchCallback->endOfFetch();
+            },
+            50);
+        co_return handle;
+      });
+
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    co_await connectClient(/*webTransport=*/true);
+
+    auto fetchCallback = std::make_shared<TestObjectCallback>();
+    auto receiver =
+        std::make_shared<ObjectReceiver>(ObjectReceiver::FETCH, fetchCallback);
+    Fetch fetch(
+        RequestID(0),
+        kIntegrationTestTrackName,
+        AbsoluteLocation{0, 0},
+        AbsoluteLocation{0, 1},
+        kDefaultPriority,
+        GroupOrder::OldestFirst);
+    auto result =
+        co_await client_->moqSession_->fetch(std::move(fetch), receiver);
+    EXPECT_FALSE(result.hasError());
+    if (result.hasError()) {
+      co_return;
+    }
+    co_await fetchCallback->waitForAllDataReceived();
+    EXPECT_EQ(fetchCallback->getObjects().size(), 1u);
+
+    auto callback = co_await subscribeAndReceive();
+    if (!callback) {
+      co_return;
+    }
+    co_await callback->waitForObjects(kDefaultObjectCount);
+    EXPECT_EQ(callback->getObjects().size(), kDefaultObjectCount);
   }));
 }
 
@@ -2470,6 +2668,318 @@ TEST_P(MoQRequestStreamTest, PeerCloseAfterGoawayWithUnansweredServerRequests) {
           }));
 }
 
+// The client runs HqWtSession too. MoQWebTransportClient does not advertise
+// stream limits, so this server cannot open streams to it.
+class MoQHqWtSessionTest : public MoQIntegrationTest {
+ protected:
+  MoQServer::Options serverOptions() const override {
+    return {.useHqWtSession = [] { return true; }};
+  }
+
+  folly::coro::Task<std::shared_ptr<MoQSession>> connectWebTransport(
+      proxygen::HQUpstreamSession* h3) {
+    // sendWebTransportRequest fails until the server's SETTINGS arrive.
+    for (int i = 0; i < 100 && !h3->supportsWebTransport(); ++i) {
+      co_await folly::coro::sleep(10ms);
+    }
+    const auto protocol = *getAlpnFromVersion(GetParam());
+    MoQWtSessionFactory factory(
+        std::make_shared<MoQFollyExecutorImpl>(
+            clientEvbThread_.getEventBase()));
+    auto resp = co_await h3->sendWebTransportRequest(
+        makeWebTransportConnect({protocol}),
+        factory.makeHandler(protocol, "localhost", kTestEndpoint));
+    EXPECT_EQ(resp->getStatusCode(), 200);
+    co_return co_await factory.establish();
+  }
+};
+
+TEST_P(MoQHqWtSessionTest, TransportReady) {
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    auto* h3 = co_await connectH3();
+    SCOPE_EXIT {
+      h3->dropConnection();
+    };
+    auto session = co_await connectWebTransport(h3);
+    SCOPE_EXIT {
+      session->close(SessionCloseErrorCode::NO_ERROR);
+    };
+    const std::vector<std::string> expectedPaths{kTestEndpoint};
+    EXPECT_EQ(server_->transportReadyPaths.copy(), expectedPaths);
+
+    auto callback = std::make_shared<TestObjectCallback>();
+    auto result = co_await session->subscribe(
+        makeSubscribe(),
+        std::make_shared<ObjectReceiver>(ObjectReceiver::SUBSCRIBE, callback));
+    EXPECT_FALSE(result.hasError());
+    co_await callback->waitForObjects(kDefaultObjectCount);
+  }));
+}
+
+// The server opens one stream per group, so groups past the client's initial
+// stream limit wait for the client's credit updates.
+TEST_P(MoQHqWtSessionTest, SendsPastInitialStreamCredit) {
+  static constexpr uint64_t kGroups = 40;
+  publisher_->setSubscribeHandler(
+      [](SubscribeRequest sub, std::shared_ptr<TrackConsumer> callback)
+          -> folly::coro::Task<Publisher::SubscribeResult> {
+        co_return co_await acceptAndSendDelayed(
+            std::move(sub),
+            std::move(callback),
+            [](std::shared_ptr<TrackConsumer> cb, RequestID) {
+              for (uint64_t g = 0; g < kGroups; ++g) {
+                auto sg = cb->beginSubgroup(g, 0, kDefaultPriority);
+                if (sg.hasError()) {
+                  return;
+                }
+                sg.value()->object(0, makePayload(kTestPayload));
+                sg.value()->endOfGroup(1);
+              }
+            });
+      });
+
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    auto* h3 = co_await connectH3();
+    SCOPE_EXIT {
+      h3->dropConnection();
+    };
+    auto session = co_await connectWebTransport(h3);
+    SCOPE_EXIT {
+      session->close(SessionCloseErrorCode::NO_ERROR);
+    };
+
+    auto callback = std::make_shared<TestObjectCallback>();
+    auto result = co_await session->subscribe(
+        makeSubscribe(),
+        std::make_shared<ObjectReceiver>(ObjectReceiver::SUBSCRIBE, callback));
+    EXPECT_FALSE(result.hasError());
+    co_await callback->waitForObjects(kGroups);
+
+    std::set<uint64_t> groups;
+    for (const auto& object : callback->getObjects()) {
+      groups.insert(object.group);
+    }
+    EXPECT_EQ(groups.size(), kGroups);
+  }));
+}
+
+// The client opens one stream per group, so groups past the server's initial
+// stream limit wait for the server's credit updates.
+TEST_P(MoQHqWtSessionTest, ReceivesPastInitialStreamCredit) {
+  static constexpr uint64_t kGroups = 40;
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    auto* h3 = co_await connectH3();
+    SCOPE_EXIT {
+      h3->dropConnection();
+    };
+    auto session = co_await connectWebTransport(h3);
+    SCOPE_EXIT {
+      session->close(SessionCloseErrorCode::NO_ERROR);
+    };
+
+    auto publishResult = session->publish(
+        PublishRequest{
+            .fullTrackName = kIntegrationTestTrackName, .forward = true},
+        makeClientPublishHandle());
+    EXPECT_FALSE(publishResult.hasError());
+    if (publishResult.hasError()) {
+      co_return;
+    }
+    auto consumer = publishResult.value().consumer;
+    for (uint64_t g = 0; g < kGroups; ++g) {
+      auto sg = consumer->beginSubgroup(g, 0, kDefaultPriority);
+      EXPECT_FALSE(sg.hasError());
+      if (sg.hasError()) {
+        co_return;
+      }
+      sg.value()->object(0, makePayload(kTestPayload));
+      sg.value()->endOfGroup(1);
+    }
+    auto publishOk = co_await std::move(publishResult.value().reply);
+    EXPECT_FALSE(publishOk.hasError());
+
+    auto receiver = subscriber_->getReceiverCallback();
+    EXPECT_NE(receiver, nullptr);
+    if (!receiver) {
+      co_return;
+    }
+    co_await receiver->waitForObjects(kGroups);
+    EXPECT_EQ(receiver->getObjects().size(), kGroups);
+  }));
+}
+
+TEST_P(MoQHqWtSessionTest, ReleasesSessionWhenClientCloses) {
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    auto* h3 = co_await connectH3();
+    SCOPE_EXIT {
+      h3->dropConnection();
+    };
+    auto session = co_await connectWebTransport(h3);
+    EXPECT_EQ(server_->liveSessions(), 1);
+
+    session->close(SessionCloseErrorCode::NO_ERROR);
+    for (int i = 0; i < 100 && server_->liveSessions() > 0; ++i) {
+      co_await folly::coro::sleep(20ms);
+    }
+    EXPECT_EQ(server_->liveSessions(), 0);
+  }));
+}
+
+// The client advertises the 64 KiB of WebTransport data credit that a revproxy
+// pool sends, so a 200 KB subgroup needs the client's credit updates.
+TEST_P(MoQHqWtSessionTest, SendsPastInitialDataCredit) {
+  if (getDraftMajorVersion(GetParam()) < 18) {
+    GTEST_SKIP() << "Draft 16 hangs in this test";
+  }
+  static constexpr uint64_t kObjects = 20;
+  publisher_->setSubscribeHandler(
+      [](SubscribeRequest sub, std::shared_ptr<TrackConsumer> callback)
+          -> folly::coro::Task<Publisher::SubscribeResult> {
+        co_return co_await acceptAndSendDelayed(
+            std::move(sub),
+            std::move(callback),
+            [](std::shared_ptr<TrackConsumer> cb, RequestID) {
+              auto sg = cb->beginSubgroup(0, 0, kDefaultPriority);
+              if (sg.hasError()) {
+                return;
+              }
+              for (uint64_t i = 0; i < kObjects; ++i) {
+                sg.value()->object(i, makePayload(std::string(10 * 1024, 'x')));
+              }
+              sg.value()->endOfGroup(kObjects);
+            });
+      });
+
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    auto* h3 = co_await connectH3(/*wtInitialMaxData=*/65535);
+    SCOPE_EXIT {
+      h3->dropConnection();
+    };
+    auto session = co_await connectWebTransport(h3);
+    SCOPE_EXIT {
+      session->close(SessionCloseErrorCode::NO_ERROR);
+    };
+
+    auto callback = std::make_shared<TestObjectCallback>();
+    auto result = co_await session->subscribe(
+        makeSubscribe(),
+        std::make_shared<ObjectReceiver>(ObjectReceiver::SUBSCRIBE, callback));
+    EXPECT_FALSE(result.hasError());
+    co_await callback->waitForObjects(kObjects);
+    EXPECT_EQ(callback->getObjects().size(), kObjects);
+  }));
+}
+
+// MoQWebTransportClient runs WebTransportImpl, which never grants more credit,
+// so it has to set up and receive past the default limits on what it
+// advertises up front.
+TEST_P(MoQHqWtSessionTest, WebTransportImplClientReceivesPastDefaultCredit) {
+  static constexpr uint64_t kGroups = 40;
+  publisher_->setSubscribeHandler(
+      [](SubscribeRequest sub, std::shared_ptr<TrackConsumer> callback)
+          -> folly::coro::Task<Publisher::SubscribeResult> {
+        co_return co_await acceptAndSendDelayed(
+            std::move(sub),
+            std::move(callback),
+            [](std::shared_ptr<TrackConsumer> cb, RequestID) {
+              for (uint64_t g = 0; g < kGroups; ++g) {
+                auto sg = cb->beginSubgroup(g, 0, kDefaultPriority);
+                if (sg.hasError()) {
+                  return;
+                }
+                sg.value()->object(0, makePayload(kTestPayload));
+                sg.value()->endOfGroup(1);
+              }
+            });
+      });
+
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    co_await connectClient(/*webTransport=*/true);
+    auto callback = std::make_shared<TestObjectCallback>();
+    auto result = co_await client_->moqSession_->subscribe(
+        makeSubscribe(),
+        std::make_shared<ObjectReceiver>(ObjectReceiver::SUBSCRIBE, callback));
+    EXPECT_FALSE(result.hasError());
+    co_await callback->waitForObjects(kGroups);
+    EXPECT_EQ(callback->getObjects().size(), kGroups);
+  }));
+}
+
+// Stream traffic bypasses the CONNECT transaction, so its idle timeout must not
+// end a session that is still delivering objects.
+class MoQHqWtSessionShortIdleTest : public MoQHqWtSessionTest {
+ protected:
+  MoQServer::Options serverOptions() const override {
+    return {.useHqWtSession = [] { return true; }, .txnTimeout = 500ms};
+  }
+};
+
+TEST_P(MoQHqWtSessionShortIdleTest, StreamTrafficOutlivesTxnTimeout) {
+  static constexpr uint64_t kObjects = 15;
+  publisher_->setSubscribeHandler(
+      [](SubscribeRequest sub, std::shared_ptr<TrackConsumer> callback)
+          -> folly::coro::Task<Publisher::SubscribeResult> {
+        co_return co_await acceptAndSendDelayed(
+            std::move(sub),
+            std::move(callback),
+            [](std::shared_ptr<TrackConsumer> cb, RequestID) {
+              folly::coro::co_withExecutor(
+                  folly::EventBaseManager::get()->getEventBase(),
+                  folly::coro::co_invoke([cb]() -> folly::coro::Task<void> {
+                    auto sg = cb->beginSubgroup(0, 0, kDefaultPriority);
+                    if (sg.hasError()) {
+                      co_return;
+                    }
+                    for (uint64_t i = 0; i < kObjects; ++i) {
+                      sg.value()->object(i, makePayload(kTestPayload));
+                      co_await folly::coro::sleep(100ms);
+                    }
+                    sg.value()->endOfGroup(kObjects);
+                  }))
+                  .start();
+            });
+      });
+
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    auto* h3 = co_await connectH3();
+    SCOPE_EXIT {
+      h3->dropConnection();
+    };
+    auto session = co_await connectWebTransport(h3);
+    SCOPE_EXIT {
+      session->close(SessionCloseErrorCode::NO_ERROR);
+    };
+
+    auto callback = std::make_shared<TestObjectCallback>();
+    auto result = co_await session->subscribe(
+        makeSubscribe(),
+        std::make_shared<ObjectReceiver>(ObjectReceiver::SUBSCRIBE, callback));
+    EXPECT_FALSE(result.hasError());
+    co_await callback->waitForObjects(kObjects);
+    EXPECT_EQ(callback->getObjects().size(), kObjects);
+  }));
+}
+
+// With no traffic, the CONNECT transaction's idle timeout still ends the
+// session, on both ends.
+TEST_P(MoQHqWtSessionShortIdleTest, IdleSessionTimesOut) {
+  runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
+    auto* h3 = co_await connectH3();
+    SCOPE_EXIT {
+      h3->dropConnection();
+    };
+    auto session = co_await connectWebTransport(h3);
+    EXPECT_EQ(server_->liveSessions(), 1);
+    for (int i = 0;
+         i < 100 && (server_->liveSessions() > 0 || !session->isClosed());
+         ++i) {
+      co_await folly::coro::sleep(20ms);
+    }
+    EXPECT_EQ(server_->liveSessions(), 0);
+    EXPECT_TRUE(session->isClosed());
+  }));
+}
+
 namespace {
 const std::vector<uint64_t> kIntegrationTestVersions(
     kSupportedVersions.begin(),
@@ -2479,6 +2989,22 @@ const std::vector<uint64_t> kIntegrationTestVersions(
 INSTANTIATE_TEST_SUITE_P(
     MoQIntegrationTest,
     MoQIntegrationTest,
+    testing::ValuesIn(kIntegrationTestVersions),
+    [](const testing::TestParamInfo<uint64_t>& info) {
+      return "Draft" + std::to_string(getDraftMajorVersion(info.param));
+    });
+
+INSTANTIATE_TEST_SUITE_P(
+    MoQHqWtSessionTest,
+    MoQHqWtSessionTest,
+    testing::ValuesIn(kIntegrationTestVersions),
+    [](const testing::TestParamInfo<uint64_t>& info) {
+      return "Draft" + std::to_string(getDraftMajorVersion(info.param));
+    });
+
+INSTANTIATE_TEST_SUITE_P(
+    MoQHqWtSessionShortIdleTest,
+    MoQHqWtSessionShortIdleTest,
     testing::ValuesIn(kIntegrationTestVersions),
     [](const testing::TestParamInfo<uint64_t>& info) {
       return "Draft" + std::to_string(getDraftMajorVersion(info.param));

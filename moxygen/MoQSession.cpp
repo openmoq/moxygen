@@ -330,7 +330,11 @@ class StreamPublisherImpl
     }
     auto* pubStats =
         publisher_ ? publisher_->getPublisherStatsCallback() : nullptr;
-    auto now = folly::chrono::coarse_steady_clock::now();
+    auto* objectAckStats =
+        pubStats ? pubStats->getObjectAckStatsCallback() : nullptr;
+    auto now = objectAckStats
+        ? folly::chrono::coarse_steady_clock::now()
+        : folly::chrono::coarse_steady_clock::time_point{};
     while (!pendingDeliveries_.empty() &&
            pendingDeliveries_.front().endOffset <= offset) {
       auto& pendingDelivery = pendingDeliveries_.front();
@@ -343,11 +347,13 @@ class StreamPublisherImpl
             pendingDelivery.objectId);
       }
 
-      auto latencyUsec = std::chrono::duration_cast<std::chrono::microseconds>(
-                             now - pendingDelivery.enqueuedAt)
-                             .count();
-      MOQ_PUBLISHER_STATS(
-          pubStats, recordObjectAckLatency, uint64_t(latencyUsec));
+      if (objectAckStats) {
+        auto latencyUsec =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                now - pendingDelivery.enqueuedAt)
+                .count();
+        objectAckStats->recordObjectAckLatency(uint64_t(latencyUsec));
+      }
 
       // Cancel delivery timeout timer when object is successfully delivered
       if (deliveryTimer_) {
@@ -530,7 +536,7 @@ class StreamPublisherImpl
       bool finStream,
       bool endObject = false);
 
-  void onStreamComplete();
+  void onStreamComplete(std::optional<ResetStreamErrorCode> resetError);
 
   std::shared_ptr<MoQSession::PublisherImpl> publisher_{nullptr};
   bool streamComplete_{false};
@@ -722,12 +728,13 @@ void StreamPublisherImpl::logObjectCreated(
   }
 }
 
-void StreamPublisherImpl::onStreamComplete() {
+void StreamPublisherImpl::onStreamComplete(
+    std::optional<ResetStreamErrorCode> resetError) {
   XCHECK_EQ(writeHandle_, nullptr);
   streamComplete_ = true;
 
   if (publisher_) {
-    publisher_->onStreamComplete(header_);
+    publisher_->onStreamComplete(header_, resetError);
   }
 }
 
@@ -812,9 +819,11 @@ StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
   }
 
   // Delivery offsets are recorded as each object ends, including held objects.
-  bool trackForStats =
-      publisher_ && publisher_->getPublisherStatsCallback() != nullptr;
-  if ((deliveryCallback_ || deliveryTimer_ || trackForStats) && endObject &&
+  auto* pubStats =
+      publisher_ ? publisher_->getPublisherStatsCallback() : nullptr;
+  auto* objectAckStats =
+      pubStats ? pubStats->getObjectAckStatsCallback() : nullptr;
+  if ((deliveryCallback_ || deliveryTimer_ || objectAckStats) && endObject &&
       (!writeBuf_.empty() || finStream)) {
     uint64_t endOffset = bytesWritten_ + writeBuf_.chainLength() - 1;
     pendingDeliveries_.emplace_back(
@@ -861,7 +870,7 @@ StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
     if (finStream) {
       // The stream is done, so there is nothing left to pace and no write
       // handle to await on.  Report success even if the transport is blocked.
-      onStreamComplete();
+      onStreamComplete(std::nullopt);
       return folly::unit;
     }
     // For FETCH, propagate transport flow control signal.  The data was
@@ -1168,7 +1177,7 @@ void StreamPublisherImpl::reset(ResetStreamErrorCode error) {
       pendingObjectLogs_.clear();
     }
   }
-  onStreamComplete();
+  onStreamComplete(error);
 }
 
 folly::Expected<folly::SemiFuture<uint64_t>, MoQPublishError>
@@ -1442,6 +1451,10 @@ class RequestUpdateSequencer {
     inFlight_.clear();
   }
 
+  bool idle() const {
+    return queued_.empty() && inFlight_.empty();
+  }
+
  private:
   std::vector<std::shared_ptr<Batch>> queued_;
   std::deque<std::shared_ptr<Batch>> inFlight_;
@@ -1601,7 +1614,9 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     }
   }
 
-  void onStreamComplete(const ObjectHeader& finalHeader) override;
+  void onStreamComplete(
+      const ObjectHeader& finalHeader,
+      std::optional<ResetStreamErrorCode> resetError) override;
 
   void onTooManyBytesBuffered() override;
 
@@ -2029,6 +2044,24 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
             version,
             bytesBufferedThreshold) {}
 
+  FetchPublisherImpl(const FetchPublisherImpl&) = delete;
+  FetchPublisherImpl& operator=(const FetchPublisherImpl&) = delete;
+  FetchPublisherImpl(FetchPublisherImpl&&) = delete;
+  FetchPublisherImpl& operator=(FetchPublisherImpl&&) = delete;
+
+  ~FetchPublisherImpl() override {
+    endFetchStat();
+  }
+
+  void beginFetchStat(
+      std::shared_ptr<MoQPublisherStatsCallback> statsCallback) {
+    fetchStatsCallback_ = std::move(statsCallback);
+    MOQ_PUBLISHER_STATS(fetchStatsCallback_, onFetchBegin);
+    if (!streamPublisher_) {
+      endFetchStat();
+    }
+  }
+
   void initialize() {
     streamPublisher_ = std::make_shared<StreamPublisherImpl>(
         shared_from_this(), logger_, nullptr);
@@ -2038,8 +2071,15 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
     return streamPublisher_;
   }
 
+  // Called right after FETCH_OK is sent, so a non-null handle_ means it was.
   void setFetchHandle(std::shared_ptr<Publisher::FetchHandle> handle) {
     handle_ = std::move(handle);
+    maybeCloseRequestStream();
+  }
+
+  void onRequestStreamFin() override {
+    peerFin_ = true;
+    maybeCloseRequestStream();
   }
 
   bool isCancelled() const {
@@ -2066,6 +2106,7 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
   }
 
   void sessionClosed(ResetStreamErrorCode code) override {
+    endFetchStat();
     // Clear streamPublisher_ first so onStreamComplete skips fetchComplete.
     // Clear session_ last: the reset reports onSubgroupReset.
     if (auto streamPublisher = std::exchange(streamPublisher_, nullptr)) {
@@ -2099,8 +2140,11 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
     return isFill_;
   }
 
-  void onStreamComplete(const ObjectHeader&) override {
+  void onStreamComplete(
+      const ObjectHeader&,
+      std::optional<ResetStreamErrorCode> resetError) override {
     cancelGoawayResetTimer();
+    endFetchStat();
     if (!streamPublisher_) {
       // sessionClosed() cleared streamPublisher_ and retired this publisher.
       return;
@@ -2116,6 +2160,21 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
       }
       return;
     }
+    if (resetError) {
+      // A cancel after FETCH_OK resets the data stream, and the request
+      // stream with it.
+      if (handle_ && replyContext_) {
+        replyContext_->cancel(*resetError);
+      }
+      PublisherImpl::fetchComplete();
+      return;
+    }
+    // Replies route through pubTracks_, so the fetch stays there until the
+    // last one is sent; see onRequestUpdateDone.
+    if (!updates_.idle()) {
+      return;
+    }
+    maybeCloseRequestStream();
     PublisherImpl::fetchComplete();
   }
 
@@ -2200,6 +2259,22 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
       }
       respondToRequestUpdates(*ready);
     }
+    if (!session_) {
+      return;
+    }
+    maybeCloseRequestStream();
+    if (!streamPublisher_ && updates_.idle()) {
+      PublisherImpl::fetchComplete();
+    }
+  }
+
+  // The request stream closes once FETCH_OK and all REQUEST_UPDATE replies are
+  // sent, and either the data stream is done or the subscriber has sent FIN.
+  void maybeCloseRequestStream() {
+    if (handle_ && replyContext_ && updates_.idle() &&
+        (!streamPublisher_ || peerFin_)) {
+      std::exchange(replyContext_, nullptr)->flushFinal();
+    }
   }
 
   void respondToRequestUpdates(RequestUpdateSequencer::Batch& batch) {
@@ -2220,12 +2295,19 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
     }
   }
 
+  void endFetchStat() {
+    auto statsCallback = std::exchange(fetchStatsCallback_, nullptr);
+    MOQ_PUBLISHER_STATS(statsCallback, onFetchEnd);
+  }
+
+  std::shared_ptr<MoQPublisherStatsCallback> fetchStatsCallback_;
   std::shared_ptr<MLogger> logger_;
   std::shared_ptr<Publisher::FetchHandle> handle_;
   std::shared_ptr<StreamPublisherImpl> streamPublisher_;
   std::weak_ptr<TrackPublisherImpl> fillOwner_;
   bool isFill_{false};
   bool cancelled_{false};
+  bool peerFin_{false};
   RequestUpdateSequencer updates_;
 };
 
@@ -2402,7 +2484,8 @@ MoQSession::TrackPublisherImpl::awaitStreamCredit() {
 }
 
 void MoQSession::TrackPublisherImpl::onStreamComplete(
-    const ObjectHeader& finalHeader) {
+    const ObjectHeader& finalHeader,
+    std::optional<ResetStreamErrorCode> /*resetError*/) {
   if (session_) {
     session_->onSubscriptionStreamClosed();
   }
@@ -2949,6 +3032,24 @@ class MoQSession::FetchTrackReceiveState
     logger_ = std::move(logger);
   }
 
+  FetchTrackReceiveState(const FetchTrackReceiveState&) = delete;
+  FetchTrackReceiveState& operator=(const FetchTrackReceiveState&) = delete;
+  FetchTrackReceiveState(FetchTrackReceiveState&&) = delete;
+  FetchTrackReceiveState& operator=(FetchTrackReceiveState&&) = delete;
+
+  ~FetchTrackReceiveState() {
+    endFetchStat();
+  }
+
+  void beginFetchStat(
+      std::shared_ptr<MoQSubscriberStatsCallback> statsCallback) {
+    fetchStatsCallback_ = std::move(statsCallback);
+    MOQ_SUBSCRIBER_STATS(fetchStatsCallback_, onFetchBegin);
+    if (!callback_) {
+      endFetchStat();
+    }
+  }
+
   folly::coro::Future<FetchResult> fetchFuture() {
     auto contract = folly::coro::makePromiseContract<FetchResult>();
     promise_ = std::move(contract.first);
@@ -3040,6 +3141,7 @@ class MoQSession::FetchTrackReceiveState
 
   void resetFetchCallback(MoQSession* session) {
     cancelStallTimeout();
+    endFetchStat();
     callback_.reset();
     if (fetchOkAndAllDataReceived()) {
       // Fetch data stream closed: FIN our bidi to release it cleanly.
@@ -3073,6 +3175,7 @@ class MoQSession::FetchTrackReceiveState
 
   void sessionClosed() {
     cancelStallTimeout();
+    endFetchStat();
     if (!fetchEstablished_) {
       return;
     }
@@ -3102,6 +3205,7 @@ class MoQSession::FetchTrackReceiveState
     if (isFill_) {
       return;
     }
+    endFetchStat();
     if (!promise_.isFulfilled()) {
       fetchErr.requestID = requestID_;
       promise_.setValue(folly::makeUnexpected(std::move(fetchErr)));
@@ -3127,6 +3231,12 @@ class MoQSession::FetchTrackReceiveState
   }
 
  private:
+  void endFetchStat() {
+    auto statsCallback = std::exchange(fetchStatsCallback_, nullptr);
+    MOQ_SUBSCRIBER_STATS(statsCallback, onFetchEnd);
+  }
+
+  std::shared_ptr<MoQSubscriberStatsCallback> fetchStatsCallback_;
   std::shared_ptr<MLogger> logger_ = nullptr;
   std::shared_ptr<FetchConsumer> callback_;
   GroupOrder fetchGroupOrder_;
@@ -3142,11 +3252,10 @@ class MoQSession::FetchTrackReceiveState
   RequestID owningSubscribeID_{0};
 };
 
-// Links a held joining FETCH to the SUBSCRIBE it references.
-// `future` completes when that subscription is handed to the publisher, with
-// its track, or with the error the FETCH fails with. Once the SUBSCRIBE has
-// been read, the dependency is bound: it stops counting toward
-// maxDeferredJoiningFetches and no longer times out.
+// Links a held joining FETCH to the SUBSCRIBE it references. `future`
+// completes with the track when that SUBSCRIBE is handed to the publisher, or
+// with the FETCH's error. A dependency is bound once the SUBSCRIBE is read,
+// and is then not counted in maxDeferredJoiningFetches or timed out.
 struct MoQSession::JoiningDependency {
   JoiningDependency(RequestID subscription, RequestID fetch)
       : subscriptionID(subscription), fetchID(fetch) {
@@ -3919,6 +4028,11 @@ folly::coro::Task<void> MoQSession::controlWriteLoop(
       }
     }
     co_await folly::coro::co_safe_point;
+    // WebTransport refuses an empty write without FIN, and a reply context's
+    // final flush can wake this loop with nothing queued.
+    if (controlWriteBuf_.empty()) {
+      continue;
+    }
     auto writeRes = egressTracker_->write(
         *controlStream, controlWriteBuf_.move(), /*fin=*/false);
     if (!writeRes) {
@@ -4492,6 +4606,12 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
     // Also reached from the peer-termination callback on STOP_SENDING, where
     // this loop exits under cancellation and skips the block.
     failRequestsOnStreamClose(*control);
+    if (bidiCallback && fin && control->requestID()) {
+      if (auto it = pubTracks_.find(*control->requestID());
+          it != pubTracks_.end()) {
+        it->second->onRequestStreamFin();
+      }
+    }
     // Sender (bidiCallback==null) mirrors peer FIN with our FIN: "done
     // updating the request". No-op if write half already closed.
     if (!bidiCallback && fin) {
@@ -5696,10 +5816,9 @@ folly::coro::Task<void> MoQSession::handleSubscribe(
   params.eraseAllParamsOfType(TrackRequestParamKey::DELIVERY_TIMEOUT);
 
   auto token = co_await folly::coro::co_current_cancellation_token;
-  // Must stay ahead of subscribe(). A joining FETCH held for this SUBSCRIBE is
-  // parked on its dependency's future, so it resumes through the executor,
-  // behind this handler, not inline: the publisher enters subscribe() before
-  // fetch() even when the FETCH was read first.
+  // Must run before subscribe(). The handler of a FETCH held for this
+  // SUBSCRIBE is suspended on the dependency's future, so it resumes through
+  // the executor after subscribe() is entered.
   resolveJoiningDependencies(requestID, trackPublisher->fullTrackName());
   auto subscribeResult = co_await co_awaitTry(publishHandler_->subscribe(
       std::move(sub), std::static_pointer_cast<TrackConsumer>(trackPublisher)));
@@ -7007,6 +7126,7 @@ folly::coro::Task<void> MoQSession::handleFetch(
     if (!sendTrackProperties) {
       fetchOkMsg.extensions = Extensions{};
     }
+    fetchPublisher->beginFetchStat(publisherStatsCallback_);
     fetchOk(fetchOkMsg, *replyContext);
     fetchPublisher->setFetchHandle(std::move(fetchHandle));
   }
@@ -7064,6 +7184,7 @@ void MoQSession::onFetchOk(FetchOk fetchOk) {
                << " sess=" << this;
     return;
   }
+  trackReceiveState->beginFetchStat(subscriberStatsCallback_);
   // After FETCH_OK the fetch data streams drive completion; a subsequent
   // FIN/RST on the bidi is informational and must not synthesize an error.
   const auto& control = trackReceiveState->bidiControl();
@@ -8667,8 +8788,7 @@ void MoQSession::fetchOk(const FetchOk& fetchOk, ReplyContext& replyContext) {
   if (logger_) {
     logger_->logFetchOk(fetchOk);
   }
-  // Bidi stream stays open after FETCH_OK so the subscriber can send
-  // REQUEST_UPDATE or signal cancellation via FIN/RST/STOP_SENDING.
+  // The request stream closes later; see maybeCloseRequestStream.
   replyContext.flush();
 }
 

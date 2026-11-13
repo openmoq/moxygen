@@ -557,6 +557,8 @@ class MoQSession : public Subscriber,
 
     virtual void onStreamCreated() {}
 
+    virtual void onRequestStreamFin() {}
+
     // A fill reports failure by opening and resetting its stream.
     virtual bool isFill() const {
       return false;
@@ -565,7 +567,10 @@ class MoQSession : public Subscriber,
     // Advance the tracked largest published object as objects are written.
     virtual void updateLargest(const AbsoluteLocation& /*location*/) {}
 
-    virtual void onStreamComplete(const ObjectHeader& finalHeader) = 0;
+    // resetError is set when the stream ended by a reset rather than a FIN.
+    virtual void onStreamComplete(
+        const ObjectHeader& finalHeader,
+        std::optional<ResetStreamErrorCode> resetError) = 0;
 
     // While this is true the publisher must stay in MoQSession::pubTracks_:
     // its data streams still route buffer accounting, stats and stream-close
@@ -1102,7 +1107,7 @@ class MoQSession : public Subscriber,
   void beginSubscriptionStat(PublisherImpl& pubTrack);
   void endSubscriptionStat(PublisherImpl& pubTrack);
 
-  // A joining FETCH waiting for the subscription it references.
+  // A joining FETCH held for the SUBSCRIBE it references.
   struct JoiningDependency;
   class JoiningDependencyTimeout;
   using JoiningDependencyResult = folly::Expected<FullTrackName, FetchError>;

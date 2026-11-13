@@ -11,12 +11,14 @@
 #include <folly/logging/xlog.h>
 #include <folly/portability/GFlags.h>
 #include <signal.h>
+#include <moxygen/MoQVersions.h>
 #include <moxygen/ObjectReceiver.h>
 #include <moxygen/mlog/FileMLogger.h>
 #include <moxygen/mlog/MLogger.h>
 #include <moxygen/relay/MoQRelayClient.h>
 #include <moxygen/samples/util/Utils.h>
 #include <moxygen/util/InsecureVerifierDangerousDoNotUseInProduction.h>
+#include <algorithm>
 #include <iostream>
 
 DEFINE_string(connect_url, "", "URL for webtransport server");
@@ -57,6 +59,11 @@ DEFINE_string(
     versions,
     "",
     "Comma-separated MoQ draft versions (e.g. \"16,18\"). Empty = all supported.");
+DEFINE_string(
+    auth_token,
+    "",
+    "If non-empty, sent as the AUTHORIZATION_TOKEN parameter (type 0, not "
+    "registered as an alias) of the subscribe or fetch");
 DEFINE_uint64(
     delivery_timeout,
     0,
@@ -81,6 +88,20 @@ DEFINE_bool(
 
 namespace {
 using namespace moxygen;
+
+// Draft 18's Meta ALPN ahead of moqt-18, so the client reaches servers built
+// with either name.
+std::vector<std::string> clientAlpns() {
+  auto alpns = getMoqtProtocols(FLAGS_versions, /*useStandard=*/true);
+  auto standard18 = std::find(
+      alpns.begin(),
+      alpns.end(),
+      getAlpnFromVersion(kVersionDraft18, /*useStandard=*/true).value());
+  if (standard18 != alpns.end()) {
+    alpns.insert(standard18, std::string(kAlpnMoqtDraft18Latest));
+  }
+  return alpns;
+}
 
 LocationFilter flags2filter() {
   std::string soStr(FLAGS_so);
@@ -121,6 +142,15 @@ void addRendezvousTimeoutParamIfSupported(
       folly::to_underlying(TrackRequestParamKey::RENDEZVOUS_TIMEOUT),
       FLAGS_rendezvous_timeout));
   XCHECK(insertResult.hasValue());
+}
+
+std::vector<Parameter> authTokenParams() {
+  if (FLAGS_auth_token.empty()) {
+    return {};
+  }
+  return {Parameter(
+      folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
+      AuthToken{0, FLAGS_auth_token, AuthToken::DontRegister})};
 }
 
 class TextHandler : public ObjectReceiverCallback {
@@ -248,7 +278,7 @@ class MoQTextClient : public Subscriber,
     auto g =
         folly::makeGuard([func = __func__] { XLOG(INFO) << "exit " << func; });
     try {
-      auto alpns = getMoqtProtocols(FLAGS_versions, true);
+      auto alpns = clientAlpns();
       co_await moqClient_.setup(
           /*publisher=*/nullptr,
           /*subscriber=*/shared_from_this(),
@@ -350,7 +380,8 @@ class MoQTextClient : public Subscriber,
                 subStart.value_or(kLocationMin),
                 fetchEnd,
                 sub.priority,
-                sub.groupOrder.value_or(GroupOrder::OldestFirst)),
+                sub.groupOrder.value_or(GroupOrder::OldestFirst),
+                authTokenParams()),
             fetchTextReceiver_);
         if (fetchTrack.hasError()) {
           XLOG(ERR) << "Fetch failed err="
@@ -488,7 +519,7 @@ int main(int argc, char* argv[]) {
   });
 
   auto subFilter = flags2filter();
-  std::vector<Parameter> params{};
+  auto params = authTokenParams();
   if (FLAGS_delivery_timeout > 0) {
     params.emplace_back(
         folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
