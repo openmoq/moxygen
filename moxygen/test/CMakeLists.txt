@@ -120,6 +120,15 @@ moxygen_add_test(TARGET MoQSessionTests
     testmain
 )
 
+moxygen_add_test(TARGET OpenMOQServerTests
+  PREFIX "OpenMOQServer"
+  SOURCES
+    OpenMOQServerTests.cpp
+  DEPENDS
+    moxygen_moq_server
+    moxygen_moq_webtransport_client
+)
+
 moxygen_add_test(TARGET MoQDeliveryTimerTests
   PREFIX "MoQDeliveryTimer"
   SOURCES

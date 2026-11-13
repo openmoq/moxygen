@@ -227,6 +227,10 @@ class MoQSession : public Subscriber,
     return id_;
   }
 
+  // Unique within the process, so a forwarder subscriber that is not a session
+  // can use one as its key.
+  static SessionId makeSessionId();
+
   void setServerMaxTokenCacheSizeGuess(size_t size);
 
   class ServerSetupCallback {
@@ -306,12 +310,15 @@ class MoQSession : public Subscriber,
   const std::optional<SetupParameters>& getLocalSetupParams() const {
     return localSetupParams_;
   }
-  const std::optional<SetupParameters>& getPeerSetupParams() const {
+  // This and getMessageParameterExtensions are virtual so a mock session can
+  // report a peer without a SETUP exchange.
+  virtual const std::optional<SetupParameters>& getPeerSetupParams() const {
     return peerSetupParams_;
   }
   // The message parameters negotiated for this session; empty until both
   // SETUPs are known.
-  const MessageParameterExtensions& getMessageParameterExtensions() const {
+  virtual const MessageParameterExtensions& getMessageParameterExtensions()
+      const {
     return *messageParameterExtensions_;
   }
   // Accessor used by PublisherImpl and others
@@ -1026,8 +1033,6 @@ class MoQSession : public Subscriber,
   static const folly::RequestToken& sessionRequestToken();
 
   void handleDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept;
-
-  static SessionId makeSessionId();
 
   const SessionId id_{makeSessionId()};
 
