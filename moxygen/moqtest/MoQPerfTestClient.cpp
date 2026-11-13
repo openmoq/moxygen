@@ -28,6 +28,14 @@ DEFINE_int32(
     1000,
     "transaction timeout in seconds for perf test.  For WebTransport this is "
     "the idle timeout on the CONNECT stream");
+DEFINE_uint64(
+    stream_window,
+    4 * 1024 * 1024,
+    "Per-stream flow control window in bytes; 0 keeps the mvfst default");
+DEFINE_uint64(
+    conn_window,
+    16 * 1024 * 1024,
+    "Connection flow control window in bytes; 0 keeps the mvfst default");
 
 // Constants for moq-test scheme parameters
 constexpr uint64_t kStartGroup = 0;
@@ -93,6 +101,17 @@ folly::coro::Task<void> SubscriberState::connect() {
           ts.rxPacketsBeforeAckAfterInit = 2;
           ts.shouldUseRecvmmsgForBatchRecv = true;
           ts.maxRecvBatchSize = 32;
+          if (FLAGS_stream_window > 0) {
+            ts.advertisedInitialBidiLocalStreamFlowControlWindow =
+                FLAGS_stream_window;
+            ts.advertisedInitialBidiRemoteStreamFlowControlWindow =
+                FLAGS_stream_window;
+            ts.advertisedInitialUniStreamFlowControlWindow =
+                FLAGS_stream_window;
+          }
+          if (FLAGS_conn_window > 0) {
+            ts.advertisedInitialConnectionFlowControlWindow = FLAGS_conn_window;
+          }
           return ts;
         }(),
         getMoqtProtocols(FLAGS_versions, true));
