@@ -103,6 +103,25 @@ class TestShardedServer : public MoQPicoQuicShardedServer {
   std::atomic<folly::Executor*> sessionExecutor{nullptr};
 };
 
+// Rejects every SETUP and keeps a weak reference to the rejected session.
+class RejectingShardedServer : public TestShardedServer {
+ public:
+  using TestShardedServer::TestShardedServer;
+
+  folly::Expected<folly::Unit, SessionCloseErrorCode> validateAuthority(
+      const Setup&,
+      uint64_t,
+      std::shared_ptr<MoQSession> session) override {
+    serverSession = session;
+    rejected.post();
+    return folly::makeUnexpected(SessionCloseErrorCode::INVALID_AUTHORITY);
+  }
+
+  // Waiting on rejected publishes serverSession to the test thread.
+  std::weak_ptr<MoQSession> serverSession;
+  folly::Baton<> rejected;
+};
+
 class NoopReceiverCallback : public ObjectReceiverCallback {
  public:
   FlowControlState
@@ -344,6 +363,51 @@ TEST(MoQPicoQuicShardedServerTest, WebTransportConnectCreatesSession) {
   keepAlive.reset();
   clientThread.join();
   server->stop();
+}
+
+// A raw QUIC session the server rejects at SETUP must be freed once its
+// connection is gone, at the latest when the server is destroyed.
+TEST(MoQPicoQuicShardedServerTest, RejectedQuicSessionIsFreed) {
+  auto certs = makeSelfSignedCert();
+  folly::ScopedEventBaseThread clientThread("client");
+  auto* clientEvb = clientThread.getEventBase();
+
+  auto server = std::make_shared<RejectingShardedServer>(
+      certs->cert, certs->key, kEndpoint);
+  server->start(folly::SocketAddress("::", 0));
+  const auto port = server->getAddress().getPort();
+
+  const quic::TransportSettings transportSettings;
+  const auto alpns = getMoqtProtocols("16", /*useStandard=*/true);
+  std::unique_ptr<MoQClient> client;
+  folly::SemiFuture<folly::Unit> setup = folly::makeSemiFuture();
+  clientEvb->runInEventBaseThreadAndWait([&] {
+    client = std::make_unique<MoQClient>(
+        std::make_shared<MoQFollyExecutorImpl>(clientEvb),
+        proxygen::URL(fmt::format("moqt://localhost:{}{}", port, kEndpoint)),
+        std::make_shared<InsecureVerifierDangerousDoNotUseInProduction>());
+    setup = folly::coro::co_withExecutor(
+                clientEvb,
+                folly::coro::timeout(
+                    client->setupMoQSession(
+                        std::chrono::seconds(10),
+                        std::chrono::seconds(3),
+                        nullptr,
+                        nullptr,
+                        transportSettings,
+                        alpns),
+                    std::chrono::seconds(15)))
+                .start();
+  });
+  std::move(setup).getTry();
+  clientEvb->runInEventBaseThreadAndWait([&] { client.reset(); });
+  server->stop();
+  EXPECT_TRUE(server->rejected.try_wait());
+
+  auto serverSession = server->serverSession;
+  server.reset();
+  EXPECT_TRUE(serverSession.expired())
+      << "the rejected session outlived its server";
 }
 
 } // namespace moxygen::test
