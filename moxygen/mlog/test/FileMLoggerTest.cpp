@@ -33,6 +33,8 @@ namespace fs = std::filesystem;
 namespace moxygen {
 namespace {
 
+constexpr uint64_t kTestControlStreamId = 2;
+
 enum class ObjectEvent {
   DATAGRAM_CREATED,
   DATAGRAM_PARSED,
@@ -47,72 +49,64 @@ struct ObjectEventCase {
   const char* name;
   const char* payloadField;
   bool datagram;
-  bool retainsBackingStorage;
 };
 
 constexpr std::array<ObjectEventCase, 6> kObjectEvents{{
     {ObjectEvent::DATAGRAM_CREATED,
      "moqt:object_datagram_created",
      "object_payload",
-     true,
      true},
     {ObjectEvent::DATAGRAM_PARSED,
      "moqt:object_datagram_parsed",
      "object_payload",
-     true,
-     false},
+     true},
     {ObjectEvent::SUBGROUP_CREATED,
      "moqt:subgroup_object_created",
      "object_payload",
-     false,
-     true},
+     false},
     {ObjectEvent::SUBGROUP_PARSED,
      "moqt:subgroup_object_parsed",
      "object_payload",
-     false,
-     true},
+     false},
     {ObjectEvent::FETCH_CREATED,
      "moqt:fetch_object_created",
      "object_payload",
-     false,
-     true},
+     false},
     {ObjectEvent::FETCH_PARSED,
      "moqt:fetch_object_parsed",
      "object_payload",
-     false,
-     true},
+     false},
 }};
 
-Payload makePayload(std::string_view head, std::string_view tail = {}) {
-  auto payload = folly::IOBuf::copyBuffer(head.data(), head.size());
-  if (!tail.empty()) {
-    payload->appendChain(folly::IOBuf::copyBuffer(tail.data(), tail.size()));
-  }
-  return payload;
-}
-
-void logObjectEvent(MLogger& logger, ObjectEvent event, Payload payload) {
+// Logs one object whose header declares a payload of `length` bytes.
+void logObjectEvent(
+    MLogger& logger,
+    ObjectEvent event,
+    std::optional<uint64_t> length) {
+  using Direction = MoQFrameObserver::Direction;
   ObjectHeader header(7, 8, 9, 10);
+  header.length = length;
+  const MoQFrameObserver::DataStream stream{17};
   switch (event) {
     case ObjectEvent::DATAGRAM_CREATED:
-      logger.logObjectDatagramCreated(TrackAlias(11), header, payload);
+      logger.onDatagramObject(Direction::Sent, TrackAlias(11), header, false);
       return;
     case ObjectEvent::DATAGRAM_PARSED:
-      logger.logObjectDatagramParsed(TrackAlias(11), header, payload);
+      logger.onDatagramObject(
+          Direction::Received, TrackAlias(11), header, false);
       return;
     case ObjectEvent::SUBGROUP_CREATED:
-      logger.logSubgroupObjectCreated(
-          17, TrackAlias(11), header, std::move(payload));
+      logger.onSubgroupObject(Direction::Sent, stream, TrackAlias(11), header);
       return;
     case ObjectEvent::SUBGROUP_PARSED:
-      logger.logSubgroupObjectParsed(
-          17, TrackAlias(11), header, std::move(payload));
+      logger.onSubgroupObject(
+          Direction::Received, stream, TrackAlias(11), header);
       return;
     case ObjectEvent::FETCH_CREATED:
-      logger.logFetchObjectCreated(17, header, std::move(payload));
+      logger.onFetchObject(Direction::Sent, stream, header);
       return;
     case ObjectEvent::FETCH_PARSED:
-      logger.logFetchObjectParsed(17, header, std::move(payload));
+      logger.onFetchObject(Direction::Received, stream, header);
       return;
   }
 }
@@ -179,27 +173,6 @@ const folly::dynamic* payloadLength(
   }
   const auto* payload = data.get_ptr(testCase.payloadField);
   return payload ? payload->get_ptr("length") : nullptr;
-}
-
-struct ReleaseCounter {
-  size_t count{0};
-};
-
-void releaseOwnedBuffer(void* buffer, void* userData) {
-  ++static_cast<ReleaseCounter*>(userData)->count;
-  delete[] static_cast<uint8_t*>(buffer);
-}
-
-Payload makeOwnedPayload(ReleaseCounter& counter) {
-  auto makeSegment = [&counter](std::string_view contents) {
-    auto* data = new uint8_t[contents.size()];
-    std::memcpy(data, contents.data(), contents.size());
-    return folly::IOBuf::takeOwnership(
-        data, contents.size(), contents.size(), releaseOwnedBuffer, &counter);
-  };
-  auto payload = makeSegment("owned-head");
-  payload->appendChain(makeSegment("owned-tail"));
-  return payload;
 }
 
 void appendViolation(
@@ -288,7 +261,7 @@ TEST_F(FileMLoggerTest, EmptyLogIsAJsonDocument) {
 TEST_F(FileMLoggerTest, QlogSchemaMetadata) {
   const auto path = (dir_ / "metadata.mlog").string();
   FileMLogger logger(VantagePoint::SERVER, path);
-  logger.logPaddingDatagramCreated(17);
+  logger.onPaddingDatagram(MoQFrameObserver::Direction::Sent, 17);
   logger.outputLogs();
 
   const auto serialized = readLogFile(path);
@@ -325,8 +298,8 @@ TEST_F(FileMLoggerTest, VantagePointIsTraceMetadata) {
     SCOPED_TRACE(type);
     const auto path = (dir_ / (std::string(type) + ".mlog")).string();
     FileMLogger logger(vantagePoint, path);
-    logger.logPaddingDatagramCreated(17);
-    logger.logPaddingDatagramParsed(19);
+    logger.onPaddingDatagram(MoQFrameObserver::Direction::Sent, 17);
+    logger.onPaddingDatagram(MoQFrameObserver::Direction::Received, 19);
     logger.outputLogs();
 
     const auto document = parseLogFile(path);
@@ -344,12 +317,8 @@ TEST_F(FileMLoggerTest, VantagePointIsTraceMetadata) {
 TEST_F(FileMLoggerTest, LegacyUnsubscribeUsesLowercaseJsonKeys) {
   const auto path = (dir_ / "unsubscribe.mlog").string();
   FileMLogger logger(VantagePoint::CLIENT, path);
-  MOQTControlMessageCreated created;
-  created.streamId = 17;
-  auto unsubscribe = std::make_unique<MOQTUnsubscribe>();
-  unsubscribe->subscribeId = 23;
-  created.message = std::move(unsubscribe);
-  logger.addControlMessageCreatedLog(std::move(created));
+  logger.onUnsubscribe(
+      MoQFrameObserver::Direction::Sent, 17, Unsubscribe{RequestID(23)});
   logger.outputLogs();
 
   const auto document = parseLogFile(path);
@@ -361,8 +330,8 @@ TEST_F(FileMLoggerTest, LegacyUnsubscribeUsesLowercaseJsonKeys) {
 TEST_F(FileMLoggerTest, MultipleEventsAreAJsonDocument) {
   const auto path = (dir_ / "multiple.mlog").string();
   FileMLogger logger(VantagePoint::SERVER, path);
-  logger.logPaddingDatagramCreated(17);
-  logger.logPaddingDatagramParsed(19);
+  logger.onPaddingDatagram(MoQFrameObserver::Direction::Sent, 17);
+  logger.onPaddingDatagram(MoQFrameObserver::Direction::Received, 19);
   logger.outputLogs();
 
   const auto document = parseLogFile(path);
@@ -382,7 +351,7 @@ TEST_F(FileMLoggerTest, MultipleEventsAreAJsonDocument) {
 TEST_F(FileMLoggerTest, EventTimeIsNumericMilliseconds) {
   const auto path = (dir_ / "time.mlog").string();
   InspectableFileMLogger logger(VantagePoint::SERVER, path);
-  logger.logPaddingDatagramCreated(17);
+  logger.onPaddingDatagram(MoQFrameObserver::Direction::Sent, 17);
   logger.setEventTime(
       0,
       std::chrono::duration_cast<std::chrono::system_clock::duration>(
@@ -397,11 +366,11 @@ TEST_F(FileMLoggerTest, EventTimeIsNumericMilliseconds) {
 TEST_F(FileMLoggerTest, OutputLogsWritesTheLatestSnapshot) {
   const auto path = (dir_ / "snapshot.mlog").string();
   FileMLogger logger(VantagePoint::SERVER, path);
-  logger.logPaddingDatagramCreated(17);
+  logger.onPaddingDatagram(MoQFrameObserver::Direction::Sent, 17);
   logger.outputLogs();
   ASSERT_EQ(parseLogFile(path)["traces"][0]["events"].size(), 1);
 
-  logger.logPaddingDatagramParsed(19);
+  logger.onPaddingDatagram(MoQFrameObserver::Direction::Received, 19);
   logger.outputLogs();
   const auto events = parseLogFile(path)["traces"][0]["events"];
   std::vector<int64_t> observed;
@@ -522,15 +491,16 @@ TEST_F(FileMLoggerTest, DerivePath_PathModeIgnoresDcid) {
   EXPECT_FALSE(fs::exists(dir_ / "dcid_derived.mlog"));
 }
 
-TEST_F(FileMLoggerTest, ObjectBodiesAbsentFromFileOutput) {
+// The logger is not given object bodies. It exports the declared length.
+TEST_F(FileMLoggerTest, ObjectEventsExportOnlyPayloadLength) {
+  constexpr uint64_t kLength = 22;
   std::string violations;
   for (size_t i = 0; i < kObjectEvents.size(); ++i) {
     const auto& testCase = kObjectEvents[i];
     SCOPED_TRACE(testCase.name);
-    const auto canary = "file-object-body-" + std::to_string(i);
     const auto path = (dir_ / (std::to_string(i) + ".mlog")).string();
     FileMLogger logger(VantagePoint::SERVER, path);
-    logObjectEvent(logger, testCase.event, makePayload(canary));
+    logObjectEvent(logger, testCase.event, kLength);
     logger.outputLogs();
 
     const auto event = parseSingleEvent(path);
@@ -539,41 +509,17 @@ TEST_F(FileMLoggerTest, ObjectBodiesAbsentFromFileOutput) {
     if (payloadBytesExported(data, testCase)) {
       appendViolation(violations, testCase, "payload field exported");
     }
-    if (folly::toJson(event).find(canary) != std::string::npos) {
-      appendViolation(violations, testCase, "canary exported");
-    }
-  }
-  EXPECT_TRUE(violations.empty()) << violations;
-}
-
-TEST_F(FileMLoggerTest, ObjectPayloadLengthUsesEntireSuppliedChain) {
-  constexpr std::string_view kHead = "length-head";
-  constexpr std::string_view kTail = "length-tail";
-  constexpr auto kExpectedLength = kHead.size() + kTail.size();
-  std::string violations;
-  for (size_t i = 0; i < kObjectEvents.size(); ++i) {
-    const auto& testCase = kObjectEvents[i];
-    SCOPED_TRACE(testCase.name);
-    const auto path =
-        (dir_ / ("length-" + std::to_string(i) + ".mlog")).string();
-    FileMLogger logger(VantagePoint::SERVER, path);
-    logObjectEvent(logger, testCase.event, makePayload(kHead, kTail));
-    logger.outputLogs();
-
-    const auto event = parseSingleEvent(path);
-    expectEventControls(event, testCase);
-    const auto& data = event["data"];
     const auto* length = payloadLength(data, testCase);
     if (!length) {
       appendViolation(violations, testCase, "payload length missing");
-    } else if (length->asInt() != kExpectedLength) {
+    } else if (length->asInt() != kLength) {
       appendViolation(violations, testCase, "payload length mismatch");
     }
   }
   EXPECT_TRUE(violations.empty()) << violations;
 }
 
-TEST_F(FileMLoggerTest, ObjectsWithoutAPayloadLogZeroLength) {
+TEST_F(FileMLoggerTest, ObjectsWithoutALengthLogZeroLength) {
   std::string violations;
   for (size_t i = 0; i < kObjectEvents.size(); ++i) {
     const auto& testCase = kObjectEvents[i];
@@ -584,7 +530,7 @@ TEST_F(FileMLoggerTest, ObjectsWithoutAPayloadLogZeroLength) {
     const auto path =
         (dir_ / ("empty-" + std::to_string(i) + ".mlog")).string();
     FileMLogger logger(VantagePoint::SERVER, path);
-    logObjectEvent(logger, testCase.event, nullptr);
+    logObjectEvent(logger, testCase.event, std::nullopt);
     logger.outputLogs();
 
     const auto event = parseSingleEvent(path);
@@ -592,31 +538,6 @@ TEST_F(FileMLoggerTest, ObjectsWithoutAPayloadLogZeroLength) {
     const auto* length = payloadLength(event["data"], testCase);
     if (!length || length->asInt() != 0) {
       appendViolation(violations, testCase, "payload length not zero");
-    }
-  }
-  EXPECT_TRUE(violations.empty()) << violations;
-}
-
-TEST_F(FileMLoggerTest, LoggerDoesNotRetainObjectBackingStorage) {
-  std::string violations;
-  for (size_t i = 0; i < kObjectEvents.size(); ++i) {
-    const auto& testCase = kObjectEvents[i];
-    if (!testCase.retainsBackingStorage) {
-      continue;
-    }
-    SCOPED_TRACE(testCase.name);
-    ReleaseCounter counter;
-    {
-      FileMLogger logger(
-          VantagePoint::SERVER,
-          (dir_ / ("retention-" + std::to_string(i) + ".mlog")).string());
-      logObjectEvent(logger, testCase.event, makeOwnedPayload(counter));
-      if (counter.count != 2) {
-        appendViolation(violations, testCase, "backing storage retained");
-      }
-    }
-    if (counter.count != 2) {
-      appendViolation(violations, testCase, "teardown did not release storage");
     }
   }
   EXPECT_TRUE(violations.empty()) << violations;
@@ -630,7 +551,10 @@ TEST_F(FileMLoggerTest, PublishNamespaceDoneByRequestId) {
   PublishNamespaceDone done;
   done.requestID = RequestID(7);
   logger.logPublishNamespaceDone(
-      done, MOQTByteStringType::STRING_VALUE, ControlMessageType::PARSED);
+      kTestControlStreamId,
+      done,
+      MOQTByteStringType::STRING_VALUE,
+      ControlMessageType::PARSED);
   logger.outputLogs();
 
   const auto event = parseSingleEvent(path);
@@ -646,7 +570,10 @@ TEST_F(FileMLoggerTest, PublishNamespaceCancelByRequestId) {
   cancel.requestID = RequestID(9);
   cancel.errorCode = RequestErrorCode::INTERNAL_ERROR;
   logger.logPublishNamespaceCancel(
-      cancel, MOQTByteStringType::STRING_VALUE, ControlMessageType::PARSED);
+      kTestControlStreamId,
+      cancel,
+      MOQTByteStringType::STRING_VALUE,
+      ControlMessageType::PARSED);
   logger.outputLogs();
 
   const auto event = parseSingleEvent(path);
@@ -684,7 +611,7 @@ TEST(MLogTypesTest, LatestTransportEventFieldNames) {
   EXPECT_EQ(stream["stream_type"], "padding");
   EXPECT_EQ(stream.count("streamId"), 0);
 
-  MOQTSubgroupHeaderCreated header;
+  MOQTSubgroupHeader header;
   header.streamId = 11;
   header.trackAlias = 12;
   header.groupId = 13;
@@ -698,7 +625,7 @@ TEST(MLogTypesTest, LatestTransportEventFieldNames) {
   EXPECT_EQ(subgroup["first_object"], true);
   EXPECT_EQ(subgroup.count("extensions_present"), 0);
 
-  MOQTFetchObjectCreated fetchObject;
+  MOQTFetchObject fetchObject;
   fetchObject.streamId = 21;
   fetchObject.endOfTimedOutRange = true;
   fetchObject.objectPayloadLength = 34;
@@ -710,64 +637,66 @@ TEST(MLogTypesTest, LatestTransportEventFieldNames) {
   EXPECT_EQ(fetch["object_payload_length"], 34);
   EXPECT_EQ(fetch.count("objectStatus"), 0);
 
-  EXPECT_EQ(MOQTPaddingDatagramParsed{55}.toDynamic()["padding_length"], 55);
+  EXPECT_EQ(MOQTPaddingDatagram{55}.toDynamic()["padding_length"], 55);
+}
+
+TEST(MLogTypesTest, PaddingDatagramLoggedInBothDirections) {
+  using Direction = MoQFrameObserver::Direction;
+  InspectableMLogger logger;
+  logger.onPaddingDatagram(Direction::Sent, 5);
+  logger.onPaddingDatagram(Direction::Received, 7);
+  EXPECT_EQ(logger.event(0)["name"], "moqt:padding_datagram_created");
+  EXPECT_EQ(logger.event(0)["data"]["padding_length"], 5);
+  EXPECT_EQ(logger.event(1)["name"], "moqt:padding_datagram_parsed");
+  EXPECT_EQ(logger.event(1)["data"]["padding_length"], 7);
 }
 
 TEST(MLogTypesTest, FetchGroupDeltaFollowsObservedDirection) {
+  using Direction = MoQFrameObserver::Direction;
+  const MoQFrameObserver::DataStream stream{17};
   ObjectHeader first(10, 1, 4, 12);
   ObjectHeader second(7, 1, 5, 12);
-
-  InspectableMLogger created;
-  created.logFetchHeaderCreated(17, 19);
-  created.logFetchObjectCreated(17, first, nullptr);
-  created.logFetchObjectCreated(17, second, nullptr);
-  EXPECT_EQ(created.event(1)["data"]["group_id_delta"], 10);
-  EXPECT_EQ(created.event(2)["data"]["group_id_delta"], 2);
-
-  InspectableMLogger parsed;
-  parsed.logFetchHeaderParsed(17, 19);
-  parsed.logFetchObjectParsed(17, first, nullptr);
-  parsed.logFetchObjectParsed(17, second, nullptr);
-  EXPECT_EQ(parsed.event(1)["data"]["group_id_delta"], 10);
-  EXPECT_EQ(parsed.event(2)["data"]["group_id_delta"], 2);
+  for (auto dir : {Direction::Sent, Direction::Received}) {
+    InspectableMLogger logger;
+    logger.onFetchHeader(dir, stream, 19);
+    logger.onFetchObject(dir, stream, first);
+    logger.onFetchObject(dir, stream, second);
+    // Event 0 is the stream type and event 1 is the FETCH header.
+    EXPECT_EQ(logger.event(2)["data"]["group_id_delta"], 10);
+    EXPECT_EQ(logger.event(3)["data"]["group_id_delta"], 2);
+  }
 }
 
 TEST(MLogTypesTest, FetchRangeEndLoggerApis) {
-  static constexpr std::array<MOQTFetchRangeEndType, 3> kRangeEndTypes = {
-      MOQTFetchRangeEndType::NONEXISTENT,
-      MOQTFetchRangeEndType::UNKNOWN,
-      MOQTFetchRangeEndType::TIMED_OUT};
-  for (size_t i = 0; i < kRangeEndTypes.size(); ++i) {
-    const auto type = kRangeEndTypes[i];
-    const auto streamId = 40 + i;
-    const auto endGroup = 50 + i;
-    const auto endObject = 60 + i;
-    auto verify = [&](const folly::dynamic& event) {
-      const auto& data = event["data"];
+  using Direction = MoQFrameObserver::Direction;
+  const MoQFrameObserver::DataStream stream{40};
+  const uint64_t endGroup = 50;
+  const uint64_t endObject = 60;
+  for (auto rangeEnd :
+       {FetchRangeEnd::NonExistent,
+        FetchRangeEnd::Unknown,
+        FetchRangeEnd::TimedOut}) {
+    for (auto dir : {Direction::Sent, Direction::Received}) {
+      InspectableMLogger logger;
+      logger.onFetchEndOfRange(dir, stream, endGroup, endObject, rangeEnd);
+      const auto data = logger.event(0)["data"];
       EXPECT_EQ(data["group_id_delta"], endGroup);
       EXPECT_EQ(data["object_id_delta"], endObject);
       EXPECT_EQ(data["object_payload_length"], 0);
       EXPECT_EQ(
           data["end_of_nonexistent_range"],
-          type == MOQTFetchRangeEndType::NONEXISTENT);
+          rangeEnd == FetchRangeEnd::NonExistent);
       EXPECT_EQ(
-          data["end_of_unknown_range"], type == MOQTFetchRangeEndType::UNKNOWN);
+          data["end_of_unknown_range"], rangeEnd == FetchRangeEnd::Unknown);
       EXPECT_EQ(
-          data["end_of_timed_out_range"],
-          type == MOQTFetchRangeEndType::TIMED_OUT);
-    };
-
-    InspectableMLogger created;
-    created.logFetchObjectCreated(streamId, endGroup, endObject, type);
-    verify(created.event(0));
-    created.logFetchObjectCreated(
-        streamId, ObjectHeader(endGroup, 0, endObject + 1), nullptr);
-    EXPECT_EQ(created.event(1)["data"].count("group_id_delta"), 0);
-    EXPECT_EQ(created.event(1)["data"].count("object_id_delta"), 0);
-
-    InspectableMLogger parsed;
-    parsed.logFetchObjectParsed(streamId, endGroup, endObject, type);
-    verify(parsed.event(0));
+          data["end_of_timed_out_range"], rangeEnd == FetchRangeEnd::TimedOut);
+      // The next object follows the range end, so it needs no deltas.
+      logger.onFetchObject(
+          dir, stream, ObjectHeader(endGroup, 0, endObject + 1));
+      const auto next = logger.event(1)["data"];
+      EXPECT_EQ(next.count("group_id_delta"), 0);
+      EXPECT_EQ(next.count("object_id_delta"), 0);
+    }
   }
 }
 
@@ -779,7 +708,8 @@ TEST_F(FileMLoggerTest, LatestSetupAndFillParameterSchemas) {
                   .insertParam(Parameter(
                       folly::to_underlying(SetupKey::PATH), "/meeting"))
                   .hasValue());
-  setupLogger.logClientSetup(setup, 20, ControlMessageType::CREATED);
+  setupLogger.logClientSetup(
+      kTestControlStreamId, setup, ControlMessageType::CREATED);
   setupLogger.outputLogs();
 
   const auto setupEvent = parseSingleEvent(setupPath);
@@ -812,7 +742,7 @@ TEST_F(FileMLoggerTest, LatestSetupAndFillParameterSchemas) {
                           TrackRequestParamKey::OBJECT_DELIVERY_TIMEOUT),
                       14))
                   .hasValue());
-  subscribeLogger.logSubscribe(subscribe);
+  subscribeLogger.logSubscribe(kTestControlStreamId, subscribe);
   subscribeLogger.outputLogs();
 
   const auto subscribeEvent = parseSingleEvent(subscribePath);
@@ -853,7 +783,7 @@ TEST_F(FileMLoggerTest, LatestRangeFilterParameterSchema) {
       std::string(
           "\x07\x02\x03\x02\x05\x05",
           6)); // set 7, property 2, ranges 3-5 and 10-15
-  logger.logRequestOk(ok);
+  logger.logRequestOk(kTestControlStreamId, ok);
   logger.outputLogs();
 
   const auto event = parseSingleEvent(path);
@@ -881,7 +811,7 @@ TEST_F(FileMLoggerTest, LatestFillParametersPreserveRangeFilters) {
       Parameter(0x27, std::string()),
       Parameter(0x28, std::string("\x04\x02\x05\x03", 4)),
   };
-  logger.logSubscribe(subscribe, fillRangeFilters);
+  logger.logSubscribe(kTestControlStreamId, subscribe, fillRangeFilters);
   logger.outputLogs();
 
   const auto event = parseSingleEvent(path);
@@ -914,7 +844,9 @@ TEST_F(FileMLoggerTest, LatestFillParametersPreserveRangeFilters) {
   InspectableMLogger updateLogger;
   SubscribeUpdate update;
   updateLogger.logSubscribeUpdate(
-      update, {Parameter(0x26, std::string("\x05\x0b", 2))});
+      kTestControlStreamId,
+      update,
+      {Parameter(0x26, std::string("\x05\x0b", 2))});
   const auto updateEvent = updateLogger.event(0);
   EXPECT_EQ(
       updateEvent["data"]["message"]["parameters"][0]["name"],
@@ -932,7 +864,8 @@ TEST_F(FileMLoggerTest, LatestResponseAndNamespaceControlMessages) {
   error.redirect = Redirect{
       "https://new.example/moq",
       FullTrackName{TrackNamespace({"replacement"}), "video"}};
-  errorLogger.logSubscribeError(error, ControlMessageType::PARSED);
+  errorLogger.logSubscribeError(
+      kTestControlStreamId, error, ControlMessageType::PARSED);
   errorLogger.outputLogs();
 
   const auto errorEvent = parseSingleEvent(errorPath);
@@ -951,7 +884,8 @@ TEST_F(FileMLoggerTest, LatestResponseAndNamespaceControlMessages) {
   RequestOk ok;
   ok.requestID = RequestID(19);
   ok.trackProperties.insertMutableExtension(Extension(2, 20));
-  okLogger.logPublishNamespaceOk(ok, ControlMessageType::PARSED);
+  okLogger.logPublishNamespaceOk(
+      kTestControlStreamId, ok, ControlMessageType::PARSED);
   okLogger.outputLogs();
 
   const auto okEvent = parseSingleEvent(okPath);

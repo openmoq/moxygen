@@ -82,11 +82,8 @@ class ReplyContext;
 
 class SubNSReply {
  public:
-  SubNSReply(
-      MoQFrameWriter& moqFrameWriter,
-      std::shared_ptr<ReplyContext> replyContext)
-      : moqFrameWriter_(moqFrameWriter),
-        replyContext_(std::move(replyContext)) {}
+  explicit SubNSReply(std::shared_ptr<ReplyContext> replyContext)
+      : replyContext_(std::move(replyContext)) {}
 
   virtual ~SubNSReply() = default;
 
@@ -106,7 +103,6 @@ class SubNSReply {
   }
 
  protected:
-  MoQFrameWriter& moqFrameWriter_;
   std::shared_ptr<ReplyContext> replyContext_;
 };
 
@@ -115,11 +111,8 @@ class SubNSReply {
 // share the generic REQUEST_OK / REQUEST_ERROR envelope.
 class MessageReply {
  public:
-  MessageReply(
-      MoQFrameWriter& moqFrameWriter,
-      std::shared_ptr<ReplyContext> replyContext)
-      : moqFrameWriter_(moqFrameWriter),
-        replyContext_(std::move(replyContext)) {}
+  explicit MessageReply(std::shared_ptr<ReplyContext> replyContext)
+      : replyContext_(std::move(replyContext)) {}
 
   virtual ~MessageReply() = default;
 
@@ -131,17 +124,14 @@ class MessageReply {
   }
 
  protected:
-  MoQFrameWriter& moqFrameWriter_;
   std::shared_ptr<ReplyContext> replyContext_;
 };
 
 class SubscribeTracksReply : public MessageReply,
                              public Publisher::PublishBlockedHandle {
  public:
-  SubscribeTracksReply(
-      MoQFrameWriter& moqFrameWriter,
-      std::shared_ptr<ReplyContext> replyContext)
-      : MessageReply(moqFrameWriter, std::move(replyContext)) {}
+  explicit SubscribeTracksReply(std::shared_ptr<ReplyContext> replyContext)
+      : MessageReply(std::move(replyContext)) {}
 
   ~SubscribeTracksReply() override = default;
 
@@ -338,14 +328,12 @@ class MoQSession : public Subscriber,
 
   virtual std::shared_ptr<SubNSReply> getSubNsReply(
       std::shared_ptr<ReplyContext> replyContext) {
-    return std::make_shared<SubNSReply>(
-        moqFrameWriter_, std::move(replyContext));
+    return std::make_shared<SubNSReply>(std::move(replyContext));
   }
 
   virtual std::shared_ptr<SubscribeTracksReply> getSubTracksReply(
       std::shared_ptr<ReplyContext> replyContext) {
-    return std::make_shared<SubscribeTracksReply>(
-        moqFrameWriter_, std::move(replyContext));
+    return std::make_shared<SubscribeTracksReply>(std::move(replyContext));
   }
 
   [[nodiscard]] MoQExecutor* getExecutor() const {
@@ -745,6 +733,7 @@ class MoQSession : public Subscriber,
         MoQSession* session,
         proxygen::WebTransport::StreamReadHandle* handle)
         : session_(session),
+          frameObserver_(session->logger_),
           handle_(handle),
           id_(handle->getID()),
           cancelToken_(handle->getCancelToken()) {}
@@ -752,6 +741,7 @@ class MoQSession : public Subscriber,
     // The callback captures this, so it cannot travel with the move.
     ReadHandleRef(ReadHandleRef&& other) noexcept
         : session_(other.session_),
+          frameObserver_(std::move(other.frameObserver_)),
           handle_(std::exchange(other.handle_, nullptr)),
           id_(other.id_),
           cancelToken_(std::move(other.cancelToken_)),
@@ -807,6 +797,10 @@ class MoQSession : public Subscriber,
         XLOG(DBG1) << "Sending STOP_SENDING id=" << id_ << " code=" << error
                    << " sess=" << session_;
         handle->stopSending(error);
+        if (frameObserver_) {
+          frameObserver_->onStopSending(
+              MoQFrameObserver::Direction::Sent, id_, uint64_t(error));
+        }
       }
     }
 
@@ -830,6 +824,7 @@ class MoQSession : public Subscriber,
     }
 
     void* session_{nullptr}; // opaque, only streamed as "sess="
+    std::shared_ptr<MoQFrameObserver> frameObserver_;
     proxygen::WebTransport::StreamReadHandle* handle_{nullptr};
     uint64_t id_{0};
     folly::CancellationToken cancelToken_;
@@ -917,6 +912,7 @@ class MoQSession : public Subscriber,
       SubscribeRequest sub,
       std::shared_ptr<FetchConsumer> consumer);
 
+  // Call before start(). Streams that are already open keep their old logger.
   void setLogger(const std::shared_ptr<MLogger>& logger);
   std::shared_ptr<MLogger> getLogger() const;
 
@@ -989,9 +985,15 @@ class MoQSession : public Subscriber,
   using SendRequestResult =
       folly::Expected<std::shared_ptr<BidiStreamControl>, SendRequestError>;
 
-  // Send a serialized request. In draft >= minBidiDraftVersion, opens a
-  // bidi stream and starts a read loop; otherwise appends to the control
-  // stream. Returns the control (null on the control-stream path).
+  // Writes a request frame. The writer passed in belongs to the stream that
+  // carries the request.
+  using RequestSerializer = folly::FunctionRef<
+      WriteResult(const MoQFrameWriter&, folly::IOBufQueue&)>;
+
+  // Send a request. In draft >= minBidiDraftVersion, this opens a bidi stream,
+  // serializes the request onto it, and starts a read loop. Otherwise it
+  // serializes the request onto the control stream. Returns the control, which
+  // is null on the control-stream path.
   // onPeerTermination fires on peer-initiated close after the terminal reply;
   // early close (before terminal) is handled by failPendingRequestOnEarlyClose.
   // In draft 18+ every response stream's first frame MUST be a terminal: the
@@ -999,7 +1001,7 @@ class MoQSession : public Subscriber,
   // frames the peer may send after the terminal (e.g. PUBLISH_DONE on a
   // SUBSCRIBE).
   SendRequestResult sendRequest(
-      folly::IOBufQueue& writeBuf,
+      RequestSerializer serialize,
       FrameType okType,
       std::vector<FrameType> postTerminal,
       RequestID requestID,
@@ -1007,8 +1009,7 @@ class MoQSession : public Subscriber,
       std::unique_ptr<MoQControlCodec::ControlCallback> senderCallback =
           nullptr,
       folly::Function<void(RequestID, std::optional<ResetStreamErrorCode>)>
-          onPeerTermination = nullptr,
-      folly::Function<void()> logRequestCreated = nullptr);
+          onPeerTermination = nullptr);
 
   // For a request stream opened at either end: appTeardown (may be null) runs
   // first, then every request that can only be answered on the stream fails.
@@ -1435,7 +1436,11 @@ class MoQSession : public Subscriber,
       const RequestUpdate& requestUpdate,
       const std::shared_ptr<FetchPublisherImpl>& fetchPublisher);
 
-  // Core frame writer and stats callbacks needed by MoQRelaySession
+  // A copy of moqFrameWriter_ that reports its frames on streamID.
+  MoQFrameWriter makeStreamWriter(uint64_t streamID) const;
+
+  // Core frame writer and stats callbacks needed by MoQRelaySession.
+  // moqFrameWriter_ serializes control-stream frames.
   MoQFrameWriter moqFrameWriter_;
   std::shared_ptr<MoQPublisherStatsCallback> publisherStatsCallback_{nullptr};
   std::shared_ptr<MoQSubscriberStatsCallback> subscriberStatsCallback_{nullptr};

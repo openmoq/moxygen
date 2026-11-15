@@ -12,6 +12,11 @@
 
 namespace moxygen {
 
+namespace {
+using FrameDirection = MoQFrameObserver::Direction;
+using DataStream = MoQFrameObserver::DataStream;
+} // namespace
+
 void MoQCodec::onIngressStart(std::unique_ptr<folly::IOBuf> data) {
   ingress_.append(std::move(data));
 }
@@ -186,6 +191,10 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
           parseState_ = ParseState::FETCH_HEADER;
         } else if (isPaddingStreamType(*version, type->first)) {
           parseState_ = ParseState::PADDING_STREAM;
+          if (frameObserver_) {
+            frameObserver_->onPaddingStream(
+                FrameDirection::Received, DataStream{streamId_});
+          }
         } else if (isValidSubgroupType(*version, type->first)) {
           parseState_ = ParseState::OBJECT_STREAM;
           subgroupOptions_ = getSubgroupOptions(*version, streamType_);
@@ -223,6 +232,10 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
         }
         totalBytesConsumed += res->bytesConsumed;
         auto requestID = res->value;
+        if (frameObserver_) {
+          frameObserver_->onFetchHeader(
+              FrameDirection::Received, DataStream{streamId_}, requestID.value);
+        }
         if (callback_) {
           auto result = callback_->onFetchHeader(requestID);
           if (result == ParseResult::ERROR_TERMINATE) {
@@ -245,8 +258,19 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
         }
         totalBytesConsumed += res->bytesConsumed;
         curObjectHeader_ = res->value.objectHeader;
+        trackAlias_ = res->value.trackAlias;
         parseState_ = ParseState::MULTI_OBJECT_HEADER;
         XCHECK_EQ(streamType_, StreamType::SUBGROUP_HEADER_SG);
+        if (frameObserver_) {
+          frameObserver_->onSubgroupHeader(
+              FrameDirection::Received,
+              DataStream{streamId_},
+              trackAlias_,
+              curObjectHeader_.group,
+              curObjectHeader_.subgroup,
+              curObjectHeader_.priority,
+              subgroupOptions_);
+        }
         if (callback_) {
           auto result = callback_->onSubgroup(
               res->value.trackAlias,
@@ -282,6 +306,15 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
             // End of Range marker received
             auto& marker =
                 std::get<MoQFrameParser::EndOfRangeMarker>(fetchRes->value);
+            if (frameObserver_) {
+              frameObserver_->onFetchEndOfRange(
+                  FrameDirection::Received,
+                  DataStream{streamId_},
+                  marker.groupId,
+                  marker.objectId,
+                  marker.isUnknownOrNonexistent ? FetchRangeEnd::Unknown
+                                                : FetchRangeEnd::NonExistent);
+            }
             if (callback_) {
               auto result = callback_->onEndOfRange(
                   marker.groupId,
@@ -309,6 +342,20 @@ MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
           }
           totalBytesConsumed += subgroupRes->bytesConsumed;
           curObjectHeader_ = subgroupRes->value;
+        }
+        if (frameObserver_) {
+          if (streamType_ == StreamType::FETCH_HEADER) {
+            frameObserver_->onFetchObject(
+                FrameDirection::Received,
+                DataStream{streamId_},
+                curObjectHeader_);
+          } else {
+            frameObserver_->onSubgroupObject(
+                FrameDirection::Received,
+                DataStream{streamId_},
+                trackAlias_,
+                curObjectHeader_);
+          }
         }
         if (curObjectHeader_.status == ObjectStatus::NORMAL) {
           XLOG(DBG2) << "Parsing object with length, need="
@@ -457,6 +504,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
         seenSetup_ = true;
         auto res = moqFrameParser_.parseClientSetup(cursor, curFrameLength_);
         if (res) {
+          notifyReceived(&MoQFrameObserver::onClientSetup, *res);
           if (callback_) {
             callback_->onClientSetup(std::move(res.value()));
           }
@@ -472,6 +520,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
         seenSetup_ = true;
         auto res = moqFrameParser_.parseServerSetup(cursor, curFrameLength_);
         if (res) {
+          notifyReceived(&MoQFrameObserver::onServerSetup, *res);
           if (callback_) {
             callback_->onServerSetup(std::move(res.value()));
           }
@@ -486,6 +535,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
           // We are a server, so this is a client setup
           auto res = moqFrameParser_.parseClientSetup(cursor, curFrameLength_);
           if (res) {
+            notifyReceived(&MoQFrameObserver::onClientSetup, *res);
             if (callback_) {
               callback_->onClientSetup(std::move(res.value()));
             }
@@ -496,6 +546,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
           // We are a client, so this is a server setup
           auto res = moqFrameParser_.parseServerSetup(cursor, curFrameLength_);
           if (res) {
+            notifyReceived(&MoQFrameObserver::onServerSetup, *res);
             if (callback_) {
               callback_->onServerSetup(std::move(res.value()));
             }
@@ -522,6 +573,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       auto res = moqFrameParser_.parseSubscribeRequest(cursor, curFrameLength_);
       if (res) {
         setStreamRequestID(res->requestID);
+        notifyReceived(&MoQFrameObserver::onSubscribe, *res);
         if (callback_) {
           callback_->onSubscribe(std::move(res.value()));
         }
@@ -537,6 +589,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
           // Stream is bound to the existing request; update has its own id.
           res->existingRequestID = *rid;
         }
+        notifyReceived(&MoQFrameObserver::onRequestUpdate, *res);
         if (callback_) {
           callback_->onRequestUpdate(std::move(res.value()));
         }
@@ -552,6 +605,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
         if (auto rid = takeNextResponseRequestID()) {
           res->requestID = *rid;
         }
+        notifyReceived(&MoQFrameObserver::onSubscribeOk, *res);
         if (callback_) {
           callback_->onSubscribeOk(std::move(res.value()));
         }
@@ -566,6 +620,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
     case FrameType::PUBLISH_ERROR: {
       auto res = moqFrameParser_.parseNamespace(cursor, curFrameLength_);
       if (res) {
+        notifyReceived(&MoQFrameObserver::onNamespace, *res);
         if (callback_) {
           callback_->onNamespace(std::move(res.value()));
         }
@@ -587,6 +642,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
             res->requestID = *rid;
           }
         }
+        notifyReceived(&MoQFrameObserver::onRequestError, *res);
         if (callback_) {
           callback_->onRequestError(std::move(res.value()), curFrameType_);
         }
@@ -598,6 +654,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
     case FrameType::UNSUBSCRIBE: {
       auto res = moqFrameParser_.parseUnsubscribe(cursor, curFrameLength_);
       if (res) {
+        notifyReceived(&MoQFrameObserver::onUnsubscribe, *res);
         if (callback_) {
           callback_->onUnsubscribe(std::move(res.value()));
         }
@@ -613,6 +670,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
         if (auto rid = getStreamRequestID()) {
           res->requestID = *rid;
         }
+        notifyReceived(&MoQFrameObserver::onPublishDone, *res);
         if (callback_) {
           callback_->onPublishDone(std::move(res.value()));
         }
@@ -625,6 +683,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       auto res = moqFrameParser_.parsePublish(cursor, curFrameLength_);
       if (res) {
         setStreamRequestID(res->requestID);
+        notifyReceived(&MoQFrameObserver::onPublish, *res);
         if (callback_) {
           callback_->onPublish(std::move(res.value()));
         }
@@ -642,6 +701,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
 
       auto res = moqFrameParser_.parsePublishOk(cursor, curFrameLength_);
       if (res) {
+        notifyReceived(&MoQFrameObserver::onPublishOk, *res);
         if (callback_) {
           callback_->onPublishOk(std::move(res.value()));
         }
@@ -653,6 +713,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
     case FrameType::MAX_REQUEST_ID: {
       auto res = moqFrameParser_.parseMaxRequestID(cursor, curFrameLength_);
       if (res) {
+        notifyReceived(&MoQFrameObserver::onMaxRequestID, *res);
         if (callback_) {
           callback_->onMaxRequestID(std::move(res.value()));
         }
@@ -664,6 +725,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
     case FrameType::REQUESTS_BLOCKED: {
       auto res = moqFrameParser_.parseRequestsBlocked(cursor, curFrameLength_);
       if (res) {
+        notifyReceived(&MoQFrameObserver::onRequestsBlocked, *res);
         if (callback_) {
           callback_->onRequestsBlocked(res.value());
         }
@@ -676,6 +738,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       auto res = moqFrameParser_.parseFetch(cursor, curFrameLength_);
       if (res) {
         setStreamRequestID(res->requestID);
+        notifyReceived(&MoQFrameObserver::onFetch, *res);
         if (callback_) {
           callback_->onFetch(std::move(res.value()));
         }
@@ -687,6 +750,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
     case FrameType::FETCH_CANCEL: {
       auto res = moqFrameParser_.parseFetchCancel(cursor, curFrameLength_);
       if (res) {
+        notifyReceived(&MoQFrameObserver::onFetchCancel, *res);
         if (callback_) {
           callback_->onFetchCancel(std::move(res.value()));
         }
@@ -702,6 +766,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
         if (auto rid = takeNextResponseRequestID()) {
           res->requestID = *rid;
         }
+        notifyReceived(&MoQFrameObserver::onFetchOk, *res);
         if (callback_) {
           callback_->onFetchOk(std::move(res.value()));
         }
@@ -714,6 +779,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       auto res = moqFrameParser_.parsePublishNamespace(cursor, curFrameLength_);
       if (res) {
         setStreamRequestID(res->requestID);
+        notifyReceived(&MoQFrameObserver::onPublishNamespace, *res);
         if (callback_) {
           callback_->onPublishNamespace(std::move(res.value()));
         }
@@ -739,6 +805,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
             res->requestID = *rid;
           }
         }
+        notifyReceived(&MoQFrameObserver::onRequestOk, *res);
         if (callback_) {
           callback_->onRequestOk(std::move(res.value()), curFrameType_);
         }
@@ -751,6 +818,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       auto res =
           moqFrameParser_.parsePublishNamespaceDone(cursor, curFrameLength_);
       if (res) {
+        notifyReceived(&MoQFrameObserver::onPublishNamespaceDone, *res);
         if (callback_) {
           callback_->onPublishNamespaceDone(std::move(res.value()));
         }
@@ -763,6 +831,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       auto res =
           moqFrameParser_.parsePublishNamespaceCancel(cursor, curFrameLength_);
       if (res) {
+        notifyReceived(&MoQFrameObserver::onPublishNamespaceCancel, *res);
         if (callback_) {
           callback_->onPublishNamespaceCancel(std::move(res.value()));
         }
@@ -775,6 +844,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       auto res = moqFrameParser_.parseSubscribeTracks(cursor, curFrameLength_);
       if (res) {
         setStreamRequestID(res->requestID);
+        notifyReceived(&MoQFrameObserver::onSubscribeTracks, *res);
         if (callback_) {
           callback_->onSubscribeTracks(std::move(res.value()));
         }
@@ -791,6 +861,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
           moqFrameParser_.parseSubscribeNamespace(cursor, curFrameLength_);
       if (res) {
         setStreamRequestID(res->requestID);
+        notifyReceived(&MoQFrameObserver::onSubscribeNamespace, *res);
         if (callback_) {
           callback_->onSubscribeNamespace(std::move(res.value()));
         }
@@ -803,6 +874,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       auto res = moqFrameParser_.parseTrackStatus(cursor, curFrameLength_);
       if (res) {
         setStreamRequestID(res->requestID);
+        notifyReceived(&MoQFrameObserver::onTrackStatus, *res);
         if (callback_) {
           callback_->onTrackStatus(std::move(res.value()));
         }
@@ -814,6 +886,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
     case FrameType::NAMESPACE_DONE: {
       auto res = moqFrameParser_.parseNamespaceDone(cursor, curFrameLength_);
       if (res) {
+        notifyReceived(&MoQFrameObserver::onNamespaceDone, *res);
         if (callback_) {
           callback_->onNamespaceDone(std::move(res.value()));
         }
@@ -827,6 +900,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
         // In draft 18+, wire type 0xF is PUBLISH_BLOCKED
         auto res = moqFrameParser_.parsePublishBlocked(cursor, curFrameLength_);
         if (res) {
+          notifyReceived(&MoQFrameObserver::onPublishBlocked, *res);
           if (callback_) {
             callback_->onPublishBlocked(std::move(res.value()));
           }
@@ -837,6 +911,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       }
       auto res = moqFrameParser_.parseTrackStatusError(cursor, curFrameLength_);
       if (res) {
+        notifyReceived(&MoQFrameObserver::onRequestError, *res);
         if (callback_) {
           callback_->onTrackStatusError(std::move(res.value()));
         }
@@ -855,6 +930,7 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       auto res = moqFrameParser_.parseGoaway(
           cursor, curFrameLength_, /*onRequestStream=*/onRequestStream);
       if (res) {
+        notifyReceived(&MoQFrameObserver::onGoaway, *res);
         if (callback_) {
           if (onRequestStream) {
             callback_->onRequestStreamGoaway(

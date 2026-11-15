@@ -10,6 +10,7 @@
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBufQueue.h>
 #include <folly/logging/xlog.h>
+#include <moxygen/MoQFrameObserver.h>
 #include <moxygen/MoQTokenCache.h>
 #include <moxygen/MoQTypes.h>
 #include <moxygen/MoQVarint.h>
@@ -633,9 +634,10 @@ WriteResult writeServerSetup(
     const Setup& serverSetup,
     uint64_t version) noexcept;
 
-// writeSetup, writeClientSetup and writeServerSetup are the only functions that
-// are version-agnostic, so we are leaving them out of the MoQFrameWriter.
 class MoQFrameWriter {
+  using FrameDirection = MoQFrameObserver::Direction;
+  using DataStream = MoQFrameObserver::DataStream;
+
  public:
   // options.priorityPresent is ignored; objectHeader.priority decides whether
   // the priority byte is written.
@@ -828,6 +830,59 @@ class MoQFrameWriter {
     messageParameterExtensions_ = std::move(extensions);
   }
 
+  // Setup is version-agnostic. This wraps the free writeSetup so the frame is
+  // reported like any other.
+  WriteResult writeSetup(
+      folly::IOBufQueue& writeBuf,
+      const Setup& setup,
+      uint64_t version,
+      bool isClient) const noexcept;
+
+  void setFrameObserver(std::shared_ptr<MoQFrameObserver> observer) noexcept {
+    frameObserver_ = std::move(observer);
+  }
+
+  // Data-stream frames serialized from here on carry a pending key until
+  // bindStream() gives their stream or abandonStream() drops them. Call it
+  // after setFrameObserver(). Without an observer it does nothing.
+  void setPendingStream() noexcept {
+    pendingKey_.value = frameObserver_ ? frameObserver_->newPendingStream() : 0;
+  }
+
+  // Frames serialized from here on are reported as sent on streamID.
+  void bindStream(uint64_t streamID) noexcept {
+    frameStreamID_ = streamID;
+    if (auto key = std::exchange(pendingKey_.value, 0); key && frameObserver_) {
+      frameObserver_->onDataStreamBound(key, streamID);
+    }
+  }
+
+  // Report a RESET_STREAM or STOP_SENDING on the bound stream.
+  void reportResetStream(FrameDirection dir, uint64_t errorCode)
+      const noexcept {
+    if (frameObserver_) {
+      frameObserver_->onResetStream(dir, frameStreamID_, errorCode);
+    }
+  }
+  void reportStreamFin(FrameDirection dir) const noexcept {
+    if (frameObserver_) {
+      frameObserver_->onStreamFin(dir, frameStreamID_);
+    }
+  }
+  void reportStopSending(FrameDirection dir, uint64_t errorCode)
+      const noexcept {
+    if (frameObserver_) {
+      frameObserver_->onStopSending(dir, frameStreamID_, errorCode);
+    }
+  }
+
+  // The pending stream will not be opened.
+  void abandonStream() noexcept {
+    if (auto key = std::exchange(pendingKey_.value, 0); key && frameObserver_) {
+      frameObserver_->onDataStreamAbandoned(key);
+    }
+  }
+
   // Encode a TrackNamespace as a TRACK_NAMESPACE_PREFIX parameter (a Track
   // Namespace tuple value, §2.4.1) for the given negotiated version. The
   // resulting parameter can be added to a REQUEST_UPDATE's parameter list to
@@ -991,8 +1046,44 @@ class MoQFrameWriter {
 
   void resetWriterFetchContext() const noexcept;
 
+  template <typename Msg>
+  void notifySent(
+      void (MoQFrameObserver::*hook)(FrameDirection, uint64_t, const Msg&),
+      const Msg& msg) const noexcept {
+    if (frameObserver_) {
+      ((*frameObserver_).*hook)(FrameDirection::Sent, frameStreamID_, msg);
+    }
+  }
+
+  DataStream observedDataStream() const noexcept {
+    using Kind = DataStream::Kind;
+    return pendingKey_.value ? DataStream{pendingKey_.value, Kind::PendingKey}
+                             : DataStream{frameStreamID_, Kind::StreamID};
+  }
+
+  // Copying a writer that has a pending key would report one stream twice.
+  // Moves use the copy operations.
+  // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
+  struct PendingKey {
+    uint64_t value{0}; // 0 means none.
+    PendingKey() = default;
+    PendingKey(const PendingKey& other) noexcept {
+      XCHECK_EQ(other.value, 0u) << "Copying a writer with a pending stream";
+    }
+    PendingKey& operator=(const PendingKey& other) noexcept {
+      XCHECK_EQ(other.value, 0u) << "Copying a writer with a pending stream";
+      value = 0;
+      return *this;
+    }
+  };
+
   std::optional<uint64_t> version_;
   bool useMoQVarint_{false};
+  std::shared_ptr<MoQFrameObserver> frameObserver_;
+  uint64_t frameStreamID_{0};
+  PendingKey pendingKey_;
+  // Subgroup objects are reported with the alias from their stream's header.
+  mutable TrackAlias observedAlias_{0};
   std::shared_ptr<const MessageParameterExtensions> messageParameterExtensions_;
   mutable std::optional<uint64_t> previousObjectID_;
   // Context for FETCH object delta encoding

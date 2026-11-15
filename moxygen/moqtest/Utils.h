@@ -12,14 +12,10 @@
 #include <utility>
 #include "moxygen/MoQConsumers.h"
 #include "moxygen/MoQFramer.h"
+#include "moxygen/MoQTimestamp.h"
 #include "moxygen/moqtest/Types.h"
 
 namespace moxygen {
-
-// Fixed extension type for the send timestamp (milliseconds since epoch).
-// Even type => integer extension. Value is large enough to avoid collision with
-// test integer extensions (which use 2 * testIntegerExtension).
-constexpr uint64_t kTimestampExtensionType = 0xC000;
 
 // The priority the server advertises as the track's publisher priority.  It is
 // deliberately not kDefaultPriority, so a subscriber that mishandles the
@@ -41,8 +37,29 @@ std::vector<std::string> parseNsPrefix(const std::string& prefix);
 
 std::vector<Extension> getExtensions(
     int integerExtensionId,
-    int variableExtensionId,
-    bool includeTimestamp = false);
+    int variableExtensionId);
+
+// Appends the OBJECT_TIMESTAMP for the Object at `location` sent at
+// `sendTime`. Returns the correction when a mapped track sends the Object off
+// its schedule.
+std::optional<int64_t> appendSendTime(
+    std::vector<Extension>& extensions,
+    const TrackTimestampInfo& timestampInfo,
+    AbsoluteLocation location,
+    std::chrono::system_clock::time_point sendTime =
+        std::chrono::system_clock::now());
+
+// Maps each Object to its paced send time on a track that starts at `start`.
+// nullopt when the track is not paced or the values overflow.
+std::optional<TrackTimestampInfo> scheduleTimestampInfo(
+    const MoQTestParameters& params,
+    std::chrono::system_clock::time_point start);
+
+// Milliseconds from the Object's wall-clock timestamp to now. nullopt when the
+// timestamp is missing, malformed, or in the future.
+std::optional<uint64_t> objectLatencyMs(
+    const TrackTimestampInfo& timestampInfo,
+    const ObjectHeader& header);
 
 int getObjectSize(uint64_t objectId, MoQTestParameters* params);
 

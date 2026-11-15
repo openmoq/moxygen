@@ -33,6 +33,26 @@ class MoQCodec {
     streamId_ = streamId;
   }
 
+  void setFrameObserver(std::shared_ptr<MoQFrameObserver> observer) {
+    frameObserver_ = std::move(observer);
+  }
+
+  // The peer finished this codec's stream.
+  void reportStreamFin() {
+    if (frameObserver_) {
+      frameObserver_->onStreamFin(
+          MoQFrameObserver::Direction::Received, streamId_);
+    }
+  }
+
+  // The peer reset this codec's stream.
+  void reportResetStream(uint64_t errorCode) {
+    if (frameObserver_) {
+      frameObserver_->onResetStream(
+          MoQFrameObserver::Direction::Received, streamId_, errorCode);
+    }
+  }
+
   void initializeVersion(uint64_t version) {
     negotiatedVersion_ = version;
     moqFrameParser_.initializeVersion(version);
@@ -63,6 +83,7 @@ class MoQCodec {
   void onIngressEnd(size_t remainingLength, bool eom, Callback* callback);
 
   uint64_t streamId_{std::numeric_limits<uint64_t>::max()};
+  std::shared_ptr<MoQFrameObserver> frameObserver_;
   folly::IOBufQueue ingress_{folly::IOBufQueue::cacheChainLength()};
 
   std::optional<ErrorCode> connError_;
@@ -212,6 +233,17 @@ class MoQControlCodec : public MoQCodec {
   }
 
   folly::Expected<folly::Unit, ErrorCode> parseFrame(folly::io::Cursor& cursor);
+
+  using FrameDirection = MoQFrameObserver::Direction;
+
+  template <typename Msg>
+  void notifyReceived(
+      void (MoQFrameObserver::*hook)(FrameDirection, uint64_t, const Msg&),
+      const Msg& msg) {
+    if (frameObserver_) {
+      ((*frameObserver_).*hook)(FrameDirection::Received, streamId_, msg);
+    }
+  }
 
   Direction dir_;
   ControlCallback* callback_{nullptr};
@@ -426,6 +458,7 @@ class MoQObjectStreamCodec : public MoQCodec {
   ParseState parseState_{ParseState::STREAM_HEADER_TYPE};
   StreamType streamType_{StreamType::SUBGROUP_HEADER_SG};
   SubgroupOptions subgroupOptions_;
+  TrackAlias trackAlias_{0};
   ObjectCallback* callback_;
 };
 

@@ -2000,3 +2000,306 @@ CO_TEST_P_X(MoQSessionTest, NullPayloadWithLogger) {
   co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+
+namespace {
+// Counts object-tier mlog records. The control-message equivalent is in
+// MoQSessionMLogTests.
+class ObjectRecordingMLogger : public MLogger {
+ public:
+  explicit ObjectRecordingMLogger(VantagePoint vp) : MLogger(vp) {}
+  void outputLogs() override {}
+
+  struct Counts {
+    size_t subgroupHeadersCreated{0};
+    size_t subgroupHeadersParsed{0};
+    size_t subgroupObjectsCreated{0};
+    size_t subgroupObjectsParsed{0};
+    size_t datagramsParsed{0};
+    size_t dataStreamTypesSet{0};
+  };
+
+  Counts counts() const {
+    Counts c;
+    for (const auto& event : logs_) {
+      const auto& name = event.name_;
+      if (name == kSubgroupHeaderCreatedName) {
+        c.subgroupHeadersCreated++;
+      } else if (name == kSubgroupHeaderParsedName) {
+        c.subgroupHeadersParsed++;
+      } else if (name == kSubgroupObjectCreatedName) {
+        c.subgroupObjectsCreated++;
+      } else if (name == kSubgroupObjectParsedName) {
+        c.subgroupObjectsParsed++;
+      } else if (name == kObjectDatagramParsedName) {
+        c.datagramsParsed++;
+      } else if (const auto* rec = std::get_if<MOQTStreamTypeSet>(&event.data_);
+                 rec && rec->streamType != MOQTStreamType::CONTROL) {
+        c.dataStreamTypesSet++;
+      }
+    }
+    return c;
+  }
+
+  // Stream IDs of every sent header, sent object and local data stream type
+  // record, in log order.
+  using MLogger::pendingDataStreamCount;
+
+  std::vector<uint64_t> sentStreamIds() const {
+    std::vector<uint64_t> ids;
+    for (const auto& event : logs_) {
+      const auto& name = event.name_;
+      if (name == kSubgroupHeaderCreatedName) {
+        ids.push_back(std::get<MOQTSubgroupHeader>(event.data_).streamId);
+      } else if (name == kSubgroupObjectCreatedName) {
+        ids.push_back(std::get<MOQTSubgroupObject>(event.data_).streamId);
+      } else if (name == kFetchHeaderCreatedName) {
+        ids.push_back(std::get<MOQTFetchHeader>(event.data_).streamId);
+      } else if (name == kFetchObjectCreatedName) {
+        ids.push_back(std::get<MOQTFetchObject>(event.data_).streamId);
+      } else if (const auto* rec = std::get_if<MOQTStreamTypeSet>(&event.data_);
+                 rec && rec->owner == Owner::LOCAL &&
+                 rec->streamType != MOQTStreamType::CONTROL) {
+        ids.push_back(rec->streamId);
+      }
+    }
+    return ids;
+  }
+
+  std::optional<uint64_t> parsedObjectPayloadLength(size_t index) const {
+    size_t seen = 0;
+    for (const auto& event : logs_) {
+      if (event.name_ == kSubgroupObjectParsedName && seen++ == index) {
+        return std::get<MOQTSubgroupObject>(event.data_).objectPayloadLength;
+      }
+    }
+    return std::nullopt;
+  }
+};
+} // namespace
+
+CO_TEST_P_X(MoQSessionTest, MLogRecordsObjectTier) {
+  auto clientLogger =
+      std::make_shared<ObjectRecordingMLogger>(VantagePoint::CLIENT);
+  auto serverLogger =
+      std::make_shared<ObjectRecordingMLogger>(VantagePoint::SERVER);
+
+  co_await setupMoQSession();
+  clientSession_->setLogger(clientLogger);
+  serverSession_->setLogger(serverLogger);
+
+  // Two subgroups in one group. The second subgroup's object arrives in two
+  // payload frames, written from separate turns of the loop.
+  expectSubscribe([this](auto sub, auto pub) -> TaskSubscribeResult {
+    auto sg0 = pub->beginSubgroup(0, 0, 0).value();
+    sg0->object(0, folly::IOBuf::copyBuffer("abcdef"), noExtensions(), false);
+    auto sg1 = pub->beginSubgroup(0, 1, 0).value();
+    sg1->beginObject(0, 6, folly::IOBuf::copyBuffer("abc"), noExtensions());
+    eventBase_.add([sub, pub, sg0, sg1] {
+      sg1->objectPayload(folly::IOBuf::copyBuffer("def"), true);
+      sg0->endOfSubgroup();
+      pub->publishDone(getTrackEndedPublishDone(sub.requestID));
+    });
+    co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+  });
+
+  auto rsg0 = std::make_shared<testing::NiceMock<MockSubgroupConsumer>>();
+  auto rsg1 = std::make_shared<testing::NiceMock<MockSubgroupConsumer>>();
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
+      .WillOnce(testing::Return(rsg0));
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 1, 0, _))
+      .WillOnce(testing::Return(rsg1));
+
+  expectPublishDone();
+  auto res = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_FALSE(res.hasError());
+  co_await publishDone_;
+
+  auto sent = serverLogger->counts();
+  auto received = clientLogger->counts();
+
+  // The publisher records each subgroup header it writes. The subscriber
+  // records each one it parses.
+  EXPECT_EQ(sent.subgroupHeadersCreated, 2u);
+  EXPECT_EQ(received.subgroupHeadersParsed, 2u);
+  // The codec reports an object when it parses the object's header, so the
+  // object split across two payload frames is recorded once.
+  EXPECT_EQ(received.subgroupObjectsParsed, 2u);
+  EXPECT_EQ(received.datagramsParsed, 0u);
+  // Each subgroup stream gets a stream type, on both sides.
+  EXPECT_EQ(sent.dataStreamTypesSet, 2u);
+  EXPECT_EQ(received.dataStreamTypesSet, 2u);
+  // The parsed record carries the full payload length.
+  EXPECT_EQ(clientLogger->parsedObjectPayloadLength(0), 6u);
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// A subgroup that waits for stream credit is serialized before its stream
+// exists. mlog records it once the stream is granted, on that stream.
+CO_TEST_P_X(MoQSessionTest, MLogRecordsSubgroupHeldForCredit) {
+  auto serverLogger =
+      std::make_shared<ObjectRecordingMLogger>(VantagePoint::SERVER);
+  co_await setupMoQSession();
+  serverSession_->setLogger(serverLogger);
+  const auto openUni = serverWt_->openLocalUniStreams().size();
+  serverWt_->setMaxLocalUniStreams(openUni);
+
+  folly::coro::Baton published;
+  std::shared_ptr<TrackConsumer> serverPub;
+  RequestID requestID;
+  expectSubscribe([&](auto sub, auto pub) -> TaskSubscribeResult {
+    serverPub = pub;
+    requestID = sub.requestID;
+    eventBase_.add([&, pub] {
+      auto sgp = pub->beginSubgroup(0, 0, 0);
+      EXPECT_TRUE(sgp.hasValue());
+      if (sgp.hasValue()) {
+        EXPECT_TRUE(sgp.value()->object(0, makeBuf(10)).hasValue());
+        EXPECT_TRUE(sgp.value()
+                        ->object(1, makeBuf(10), noExtensions(), true)
+                        .hasValue());
+      }
+      published.post();
+    });
+    co_return makeSubscribeOkResult(sub);
+  });
+  auto sg = std::make_shared<testing::NiceMock<MockSubgroupConsumer>>();
+  folly::coro::Baton received;
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
+      .WillOnce(testing::Return(sg));
+  EXPECT_CALL(*sg, object(0, _, _, false))
+      .WillOnce(testing::Return(folly::unit));
+  EXPECT_CALL(*sg, object(1, _, _, true)).WillOnce([&] {
+    received.post();
+    return folly::unit;
+  });
+
+  auto res = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_FALSE(res.hasError());
+  co_await published;
+  co_await rescheduleN(5);
+  EXPECT_EQ(serverLogger->counts().subgroupHeadersCreated, 0u);
+
+  serverWt_->setMaxLocalUniStreams(openUni + 1);
+  co_await received;
+  const auto sent = serverLogger->counts();
+  EXPECT_EQ(sent.subgroupHeadersCreated, 1u);
+  EXPECT_EQ(sent.subgroupObjectsCreated, 2u);
+  // Stream type, header and both objects, all on the one granted stream.
+  const auto ids = serverLogger->sentStreamIds();
+  EXPECT_EQ(ids.size(), 4u);
+  if (!ids.empty()) {
+    EXPECT_EQ(std::count(ids.begin(), ids.end(), ids.front()), ids.size());
+  }
+
+  expectPublishDone();
+  serverPub->publishDone(getTrackEndedPublishDone(requestID));
+  co_await publishDone_;
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// A subgroup reset while it waits for stream credit does not open a stream, so
+// mlog does not record it.
+CO_TEST_P_X(MoQSessionTest, MLogDropsSubgroupResetBeforeCredit) {
+  auto serverLogger =
+      std::make_shared<ObjectRecordingMLogger>(VantagePoint::SERVER);
+  co_await setupMoQSession();
+  serverSession_->setLogger(serverLogger);
+  const auto openUni = serverWt_->openLocalUniStreams().size();
+  serverWt_->setMaxLocalUniStreams(openUni);
+  expectSubscribe([&](auto sub, auto pub) -> TaskSubscribeResult {
+    eventBase_.add([pub, requestID = sub.requestID] {
+      auto sgp = pub->beginSubgroup(0, 0, 0);
+      EXPECT_TRUE(sgp.hasValue());
+      if (sgp.hasValue()) {
+        EXPECT_TRUE(sgp.value()->object(0, makeBuf(10)).hasValue());
+        sgp.value()->reset(ResetStreamErrorCode::DELIVERY_TIMEOUT);
+      }
+      pub->publishDone(getTrackEndedPublishDone(requestID));
+    });
+    co_return makeSubscribeOkResult(sub);
+  });
+  EXPECT_CALL(*subscribeCallback_, publishDone(_)).WillOnce([&](const auto&) {
+    publishDone_.post();
+    return folly::unit;
+  });
+
+  auto res = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_FALSE(res.hasError());
+  co_await publishDone_;
+  serverWt_->setMaxLocalUniStreams(openUni + 1);
+  co_await rescheduleN(5);
+  const auto sent = serverLogger->counts();
+  EXPECT_EQ(sent.subgroupHeadersCreated, 0u);
+  EXPECT_EQ(sent.subgroupObjectsCreated, 0u);
+  EXPECT_TRUE(serverLogger->sentStreamIds().empty());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// A FETCH stream is opened with its first object, so its FETCH_HEADER is
+// serialized first under a pending key. mlog records both on the stream.
+CO_TEST_P_X(MoQSessionTest, MLogRecordsFetchOnItsStream) {
+  auto serverLogger =
+      std::make_shared<ObjectRecordingMLogger>(VantagePoint::SERVER);
+  co_await setupMoQSession();
+  serverSession_->setLogger(serverLogger);
+  expectFetch([](Fetch fetch, auto fetchPub) -> TaskFetchResult {
+    auto standalone = std::get_if<StandaloneFetch>(&fetch.args);
+    EXPECT_NE(standalone, nullptr);
+    if (standalone) {
+      fetchPub->object(
+          standalone->start.group,
+          /*subgroupID=*/0,
+          standalone->start.object,
+          moxygen::test::makeBuf(100),
+          noExtensions(),
+          /*finFetch=*/true);
+    }
+    co_return makeFetchOkResult(fetch, AbsoluteLocation{100, 100});
+  });
+  folly::coro::Baton baton;
+  EXPECT_CALL(*fetchCallback_, object(0, 0, 0, _, _, true, _)).WillOnce([&] {
+    baton.post();
+    return folly::unit;
+  });
+  auto res =
+      co_await clientSession_->fetch(getFetch({0, 0}, {0, 1}), fetchCallback_);
+  EXPECT_FALSE(res.hasError());
+  co_await baton;
+  // Stream type, FETCH_HEADER and the object, all on the one fetch stream.
+  const auto ids = serverLogger->sentStreamIds();
+  EXPECT_EQ(ids.size(), 3u);
+  if (!ids.empty()) {
+    EXPECT_EQ(std::count(ids.begin(), ids.end(), ids.front()), ids.size());
+  }
+  EXPECT_EQ(serverLogger->pendingDataStreamCount(), 0u);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// A FETCH refused before any object leaves its FETCH_HEADER unsent. mlog does
+// not record it and does not keep holding it.
+CO_TEST_P_X(MoQSessionTest, MLogDropsFetchWithoutStream) {
+  auto serverLogger =
+      std::make_shared<ObjectRecordingMLogger>(VantagePoint::SERVER);
+  co_await setupMoQSession();
+  serverSession_->setLogger(serverLogger);
+  expectFetch(
+      [](Fetch fetch, auto) -> TaskFetchResult {
+        co_return folly::makeUnexpected(
+            FetchError{
+                fetch.requestID,
+                FetchErrorCode::DOES_NOT_EXIST,
+                "Bad trackname"});
+      },
+      FetchErrorCode::DOES_NOT_EXIST);
+  auto res =
+      co_await clientSession_->fetch(getFetch({0, 0}, {0, 1}), fetchCallback_);
+  EXPECT_TRUE(res.hasError());
+  co_await rescheduleN(5);
+  EXPECT_TRUE(serverLogger->sentStreamIds().empty());
+  EXPECT_EQ(serverLogger->pendingDataStreamCount(), 0u);
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}

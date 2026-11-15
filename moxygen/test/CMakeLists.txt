@@ -103,6 +103,7 @@ moxygen_add_test(TARGET MoQSessionTests
   SOURCES
     MoQSessionFetchTests.cpp
     MoQSessionGroupRankTests.cpp
+    MoQSessionMLogTests.cpp
     MoQSessionObjectDeliveryTests.cpp
     MoQSessionPublishNamespaceTests.cpp
     MoQSessionPublishTests.cpp
@@ -155,6 +156,15 @@ moxygen_add_test(TARGET MoQTokenCacheTests
     MoQTokenCacheTest.cpp
   DEPENDS
     moxygen_moq_token_cache
+    testmain
+)
+
+moxygen_add_test(TARGET MoQTimestampTests
+  PREFIX "MoQTimestamp"
+  SOURCES
+    MoQTimestampTest.cpp
+  DEPENDS
+    moxygen_moq_timestamp
     testmain
 )
 

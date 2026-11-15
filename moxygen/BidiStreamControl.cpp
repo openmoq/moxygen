@@ -16,13 +16,14 @@ BidiStreamControl::BidiStreamControl(
     folly::CancellationToken sessionShutdownToken,
     uint64_t negotiatedVersion,
     bool finIsCancellation,
-    std::shared_ptr<EgressAckTracker> egressTracker)
+    std::shared_ptr<EgressAckTracker> egressTracker,
+    MoQFrameWriter writer)
     : writeHandle_(writeHandle),
-      streamId_(writeHandle ? writeHandle->getID() : 0),
       sessionShutdownToken_(std::move(sessionShutdownToken)),
       negotiatedVersion_(negotiatedVersion),
       finIsCancellation_(finIsCancellation),
-      egressTracker_(std::move(egressTracker)) {
+      egressTracker_(std::move(egressTracker)),
+      writer_(std::move(writer)) {
   if (writeHandle_) {
     writeCancelCb_.emplace(
         writeHandle_->getCancelToken(), [this] { onPeerStopSending(); });
@@ -39,7 +40,9 @@ void BidiStreamControl::onPeerStopSending() {
   uint32_t code = ex->error;
   XLOG(DBG1) << "STOP_SENDING received on bidi stream id="
              << writeHandle_->getID() << " code=" << code;
+  writer_.reportStopSending(MoQFrameObserver::Direction::Received, code);
   writeHandle_->resetStream(code);
+  writer_.reportResetStream(MoQFrameObserver::Direction::Sent, code);
   writeHandle_ = nullptr;
   setPeerClose(PeerClose::StopSending);
   readCancelCode_ = toWireResetStreamErrorCode(
@@ -75,6 +78,7 @@ void BidiStreamControl::write(std::unique_ptr<folly::IOBuf> data, bool fin) {
   }
   egressTracker_->write(*writeHandle_, std::move(data), fin);
   if (fin) {
+    writer_.reportStreamFin(MoQFrameObserver::Direction::Sent);
     onLocalWriteClose();
   }
 }
@@ -86,6 +90,8 @@ void BidiStreamControl::cancel(ResetStreamErrorCode code) {
     // Before resetStream: its cancellation would re-enter onPeerStopSending.
     onLocalWriteClose();
     wh->resetStream(readCancelCode_);
+    writer_.reportResetStream(
+        MoQFrameObserver::Direction::Sent, readCancelCode_);
   }
   readCancelSource_.requestCancellation();
 }
