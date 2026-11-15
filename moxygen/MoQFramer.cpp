@@ -33,6 +33,12 @@ enum class FetchHeaderSerializationBits : uint8_t {
   EXTENSIONS_BITMASK = 0x20
 };
 
+// FetchOk::endLocation is exclusive for every version; draft 22 puts the
+// inclusive end on the wire.
+bool fetchOkEndIsInclusive(uint64_t version) {
+  return moxygen::getDraftMajorVersion(version) >= 22;
+}
+
 uint64_t getLocationTypeValue(
     moxygen::LocationType locationType,
     uint64_t /*version*/) {
@@ -954,9 +960,20 @@ folly::Expected<FillParameters, ErrorCode> MoQFrameParser::parseFillParameters(
     size_t& length) const noexcept {
   FillParameters fill;
   const auto version = *version_;
+  // Draft 22: a parameter count inside the length-prefixed value.
+  auto numParams = decodeVarint(cursor, length);
+  if (!numParams) {
+    XLOG(DBG4) << "parseFillParameters: UNDERFLOW on numParams";
+    return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+  }
+  length -= numParams->second;
   // Its own duplicate scope, so a type may appear here and in the message.
   uint64_t previousKey = 0;
-  while (length > 0) {
+  for (uint64_t i = 0; i < numParams->first; i++) {
+    if (length == 0) {
+      XLOG(DBG4) << "parseFillParameters: UNDERFLOW on param " << i;
+      return folly::makeUnexpected(ErrorCode::PARSE_UNDERFLOW);
+    }
     auto key = parseParamKey(cursor, length, version, previousKey);
     if (key.hasError()) {
       return folly::makeUnexpected(key.error());
@@ -995,6 +1012,11 @@ folly::Expected<FillParameters, ErrorCode> MoQFrameParser::parseFillParameters(
       default:
         break;
     }
+  }
+  if (length > 0) {
+    XLOG(ERR) << "parseFillParameters: " << length << " bytes left after "
+              << numParams->first << " params";
+    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
   }
   return fill;
 }
@@ -1039,6 +1061,19 @@ MoQFrameParser::parseVariableParam(
       return folly::makeUnexpected(res.error());
     }
     p.asLocationFilter = res.value();
+  } else if (
+      key ==
+          folly::to_underlying(TrackRequestParamKey::TRACK_NAMESPACE_PREFIX) &&
+      getDraftMajorVersion(version) >= 22) {
+    // The tuple's field count, not a length, bounds the value. asString keeps
+    // the encoded tuple, as on earlier drafts.
+    auto tupleStart = cursor;
+    auto lengthBefore = length;
+    auto tuple = parseNamespaceTuple(cursor, length);
+    if (!tuple) {
+      return folly::makeUnexpected(tuple.error());
+    }
+    p.asString = tupleStart.readFixedString(lengthBefore - length);
   } else if (
       key == subscriptionFilterKey ||
       (key == folly::to_underlying(TrackRequestParamKey::FILL_PARAMETERS) &&
@@ -3032,7 +3067,9 @@ folly::Expected<FetchOk, ErrorCode> MoQFrameParser::parseFetchOk(
   if (!res2) {
     return folly::makeUnexpected(res2.error());
   }
-  fetchOk.endLocation = std::move(res2.value());
+  fetchOk.endLocation = fetchOkEndIsInclusive(*version_)
+      ? res2->next().value_or(kLocationMax)
+      : res2.value();
 
   auto numParams = decodeVarint(cursor, length);
   if (!numParams) {
@@ -4428,6 +4465,15 @@ void MoQFrameWriter::writeV18ParamValue(
         writeLocationFilter(writeBuf, param.asLocationFilter, size, error);
         return;
       }
+      if (!isExtension &&
+          param.key ==
+              folly::to_underlying(
+                  TrackRequestParamKey::TRACK_NAMESPACE_PREFIX) &&
+          getDraftMajorVersion(*version_) >= 22) {
+        writeBuf.append(param.asString.data(), param.asString.size());
+        size += param.asString.size();
+        return;
+      }
       if (isExtension ||
           (!isFill &&
            param.key !=
@@ -4599,6 +4645,11 @@ void MoQFrameWriter::writeFillParameters(
     const FillParameters& fill,
     size_t& size,
     bool& error) const noexcept {
+  // Draft 22: a parameter count inside the length-prefixed value.
+  const uint64_t numParams = fill.fillTimeout.has_value() +
+      fill.subscriberPriority.has_value() + fill.locationFilter.has_value() +
+      fill.groupOrder.has_value();
+  writeVarint(writeBuf, numParams, size, error);
   // Ascending type order, delta encoded, like any other parameter block.
   uint64_t previousKey = 0;
   auto writeKey = [&](TrackRequestParamKey key) {
@@ -5845,8 +5896,13 @@ WriteResult MoQFrameWriter::writeFetchOk(
   }
   frameBuf.append(&fetchOk.endOfTrack, 1);
   size += 1;
-  writeVarint(frameBuf, fetchOk.endLocation.group, size, error);
-  writeVarint(frameBuf, fetchOk.endLocation.object, size, error);
+  // Draft 22 can't express an empty range: End == Start comes out below Start,
+  // which the receiver treats as a session error.
+  const auto wireEnd = fetchOkEndIsInclusive(*version_)
+      ? fetchOk.endLocation.prev().value_or(kLocationMin)
+      : fetchOk.endLocation;
+  writeVarint(frameBuf, wireEnd.group, size, error);
+  writeVarint(frameBuf, wireEnd.object, size, error);
 
   writeTrackRequestParams(frameBuf, fetchOk.params, {}, size, error);
 

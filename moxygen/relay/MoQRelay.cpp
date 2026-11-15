@@ -563,11 +563,10 @@ Subscriber::PublishResult MoQRelay::publish(
   }
   forwarder->setCallback(shared_from_this());
 
-  // Wrap forwarder in filter to intercept publishDone
-  auto filterImpl = std::make_shared<TerminationFilter>(
-      shared_from_this(), pub.fullTrackName, forwarder);
-  std::shared_ptr<TrackConsumer> filter =
-      std::static_pointer_cast<TrackConsumer>(filterImpl);
+  if (cache_) {
+    cache_->setTrackState(pub.fullTrackName, pub.largest, pub.extensions);
+  }
+  auto filter = getSubscribeWriteback(pub.fullTrackName, forwarder);
 
   wakePendingRendezvousForTrack(pub.fullTrackName);
 
@@ -1731,7 +1730,8 @@ MoQRelay::subscribeToExistingRelaySubscription(
   XLOG(DBG4) << "added subscriber for ftn=" << subReq.fullTrackName;
   forwarder->tryProcessNewGroupRequest(subReq.params);
   if (subReq.fill) {
-    subscriber->requestFill(subReq.requestID, *subReq.fill);
+    subscriber->requestFill(
+        subReq.requestID, *subReq.fill, subscriber->subscribeOk().largest);
   }
   co_return subscriber;
 }
@@ -1863,9 +1863,10 @@ MoQRelay::subscribeToFirstRelaySubscription(
   // Record NGR as outstanding (no fire — it rides the outgoing SUBSCRIBE).
   forwarder->tryProcessNewGroupRequest(subReq.params, /*fire=*/false);
   rsub.promise.setValue(folly::unit);
-  // Only now is upstream's Largest known, to both the forwarder and the cache.
+  // Objects past upstream's Largest reached this subscriber live during the
+  // co_await, so the fill uses upstream's Largest.
   if (subReq.fill) {
-    subscriber->requestFill(subReq.requestID, *subReq.fill);
+    subscriber->requestFill(subReq.requestID, *subReq.fill, largest);
   }
   co_return subscriber;
 }
@@ -1992,10 +1993,13 @@ folly::coro::Task<Publisher::TrackStatusResult> MoQRelay::trackStatus(
     TrackStatusOk trackStatusOk;
     trackStatusOk.requestID = trackStatus.requestID;
     trackStatusOk.groupOrder = forwarder->groupOrder();
-    trackStatusOk.trackProperties.insertMutableExtension(
-        Extension{
-            kPublisherGroupOrderExtensionType,
-            folly::to_underlying(forwarder->groupOrder())});
+    trackStatusOk.trackProperties = forwarder->extensions();
+    if (!getPublisherGroupOrder(trackStatusOk.trackProperties)) {
+      trackStatusOk.trackProperties.insertMutableExtension(
+          Extension{
+              kPublisherGroupOrderExtensionType,
+              folly::to_underlying(forwarder->groupOrder())});
+    }
     trackStatusOk.largest = forwarder->largest();
 
     XLOG(DBG1) << "Returning local track status for "

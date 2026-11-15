@@ -489,6 +489,67 @@ TEST_P(MoQFramerTest, SerializeAndParseAll) {
   parseAll(cursor, true);
 }
 
+namespace {
+
+// Writes `fetchOk` at `version` and returns the End Location as written on the
+// wire, plus the parsed FetchOk.
+std::pair<AbsoluteLocation, FetchOk> fetchOkWireAndParsed(
+    uint64_t version,
+    const FetchOk& fetchOk) {
+  MoQFrameWriter writer;
+  writer.initializeVersion(version);
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  EXPECT_TRUE(writer.writeFetchOk(writeBuf, fetchOk).hasValue());
+
+  MoQFrameParser parser;
+  parser.initializeVersion(version);
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+  auto frameType = parser.decodeVarint(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::FETCH_OK));
+  auto bodyLen = cursor.readBE<uint16_t>();
+
+  folly::io::Cursor wire(cursor);
+  if (getDraftMajorVersion(version) < 18) {
+    parser.decodeVarint(wire); // requestID
+  }
+  wire.skip(1); // End Of Track
+  AbsoluteLocation wireEnd;
+  wireEnd.group = parser.decodeVarint(wire)->first;
+  wireEnd.object = parser.decodeVarint(wire)->first;
+
+  auto parsed = parser.parseFetchOk(cursor, bodyLen);
+  EXPECT_TRUE(parsed.hasValue());
+  return {wireEnd, parsed.value_or(FetchOk{})};
+}
+
+} // namespace
+
+TEST(MoQFramerFetchOkTest, Draft22EndLocationIsInclusiveOnTheWire) {
+  FetchOk fetchOk;
+  fetchOk.endLocation = {2, 10};
+  auto [wireEnd, parsed] = fetchOkWireAndParsed(kVersionDraft22, fetchOk);
+  EXPECT_EQ(wireEnd, (AbsoluteLocation{2, 9}));
+  EXPECT_EQ(parsed.endLocation, fetchOk.endLocation);
+}
+
+TEST(MoQFramerFetchOkTest, Draft22EndAtGroupBoundary) {
+  // Exclusive {3,0} is "through the end of group 2".
+  FetchOk fetchOk;
+  fetchOk.endLocation = {3, 0};
+  auto [wireEnd, parsed] = fetchOkWireAndParsed(kVersionDraft22, fetchOk);
+  EXPECT_EQ(wireEnd, (AbsoluteLocation{2, kEightByteLimit}));
+  EXPECT_EQ(parsed.endLocation, fetchOk.endLocation);
+}
+
+TEST(MoQFramerFetchOkTest, PreDraft22EndLocationUnchanged) {
+  FetchOk fetchOk;
+  fetchOk.endLocation = {2, 10};
+  auto [wireEnd, parsed] = fetchOkWireAndParsed(kVersionDraft21, fetchOk);
+  EXPECT_EQ(wireEnd, fetchOk.endLocation);
+  EXPECT_EQ(parsed.endLocation, fetchOk.endLocation);
+}
+
 TEST(MoQFramerGoawayTest, Draft17RemainsUriOnly) {
   MoQFrameWriter writer;
   writer.initializeVersion(kVersionDraft17);
@@ -2680,6 +2741,57 @@ TEST(MoQFramerTest, TrackNamespacePrefixParamRoundTrip) {
   EXPECT_EQ(*decoded, prefix);
 }
 
+// Draft 22 makes Track Namespace its own value encoding, so the prefix goes on
+// the wire as the bare tuple. Drafts 18-21 keep a length in front of it, which
+// peers on those drafts expect.
+TEST(MoQFramerTest, TrackNamespacePrefixParamWireFormat) {
+  const TrackNamespace prefix(std::vector<std::string>{"foo", "bar"});
+  const std::vector<uint8_t> tuple{
+      0x02, 0x03, 'f', 'o', 'o', 0x03, 'b', 'a', 'r'};
+  for (auto version : {kVersionDraft18, kVersionDraft22}) {
+    SCOPED_TRACE(version);
+    MoQFrameWriter writer;
+    writer.initializeVersion(version);
+    MoQFrameParser parser;
+    parser.initializeVersion(version);
+
+    RequestUpdate update;
+    update.requestID = RequestID(4);
+    update.params.setMajorVersion(getDraftMajorVersion(version));
+    ASSERT_TRUE(update.params
+                    .insertParam(
+                        MoQFrameWriter::encodeTrackNamespacePrefixParam(
+                            prefix, version))
+                    .hasValue());
+    folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+    ASSERT_TRUE(writer.writeSubscribeUpdate(writeBuf, update).hasValue());
+    auto buf = writeBuf.move();
+    buf->coalesce();
+
+    // The prefix is the only parameter, so it ends the message.
+    std::vector<uint8_t> expectedParam{0x34};
+    if (getDraftMajorVersion(version) < 22) {
+      expectedParam.push_back(tuple.size());
+    }
+    expectedParam.insert(expectedParam.end(), tuple.begin(), tuple.end());
+    std::vector<uint8_t> wire(buf->data(), buf->data() + buf->length());
+    ASSERT_GE(wire.size(), expectedParam.size());
+    EXPECT_EQ(
+        std::vector<uint8_t>(wire.end() - expectedParam.size(), wire.end()),
+        expectedParam);
+
+    folly::io::Cursor cursor(buf.get());
+    ASSERT_TRUE(parser.decodeVarint(cursor).has_value());
+    auto parsed = parser.parseRequestUpdate(cursor, cursor.readBE<uint16_t>());
+    ASSERT_TRUE(parsed.hasValue());
+    auto decoded =
+        MoQFrameParser::findTrackNamespacePrefixParam(parsed->params, version);
+    ASSERT_TRUE(decoded.hasValue());
+    ASSERT_TRUE(decoded->has_value());
+    EXPECT_EQ(**decoded, prefix);
+  }
+}
+
 // A value that is not a valid Track Namespace tuple must fail to decode (here
 // the tuple claims 5 elements but carries no element data).
 TEST(MoQFramerTest, TrackNamespacePrefixParamMalformed) {
@@ -3077,9 +3189,9 @@ ErrorCode parseSubscribeBodyError(const std::unique_ptr<folly::IOBuf>& bytes) {
 // The nested block has its own allowlist, narrower than the message's.
 TEST(MoQFramerFillParameters, DisallowedNestedTypeIsAViolation) {
   // FORWARD is a legal SUBSCRIBE parameter but has no meaning inside a fill.
-  const std::string nested(
-      1,
-      static_cast<char>(folly::to_underlying(TrackRequestParamKey::FORWARD)));
+  const std::string nested{
+      '\x01', // one parameter
+      static_cast<char>(folly::to_underlying(TrackRequestParamKey::FORWARD))};
   EXPECT_EQ(
       parseSubscribeBodyError(
           subscribeWithRawParam(TrackRequestParamKey::FILL_PARAMETERS, nested)),
@@ -3089,8 +3201,8 @@ TEST(MoQFramerFillParameters, DisallowedNestedTypeIsAViolation) {
 // Range Filters are rejected inside FILL_PARAMETERS, as at the top level,
 // until moxygen implements them.
 TEST(MoQFramerFillParameters, RangeFilterIsAViolation) {
-  // Type 0x25 (a Range Filter) with an empty value.
-  const std::string nested("\x25\x00", 2);
+  // One parameter: type 0x25 (a Range Filter) with an empty value.
+  const std::string nested("\x01\x25\x00", 3);
   EXPECT_EQ(
       parseSubscribeBodyError(
           subscribeWithRawParam(TrackRequestParamKey::FILL_PARAMETERS, nested)),
@@ -3255,10 +3367,36 @@ TEST(MoQFramerFillParameters, AbsentWhenNotRequested) {
   EXPECT_FALSE(parseRes->fill.has_value());
 }
 
+// Length 4, one parameter: a LOCATION_FILTER of one group back.
+TEST(MoQFramerFillParameters, ParsesLengthAndCount) {
+  const std::string nested("\x01\x21\x01\x01", 4);
+  auto parseRes = parseSubscribeBody(
+      subscribeWithRawParam(TrackRequestParamKey::FILL_PARAMETERS, nested));
+  ASSERT_TRUE(parseRes.hasValue());
+  ASSERT_TRUE(parseRes->fill.has_value());
+  EXPECT_EQ(parseRes->fill->locationFilter, LocationFilter::relativeStart(1));
+}
+
+// The count and the length must agree.
+TEST(MoQFramerFillParameters, CountLengthMismatchIsAnError) {
+  // Count 1, then two parameters' worth of bytes.
+  const std::string extra("\x01\x20\xff\x02\x01", 5);
+  EXPECT_EQ(
+      parseSubscribeBodyError(
+          subscribeWithRawParam(TrackRequestParamKey::FILL_PARAMETERS, extra)),
+      ErrorCode::PROTOCOL_VIOLATION);
+  // Count 2, but only one parameter's bytes.
+  const std::string missing("\x02\x20\xff", 3);
+  EXPECT_NE(
+      parseSubscribeBodyError(subscribeWithRawParam(
+          TrackRequestParamKey::FILL_PARAMETERS, missing)),
+      ErrorCode::NO_ERROR);
+}
+
 // FILL_PARAMETERS below draft 22 is a protocol violation.
 TEST(MoQFramerFillParameters, RejectedBelowV22) {
   // A nested LOCATION_FILTER of one group back.
-  const std::string nested("\x21\x01\x01", 3);
+  const std::string nested("\x01\x21\x01\x01", 4);
   auto parseRes = parseSubscribeBody(
       subscribeWithRawParam(TrackRequestParamKey::FILL_PARAMETERS, nested),
       kVersionDraft18);
@@ -3279,7 +3417,8 @@ TEST(MoQFramerLocationFilter, FillParametersOnFetchIsAViolation) {
   writeVarintTo(body, 1); // one parameter
   writeVarintTo(
       body, folly::to_underlying(TrackRequestParamKey::FILL_PARAMETERS));
-  writeVarintTo(body, 0); // empty FILL_PARAMETERS value
+  writeVarintTo(body, 1); // FILL_PARAMETERS value: length 1,
+  writeVarintTo(body, 0); // holding a count of zero
 
   auto bytes = body.move();
   MoQFrameParser parser;
