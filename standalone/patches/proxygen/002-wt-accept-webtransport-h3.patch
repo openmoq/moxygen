@@ -1,0 +1,34 @@
+SETTINGS_WT_ENABLED (sent by the HQServer egress settings) means the
+draft-15+ variant, whose :protocol token is webtransport-h3. Accept it in
+isConnectMessage alongside the draft-14 webtransport token.
+
+diff --git a/proxygen/lib/http/HeaderConstants.h b/proxygen/lib/http/HeaderConstants.h
+index ab6ed8a22..7140ccb1c 100644
+--- a/proxygen/lib/http/HeaderConstants.h
++++ b/proxygen/lib/http/HeaderConstants.h
+@@ -27,6 +27,7 @@ extern const std::string kWebsocketString;
+ extern const std::string kStatus200;
+ 
+ constexpr std::string_view kWebTransport{"webtransport"};
++constexpr std::string_view kWebTransportH3{"webtransport-h3"};
+ constexpr std::string_view kSecWebTransportHttp3Draft02{
+     "sec-webtransport-http3-draft02"};
+ constexpr std::string_view kSecWebTransportHttp3Draft02Value{"1"};
+diff --git a/proxygen/lib/http/webtransport/HTTPWebTransport.cpp b/proxygen/lib/http/webtransport/HTTPWebTransport.cpp
+index 34ae86f57..2c35fbbea 100644
+--- a/proxygen/lib/http/webtransport/HTTPWebTransport.cpp
++++ b/proxygen/lib/http/webtransport/HTTPWebTransport.cpp
+@@ -18,9 +18,12 @@ namespace proxygen {
+ using WTProtocolError = HTTPWebTransport::WTProtocolError;
+ 
+ /*static*/ bool HTTPWebTransport::isConnectMessage(const HTTPMessage& msg) {
++  // webtransport-h3 is the draft-15+ token tied to SETTINGS_WT_ENABLED;
++  // webtransport is the draft-14 token browsers still send
+   return msg.isRequest() && msg.getMethod() == proxygen::HTTPMethod::CONNECT &&
+          msg.getUpgradeProtocol() &&
+-         *msg.getUpgradeProtocol() == headers::kWebTransport;
++         (*msg.getUpgradeProtocol() == headers::kWebTransportH3 ||
++          *msg.getUpgradeProtocol() == headers::kWebTransport);
+ }
+ 
+ /*static*/ HTTPMessage HTTPWebTransport::makeConnectRequest(
