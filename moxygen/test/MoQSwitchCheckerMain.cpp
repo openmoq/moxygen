@@ -85,6 +85,11 @@ DEFINE_int64(
     "How long after --duration_ms to wait for replies, joiners' histories and "
     "ended tracks' streams to arrive");
 DEFINE_string(report, "", "Where to write the JSON report; empty = stdout");
+DEFINE_string(
+    auth_token,
+    "",
+    "AUTHORIZATION_TOKEN value for every SUBSCRIBE and FETCH; empty sends "
+    "none");
 
 namespace {
 using namespace moxygen;
@@ -143,6 +148,8 @@ class CheckerRun {
       }
     }
     checker_.startWatch();
+    // A test that injects faults waits for this line before it starts.
+    std::cerr << "watching" << std::endl;
     const auto start = Clock::now();
     const auto executor = co_await folly::coro::co_current_executor;
     for (auto at : joinTimes_) {
@@ -183,7 +190,9 @@ class CheckerRun {
     // Named locals: gcc 11 mishandles temporaries in a co_await expression.
     quic::TransportSettings transportSettings;
     transportSettings.orderedReadCallbacks = true;
-    const auto alpns = getMoqtProtocols(FLAGS_versions, true);
+    // moxygen's servers and revproxy know each draft by its Meta ALPN, not
+    // the standard one.
+    const auto alpns = getMoqtProtocols(FLAGS_versions, /*useStandard=*/false);
     std::shared_ptr<fizz::CertificateVerifier> verifier;
     if (FLAGS_insecure) {
       verifier = std::make_shared<
@@ -281,6 +290,9 @@ int main(int argc, char* argv[]) {
   }
   if (FLAGS_max_stall_ms > 0) {
     options.maxStall = milliseconds(FLAGS_max_stall_ms);
+  }
+  if (!FLAGS_auth_token.empty()) {
+    options.authToken = FLAGS_auth_token;
   }
 
   // The sessions and the checker run on one worker.

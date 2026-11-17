@@ -10,6 +10,7 @@
 #include <folly/container/F14Map.h>
 #include <folly/futures/Future.h>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <random>
 #include <vector>
@@ -18,6 +19,7 @@
 #include "moxygen/Subscriber.h"
 #include "moxygen/proxy/MoQGroupCache.h"
 #include "moxygen/proxy/MoQProxyTrack.h"
+#include "moxygen/proxy/MoQProxyTrackObserver.h"
 #include "moxygen/proxy/MoQUpstreamProvider.h"
 
 namespace moxygen {
@@ -29,6 +31,9 @@ struct MoQProxyOptions {
   // Accounted bytes shared by every track's cache and accepted replays.
   // Admission is first come, first served; overload only causes misses.
   size_t maxCacheBytes{10 * 1024 * 1024};
+  // Evaluated on UNAUTHORIZED; null preserves cached history.
+  // Runs on the event loop and must not block or throw.
+  std::function<bool()> cancelReplayOnUnauthorized;
   // Absolute extra wait for objects still arriving locally. Provisional.
   std::chrono::milliseconds cacheCompletionWait{100};
   // Longest time a local replay may go without an accepted write.
@@ -39,6 +44,8 @@ struct MoQProxyOptions {
   // Times the bounded waits above and the switch retries; null uses folly's
   // default.
   std::shared_ptr<folly::Timekeeper> timekeeper;
+  // Gives each new track its object observer; empty observes no track.
+  MoQProxyTrackObserverFactory trackObservers;
 };
 
 // Counters for telling a working cache from one that only passes warm tests.
@@ -178,8 +185,7 @@ class MoQProxy : public Publisher,
   std::shared_ptr<MoQProxySwitchStats> switchStats_{
       std::make_shared<MoQProxySwitchStats>()};
   // Shared by all tracks, which may share upstream sessions.
-  std::shared_ptr<MoQUpstreamGoaways> upstreamGoaways_{
-      std::make_shared<MoQUpstreamGoaways>()};
+  std::shared_ptr<MoQUpstreamGoaways> upstreamGoaways_;
   // Jitter for every track's switches.
   std::shared_ptr<std::mt19937_64> switchRandom_;
   // Cancels cache waits and local replays when the proxy closes.

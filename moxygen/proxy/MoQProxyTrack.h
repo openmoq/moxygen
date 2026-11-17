@@ -21,6 +21,7 @@
 
 #include "moxygen/Publisher.h"
 #include "moxygen/proxy/MoQGroupCache.h"
+#include "moxygen/proxy/MoQProxyTrackObserver.h"
 #include "moxygen/proxy/MoQUpstreamGoaways.h"
 #include "moxygen/proxy/MoQUpstreamHandoffArbiter.h"
 #include "moxygen/proxy/MoQUpstreamProvider.h"
@@ -41,6 +42,7 @@ struct MoQProxyTrackCacheConfig {
   // Newest group IDs kept, including the active group; 0 disables caching.
   size_t maxGroups{0};
   std::shared_ptr<MoQCacheBudget> budget;
+  std::function<bool()> cancelReplayOnUnauthorized;
 };
 
 // How a track moves to a replacement upstream when its upstream goes away.
@@ -124,6 +126,11 @@ struct MoQProxySwitchStats {
   // Each session or request-stream GOAWAY, once per track it reaches: a session
   // GOAWAY and a request-stream GOAWAY reaching one track count two.
   uint64_t upstreamGoaways{0};
+  // Session GOAWAYs received by the proxy's watched upstream sessions, once
+  // per session rather than once per track.
+  uint64_t sessionGoaways{0};
+  // Request-stream GOAWAYs received by the tracks' upstream subscriptions.
+  uint64_t requestStreamGoaways{0};
   // Upstream subscriptions that ended because their relay went away or their
   // session closed, rather than because the track ended.
   uint64_t upstreamsLost{0};
@@ -220,7 +227,8 @@ class MoQProxyTrack : public std::enable_shared_from_this<MoQProxyTrack> {
       FullTrackName fullTrackName,
       std::vector<std::shared_ptr<MoQUpstreamProvider>> upstreamProviders,
       CacheConfig cacheConfig = {},
-      UpstreamConfig upstreamConfig = {});
+      UpstreamConfig upstreamConfig = {},
+      std::shared_ptr<MoQProxyTrackObserver> observer = nullptr);
 
   ~MoQProxyTrack();
 
@@ -265,6 +273,9 @@ class MoQProxyTrack : public std::enable_shared_from_this<MoQProxyTrack> {
 
   const std::shared_ptr<MoQGroupCache>& groupCache() const {
     return cache_;
+  }
+  folly::CancellationToken replayCancellationToken() const {
+    return replayStopped_.getToken();
   }
   folly::coro::Task<folly::Unit> awaitUpstreamSubscription();
   // Still set after the upstream ends publishing, for historical fallback.
@@ -325,7 +336,8 @@ class MoQProxyTrack : public std::enable_shared_from_this<MoQProxyTrack> {
       FullTrackName fullTrackName,
       std::vector<std::shared_ptr<MoQUpstreamProvider>> upstreamProviders,
       CacheConfig cacheConfig,
-      UpstreamConfig upstreamConfig);
+      UpstreamConfig upstreamConfig,
+      std::shared_ptr<MoQProxyTrackObserver> observer);
 
   folly::coro::Task<Publisher::SubscribeResult> handleFirstSubscription(
       SubscribeRequest subscribeRequest,
@@ -376,6 +388,7 @@ class MoQProxyTrack : public std::enable_shared_from_this<MoQProxyTrack> {
   folly::coro::Task<void> enforceSwitchDeadline(
       std::chrono::milliseconds deadline,
       folly::CancellationToken stopped);
+  void noteUpstreamExtensions();
   void adoptReplacement(UpstreamAttempt attempt);
   void completeSwitch();
   void failSwitch();
@@ -455,6 +468,7 @@ class MoQProxyTrack : public std::enable_shared_from_this<MoQProxyTrack> {
   void onUpstreamLost(const PublishDone& publishDone);
   void notifyNoSubscribers();
   void stopCaching();
+  void shutdownCache();
   void joiningFetchAccepted(
       uint64_t attempt,
       std::shared_ptr<Publisher::FetchHandle> handle);
@@ -469,12 +483,16 @@ class MoQProxyTrack : public std::enable_shared_from_this<MoQProxyTrack> {
   std::vector<std::shared_ptr<MoQUpstreamProvider>> upstreamProviders_;
   std::shared_ptr<MoQForwarder> forwarder_;
   std::shared_ptr<MoQGroupCache> cache_;
+  const std::function<bool()> cancelReplayOnUnauthorized_;
+  folly::CancellationSource replayStopped_;
   std::shared_ptr<MoQUpstreamGoaways> goaways_;
   std::shared_ptr<MoQProxySwitchStats> switchStats_;
   MoQProxySwitchOptions switchOptions_;
   std::shared_ptr<folly::Timekeeper> timekeeper_;
   std::function<std::chrono::steady_clock::time_point()> clock_;
   std::shared_ptr<std::mt19937_64> random_;
+  // Null when the track is unobserved.
+  std::shared_ptr<MoQProxyObjectTap> objectTap_;
   UpstreamAttempt upstream_;
   // The GOAWAY watch of the upstream attempt being established, which the
   // track stops when it stops waiting for that attempt.

@@ -493,6 +493,8 @@ TEST_F(MoQProxyTest, SessionGoawayReachesEveryTrackOnThatSession) {
       .onGoaway(Goaway{});
 
   EXPECT_EQ(proxy_->switchStats().upstreamGoaways, 2);
+  EXPECT_EQ(proxy_->switchStats().sessionGoaways, 1);
+  EXPECT_EQ(proxy_->switchStats().requestStreamGoaways, 0);
   EXPECT_EQ(proxy_->switchStats().gracefulSwitches.started, 2);
   video.value()->unsubscribe();
   audio.value()->unsubscribe();
@@ -1010,6 +1012,7 @@ class MoQProxyJoiningTest : public MoQProxyTest {
     options.timekeeper = timekeeper_;
     options.cacheCompletionWait = 100ms;
     options.replayStallTimeout = 5s;
+    options.trackObservers = trackObservers_;
     return options;
   }
 
@@ -1026,6 +1029,8 @@ class MoQProxyJoiningTest : public MoQProxyTest {
           kPublisherGroupOrderExtensionType,
           folly::to_underlying(*upstreamGroupOrder_)));
     }
+    subscribeOk.extensions.insertMutableExtensions(
+        upstreamExtensions_.getMutableExtensions());
     return std::make_shared<NiceMock<MockSubscriptionHandle>>(
         std::move(subscribeOk));
   }
@@ -1151,6 +1156,7 @@ class MoQProxyJoiningTest : public MoQProxyTest {
       std::make_shared<folly::ManualTimekeeper>()};
   // The publisher group order the upstream SUBSCRIBE_OK advertises, if any.
   std::optional<GroupOrder> upstreamGroupOrder_;
+  Extensions upstreamExtensions_;
   std::shared_ptr<NiceMock<test::MockMoQSession>> firstViewer_{
       makeDownstreamSession()};
   std::shared_ptr<test::LiveViewerConsumer> firstViewerLive_{
@@ -1158,6 +1164,7 @@ class MoQProxyJoiningTest : public MoQProxyTest {
   std::shared_ptr<Publisher::SubscriptionHandle> firstHandle_;
   std::vector<std::shared_ptr<Publisher::SubscriptionHandle>> viewerHandles_;
   std::shared_ptr<TrackConsumer> upstreamConsumer_;
+  MoQProxyTrackObserverFactory trackObservers_;
 };
 
 TEST_F(MoQProxyJoiningTest, PendingSubscribersShareJoiningLocation) {
@@ -1621,6 +1628,147 @@ TEST_F(MoQProxyJoiningTest, CancellingLocalReplayStopsFurtherWrites) {
   EXPECT_EQ(proxy_->joinStats().replayStallResets, 0);
 }
 
+TEST_F(MoQProxyJoiningTest, FinalLiveObjectsArriveAfterPublishDone) {
+  auto options = makeOptions();
+  options.cancelReplayOnUnauthorized = [] {
+    ADD_FAILURE() << "Normal publication end must not evaluate the policy";
+    return true;
+  };
+  proxy_ = MoQProxy::create({provider_}, options);
+  establish();
+  auto live = makeConsumer();
+  auto downstream = std::make_shared<StrictMock<MockSubgroupConsumer>>();
+  EXPECT_CALL(*live, beginSubgroup(41, 0, _, _)).WillOnce(Return(downstream));
+  EXPECT_CALL(*downstream, object(0, _, _, false))
+      .WillOnce(Return(folly::unit));
+  EXPECT_CALL(*downstream, object(1, _, _, true)).WillOnce(Return(folly::unit));
+  EXPECT_CALL(*downstream, reset(_)).Times(0);
+  addViewer(RequestID(5), live);
+  auto subgroup = openSubgroup(41);
+  ASSERT_TRUE(subgroup);
+  ASSERT_TRUE(
+      subgroup->object(0, payloadOf(10), noExtensions(), false).hasValue());
+  ASSERT_TRUE(
+      upstreamConsumer_
+          ->publishDone(
+              PublishDone{
+                  RequestID(0), PublishDoneStatusCode::TRACK_ENDED, 1, "ended"})
+          .hasValue());
+  EXPECT_TRUE(
+      subgroup->object(1, payloadOf(10), noExtensions(), true).hasValue());
+  EXPECT_EQ(
+      firstViewerLive_->received,
+      std::vector<AbsoluteLocation>({{41, 0}, {41, 1}}));
+}
+
+TEST_F(MoQProxyJoiningTest, EnablingPolicyCancelsExistingReplayOnUnauthorized) {
+  auto options = makeOptions();
+  auto enabled = std::make_shared<bool>(false);
+  options.cancelReplayOnUnauthorized = [enabled] { return *enabled; };
+  proxy_ = MoQProxy::create({provider_}, options);
+  establish();
+  publishGroup(41, 3);
+  auto viewer = addViewer(RequestID(5));
+  auto consumer = std::make_shared<test::RecordingFetchConsumer>();
+  consumer->readyWrites = 1;
+  auto result =
+      fetch(viewer, joiningFetch(RequestID(7), RequestID(5), 41), consumer);
+  drive();
+  ASSERT_TRUE(result.hasValue());
+  auto retained = cache();
+  ASSERT_TRUE(retained);
+  *enabled = true;
+  upstreamConsumer_->publishDone(
+      PublishDone{
+          RequestID(0),
+          PublishDoneStatusCode::UNAUTHORIZED,
+          0,
+          "authorization revoked"});
+  drive();
+  EXPECT_EQ(consumer->resetCode, ResetStreamErrorCode::CANCELLED);
+  EXPECT_EQ(retained->inspect({41, 0}, {41, 3}), MoQGroupCache::Coverage::Miss);
+  consumer->makeReady();
+  drive();
+  EXPECT_EQ(consumer->log, std::vector<std::string>({"object 41/0 10"}));
+}
+
+class MoQProxyReplayEndTest : public MoQProxyJoiningTest {
+ protected:
+  void checkReplayFinishes(
+      PublishDoneStatusCode status,
+      std::optional<bool> cancelReplay) {
+    auto options = makeOptions();
+    auto enabled = std::make_shared<bool>(true);
+    if (cancelReplay.has_value()) {
+      options.cancelReplayOnUnauthorized = [enabled] { return *enabled; };
+    }
+    proxy_ = MoQProxy::create({provider_}, options);
+    establish();
+    publishGroup(41, 3);
+    auto viewer = addViewer(RequestID(5));
+    auto consumer = std::make_shared<test::RecordingFetchConsumer>();
+    consumer->readyWrites = 1;
+    auto result =
+        fetch(viewer, joiningFetch(RequestID(7), RequestID(5), 41), consumer);
+    ASSERT_TRUE(result.hasValue());
+    drive();
+    ASSERT_EQ(consumer->log.size(), 1);
+    *enabled = cancelReplay.value_or(false);
+    upstreamConsumer_->publishDone(
+        PublishDone{RequestID(0), status, 0, "ended"});
+    drive();
+    EXPECT_FALSE(consumer->resetCode.has_value());
+    consumer->makeReady();
+    drive();
+    EXPECT_EQ(
+        consumer->log,
+        expectedReplay({"object 41/0 10", "object 41/1 10", "object 41/2 10"}));
+  }
+};
+
+TEST_F(MoQProxyReplayEndTest, NormalEndPreservesAcceptedReplay) {
+  checkReplayFinishes(PublishDoneStatusCode::TRACK_ENDED, true);
+}
+
+TEST_F(MoQProxyReplayEndTest, DisablingPolicyPreservesReplayOnUnauthorized) {
+  checkReplayFinishes(PublishDoneStatusCode::UNAUTHORIZED, false);
+}
+
+TEST_F(MoQProxyReplayEndTest, UnauthorizedPreservesReplayWithNoPolicy) {
+  checkReplayFinishes(PublishDoneStatusCode::UNAUTHORIZED, std::nullopt);
+}
+
+TEST_F(MoQProxyJoiningTest, UnauthorizedEndsWaitingJoinWithoutHistoryFallback) {
+  auto options = makeOptions();
+  options.cancelReplayOnUnauthorized = [] { return true; };
+  proxy_ = MoQProxy::create({provider_}, options);
+  establish();
+  auto active = openSubgroup(41, /*containsLastInGroup=*/false);
+  ASSERT_TRUE(
+      active->beginObject(0, 20, payloadOf(5), noExtensions()).hasValue());
+  auto viewer = addViewer(RequestID(5));
+  EXPECT_CALL(*upstreamSession_, fetch(_, _)).Times(0);
+  auto pending = startFetch(
+      viewer,
+      joiningFetch(RequestID(7), RequestID(5), 41),
+      std::make_shared<test::RecordingFetchConsumer>());
+  drive();
+  ASSERT_FALSE(pending.isReady());
+  upstreamConsumer_->publishDone(
+      PublishDone{
+          RequestID(0),
+          PublishDoneStatusCode::UNAUTHORIZED,
+          1,
+          "authorization revoked"});
+  drive();
+  ASSERT_TRUE(pending.isReady());
+  auto result = std::move(pending).get();
+  ASSERT_TRUE(result.hasError());
+  EXPECT_EQ(result.error().errorCode, FetchErrorCode::CANCELLED);
+  auto later = fetch(viewer, joiningFetch(RequestID(9), RequestID(5), 41));
+  EXPECT_TRUE(later.hasError());
+}
+
 TEST_F(MoQProxyJoiningTest, StalledReplayIsResetWithoutAffectingLive) {
   establish();
   publishGroup(41, 3);
@@ -1804,6 +1952,173 @@ TEST_F(MoQProxyJoiningTest, HistoryRefusedAsGoingAwayWithoutASwitchFails) {
 }
 
 // A track whose upstream can be lost, with a second upstream to switch to.
+class RecordingObjectObserver final : public MoQProxyTrackObserver {
+ public:
+  struct Chunk {
+    MoQProxyObjectId id;
+    size_t bytes{0};
+    bool first{false};
+    bool complete{false};
+    size_t extensions{0};
+
+    bool operator==(const Chunk&) const = default;
+  };
+  struct Forwarded {
+    MoQProxyObjectId id;
+
+    bool operator==(const Forwarded&) const = default;
+  };
+
+  void onObjectData(const MoQProxyObjectChunk& chunk) override {
+    chunks.push_back(
+        Chunk{
+            .id = chunk.id,
+            .bytes =
+                chunk.payload ? chunk.payload->computeChainDataLength() : 0,
+            .first = chunk.first,
+            .complete = chunk.complete,
+            .extensions = chunk.extensions ? chunk.extensions->size() : 0});
+  }
+
+  void onObjectForwarded(const MoQProxyObjectForwarded& event) override {
+    forwarded.push_back(Forwarded{.id = event.id});
+  }
+
+  void onUpstreamExtensions(const Extensions& extensions) override {
+    upstreamExtensions.push_back(extensions);
+  }
+
+  Extensions downstreamExtensions(Extensions upstream) override {
+    upstream.insertMutableExtension(Extension(kAddedType, 1));
+    return upstream;
+  }
+
+  static constexpr uint64_t kAddedType{0x12};
+  std::vector<Chunk> chunks;
+  std::vector<Forwarded> forwarded;
+  std::vector<Extensions> upstreamExtensions;
+};
+
+TEST(MoQProxyObjectTapTest, AThrowingForwardDoesNotStopLaterReports) {
+  auto observer = std::make_shared<RecordingObjectObserver>();
+  auto tap = std::make_shared<MoQProxyObjectTap>(
+      observer, [] { return std::chrono::steady_clock::now(); });
+
+  EXPECT_THROW(
+      tap->forwardLastByte(
+          MoQProxyObjectId{1, 0, 0},
+          []() -> int { throw std::runtime_error("write failed"); }),
+      std::runtime_error);
+  tap->forwardLastByte(MoQProxyObjectId{1, 0, 1}, [&] {
+    tap->onDownstreamWrite();
+    return 0;
+  });
+
+  ASSERT_EQ(observer->forwarded.size(), 1);
+  EXPECT_EQ(observer->forwarded[0].id, (MoQProxyObjectId{1, 0, 1}));
+}
+
+class MoQProxyTrackObserverTest : public MoQProxyJoiningTest {
+ protected:
+  MoQProxyTrackObserverTest() {
+    trackObservers_ = [this](const FullTrackName& fullTrackName) {
+      observedTracks_.push_back(fullTrackName);
+      return observer_;
+    };
+  }
+
+  std::shared_ptr<RecordingObjectObserver> observer_{
+      std::make_shared<RecordingObjectObserver>()};
+  std::vector<FullTrackName> observedTracks_;
+};
+
+TEST_F(MoQProxyTrackObserverTest, ReportsEachObjectOnceHoweverManyGetIt) {
+  establish();
+  addViewer(RequestID(5));
+  Extensions extensions;
+  extensions.insertMutableExtension(Extension(0x10, 7));
+
+  EXPECT_TRUE(openSubgroup(41)
+                  ->object(0, payloadOf(10), std::move(extensions), false)
+                  .hasValue());
+
+  const std::vector<FullTrackName> tracks{kTrackName};
+  EXPECT_EQ(observedTracks_, tracks);
+  const std::vector<RecordingObjectObserver::Chunk> chunks{
+      {.id = {41, 0, 0},
+       .bytes = 10,
+       .first = true,
+       .complete = true,
+       .extensions = 1}};
+  EXPECT_EQ(observer_->chunks, chunks);
+  const std::vector<RecordingObjectObserver::Forwarded> forwarded{
+      {.id = {41, 0, 0}}};
+  EXPECT_EQ(observer_->forwarded, forwarded);
+}
+
+TEST_F(MoQProxyTrackObserverTest, SubscribersAreToldWhatTheObserverMakesOfIt) {
+  upstreamExtensions_.insertMutableExtension(Extension(0x10, 7));
+  establish();
+  addViewer(RequestID(5));
+
+  ASSERT_EQ(observer_->upstreamExtensions.size(), 1);
+  EXPECT_EQ(observer_->upstreamExtensions[0].getIntExtension(0x10), 7);
+  for (const auto& handle : {firstHandle_, viewerHandles_.back()}) {
+    const auto& told = handle->subscribeOk().extensions;
+    EXPECT_EQ(told.getIntExtension(0x10), 7);
+    EXPECT_EQ(told.getIntExtension(RecordingObjectObserver::kAddedType), 1);
+  }
+}
+
+TEST_F(MoQProxyTrackObserverTest, StreamedObjectIsForwardedAtItsLastChunk) {
+  establish();
+  auto subgroup = openSubgroup(41);
+
+  EXPECT_TRUE(
+      subgroup->beginObject(0, 20, payloadOf(5), noExtensions()).hasValue());
+  EXPECT_TRUE(observer_->forwarded.empty());
+  EXPECT_TRUE(subgroup->objectPayload(payloadOf(15), false).hasValue());
+
+  const std::vector<RecordingObjectObserver::Chunk> chunks{
+      {.id = {41, 0, 0}, .bytes = 5, .first = true},
+      {.id = {41, 0, 0}, .bytes = 15, .complete = true}};
+  EXPECT_EQ(observer_->chunks, chunks);
+  const std::vector<RecordingObjectObserver::Forwarded> forwarded{
+      {.id = {41, 0, 0}}};
+  EXPECT_EQ(observer_->forwarded, forwarded);
+}
+
+TEST_F(MoQProxyTrackObserverTest, RefusedWriteIsNotForwarded) {
+  firstViewerLive_->stoppedObjects = {{41, 0}};
+  establish();
+
+  publishGroup(41, 1);
+  publishGroup(42, 1);
+
+  EXPECT_EQ(observer_->chunks.size(), 2);
+  const std::vector<RecordingObjectObserver::Forwarded> forwarded{
+      {.id = {42, 0, 0}}};
+  EXPECT_EQ(observer_->forwarded, forwarded);
+}
+
+TEST_F(MoQProxyTrackObserverTest, ReportsObjectStreams) {
+  establish();
+
+  EXPECT_TRUE(upstreamConsumer_
+                  ->objectStream(
+                      ObjectHeader(41, 3, 0, kDefaultPriority, 10),
+                      payloadOf(10),
+                      false)
+                  .hasValue());
+
+  const std::vector<RecordingObjectObserver::Chunk> chunks{
+      {.id = {41, 3, 0}, .bytes = 10, .first = true, .complete = true}};
+  EXPECT_EQ(observer_->chunks, chunks);
+  const std::vector<RecordingObjectObserver::Forwarded> forwarded{
+      {.id = {41, 3, 0}}};
+  EXPECT_EQ(observer_->forwarded, forwarded);
+}
+
 class MoQProxyJoiningSwitchTest : public MoQProxyJoiningTest {
  protected:
   void SetUp() override {
