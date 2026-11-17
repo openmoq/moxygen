@@ -29,7 +29,6 @@ concurrency:
 
 permissions:
   contents: write
-  checks: write
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════

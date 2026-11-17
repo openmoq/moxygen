@@ -15,7 +15,6 @@ concurrency:
 
 permissions:
   contents: read
-  checks: write
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
@@ -124,22 +123,15 @@ jobs:
           ASAN_OPTIONS: ${{ matrix.name == 'asan debug' && 'detect_leaks=1:abort_on_error=1' || '' }}
         run: ctest --test-dir _build --output-on-failure --output-junit test-results.xml
 
-      # Report goes to the job summary. Skipped on cross-repo PRs; ctest output
-      # above still shows pass/fail.
       - name: Publish test results
         uses: dorny/test-reporter@v3.2.0
-        if: ${{ (success() || failure()) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        if: success() || failure()
         with:
           name: "test (${{ matrix.name }})"
           path: _build/test-results.xml
           reporter: java-junit
           list-tests: failed
           fail-on-empty: ${{ job.status == 'success' && 'true' || 'false' }}
-
-      - name: Note fork-PR reporter skip
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-        run: |
-          echo "::notice::Publish test results skipped — fork-PR GITHUB_TOKEN lacks checks:write. ctest output above is authoritative."
 
       - name: Install (smoke test)
         if: matrix.name != 'asan debug'
