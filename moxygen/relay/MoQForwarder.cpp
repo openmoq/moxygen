@@ -508,6 +508,10 @@ void MoQForwarder::removeSubscriberIt(
   }
   subscriber->detach();
   XLOG(DBG1) << "subscribers_.size()=" << subscribers_.size();
+  if (callback_) {
+    callback_->onSubscriberRemoved(
+        this, subscriber->sessionId, subscriber->requestID);
+  }
   checkAndFireOnEmpty();
 }
 
@@ -1097,8 +1101,12 @@ void MoQForwarder::Subscriber::requestFill(
 
 void MoQForwarder::Subscriber::unsubscribe() {
   XLOG(DBG4) << "unsubscribe sess=" << this;
-  if (forwarder) {
-    forwarder->removeSubscriber(sessionId, std::nullopt, "unsubscribe");
+  if (!forwarder) {
+    return;
+  }
+  auto it = forwarder->subscribers_.find(sessionId);
+  if (it != forwarder->subscribers_.end() && it->second.get() == this) {
+    forwarder->removeSubscriberIt(it, std::nullopt, "unsubscribe");
   }
 }
 

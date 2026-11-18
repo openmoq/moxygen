@@ -509,7 +509,7 @@ class MoQSession : public Subscriber,
       return groupOrder_;
     }
 
-    std::optional<uint8_t> getPublisherPriority() const {
+    virtual std::optional<uint8_t> getPublisherPriority() const {
       return publisherPriority_;
     }
 
