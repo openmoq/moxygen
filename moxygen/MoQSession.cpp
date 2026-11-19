@@ -9325,7 +9325,7 @@ std::optional<std::string> MoQSession::getMoQTImplementationIfPresent(
 
 /*static*/
 std::string MoQSession::getMoQTImplementationString(uint64_t version) {
-  return fmt::format("Meta moxygen draft-{}", getDraftMajorVersion(version));
+  return fmt::format("openmoq moxygen draft-{}", getDraftMajorVersion(version));
 }
 
 uint64_t MoQSession::getMaxAuthTokenCacheSizeIfPresent(
