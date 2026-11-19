@@ -1081,6 +1081,16 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
   co_await folly::coro::co_safe_point;
   folly::RequestContextScopeGuard guard;
   setRequestSession();
+  // The application can clear the handler while this request is queued.
+  if (!subscribeHandler_) {
+    publishNamespaceError(
+        PublishNamespaceError{
+            publishNamespace.requestID,
+            PublishNamespaceErrorCode::NOT_SUPPORTED,
+            "Not a subscriber"},
+        *replyContext);
+    co_return;
+  }
   auto pubNsCb = std::make_shared<SubscriberPublishNamespaceCallback>(
       *this, publishNamespace.requestID, replyContext);
   auto token = co_await folly::coro::co_current_cancellation_token;
@@ -1438,6 +1448,16 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
   co_await folly::coro::co_safe_point;
   folly::RequestContextScopeGuard guard;
   setRequestSession();
+  // The application can clear the handler while this request is queued.
+  if (!publishHandler_) {
+    subscribeNamespaceError(
+        SubscribeNamespaceError{
+            subNs.requestID,
+            SubscribeNamespaceErrorCode::NOT_SUPPORTED,
+            "Not a publisher"},
+        std::move(subNsReply));
+    co_return;
+  }
   auto publishHandle = std::make_shared<MoQNamespacePublishHandle>(
       subNsReply, getMessageParameterExtensions());
   auto token = co_await folly::coro::co_current_cancellation_token;
@@ -1698,6 +1718,16 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeTracks(
   co_await folly::coro::co_safe_point;
   folly::RequestContextScopeGuard guard;
   setRequestSession();
+  // The application can clear the handler while this request is queued.
+  if (!publishHandler_) {
+    subscribeTracksError(
+        SubscribeTracksError{
+            subTracks.requestID,
+            SubscribeTracksErrorCode::NOT_SUPPORTED,
+            "Not a publisher"},
+        std::move(subTracksReply));
+    co_return;
+  }
   std::shared_ptr<Publisher::PublishBlockedHandle> publishBlockedHandle =
       subTracksReply;
   auto token = co_await folly::coro::co_current_cancellation_token;

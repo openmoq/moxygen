@@ -25,6 +25,20 @@ CO_TEST_P_X(MoQSessionTest, NoPublishHandler) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
+// The application clears its publish handler after the session accepts a
+// TRACK_STATUS but before the TRACK_STATUS handler runs.
+CO_TEST_P_X(MoQSessionTest, TrackStatusAfterPublishHandlerCleared) {
+  co_await setupMoQSession();
+  EXPECT_CALL(*serverPublisherStatsCallback_, onTrackStatus()).WillOnce([this] {
+    MoQExecutor_->add([this] { serverSession_->setPublishHandler(nullptr); });
+  });
+  EXPECT_CALL(*serverPublisher, trackStatus(_)).Times(0);
+  auto res = co_await clientSession_->trackStatus(getTrackStatus());
+  EXPECT_TRUE(res.hasError());
+  EXPECT_FALSE(serverSession_->isClosed());
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, FailedPublishWriteDoesNotReachPeer) {
   co_await setupMoQSessionForPublish(initialMaxRequestID_);
   EXPECT_CALL(*serverSubscriber, publish(_, _))
@@ -596,6 +610,34 @@ CO_TEST_P_X(MoQSessionTest, PublishBasicSuccess) {
 
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+
+// The application clears its subscribe handler after the session accepts a
+// PUBLISH but before the PUBLISH handler runs. The session stays open.
+CO_TEST_P_X(MoQSessionTest, PublishAfterSubscribeHandlerCleared) {
+  co_await setupMoQSessionForPublish(initialMaxRequestID_);
+  EXPECT_CALL(*serverSubscriberStatsCallback_, onPublish()).WillOnce([this] {
+    // Runs ahead of the handler that onPublishImpl spawns next.
+    MoQExecutor_->add([this] { serverSession_->setSubscribeHandler(nullptr); });
+  });
+  EXPECT_CALL(*serverSubscriber, publish(_, _)).Times(0);
+
+  PublishRequest pub{
+      RequestID(0),
+      FullTrackName{TrackNamespace{{"test"}}, "test-track"},
+      TrackAlias(100),
+      GroupOrder::OldestFirst,
+      AbsoluteLocation{0, 100},
+      true,
+  };
+  auto result = clientSession_->publish(std::move(pub), makePublishHandle());
+  CO_ASSERT_TRUE(result.hasValue());
+  auto reply = co_await std::move(result->reply);
+  EXPECT_TRUE(reply.hasError());
+  EXPECT_FALSE(serverSession_->isClosed());
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 CO_TEST_P_X(MoQSessionTest, PublishWithFilterParameters) {
   co_await setupMoQSessionForPublish(initialMaxRequestID_);
 
