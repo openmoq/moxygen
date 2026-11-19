@@ -25,3 +25,12 @@ moxygen_add_test(TARGET MoQTrackTests
     moqtest_utils
     testmain
 )
+
+moxygen_add_test(TARGET LatencyQuantilesTests
+  PREFIX "LatencyQuantiles"
+  SOURCES
+    LatencyQuantilesTest.cpp
+  DEPENDS
+    moqtest_utils
+    testmain
+)

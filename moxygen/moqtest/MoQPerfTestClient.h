@@ -19,6 +19,7 @@
 #include "moxygen/events/MoQFollyExecutorImpl.h"
 #include "moxygen/moqtest/AtomicLatency.h"
 #include "moxygen/moqtest/LatencyHistogram.h"
+#include "moxygen/moqtest/LatencyQuantiles.h"
 #include "moxygen/moqtest/Types.h"
 #include "moxygen/samples/util/Utils.h"
 
@@ -126,6 +127,7 @@ class MoQPerfTestClient {
     uint64_t latencyObjects{0};
     // Drained by each call, so only the aggregator should ask for it.
     AtomicLatency::Interval intervalLatency;
+    LatencyQuantiles intervalQuantiles;
     LatencyHistogram latency;
     uint32_t totalResets{0};
     uint32_t totalFailures{0};
@@ -182,6 +184,7 @@ class MoQPerfTestClient {
   std::atomic<uint64_t> objects_{0};
   std::atomic<uint64_t> bytes_{0};
   mutable AtomicLatencyHistogram latency_;
+  mutable AtomicLatencyQuantiles latencyQuantiles_;
 };
 
 } // namespace moxygen

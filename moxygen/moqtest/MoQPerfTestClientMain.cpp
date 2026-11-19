@@ -79,6 +79,7 @@ struct Totals {
   uint64_t latencySumMs{0};
   uint64_t latencyObjects{0};
   moxygen::AtomicLatency::Interval interval;
+  moxygen::LatencyQuantiles quantiles;
   moxygen::LatencyHistogram latency;
 
   double avgLatencyMs() const {
@@ -104,10 +105,22 @@ Totals sumResults(const Clients& clients) {
     t.latencySumMs += r.totalLatencyMs;
     t.latencyObjects += r.latencyObjects;
     t.interval.merge(r.intervalLatency);
+    t.quantiles.merge(r.intervalQuantiles);
     t.latency.merge(r.latency);
   }
   return t;
 }
+
+// Whole-run latency built from the drained intervals.
+struct RunLatency {
+  moxygen::LatencyQuantiles quantiles;
+  moxygen::AtomicLatency::Interval interval;
+
+  void add(const Totals& t) {
+    quantiles.merge(t.quantiles);
+    interval.merge(t.interval);
+  }
+};
 
 // Rewrite the whole .prom file each tick.
 void writePromFile(
@@ -138,7 +151,8 @@ folly::coro::Task<void> aggregateStats(
     const Clients& clients,
     folly::CancellationToken cancelToken,
     std::string metricsOut,
-    std::string promLabels) {
+    std::string promLabels,
+    RunLatency& runLatency) {
   auto startTime = std::chrono::steady_clock::now();
   Totals last;
 
@@ -172,6 +186,11 @@ folly::coro::Task<void> aggregateStats(
                << " | Failures: " << t.failures - last.failures << "/s, "
                << t.failures << " total"
                << " | Done: " << t.completed << "/" << clients.size();
+    if (t.quantiles.count() > 0) {
+      XLOG(INFO) << "[LATENCY_HIST] [" << elapsed << "s] "
+                 << t.quantiles.toString();
+    }
+    runLatency.add(t);
 
     if (!metricsOut.empty()) {
       writePromFile(metricsOut, promLabels, t, mbps);
@@ -272,12 +291,17 @@ int main(int argc, char** argv) {
       clients.push_back(std::move(client));
     }
 
+    RunLatency runLatency;
     {
       folly::ScopedEventBaseThread statsThread;
       folly::coro::co_withExecutor(
           statsThread.getEventBase(),
           aggregateStats(
-              clients, cancelSource.getToken(), FLAGS_metrics_out, promLabels))
+              clients,
+              cancelSource.getToken(),
+              FLAGS_metrics_out,
+              promLabels,
+              runLatency))
           .start();
 
       // Wait for all client tasks to complete
@@ -286,6 +310,7 @@ int main(int argc, char** argv) {
     }
 
     auto t = sumResults(clients);
+    runLatency.add(t);
     auto duration = t.durationSeconds;
     double throughputMbps = duration > 0
         ? t.bytes * 8.0 / kBitsPerMbit / static_cast<double>(duration)
@@ -305,6 +330,17 @@ int main(int argc, char** argv) {
       XLOG(INFO) << "  Avg Object Latency: "
                  << fmt::format("{:.1f}", t.avgLatencyMs()) << " ms ("
                  << t.latencyObjects << " objects measured)";
+    }
+    if (runLatency.quantiles.count() > 0) {
+      const auto& q = runLatency.quantiles;
+      XLOG(INFO) << fmt::format(
+          "  Object Latency p50/p90/p95/p99/p99.9/max: {}/{}/{}/{}/{}/{} ms",
+          *q.quantile(0.5),
+          *q.quantile(0.9),
+          *q.quantile(0.95),
+          *q.quantile(0.99),
+          *q.quantile(0.999),
+          runLatency.interval.maxMs);
     }
     XLOG(INFO) << "  Result: "
                << (t.completed == clients.size()
