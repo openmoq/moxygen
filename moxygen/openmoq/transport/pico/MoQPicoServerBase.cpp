@@ -321,6 +321,12 @@ bool MoQPicoServerBase::createQuicContext() {
   XLOG(DBG1) << "Supported ALPNs: "
              << folly::join(", ", buildSupportedAlpns(versions_, wtConfig_));
 
+  static_assert(
+      std::tuple_size_v<decltype(transportConfig_.resetSeed)::value_type> ==
+      PICOQUIC_RESET_SECRET_SIZE);
+  // picoquic_create copies the seed but takes a non-const pointer.
+  auto resetSeed = transportConfig_.resetSeed;
+
   uint64_t current_time = picoquic_current_time();
   quic_ = picoquic_create(
       1000000,
@@ -332,7 +338,7 @@ bool MoQPicoServerBase::createQuicContext() {
       this,    // callback_ctx
       nullptr, // cnx_id_callback
       nullptr, // cnx_id_callback_ctx
-      nullptr, // reset_seed
+      resetSeed ? resetSeed->data() : nullptr,
       current_time,
       nullptr, // simulated_time
       nullptr, // ticket_file_name
