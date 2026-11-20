@@ -9,9 +9,46 @@
 #include <folly/Try.h>
 #include <folly/logging/xlog.h>
 #include <moxygen/openmoq/transport/pico/MoQPicoQuicEventBaseServer.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <cstring>
 #include <stdexcept>
 
 namespace moxygen {
+
+namespace {
+
+// First 16 bytes of HMAC-SHA256(seed, big-endian shard index).
+std::array<uint8_t, 16> shardResetSeed(
+    const std::array<uint8_t, 16>& seed,
+    uint32_t index) {
+  const uint8_t msg[4] = {
+      uint8_t(index >> 24),
+      uint8_t(index >> 16),
+      uint8_t(index >> 8),
+      uint8_t(index)};
+  uint8_t mac[EVP_MAX_MD_SIZE];
+  unsigned int len = 0;
+  if (!HMAC(
+          EVP_sha256(),
+          seed.data(),
+          int(seed.size()),
+          msg,
+          sizeof(msg),
+          mac,
+          &len) ||
+      len < 16) {
+    throw std::runtime_error(
+        "MoQPicoQuicShardedServer: failed to derive a shard reset seed");
+  }
+  std::array<uint8_t, 16> out;
+  std::memcpy(out.data(), mac, out.size());
+  OPENSSL_cleanse(mac, sizeof(mac));
+  return out;
+}
+
+} // namespace
 
 // Forwards the overridable virtuals to the parent so a subclass's overrides
 // run unchanged. validateAuthority() needs none: MoQSession reaches it through
@@ -126,6 +163,15 @@ void MoQPicoQuicShardedServer::start(
 
   shards_.reserve(evbs.size());
   for (auto* workerEvb : evbs) {
+    // A packet from another source port can reach a shard without its
+    // connection; a per-shard seed keeps that shard's reset invalid. Shards
+    // bind in order, so after a restart with the same shard count the kernel
+    // hash sends each flow back to the same index.
+    PicoTransportConfig shardCfg = cfg;
+    if (cfg.resetSeed) {
+      shardCfg.resetSeed =
+          shardResetSeed(*cfg.resetSeed, uint32_t(shards_.size()));
+    }
     auto destroyed = std::make_shared<folly::Baton<>>();
     // The deleter runs after every base destructor, so teardown()'s waiter
     // cannot outrace ~MoQPicoServerBase.
@@ -139,7 +185,7 @@ void MoQPicoQuicShardedServer::start(
                 endpoint_,
                 folly::getKeepAliveToken(workerEvb),
                 versions_,
-                cfg,
+                std::move(shardCfg),
                 wtConfig_,
                 sharded),
             [destroyed](ShardServer* shard) {

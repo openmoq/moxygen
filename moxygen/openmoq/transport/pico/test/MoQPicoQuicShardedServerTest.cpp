@@ -27,9 +27,18 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <exception>
+#include <optional>
+#include <set>
+#include <string>
 #include <thread>
 
 namespace moxygen::test {
@@ -130,6 +139,91 @@ folly::coro::Task<bool> serverAnswersSubscribe(
   bool notSupported = result.hasValue() && result->hasError() &&
       result->error().errorCode == SubscribeErrorCode::NOT_SUPPORTED;
   co_return notSupported;
+}
+
+// Sends 1-RTT-shaped datagrams with an unknown connection ID from one local
+// port. The shard that receives one answers with a stateless reset whose last
+// 16 bytes are the token derived from its seed and the connection ID.
+class ResetProbe {
+ public:
+  ResetProbe() : fd_(::socket(AF_INET6, SOCK_DGRAM, 0)) {
+    XCHECK_GE(fd_, 0);
+    sockaddr_in6 local{};
+    local.sin6_family = AF_INET6;
+    local.sin6_addr = in6addr_loopback;
+    XCHECK_EQ(
+        ::bind(fd_, reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+    timeval timeout{0, 250000};
+    XCHECK_EQ(
+        ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)),
+        0);
+  }
+  ~ResetProbe() {
+    ::close(fd_);
+  }
+  ResetProbe(const ResetProbe&) = delete;
+  ResetProbe& operator=(const ResetProbe&) = delete;
+
+  // Retries because picoquic sends at most one reset per 100 ms per shard.
+  std::optional<std::string> token(uint16_t port) {
+    std::array<uint8_t, 128> reply{};
+    while (::recv(fd_, reply.data(), reply.size(), MSG_DONTWAIT) > 0) {
+    }
+    sockaddr_in6 server{};
+    server.sin6_family = AF_INET6;
+    server.sin6_addr = in6addr_loopback;
+    server.sin6_port = htons(port);
+    std::array<uint8_t, 64> packet{};
+    packet[0] = 0x41; // short header with the fixed bit
+    for (size_t i = 1; i <= 8; ++i) {
+      packet[i] = uint8_t(0xa0 + i); // 8-byte connection ID
+    }
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      ::sendto(
+          fd_,
+          packet.data(),
+          packet.size(),
+          0,
+          reinterpret_cast<sockaddr*>(&server),
+          sizeof(server));
+      auto n = ::recv(fd_, reply.data(), reply.size(), 0);
+      if (n >= 21) {
+        return std::string(
+            reinterpret_cast<const char*>(reply.data()) + n - 16, 16);
+      }
+    }
+    return std::nullopt;
+  }
+
+ private:
+  int fd_;
+};
+
+PicoTransportConfig seededConfig() {
+  PicoTransportConfig cfg;
+  auto& seed = cfg.resetSeed.emplace();
+  for (size_t i = 0; i < seed.size(); ++i) {
+    seed[i] = uint8_t(i);
+  }
+  return cfg;
+}
+
+// Starts a two-shard server on port, probes it once, and stops it.
+std::optional<std::string> probeTwoShardServer(
+    const CertFiles& certs,
+    uint16_t port,
+    const PicoTransportConfig& cfg,
+    ResetProbe& probe) {
+  folly::ScopedEventBaseThread shard0("shard0");
+  folly::ScopedEventBaseThread shard1("shard1");
+  auto server = std::make_shared<TestShardedServer>(
+      certs.cert, certs.key, kEndpoint, "", cfg);
+  server->start(
+      folly::SocketAddress("::", port),
+      {shard0.getEventBase(), shard1.getEventBase()});
+  auto token = probe.token(port);
+  server->stop();
+  return token;
 }
 
 } // namespace
@@ -343,6 +437,59 @@ TEST(MoQPicoQuicShardedServerTest, WebTransportConnectCreatesSession) {
   clientEvb->runInEventBaseThreadAndWait([&] { client.reset(); });
   keepAlive.reset();
   clientThread.join();
+  server->stop();
+}
+
+// The same flow reaches the same shard index after a restart, so a restarted
+// server with the same seed sends the same token.
+TEST(MoQPicoQuicShardedServerTest, ResetTokenSurvivesRestartWithSeed) {
+  auto certs = makeSelfSignedCert();
+  auto port = pickFreeUdpPort();
+  ResetProbe probe;
+  auto before = probeTwoShardServer(*certs, port, seededConfig(), probe);
+  auto after = probeTwoShardServer(*certs, port, seededConfig(), probe);
+  ASSERT_TRUE(before.has_value());
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(*before, *after);
+}
+
+TEST(MoQPicoQuicShardedServerTest, ResetTokenChangesAcrossRestartWithoutSeed) {
+  auto certs = makeSelfSignedCert();
+  auto port = pickFreeUdpPort();
+  ResetProbe probe;
+  auto before = probeTwoShardServer(*certs, port, PicoTransportConfig{}, probe);
+  auto after = probeTwoShardServer(*certs, port, PicoTransportConfig{}, probe);
+  ASSERT_TRUE(before.has_value());
+  ASSERT_TRUE(after.has_value());
+  EXPECT_NE(*before, *after);
+}
+
+// A packet that reaches a shard without its connection must not draw the
+// token of the shard that holds it.
+TEST(MoQPicoQuicShardedServerTest, ShardsDeriveDistinctResetSeeds) {
+#ifndef __linux__
+  GTEST_SKIP() << "needs SO_REUSEPORT load balancing";
+#endif
+  auto certs = makeSelfSignedCert();
+  auto port = pickFreeUdpPort();
+  folly::ScopedEventBaseThread shard0("shard0");
+  folly::ScopedEventBaseThread shard1("shard1");
+  auto server = std::make_shared<TestShardedServer>(
+      certs->cert, certs->key, kEndpoint, "", seededConfig());
+  server->start(
+      folly::SocketAddress("::", port),
+      {shard0.getEventBase(), shard1.getEventBase()});
+
+  // Each probe has its own source port; 24 all hashing to one shard has odds
+  // of about 1 in 8 million.
+  std::set<std::string> tokens;
+  for (int i = 0; i < 24 && tokens.size() < 2; ++i) {
+    ResetProbe probe;
+    auto token = probe.token(port);
+    ASSERT_TRUE(token.has_value());
+    tokens.insert(*token);
+  }
+  EXPECT_EQ(tokens.size(), 2u);
   server->stop();
 }
 
