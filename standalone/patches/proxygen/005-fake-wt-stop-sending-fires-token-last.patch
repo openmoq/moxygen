@@ -1,0 +1,61 @@
+FakeStreamHandle::stopSending fired the write cancel token before it finished
+updating the handle. The fake wires both sessions together on one thread, so
+the peer reacts inside that call. A peer that closes the session then destroys
+the handle, and the rest of stopSending touched freed memory. Fire the token
+last, as resetStream already does.
+
+Add deliverPeerReset, which fails a read half without resetting the writer.
+resetStream also fires the writer's cancel token, so a session on the writing
+side reacts to its own reset and the reader cannot see a RESET_STREAM alone.
+
+diff --git a/proxygen/lib/http/webtransport/test/FakeSharedWebTransport.h b/proxygen/lib/http/webtransport/test/FakeSharedWebTransport.h
+index 68e83b569..a9e5cc74c 100644
+--- a/proxygen/lib/http/webtransport/test/FakeSharedWebTransport.h
++++ b/proxygen/lib/http/webtransport/test/FakeSharedWebTransport.h
+@@ -76,11 +76,6 @@ class FakeStreamHandle
+     if (!stopSendingErr_) {
+       stopSendingErr_ = code;
+     }
+-    auto& ex = WebTransport::StreamWriteHandle::ex_;
+-    if (!ex) {
+-      ex = folly::make_exception_wrapper<WebTransport::Exception>(code);
+-      WebTransport::StreamWriteHandle::cs_.requestCancellation();
+-    }
+     if (!writeErr_) {
+       writeErr_.emplace(code);
+     }
+@@ -90,6 +85,12 @@ class FakeStreamHandle
+       auto cb = std::move(onWriteTerminal_);
+       cb();
+     }
++    // Last: a synchronous peer reaction can destroy this handle.
++    auto& ex = WebTransport::StreamWriteHandle::ex_;
++    if (!ex) {
++      ex = folly::make_exception_wrapper<WebTransport::Exception>(code);
++      WebTransport::StreamWriteHandle::cs_.requestCancellation();
++    }
+     return folly::unit;
+   }
+ 
+@@ -239,6 +240,21 @@ class FakeStreamHandle
+     WebTransport::StreamWriteHandle::cs_.requestCancellation();
+     return folly::unit;
+   }
++
++  // Simulate a peer RESET_STREAM on this read half. The writer's state stays as
++  // if it had not reset.
++  void deliverPeerReset(uint32_t err) {
++    if (promise_) {
++      promise_->setException(WebTransport::Exception(err));
++      promise_.reset();
++    }
++    writeErr_ = err;
++    if (!fin_ && onWriteTerminal_) {
++      auto cb = std::move(onWriteTerminal_);
++      cb();
++    }
++  }
++
+   GenericApiRet setPriority(quic::PriorityQueue::Priority priority) override {
+     quic::HTTPPriorityQueue::Priority httpPri(priority);
+     pri.emplace(std::forward_as_tuple(

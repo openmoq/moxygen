@@ -151,6 +151,32 @@ TEST_F(MoQTrackTest, testConversionWithInvalidEndParams) {
   EXPECT_TRUE(params.hasError());
 }
 
+TEST_F(MoQTrackTest, testConversionWithPrefix) {
+  CreatDefaultTrackNamespace();
+  track_.trackNamespace.insert(track_.trackNamespace.begin(), {"a", "b"});
+  auto params = moxygen::convertTrackNamespaceToMoqTestParam(&track_);
+  ASSERT_FALSE(params.hasError());
+  EXPECT_EQ(params.value().nsPrefix, std::vector<std::string>({"a", "b"}));
+  EXPECT_EQ(params.value().lastGroupInTrack, 10);
+
+  auto roundTrip = moxygen::convertMoqTestParamToTrackNamespace(params.value());
+  ASSERT_FALSE(roundTrip.hasError());
+  EXPECT_EQ(roundTrip.value().trackNamespace, track_.trackNamespace);
+}
+
+TEST_F(MoQTrackTest, testConversionWithTrailingTuple) {
+  CreatDefaultTrackNamespace();
+  track_.trackNamespace.emplace_back("0");
+  auto params = moxygen::convertTrackNamespaceToMoqTestParam(&track_);
+  EXPECT_TRUE(params.hasError());
+}
+
+TEST_F(MoQTrackTest, testParseNsPrefix) {
+  EXPECT_TRUE(moxygen::parseNsPrefix("").empty());
+  EXPECT_EQ(
+      moxygen::parseNsPrefix("a/b"), std::vector<std::string>({"a", "b"}));
+}
+
 TEST_F(MoQTrackTest, testConversionWithTrackNamespaceHavingNonDigitValues) {
   CreatDefaultTrackNamespace();
   track_.trackNamespace[1] = "a";
