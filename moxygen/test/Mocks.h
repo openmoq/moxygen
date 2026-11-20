@@ -442,6 +442,12 @@ class MockSubscriber : public Subscriber {
       (override));
 };
 
+class MockMoQServerStats : public MoQServerStatsCallback {
+ public:
+  MOCK_METHOD(void, onSessionBegin, (), (override));
+  MOCK_METHOD(void, onSessionEnd, (), (override));
+};
+
 class MockObjectAckStats
     : public MoQPublisherStatsCallback::ObjectAckStatsCallback {
  public:
@@ -450,6 +456,16 @@ class MockObjectAckStats
 
 class MockMoQProxyStats : public MoQProxyStatsCallback {
  public:
+  MOCK_METHOD(
+      void,
+      recordUpstreamTimeToFirstSubscribeObject,
+      (uint64_t),
+      (override));
+  MOCK_METHOD(
+      void,
+      recordUpstreamTimeToFirstFetchObject,
+      (uint64_t),
+      (override));
   MOCK_METHOD(void, onUpstreamGoaway, (), (override));
   MOCK_METHOD(void, onUpstreamSessionGoaway, (), (override));
   MOCK_METHOD(void, onUpstreamRequestStreamGoaway, (), (override));
