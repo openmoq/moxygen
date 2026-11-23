@@ -6,7 +6,7 @@ streams-available callbacks complete. WebTransportFilter waits for
 WT_MAX_STREAMS when that limit blocks, and otherwise forwards to HQSession.
 
 diff --git a/proxygen/lib/http/session/HQSession.cpp b/proxygen/lib/http/session/HQSession.cpp
-index f628cc54e..fd55efc3c 100644
+index 4eb68141e..62e340f36 100644
 --- a/proxygen/lib/http/session/HQSession.cpp
 +++ b/proxygen/lib/http/session/HQSession.cpp
 @@ -240,6 +240,11 @@ void HQSession::dispatchRequestStreamImpl(quic::StreamId id) {
@@ -37,7 +37,7 @@ index f628cc54e..fd55efc3c 100644
  void HQSession::onNewUnidirectionalStream(quic::StreamId id) noexcept {
    // This is where a new unidirectional ingress stream is available
    // Try to check whether this is a push
-@@ -3934,6 +3948,26 @@ bool HQSession::HQStreamTransport::canCreateBidiStream() {
+@@ -3751,6 +3765,26 @@ bool HQSession::HQStreamTransport::canCreateBidiStream() {
    return session_.sock_->getNumOpenableBidirectionalStreams() > 0;
  }
  
@@ -65,10 +65,10 @@ index f628cc54e..fd55efc3c 100644
  HQSession::HQStreamTransport::sendWebTransportStreamData(
      HTTPCodec::StreamID id,
 diff --git a/proxygen/lib/http/session/HQSession.h b/proxygen/lib/http/session/HQSession.h
-index 3029a8fb5..be9218a93 100644
+index 5f1af213f..abcfdf964 100644
 --- a/proxygen/lib/http/session/HQSession.h
 +++ b/proxygen/lib/http/session/HQSession.h
-@@ -200,6 +200,9 @@ class HQSession
+@@ -195,6 +195,9 @@ class HQSession
    void onBidirectionalStreamsAvailable(
        uint64_t /*numStreamsAvailable*/) noexcept override;
  
@@ -78,7 +78,7 @@ index 3029a8fb5..be9218a93 100644
    void onStopSending(quic::StreamId id,
                       quic::ApplicationErrorCode error) noexcept override;
  
-@@ -1897,6 +1900,9 @@ class HQSession
+@@ -1813,6 +1816,9 @@ class HQSession
      bool canCreateUniStream() override;
      bool canCreateBidiStream() override;
  
@@ -88,7 +88,7 @@ index 3029a8fb5..be9218a93 100644
      folly::Expected<WebTransport::FCState, WebTransport::ErrorCode>
      sendWebTransportStreamData(
          HTTPCodec::StreamID /*id*/,
-@@ -2061,6 +2067,10 @@ class HQSession
+@@ -1980,6 +1986,10 @@ class HQSession
    };
    HTTPSettings ingressSettings_;
    uint64_t wtInitialSendWindow_{quic::kMaxVarInt};
@@ -100,11 +100,11 @@ index 3029a8fb5..be9218a93 100644
    quic::StreamId peerMinUnseenId_{hq::kMaxClientBidiStreamId};
    uint64_t minUnseenIncomingPushId_{0};
 diff --git a/proxygen/lib/http/session/WebTransportFilter.h b/proxygen/lib/http/session/WebTransportFilter.h
-index ba5ad76c2..a8e64464b 100644
+index 4239f9fd8..b36f2c63f 100644
 --- a/proxygen/lib/http/session/WebTransportFilter.h
 +++ b/proxygen/lib/http/session/WebTransportFilter.h
-@@ -287,12 +287,30 @@ class WebTransportFilter
-                  : folly::unit;
+@@ -292,12 +292,30 @@ class WebTransportFilter
+     return h3Tp_ ? h3Tp_->updateReliableDeliveryCheckpoint(id) : folly::unit;
    }
  
 +  // Waits on whichever limit blocks: the session's WT_MAX_STREAMS, or the
@@ -136,7 +136,7 @@ index ba5ad76c2..a8e64464b 100644
    }
  
    bool canCreateUniStream() override {
-@@ -373,6 +391,9 @@ class WebTransportFilter
+@@ -378,6 +396,9 @@ class WebTransportFilter
    void onMaxStreamsBidi(WTMaxStreamsCapsule capsule) noexcept override {
      XLOG(DBG1) << __func__;
      maxWTBidiStreams_ = capsule.maximumStreams;
@@ -146,7 +146,7 @@ index ba5ad76c2..a8e64464b 100644
      if (wtImpl_) {
        wtImpl_->onMaxStreams(capsule.maximumStreams, true);
      }
-@@ -380,6 +401,9 @@ class WebTransportFilter
+@@ -385,6 +406,9 @@ class WebTransportFilter
    void onMaxStreamsUni(WTMaxStreamsCapsule capsule) noexcept override {
      XLOG(DBG1) << __func__;
      maxWTUniStreams_ = capsule.maximumStreams;
@@ -156,7 +156,7 @@ index ba5ad76c2..a8e64464b 100644
      if (wtImpl_) {
        wtImpl_->onMaxStreams(capsule.maximumStreams, false);
      }
-@@ -444,6 +468,10 @@ class WebTransportFilter
+@@ -449,6 +473,10 @@ class WebTransportFilter
    uint64_t nextNewWTUniStream_{2};
    uint64_t maxWTBidiStreams_{quic::kMaxVarInt};
    uint64_t maxWTUniStreams_{quic::kMaxVarInt};
