@@ -48,7 +48,7 @@ class OpenMOQForwarderTest : public ::testing::Test {
   std::shared_ptr<MockMoQSession> createMockSession() {
     auto session = std::make_shared<NiceMock<MockMoQSession>>();
     ON_CALL(*session, getNegotiatedVersion())
-        .WillByDefault(Return(std::optional<uint64_t>(kVersionDraftCurrent)));
+        .WillByDefault(Return(kVersionDraftCurrent));
     return session;
   }
 

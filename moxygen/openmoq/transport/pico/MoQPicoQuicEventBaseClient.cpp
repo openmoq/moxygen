@@ -249,8 +249,9 @@ folly::EventBase* MoQPicoQuicEventBaseClient::getEventBase() const {
 
 std::shared_ptr<MoQSession> MoQPicoQuicEventBaseClient::createSession(
     folly::MaybeManagedPtr<proxygen::WebTransport> wt,
+    uint64_t negotiatedVersion,
     std::shared_ptr<MoQExecutor> executor) {
-  return std::make_shared<MoQSession>(wt, executor);
+  return std::make_shared<MoQSession>(wt, negotiatedVersion, executor);
 }
 
 void MoQPicoQuicEventBaseClient::onConnectionReady(void* vcnx) {
@@ -279,18 +280,19 @@ void MoQPicoQuicEventBaseClient::onConnectionReady(void* vcnx) {
   webTransport->setOnConnectionClosedCallback(
       [handler = impl_->handler.get()] { handler->closeMaybeDeferred(); });
 
-  auto moqSession = createSession(webTransport, executor_);
-  webTransport->setHandler(moqSession.get());
-
   const char* alpn = picoquic_tls_get_negotiated_alpn(cnx);
   XLOG(DBG1) << "Negotiated ALPN: " << (alpn ? alpn : "(null)");
-  if (!alpn || !moqSession->validateAndSetVersionFromAlpn(alpn)) {
+  auto negotiatedVersion = alpn ? getVersionFromAlpn(alpn) : std::nullopt;
+  if (!negotiatedVersion) {
     picoquic_close(
         cnx,
         folly::to_underlying(
             SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED));
     return;
   }
+
+  auto moqSession = createSession(webTransport, *negotiatedVersion, executor_);
+  webTransport->setHandler(moqSession.get());
 
   // Switch callback_ctx from `this` to a PicoConnectionContext so subsequent
   // events route through the shared dispatch.
@@ -315,9 +317,9 @@ void MoQPicoQuicEventBaseClient::onConnectionReady(void* vcnx) {
         try {
           auto serverSetup = co_await moqSession->setup(std::move(clientSetup));
           (void)serverSetup;
-          auto negotiatedVersion = moqSession->getNegotiatedVersion();
           XLOG(DBG1) << "MoQ SETUP complete, negotiated draft-"
-                     << getDraftMajorVersion(*negotiatedVersion);
+                     << getDraftMajorVersion(
+                            moqSession->getNegotiatedVersion());
         } catch (const std::exception& ex) {
           XLOG(ERR) << "MoQ SETUP failed: " << ex.what();
           co_return;
