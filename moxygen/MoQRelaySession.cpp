@@ -21,12 +21,15 @@ namespace moxygen {
 
 std::function<std::shared_ptr<MoQSession>(
     folly::MaybeManagedPtr<proxygen::WebTransport>,
+    uint64_t,
     std::shared_ptr<MoQExecutor>)>
 MoQRelaySession::createRelaySessionFactory() {
   static auto factory = [](folly::MaybeManagedPtr<proxygen::WebTransport> wt,
+                           uint64_t negotiatedVersion,
                            std::shared_ptr<MoQExecutor> exec) {
     return std::static_pointer_cast<MoQSession>(
-        std::make_shared<MoQRelaySession>(wt, std::move(exec)));
+        std::make_shared<MoQRelaySession>(
+            wt, negotiatedVersion, std::move(exec)));
   };
   return factory;
 }
@@ -555,20 +558,12 @@ MoQRelaySession::sendRequestUpdateOnBidi(
   if (auto refusal = refuseNewLocalRequest(/*allowedWhileDraining=*/true)) {
     co_return folly::makeUnexpected(std::move(*refusal));
   }
-  auto version = getNegotiatedVersion();
-  if (!version) {
-    co_return folly::makeUnexpected(
-        RequestError{
-            failedLocalRequestID(),
-            RequestErrorCode::INTERNAL_ERROR,
-            "No negotiated version"});
-  }
   // Draft 18+ carries the update on the subscription's own bidi request stream.
   // Pre-18 there are no per-request bidi streams, so it rides the shared
   // control stream instead; the REQUEST_OK / REQUEST_ERROR reply comes back
   // there too (getRequestUpdateReplyContext falls back to the control stream
   // pre-18) and is correlated by the on-wire requestID.
-  const bool onBidi = getDraftMajorVersion(*version) >= 18;
+  const bool onBidi = getDraftMajorVersion(negotiatedVersion_) >= 18;
   auto* writeHandle = control ? control->writeHandle() : nullptr;
   // onBidi needs a live request stream for the reply to come back on. A null
   // write handle (peer STOP_SENDING / local close) or a read loop that has
@@ -1020,7 +1015,7 @@ void MoQRelaySession::publishNamespaceDone(
               << this;
     return;
   }
-  if (getDraftMajorVersion(*negotiatedVersion_) < 18) {
+  if (getDraftMajorVersion(negotiatedVersion_) < 18) {
     auto res = replyCtx->writer().writePublishNamespaceDone(
         replyCtx->writeBuf(), pubNsDone);
     if (!res) {
@@ -1118,7 +1113,7 @@ folly::coro::Task<void> MoQRelaySession::handlePublishNamespace(
     auto publishNamespaceOkMsg = handle->publishNamespaceOk();
     publishNamespaceOk(publishNamespaceOkMsg, *replyContext);
     publishNamespaceHandles_[publishNamespace.requestID] = std::move(handle);
-    if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
+    if (getDraftMajorVersion(negotiatedVersion_) >= 18) {
       // Retain the bidi reply context so a failed REQUEST_UPDATE can close it.
       requestUpdateReplyContexts_[publishNamespace.requestID] = replyContext;
     }
@@ -1144,7 +1139,7 @@ void MoQRelaySession::publishNamespaceCancel(
     const PublishNamespaceCancel& pubNsCancel,
     std::shared_ptr<ReplyContext> replyContext) {
   MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onPublishNamespaceCancel);
-  if (useUniControlStreams(*getNegotiatedVersion())) {
+  if (useUniControlStreams(negotiatedVersion_)) {
     // Draft 18+: PUBLISH_NAMESPACE_CANCEL was removed from the wire. Cancel
     // by RSTing our read half of the PUBLISH_NAMESPACE bidi stream.
     if (replyContext) {
@@ -1472,7 +1467,7 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeNamespace(
     auto handle = std::move(subNsResult->value());
     auto subNsOk = handle->subscribeNamespaceOk();
     std::shared_ptr<ReplyContext> replyContext;
-    if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
+    if (getDraftMajorVersion(negotiatedVersion_) >= 18) {
       // Retain the bidi reply context so a failed REQUEST_UPDATE can close it.
       replyContext = subNsReply->replyContext();
     }
@@ -1580,7 +1575,7 @@ MoQRelaySession::subscribeTracks(
     std::shared_ptr<PublishBlockedHandle> publishBlockedHandle) {
   XLOG(DBG1) << __func__ << " prefix=" << subTracks.trackNamespacePrefix
              << " sess=" << this;
-  if (getDraftMajorVersion(*getNegotiatedVersion()) < 18) {
+  if (getDraftMajorVersion(negotiatedVersion_) < 18) {
     // SUBSCRIBE_TRACKS doesn't exist before draft 18; fall back to
     // SUBSCRIBE_NAMESPACE, which has the same effect (the publisher PUBLISHes
     // matching tracks). On draft 16-17 the PUBLISH option requests this
@@ -1730,7 +1725,7 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeTracks(
   }
   auto handle = std::move(subTracksResult->value());
   auto subTracksOk = handle->subscribeTracksOk();
-  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
+  if (getDraftMajorVersion(negotiatedVersion_) >= 18) {
     // Retain the bidi reply context so a failed REQUEST_UPDATE can close it.
     requestUpdateReplyContexts_[subTracks.requestID] =
         subTracksReply->replyContext();

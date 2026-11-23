@@ -55,8 +55,10 @@ class MoQPicoQuicShardedServer::ShardServer
  protected:
   std::shared_ptr<MoQSession> createSession(
       folly::MaybeManagedPtr<proxygen::WebTransport> wt,
+      uint64_t negotiatedVersion,
       std::shared_ptr<MoQExecutor> executor) override {
-    return parent_->createSession(std::move(wt), std::move(executor));
+    return parent_->createSession(
+        std::move(wt), negotiatedVersion, std::move(executor));
   }
 
   // handleClientSession sends the proactive SERVER_SETUP from the shard.

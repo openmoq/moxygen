@@ -55,8 +55,6 @@ struct MoQSettings {
   BufferingThresholds bufferingThresholds{};
   // Timeout for waiting for setup to complete
   std::chrono::milliseconds setupTimeout{std::chrono::seconds(5)};
-  // Timeout for waiting for version negotiation to complete
-  std::chrono::milliseconds versionNegotiationTimeout{std::chrono::seconds(2)};
   // Timeout for waiting for unknown alias resolution
   std::chrono::milliseconds unknownAliasTimeout{std::chrono::seconds(2)};
   // Timeout for waiting for in-flight streams when PUBLISH_DONE is received
@@ -282,17 +280,23 @@ class MoQSession : public Subscriber,
     return path_;
   }
 
+  // negotiatedVersion is the one the ALPN or WT protocol maps to.
   explicit MoQSession(
       folly::MaybeManagedPtr<proxygen::WebTransport> wt,
+      uint64_t negotiatedVersion,
       std::shared_ptr<MoQExecutor> exec);
 
   explicit MoQSession(
       folly::MaybeManagedPtr<proxygen::WebTransport> wt,
+      uint64_t negotiatedVersion,
       ServerSetupCallback& serverSetupCallback,
       std::shared_ptr<MoQExecutor> exec,
       bool authTokenCacheEnabled = true);
 
-  void setVersion(uint64_t version);
+  // Puts the session in the post-SETUP state without a handshake.
+  void markSetupCompleteForTesting() {
+    markSetupComplete();
+  }
   void setMoqSettings(MoQSettings settings);
   // Must be called before sendSetup().
   void addExtension(std::shared_ptr<MoQExtension> extension);
@@ -323,7 +327,7 @@ class MoQSession : public Subscriber,
       PublishRequest pub,
       std::shared_ptr<Publisher::SubscriptionHandle> handle = nullptr) override;
 
-  virtual std::optional<uint64_t> getNegotiatedVersion() const {
+  virtual uint64_t getNegotiatedVersion() const {
     return negotiatedVersion_;
   }
 
@@ -403,16 +407,6 @@ class MoQSession : public Subscriber,
 
   uint64_t maxRequestID() const {
     return maxRequestID_;
-  }
-
-  // Sets the negotiated version from the ALPN or WT protocol. Returns false,
-  // leaving the version unset, if the protocol maps to no supported version.
-  bool validateAndSetVersionFromAlpn(const std::string& alpn);
-
-  // Sets a version no ALPN maps to, such as a draft that is implemented but
-  // not yet supported.
-  void setNegotiatedVersionForTesting(uint64_t version) {
-    initializeNegotiatedVersion(version);
   }
 
   void setNextGroupRankForTesting(uint64_t rank) {
@@ -1343,9 +1337,7 @@ class MoQSession : public Subscriber,
   void initLocalMaxRequestID(uint64_t fromParam);
   void initPeerMaxRequestID(const Parameters& peerParams);
   void deliverBufferedData(TrackAlias trackAlias);
-  void aliasifyAuthTokens(
-      Parameters& params,
-      const std::optional<uint64_t>& forceVersion = std::nullopt);
+  void aliasifyAuthTokens(Parameters& params);
   RequestID getNextRequestID();
   // Cancels the request unless dismissed once its reply arrives. It runs where
   // the awaiting coroutine resumes, on the session executor.
@@ -1709,7 +1701,7 @@ class MoQSession : public Subscriber,
       FrameType resolvedFrameType);
 
  protected:
-  std::optional<uint64_t> negotiatedVersion_;
+  const uint64_t negotiatedVersion_;
 
   // Shared receive-side auth token cache. All codecs that parse auth tokens
   // (control stream, SUBSCRIBE_NAMESPACE bidi streams, etc.) point to
@@ -1741,7 +1733,7 @@ class MoQSession : public Subscriber,
   using AliasWaiterList = folly::IntrusiveList<AliasWaiter, &AliasWaiter::hook>;
 
   // Private implementation methods
-  void initializeNegotiatedVersion(uint64_t negotiatedVersion);
+  void initializeVersionState();
   // Returns false if an extension rejected the SETUPs and closed the session.
   bool negotiateMessageParameters();
   void markSetupComplete();
@@ -1779,7 +1771,6 @@ class MoQSession : public Subscriber,
   // F14Node: moving an intrusive list head would relink every waiter.
   folly::F14NodeMap<TrackAlias, AliasWaiterList, TrackAlias::hash>
       bufferedSubgroups_;
-  std::list<std::shared_ptr<moxygen::TimedBaton>> subgroupsWaitingForVersion_;
 
   uint64_t closedRequests_{0};
   uint64_t maxConcurrentRequests_{100};

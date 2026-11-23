@@ -472,7 +472,13 @@ void MoQPicoServerBase::onNewConnectionImpl(void* vcnx) {
       std::make_shared<PicoQuicWebTransport>(cnx, localSockAddr, peerSockAddr);
   onWebTransportCreated(*webTransport);
 
-  auto moqSession = createSession(webTransport, executor_);
+  // picoCallback calls this only for an ALPN that names a supported version.
+  const char* alpn = picoquic_tls_get_negotiated_alpn(cnx);
+  XLOG(DBG1) << "Setting MOQT version from negotiated ALPN: " << alpn;
+  auto negotiatedVersion = getVersionFromAlpn(alpn);
+  XCHECK(negotiatedVersion);
+
+  auto moqSession = createSession(webTransport, *negotiatedVersion, executor_);
   if (mLoggerFactory_) {
     auto logger = createLogger();
     auto picoCid = picoquic_get_local_cnxid(cnx);
@@ -483,11 +489,6 @@ void MoQPicoServerBase::onNewConnectionImpl(void* vcnx) {
     moqSession->setLogger(logger);
   }
   webTransport->setHandler(moqSession.get());
-
-  // picoCallback calls this only for an ALPN that names a supported version.
-  const char* alpn = picoquic_tls_get_negotiated_alpn(cnx);
-  XLOG(DBG1) << "Setting MOQT version from negotiated ALPN: " << alpn;
-  XCHECK(moqSession->validateAndSetVersionFromAlpn(alpn));
 
   auto* ctx = new PicoConnectionContext{
       .webTransport = webTransport, .moqSession = moqSession};
@@ -588,16 +589,17 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
              << (clientProtos ? clientProtos : "NULL") << "], server offers ["
              << alpnList << "]";
 
-  const char* selectedProto = nullptr;
+  // The WT protocol is the only source of the MoQT version.
   int wtProtoRet = picowt_select_wt_protocol(streamCtx, alpnList.c_str());
-  if (wtProtoRet == 0 && streamCtx->ps.stream_state.wt_protocol) {
-    selectedProto = streamCtx->ps.stream_state.wt_protocol;
-    XLOG(DBG1) << "WebTransport selected protocol: " << selectedProto;
-  } else {
-    // The WT protocol is the only source of the MoQT version.
+  const char* selectedProto = streamCtx->ps.stream_state.wt_protocol;
+  auto negotiatedVersion = (wtProtoRet == 0 && selectedProto)
+      ? getVersionFromAlpn(selectedProto)
+      : std::nullopt;
+  if (!negotiatedVersion) {
     XLOG(DBG1) << "WT subprotocol not negotiated";
     return -1;
   }
+  XLOG(DBG1) << "WebTransport selected protocol: " << selectedProto;
 
   // Create PicoH3WebTransport adapter
   auto webTransport = std::make_shared<PicoH3WebTransport>(
@@ -605,7 +607,7 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
   onWebTransportCreated(*webTransport);
 
   // Create MoQSession
-  auto moqSession = createSession(webTransport, executor_);
+  auto moqSession = createSession(webTransport, *negotiatedVersion, executor_);
   if (mLoggerFactory_) {
     auto logger = createLogger();
     auto picoCid = picoquic_get_local_cnxid(cnx);
@@ -624,8 +626,6 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
     moqSession->setPath(
         std::string(reinterpret_cast<const char*>(hdr.path), hdr.path_length));
   }
-
-  moqSession->validateAndSetVersionFromAlpn(selectedProto);
 
   // Store session context on the control stream. Data streams inherit it via
   // path_callback in PicoH3WebTransport::markStreamActiveImpl, so all stream

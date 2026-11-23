@@ -745,9 +745,10 @@ class RelaySessionTestServer : public TestServer {
  protected:
   std::shared_ptr<MoQSession> createSession(
       folly::MaybeManagedPtr<proxygen::WebTransport> wt,
+      uint64_t negotiatedVersion,
       std::shared_ptr<MoQExecutor> executor) override {
     return std::make_shared<MoQRelaySession>(
-        std::move(wt), *this, std::move(executor));
+        std::move(wt), negotiatedVersion, *this, std::move(executor));
   }
 
  private:
@@ -1753,7 +1754,8 @@ TEST_P(MoQIntegrationTest, SessionSetup_ConnectAndDisconnect) {
   runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
     co_await connectClient();
     EXPECT_NE(client_->moqSession_, nullptr);
-    EXPECT_TRUE(client_->moqSession_->getNegotiatedVersion().has_value());
+    EXPECT_TRUE(
+        isSupportedVersion(client_->moqSession_->getNegotiatedVersion()));
 
     // Verify data actually flows over the connection before closing
     auto callback = co_await subscribeAndReceive();
@@ -1780,11 +1782,8 @@ INSTANTIATE_TEST_SUITE_P(
 TEST_P(MoQProductionVersionTest, SessionSetup_VersionNegotiation) {
   runTest(folly::coro::co_invoke([this]() -> folly::coro::Task<void> {
     co_await connectClient();
-    auto version = client_->moqSession_->getNegotiatedVersion();
-    EXPECT_TRUE(version.has_value());
-    if (version) {
-      EXPECT_TRUE(isSupportedVersion(*version));
-    }
+    EXPECT_TRUE(
+        isSupportedVersion(client_->moqSession_->getNegotiatedVersion()));
 
     // Verify the negotiated version actually works for data exchange
     auto callback = co_await subscribeAndReceive();
@@ -2014,7 +2013,8 @@ TEST_P(MoQProductionVersionTest, WebTransport_NoMoqtProtocolRejected) {
     }
 
     co_await connectClient();
-    EXPECT_TRUE(client_->moqSession_->getNegotiatedVersion().has_value());
+    EXPECT_TRUE(
+        isSupportedVersion(client_->moqSession_->getNegotiatedVersion()));
     EXPECT_EQ(server_->sessionsCreated.load(), 1);
   }));
 }
@@ -2688,7 +2688,7 @@ class MoQHqWtSessionTest : public MoQIntegrationTest {
             clientEvbThread_.getEventBase()));
     auto resp = co_await h3->sendWebTransportRequest(
         makeWebTransportConnect({protocol}),
-        factory.makeHandler(protocol, "localhost", kTestEndpoint));
+        factory.makeHandler(GetParam(), "localhost", kTestEndpoint));
     EXPECT_EQ(resp->getStatusCode(), 200);
     co_return co_await factory.establish();
   }

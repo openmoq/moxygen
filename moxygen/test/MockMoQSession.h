@@ -18,9 +18,12 @@ namespace moxygen::test {
 class MockMoQSession : public MoQSession {
  public:
   // Constructor that accepts an external executor
-  explicit MockMoQSession(std::shared_ptr<MoQExecutor> exec)
+  explicit MockMoQSession(
+      std::shared_ptr<MoQExecutor> exec,
+      uint64_t negotiatedVersion = kVersionDraftCurrent)
       : MoQSession(
             folly::MaybeManagedPtr<proxygen::WebTransport>(nullptr),
+            negotiatedVersion,
             exec),
         ownsEventBase_(false) {
     setSetupDefaults();
@@ -30,6 +33,7 @@ class MockMoQSession : public MoQSession {
   MockMoQSession()
       : MoQSession(
             folly::MaybeManagedPtr<proxygen::WebTransport>(nullptr),
+            kVersionDraftCurrent,
             std::make_shared<MoQFollyExecutorImpl>(&evb_)),
         ownsEventBase_(true) {
     setSetupDefaults();
@@ -71,11 +75,7 @@ class MockMoQSession : public MoQSession {
       (Fetch, std::shared_ptr<FetchConsumer>),
       (override));
 
-  MOCK_METHOD(
-      std::optional<uint64_t>,
-      getNegotiatedVersion,
-      (),
-      (const, override));
+  MOCK_METHOD(uint64_t, getNegotiatedVersion, (), (const, override));
 
   MOCK_METHOD(
       const std::optional<SetupParameters>&,

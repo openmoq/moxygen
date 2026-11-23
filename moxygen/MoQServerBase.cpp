@@ -29,9 +29,14 @@ std::shared_ptr<MLogger> MoQServerBase::createLogger() const {
 
 std::shared_ptr<MoQSession> MoQServerBase::createSession(
     folly::MaybeManagedPtr<proxygen::WebTransport> wt,
+    uint64_t negotiatedVersion,
     std::shared_ptr<MoQExecutor> executor) {
   return std::make_shared<MoQSession>(
-      std::move(wt), *this, std::move(executor), authTokenCacheEnabled_);
+      std::move(wt),
+      negotiatedVersion,
+      *this,
+      std::move(executor),
+      authTokenCacheEnabled_);
 }
 
 folly::coro::Task<void> MoQServerBase::handleClientSession(
@@ -67,7 +72,7 @@ folly::coro::Task<void> MoQServerBase::handleClientSession(
 
   // In uni control mode, the server proactively sends SERVER_SETUP
   auto version = clientSession->getNegotiatedVersion();
-  if (version && useUniControlStreams(*version)) {
+  if (useUniControlStreams(version)) {
     auto setup = makeServerSetup();
     auto res = clientSession->sendSetup(std::move(setup));
     if (res.hasError()) {
@@ -107,13 +112,10 @@ folly::Try<Setup> MoQServerBase::onClientSetup(
     const std::shared_ptr<MoQSession>& session) {
   XLOG(DBG1) << "MoQServerBase::ClientSetup";
 
-  // Version is negotiated via ALPN.
   auto sessionVersion = session->getNegotiatedVersion();
-  if (sessionVersion) {
-    XLOG(DBG1)
-        << "MoQServerBase::ClientSetup: Using ALPN-negotiated version: moqt-"
-        << getDraftMajorVersion(*sessionVersion);
-  }
+  XLOG(DBG1)
+      << "MoQServerBase::ClientSetup: Using ALPN-negotiated version: moqt-"
+      << getDraftMajorVersion(sessionVersion);
 
   auto serverSetup = makeServerSetup();
   return folly::Try<Setup>(serverSetup);

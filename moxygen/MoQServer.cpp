@@ -203,7 +203,8 @@ void MoQServer::createMoQQuicSession(
     alpn = *stdAlpn;
     XLOG(DBG1) << "Server: Negotiated ALPN: " << *alpn;
   }
-  if (!alpn || !getVersionFromAlpn(*alpn)) {
+  auto negotiatedVersion = alpn ? getVersionFromAlpn(*alpn) : std::nullopt;
+  if (!negotiatedVersion) {
     XLOG(ERR) << "Server: no supported MoQT version for ALPN "
               << alpn.value_or("<none>");
     quic::ApplicationErrorCode err(
@@ -234,7 +235,8 @@ void MoQServer::createMoQQuicSession(
   auto* wtPtr = wt.get();
   auto evb = qevb->getTypedEventBase<quic::FollyQuicEventBase>()
                  ->getBackingEventBase();
-  auto moqSession = createSession(std::move(wt), getOrCreateExecutor(evb));
+  auto moqSession = createSession(
+      std::move(wt), *negotiatedVersion, getOrCreateExecutor(evb));
   if (auto logger = createLogger()) {
     // Set QUIC connection IDs and addresses on the logger
     if (clientCid) {
@@ -247,8 +249,6 @@ void MoQServer::createMoQQuicSession(
     logger->setLocalAddress(localAddress);
     moqSession->setLogger(logger);
   }
-
-  moqSession->validateAndSetVersionFromAlpn(*alpn);
 
   if (useQuicWtSession) {
     static_cast<proxygen::QuicWtSession*>(wtPtr)->setHandler(moqSession.get());
@@ -416,7 +416,10 @@ void MoQServer::Handler::onHeadersComplete(
   }
   // The WT protocol is the only source of the MoQT version, so refuse the
   // session rather than create one without a version.
-  if (!negotiatedProtocol || !getVersionFromAlpn(*negotiatedProtocol)) {
+  auto negotiatedVersion = negotiatedProtocol
+      ? getVersionFromAlpn(*negotiatedProtocol)
+      : std::nullopt;
+  if (!negotiatedVersion) {
     XLOG(DBG4) << "Failed to negotiate a MoQT WebTransport protocol";
     resp.setStatusCode(400);
     txn_->sendHeadersWithEOM(resp);
@@ -444,14 +447,14 @@ void MoQServer::Handler::onHeadersComplete(
              quicSocket,
              authority = std::move(authority),
              path = std::move(path),
-             protocol = *negotiatedProtocol](
+             version = *negotiatedVersion](
                 std::shared_ptr<proxygen::WebTransport> wt) mutable {
               return server.startWebTransportSession(
                   folly::MaybeManagedPtr<proxygen::WebTransport>(wt),
                   quicSocket,
                   std::move(authority),
                   std::move(path),
-                  protocol);
+                  version);
             }));
     return;
   }
@@ -467,7 +470,7 @@ void MoQServer::Handler::onHeadersComplete(
       quicSocket,
       std::move(authority),
       std::move(path),
-      *negotiatedProtocol);
+      *negotiatedVersion);
 }
 
 std::shared_ptr<MoQSession> MoQServer::startWebTransportSession(
@@ -475,9 +478,10 @@ std::shared_ptr<MoQSession> MoQServer::startWebTransportSession(
     quic::QuicSocket* quicSocket,
     std::string authority,
     std::string path,
-    const std::string& protocol) {
+    uint64_t negotiatedVersion) {
   auto evb = folly::EventBaseManager::get()->getEventBase();
-  auto session = createSession(std::move(wt), getOrCreateExecutor(evb));
+  auto session =
+      createSession(std::move(wt), negotiatedVersion, getOrCreateExecutor(evb));
   session->setAuthority(std::move(authority));
   session->setPath(std::move(path));
   if (auto logger = createLogger()) {
@@ -495,8 +499,6 @@ std::shared_ptr<MoQSession> MoQServer::startWebTransportSession(
     }
     session->setLogger(logger);
   }
-
-  session->validateAndSetVersionFromAlpn(protocol);
 
   if (quicSocket) {
     QuicTransportObservers observers(*quicSocket);
