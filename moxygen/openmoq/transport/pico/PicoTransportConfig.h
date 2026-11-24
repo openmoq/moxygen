@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -82,6 +84,10 @@ struct PicoTransportConfig {
   uint8_t defaultDatagramPriority{1}; // default datagram priority
   std::string ccAlgo{"bbr"};          // congestion control algorithm name
   uint32_t mtuMax{1500};              // EMSGSIZE if above real link MTU
+
+  // Server stateless reset seed (picoquic reset_seed). The same seed across
+  // restarts keeps resets for old connections valid. Unset: random per context.
+  std::optional<std::array<uint8_t, 16>> resetSeed;
 
   PicoSocketConfig socket{}; // socket handler tuning, not passed to picoquic
 };

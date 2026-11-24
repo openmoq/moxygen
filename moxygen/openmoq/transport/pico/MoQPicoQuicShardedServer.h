@@ -33,6 +33,9 @@ namespace moxygen {
  * More than one shard forces QUIC connection migration off: SO_REUSEPORT
  * cannot route a migrated connection's packets to the shard holding its
  * state. A single shard behaves exactly like MoQPicoQuicEventBaseServer.
+ *
+ * With transportConfig.resetSeed set, each shard derives its own seed from it
+ * and the shard's index.
  */
 class MoQPicoQuicShardedServer : public MoQServerBase {
  public:
