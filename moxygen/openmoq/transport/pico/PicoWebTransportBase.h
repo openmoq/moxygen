@@ -271,15 +271,14 @@ class PicoWebTransportBase : public proxygen::WebTransport {
 
  private:
   /**
-   * Dispatch and clear WtStreamManager's queued control events. eventsAvailable
-   * is edge-triggered on (writable streams || queued events), and pico keeps
-   * streams queued for a whole burst, so it never fires mid-burst.
+   * Dispatch and clear WtStreamManager's queued control events.
    */
   void drainEgressEvents();
 
   /**
-   * Hand the head of the writable queue to picoquic. Only one stream is marked
-   * active at a time, so if nothing starts the next one the connection stalls.
+   * Mark the head of the writable queue active with picoquic. Runs on every
+   * eventsAvailable and when a stream's burst ends; without the latter the
+   * next stream never starts. Re-marking an active stream is a no-op.
    */
   void markNextWritableStreamActive();
 

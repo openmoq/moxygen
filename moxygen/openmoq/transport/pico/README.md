@@ -288,12 +288,13 @@ proactively but provided on demand.
           -> Fire delivery callback (optimistic)
 ```
 
-Only one stream is marked active with picoquic at a time. When it drains,
-`markNextWritableStreamActive()` hands picoquic the head of `WtStreamManager`'s
-writable queue. `WtStreamManager`'s `eventsAvailable` is edge-triggered and does
-not fire while streams stay queued through a burst, so the JIT path also calls
-`drainEgressEvents()` to dispatch control events (reset, stop-sending, close)
-queued mid-burst.
+`markNextWritableStreamActive()` marks the head of `WtStreamManager`'s writable
+queue active with picoquic. It runs on every `eventsAvailable`, which is
+level-triggered (each write, priority change, or control event such as reset,
+stop-sending, or close), and again when a stream's burst ends so the next
+stream starts. Re-marking an already-active stream is a no-op in picoquic. A
+stream that takes the head mid-burst is marked right away, so more than one
+stream can be active with picoquic at once.
 
 ### Datagram Writes
 

@@ -196,17 +196,16 @@ TEST_F(PicoWebTransportBaseTest, DrainedStreamHandsOffToTheNextOne) {
   ASSERT_NE(second, nullptr);
   auto secondId = second->getID();
   second->writeStreamData(folly::IOBuf::copyBuffer("two"), false, nullptr);
-  // Only the head of the queue is active; the second stream waits its turn.
-  ASSERT_THAT(wt_->activated, ElementsAre(firstId));
+  // Only the head of the queue is marked; the second stream waits its turn.
+  ASSERT_THAT(wt_->activated, AllOf(Not(IsEmpty()), Each(firstId)));
 
   wt_->pull(firstId);
   wt_->pull(firstId);
 
-  EXPECT_THAT(wt_->activated, ElementsAre(firstId, secondId));
+  EXPECT_EQ(wt_->activated.back(), secondId);
 }
 
-// An event queued while another stream is still writable fires no callback, so
-// unless the JIT path drains it the edge never re-arms again.
+// A stream prioritized mid-burst must not leave egress stalled after the burst.
 TEST_F(PicoWebTransportBaseTest, PriorityChangeMidBurstDoesNotStallEgress) {
   auto* group0 = createUni();
   ASSERT_NE(group0, nullptr);
@@ -214,7 +213,7 @@ TEST_F(PicoWebTransportBaseTest, PriorityChangeMidBurstDoesNotStallEgress) {
   group0->writeStreamData(folly::IOBuf::copyBuffer("group-0"), false, nullptr);
   ASSERT_THAT(wt_->activated, ElementsAre(group0Id));
 
-  // Prioritized while group 0 still has data queued: the silent enqueue.
+  // Prioritized while group 0 still has data queued.
   auto* group1 = createUni();
   ASSERT_NE(group1, nullptr);
   auto group1Id = group1->getID();
@@ -247,18 +246,19 @@ TEST_F(PicoWebTransportBaseTest, ResetOfActiveStreamStillSchedulesTheNextOne) {
   ASSERT_NE(second, nullptr);
   auto secondId = second->getID();
   second->writeStreamData(folly::IOBuf::copyBuffer("two"), false, nullptr);
-  ASSERT_THAT(wt_->activated, ElementsAre(firstId));
+  ASSERT_THAT(wt_->activated, AllOf(Not(IsEmpty()), Each(firstId)));
 
   first->resetStream(42);
 
   wt_->pull(firstId);
 
   EXPECT_THAT(wt_->resets, ElementsAre(Pair(firstId, 42u)));
-  EXPECT_THAT(wt_->activated, ElementsAre(firstId, secondId));
+  EXPECT_EQ(wt_->activated.back(), secondId);
 }
 
-// Same latch, reached through an event with a visible side effect.
-TEST_F(PicoWebTransportBaseTest, ResetQueuedMidBurstIsDeliveredOnNextPull) {
+// A reset queued while another stream is mid-burst goes out at once, and only
+// once.
+TEST_F(PicoWebTransportBaseTest, ResetQueuedMidBurstIsDeliveredImmediately) {
   auto* busy = createUni();
   ASSERT_NE(busy, nullptr);
   auto busyId = busy->getID();
@@ -269,7 +269,7 @@ TEST_F(PicoWebTransportBaseTest, ResetQueuedMidBurstIsDeliveredOnNextPull) {
   auto doomedId = doomed->getID();
   doomed->writeStreamData(folly::IOBuf::copyBuffer("doomed"), false, nullptr);
   doomed->resetStream(42);
-  ASSERT_THAT(wt_->resets, IsEmpty());
+  EXPECT_THAT(wt_->resets, ElementsAre(Pair(doomedId, 42u)));
 
   wt_->pull(busyId);
 
