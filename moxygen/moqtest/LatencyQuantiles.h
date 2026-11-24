@@ -91,8 +91,10 @@ class LatencyQuantiles {
     if (count_ == 0) {
       return std::nullopt;
     }
-    // The epsilon keeps q * count from rounding up past an exact integer.
-    double target = std::ceil(q * static_cast<double>(count_) - 1e-9);
+    // Step down one ULP so a product that rounded up past an integer doesn't
+    // add a rank.
+    double target =
+        std::ceil(std::nextafter(q * static_cast<double>(count_), 0.0));
     auto rank = static_cast<uint64_t>(
         std::clamp(target, 1.0, static_cast<double>(count_)));
     uint64_t running = 0;

@@ -58,11 +58,20 @@ TEST(LatencyQuantilesTest, ExactRangeNearestRank) {
   }
   EXPECT_EQ(q.count(), 100);
   EXPECT_EQ(*q.quantile(0.0), 1);
+  EXPECT_EQ(*q.quantile(0.07), 7);
   EXPECT_EQ(*q.quantile(0.5), 50);
   EXPECT_EQ(*q.quantile(0.9), 90);
   EXPECT_EQ(*q.quantile(0.95), 95);
   EXPECT_EQ(*q.quantile(0.99), 99);
   EXPECT_EQ(*q.quantile(1.0), 100);
+}
+
+TEST(LatencyQuantilesTest, RankRoundingAtLargeCount) {
+  // 0.07 * 280037900 evaluates to 19602653.000000004.
+  LatencyQuantiles q;
+  q.addBucket(1, 19602653);
+  q.addBucket(2, 280037900 - 19602653);
+  EXPECT_EQ(*q.quantile(0.07), 1);
 }
 
 TEST(LatencyQuantilesTest, TailInLogRange) {
