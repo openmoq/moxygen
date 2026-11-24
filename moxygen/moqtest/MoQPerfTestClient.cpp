@@ -525,6 +525,7 @@ void MoQPerfTestClient::recordObject(
   bytes_.fetch_add(bytes, std::memory_order_relaxed);
   if (latencyMs) {
     latency_.record(*latencyMs);
+    latencyQuantiles_.record(*latencyMs);
   }
 }
 
@@ -540,6 +541,7 @@ MoQPerfTestClient::TestResults MoQPerfTestClient::getResults() const {
   results.totalLatencyMs = latency_.sumMs();
   results.latencyObjects = latency_.count();
   results.intervalLatency = latency_.takeInterval();
+  results.intervalQuantiles = latencyQuantiles_.takeInterval();
   results.latency = latency_.snapshot();
   results.durationSeconds =
       std::chrono::duration_cast<std::chrono::seconds>(
