@@ -1654,6 +1654,77 @@ CO_TEST_P_X(MoQSessionTest, PauseStopsStreamsAfterHandler) {
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
 
+// A subgroup that the pause handler opens without stream credit does not open
+// a stream when credit arrives after the pause completes. After a resume, the
+// dropped subgroup's next write returns CANCELLED.
+CO_TEST_P_X(MoQSessionTest, PauseDropsSubgroupWaitingForCredit) {
+  co_await setupMoQSession();
+  std::shared_ptr<MockSubscriptionHandle> serverHandle;
+  std::shared_ptr<TrackConsumer> trackConsumer;
+  expectSubscribe(
+      [&serverHandle, &trackConsumer](auto sub, auto pub)
+          -> TaskSubscribeResult {
+        trackConsumer = pub;
+        serverHandle = makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+        co_return serverHandle;
+      });
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(_, _, _, _)).Times(0);
+
+  auto subscribeRequest = getSubscribe(kTestTrackName);
+  auto res =
+      co_await clientSession_->subscribe(subscribeRequest, subscribeCallback_);
+  CO_ASSERT_FALSE(res.hasError());
+  auto subscribeHandle = res.value();
+
+  const auto openUni = serverWt_->openLocalUniStreams().size();
+  serverWt_->setMaxLocalUniStreams(openUni);
+  std::shared_ptr<SubgroupConsumer> subgroup;
+  EXPECT_CALL(*serverHandle, requestUpdateCalled)
+      .WillOnce([&](const auto&) {
+        auto begun = trackConsumer->beginSubgroup(0, 0, 0);
+        EXPECT_TRUE(begun.hasValue());
+        if (begun.hasValue()) {
+          subgroup = *begun;
+          EXPECT_TRUE(
+              subgroup
+                  ->object(0, moxygen::test::makeBuf(10), noExtensions())
+                  .hasValue());
+        }
+      })
+      .WillOnce(testing::Return());
+  EXPECT_CALL(*serverHandle, requestUpdateResult)
+      .Times(2)
+      .WillRepeatedly(
+          testing::Return(RequestOk{.requestID = subscribeRequest.requestID}));
+  RequestUpdate update;
+  update.existingRequestID = subscribeRequest.requestID;
+  update.forward = false;
+  EXPECT_FALSE((co_await subscribeHandle->requestUpdate(update)).hasError());
+
+  serverWt_->setMaxLocalUniStreams(openUni + 1);
+  co_await rescheduleN(5);
+  EXPECT_EQ(serverWt_->openLocalUniStreams().size(), openUni);
+
+  update.forward = true;
+  EXPECT_FALSE((co_await subscribeHandle->requestUpdate(update)).hasError());
+  CO_ASSERT_TRUE(subgroup);
+  auto res2 = subgroup->object(
+      1, moxygen::test::makeBuf(10), noExtensions(), /*finSubgroup=*/true);
+  CO_ASSERT_TRUE(res2.hasError());
+  EXPECT_EQ(res2.error().code, MoQPublishError::CANCELLED);
+
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
+      .WillOnce([&](const PublishDone& pubDone) {
+        EXPECT_EQ(pubDone.streamCount, 0);
+        publishDone_.post();
+        return folly::unit;
+      });
+  trackConsumer->publishDone(
+      getTrackEndedPublishDone(subscribeRequest.requestID));
+  co_await publishDone_;
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
 // A resume that arrives while a pause is still in the handler stays in effect
 // after the pause completes.
 CO_TEST_P_X(Draft18Test, LaterResumeSupersedesInFlightPause) {
