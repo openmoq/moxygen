@@ -1858,6 +1858,8 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     if (pendingPauseID_ == requestID) {
       pendingPauseID_.reset();
       setForward(false);
+      // A subgroup still waiting for credit has not reached the wire.
+      resetWaitingSubgroups(ResetStreamErrorCode::CANCELLED);
     }
   }
 
