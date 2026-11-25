@@ -316,7 +316,8 @@ INSTANTIATE_TEST_SUITE_P(
     ClusterSessionTest,
     testing::Values(
         VersionParams{{kVersionDraft16}, kVersionDraft16},
-        VersionParams{{kVersionDraft18}, kVersionDraft18}));
+        VersionParams{{kVersionDraft18}, kVersionDraft18}),
+    versionParamsName);
 
 CO_TEST_P_X(ClusterSessionTest, PeersLearnEachOthersHopAndCost) {
   clientSession_->addExtension(std::make_shared<Cluster>(41, 0));

@@ -246,7 +246,8 @@ INSTANTIATE_TEST_SUITE_P(
         kVersionDraft16,
         kVersionDraft17,
         kVersionDraft18,
-        kVersionDraft22));
+        kVersionDraft22),
+    versionName);
 
 TEST_P(TopTracksFramerTest, EachDirectionHasItsOwnLimit) {
   // We accept up to 2 and the peer accepts up to 5; `theirs` is the peer's
@@ -352,7 +353,8 @@ using TopTracksNamespaceSessionTest = MoQSessionTest;
 INSTANTIATE_TEST_SUITE_P(
     TopTracksNamespaceSessionTest,
     TopTracksNamespaceSessionTest,
-    testing::Values(VersionParams{{kVersionDraft16}, kVersionDraft16}));
+    testing::Values(VersionParams{{kVersionDraft16}, kVersionDraft16}),
+    versionParamsName);
 
 CO_TEST_P_X(TopTracksNamespaceSessionTest, ServerReceivesFilterWithinItsLimit) {
   clientSession_->addExtension(std::make_shared<TopTracks>(0));
@@ -392,7 +394,8 @@ INSTANTIATE_TEST_SUITE_P(
     TopTracksTracksSessionTest,
     testing::Values(
         VersionParams{{kVersionDraft18}, kVersionDraft18},
-        VersionParams{{kVersionDraft22}, kVersionDraft22}));
+        VersionParams{{kVersionDraft22}, kVersionDraft22}),
+    versionParamsName);
 
 CO_TEST_P_X(TopTracksTracksSessionTest, ServerReceivesFilterWithinItsLimit) {
   clientSession_->addExtension(std::make_shared<TopTracks>(0));
