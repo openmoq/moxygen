@@ -217,6 +217,12 @@ class StreamPublisherImpl
   folly::Expected<folly::Unit, MoQPublishError> endOfSubgroup() override;
   void reset(ResetStreamErrorCode error) override;
 
+  // A session-side reset. Later writes return CANCELLED.
+  void cancel(ResetStreamErrorCode error) {
+    cancelled_ = true;
+    reset(error);
+  }
+
   // Null for a subgroup stream, whose counts belong to its track.
   std::shared_ptr<const MoQTrackStats> getTrackStats() const override {
     if (streamType_ != StreamType::FETCH_HEADER) {
@@ -399,6 +405,12 @@ class StreamPublisherImpl
   }
 
   MoQPublishError stopForwarding() {
+    // The session can drop a subgroup during a pause. A later resume does not
+    // reach the dropped subgroup.
+    if (cancelled_) {
+      return MoQPublishError(
+          MoQPublishError::CANCELLED, "Write after stream cancelled");
+    }
     reset(ResetStreamErrorCode::INTERNAL_ERROR);
     return MoQPublishError(
         MoQPublishError::API_ERROR, "shouldForward is false");
@@ -1590,7 +1602,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       }
     }
     for (auto& subgroup : waiting) {
-      subgroup->reset(code);
+      subgroup->cancel(code);
     }
   }
 
@@ -1858,6 +1870,8 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     if (pendingPauseID_ == requestID) {
       pendingPauseID_.reset();
       setForward(false);
+      // A subgroup still waiting for credit has not reached the wire.
+      resetWaitingSubgroups(ResetStreamErrorCode::CANCELLED);
     }
   }
 
