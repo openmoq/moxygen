@@ -25,7 +25,9 @@ class MockMoQSession : public MoQSession {
             folly::MaybeManagedPtr<proxygen::WebTransport>(nullptr),
             negotiatedVersion,
             exec),
-        ownsEventBase_(false) {}
+        ownsEventBase_(false) {
+    setSetupDefaults();
+  }
 
   // Default constructor that creates and manages its own executor
   MockMoQSession()
@@ -34,6 +36,7 @@ class MockMoQSession : public MoQSession {
             kVersionDraftCurrent,
             std::make_shared<MoQFollyExecutorImpl>(&evb_)),
         ownsEventBase_(true) {
+    setSetupDefaults();
     // Start EventBase in background thread for async operations
     evbThread_ = std::thread([this]() { evb_.loopForever(); });
   }
@@ -75,12 +78,35 @@ class MockMoQSession : public MoQSession {
   MOCK_METHOD(uint64_t, getNegotiatedVersion, (), (const, override));
 
   MOCK_METHOD(
+      const std::optional<SetupParameters>&,
+      getPeerSetupParams,
+      (),
+      (const, override));
+
+  MOCK_METHOD(
+      const MessageParameterExtensions&,
+      getMessageParameterExtensions,
+      (),
+      (const, override));
+
+  // What the getters above return unless a test overrides them.
+  std::optional<SetupParameters> peerSetupParams;
+  MessageParameterExtensions messageParameterExtensions;
+
+  MOCK_METHOD(
       folly::coro::Task<Publisher::TrackStatusResult>,
       trackStatus,
       (TrackStatus),
       (override));
 
  private:
+  void setSetupDefaults() {
+    ON_CALL(*this, getPeerSetupParams())
+        .WillByDefault(testing::ReturnRef(peerSetupParams));
+    ON_CALL(*this, getMessageParameterExtensions())
+        .WillByDefault(testing::ReturnRef(messageParameterExtensions));
+  }
+
   folly::EventBase evb_;
   std::thread evbThread_;
   bool ownsEventBase_;
